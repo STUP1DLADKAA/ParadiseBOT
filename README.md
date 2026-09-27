@@ -1,67 +1,45 @@
 # Paradise Bot
 
-Paradise is a small Discord bot for one private server. It comes online, quietly changes what it is doing, keeps a few daily notes, and answers one health command. That is all Phase 1 is meant to do.
+A small private Discord bot for a friends-only server. Paradise has slash commands, quiet conversational reactions, in-memory reminders/AFK state, and a slowly changing presence. It is intentionally not a moderation suite, dashboard, or AI wrapper.
 
-## Requirements
+## Run it
 
-- Node.js 20 or newer
-- A Discord application with a bot added to the Paradise server
-- The `bot` and `applications.commands` OAuth scopes
+Requires Python 3.11 or newer.
 
-Paradise only requests the `Guilds` gateway intent. No privileged intents are needed.
-
-## Setup
-
-Install dependencies:
+1. Create an application and bot in the [Discord Developer Portal](https://discord.com/developers/applications).
+2. On the bot page, enable the **Message Content Intent**. Paradise uses it for rare reactions, AFK clearing, and conversational responses.
+3. Invite it with the `bot` and `applications.commands` scopes. Useful permissions are View Channels, Send Messages, Embed Links, Add Reactions, Read Message History, and Use External Emojis.
+4. Install and configure:
 
 ```bash
-npm install
-```
-
-Copy the example environment file:
-
-```bash
+python -m pip install -r requirements.txt
 cp .env.example .env
+# Put the bot token after DISCORD_TOKEN= in .env
+python bot.py
 ```
 
-Fill in all three values:
+The only required setting is:
 
 ```env
-DISCORD_TOKEN=
-CLIENT_ID=
-GUILD_ID=
+DISCORD_TOKEN=your_token_here
 ```
 
-`CLIENT_ID` is the Discord application ID. `GUILD_ID` is the ID of the private server. Keep `.env` private; it is ignored by Git.
+Slash commands are synced globally at startup. Discord can take a little while to show newly registered global commands.
 
-Start Paradise:
+## Commands
 
-```bash
-npm start
-```
+- Fun: `/ping`, `/8ball`, `/coinflip`, `/roll`, `/choose`
+- Social: `/truth`, `/dare`, `/rate`, `/ship`, `/vibe`
+- Useful: `/remind`, `/poll`, `/afk`, `/userinfo`, `/serverinfo`
 
-A successful connection prints:
+Choices for `/choose` and `/poll` are separated with `|`, for example:
 
 ```text
-🌴 Paradise is awake.
+/choose options:pizza | burgers | something responsible
 ```
 
-The guild-scoped `/ping` command is registered at startup and replies with `alive unfortunately.`
+Reminders and AFK states live only in memory and disappear when the bot restarts. Limits and per-user command cooldowns keep temporary state and accidental spam under control.
 
-## Presence
+## Presence note
 
-Activities live in [`src/presence/activities.js`](src/presence/activities.js). They are grouped into normal, gaming, weird, sleepy, chaotic, mysterious, server, and pointless categories.
-
-Paradise picks across those categories and waits a random 20–60 minutes before considering another activity. It avoids an immediate repeat and sometimes leaves the current activity alone. Add a short activity to the appropriate category to extend the pool.
-
-## Daily notes
-
-Daily note text lives in [`src/personality/notes.js`](src/personality/notes.js). Paradise selects between one and four unique notes for each UTC day. It shows one as a Discord custom status at startup, returns to the day's set occasionally during activity rotation, and shows a new set after the next UTC midnight.
-
-The current set is saved in `data/daily-notes.json`, so restarting on the same day does not choose new notes. The runtime file is ignored by Git. On a host with an ephemeral filesystem, persist or mount the `data` directory if notes must survive deployments.
-
-## Checks
-
-```bash
-npm test
-```
+Discord gives bot accounts one visible activity slot. Paradise maintains separate custom-status and activity rotations, and the two loops take turns using that slot. Activities rotate every 20–60 minutes; custom-style statuses change much less often. Neither pool immediately repeats itself.
