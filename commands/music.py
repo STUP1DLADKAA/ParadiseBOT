@@ -15,7 +15,6 @@ from functions.music import MusicService
 from functions.music.panel import (
     QueuePaginator,
     render_now_playing,
-    render_queue_page,
 )
 
 log = logging.getLogger(__name__)
@@ -234,12 +233,9 @@ class Music(commands.Cog):
     async def queue(self, interaction: discord.Interaction) -> None:
         if not await self._ready(interaction):
             return
-        state = self._music().panel_state(interaction.guild_id)
         view = QueuePaginator(self._music(), interaction.guild_id)
         try:
-            await interaction.response.send_message(
-                embed=render_queue_page(state, 0), view=view
-            )
+            await interaction.response.send_message(view=view)
         except discord.DiscordException:
             log.debug("Queue response failed", exc_info=True)
             await interaction.response.send_message(
@@ -341,25 +337,26 @@ class Music(commands.Cog):
         if not await self._ready(interaction):
             return
         await interaction.response.defer()
-        state = self._music().panel_state(interaction.guild_id)
-        if state.track is None:
-            await interaction.followup.send(
-                "nothing is playing right now, so no lyrics either.", ephemeral=True
-            )
+        try:
+            track, text = await self._music().lyrics_for_guild(interaction.guild_id)
+        except MusicError as error:
+            await interaction.followup.send(str(error), ephemeral=True)
             return
-        title, artist = lyrics.clean_query(state.track.title, state.track.author)
-        text = await lyrics.fetch_lyrics(artist, title)
+        except Exception:
+            log.exception("/lyrics failed")
+            await interaction.followup.send("lyrics are unavailable right now.", ephemeral=True)
+            return
         if text is None:
             await interaction.followup.send(
-                f"couldn't find lyrics for **{shorten(state.track.title, 70)}**. "
-                "they might just not be out there."
+                f"couldn't find lyrics for **{shorten(track.title, 70)}**. "
+                "they may not be available from the provider."
             )
             return
         pages = lyrics.paginate(text)
-        view = lyrics.LyricsPaginator(pages).bind(state.track.title, artist)
-        embed = lyrics.render_lyrics_page(pages, 0, state.track.title, artist)
+        view = lyrics.LyricsPaginator(pages).bind(track.title, track.author)
         try:
-            await interaction.followup.send(embed=embed, view=view)
+            await interaction.followup.send(view=view)
+            await self._music().refresh_panel(interaction.guild_id)
         except discord.DiscordException:
             log.debug("Lyrics response failed", exc_info=True)
 
