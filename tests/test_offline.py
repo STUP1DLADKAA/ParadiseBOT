@@ -3,7 +3,8 @@
 Runs without a Discord token, network, or Lavalink node: it checks the
 exact registered command set, the removed commands, and the pure logic
 behind ping, coinflip, TTS limits, panels, queue pagination, settings,
-lyrics and AI message building.
+lyrics, AI message building, node plugin diagnostics and the search
+source fallback.
 
     python -m unittest discover -s tests -v
 """
@@ -51,6 +52,7 @@ from functions.music.panel import (  # noqa: E402
 from functions.music.service import MusicService  # noqa: E402
 from functions.settings import GuildSettings, SettingsStore, TTS_COOLDOWN_CHOICES  # noqa: E402
 from functions.tts import TTSService  # noqa: E402
+from lavalink.server import LoadType  # noqa: E402
 
 EXPECTED_COMMANDS = {
     "ping", "8ball", "coinflip", "choose",
@@ -524,6 +526,24 @@ class TestConfig(unittest.TestCase):
         with open(path, encoding="utf-8") as handle:
             content = handle.read()
         self.assertNotIn("heavencloud.in", content.lower())
+
+    def test_expected_plugins_parsing(self):
+        config = Config.from_env(
+            {"LAVALINK_EXPECTED_PLUGINS": " youtube-plugin:f45bb , chanom-plugin:1.0.6 , , :x , bare ,foo:"}
+        )
+        self.assertEqual(
+            config.expected_plugins,
+            (
+                ("youtube-plugin", "f45bb"),
+                ("chanom-plugin", "1.0.6"),
+                ("bare", None),
+                ("foo", None),
+            ),
+        )
+
+    def test_expected_plugins_empty(self):
+        self.assertEqual(Config().expected_plugins, ())
+        self.assertEqual(Config(lavalink_expected_plugins="   ").expected_plugins, ())
 
 
 # ---------------------------------------------------------------------------
@@ -1229,6 +1249,316 @@ def _voiceless_member():
         voice=None,
         guild_permissions=SimpleNamespace(move_members=False, administrator=False),
     )
+
+
+# ---------------------------------------------------------------------------
+# Node info / plugin diagnostics (what /v4/info reports drives /play)
+# ---------------------------------------------------------------------------
+
+REAL_INFO = {
+    "version": {"semver": "4.2.1", "major": 4, "minor": 2, "patch": 1},
+    "sourceManagers": ["soundcloud", "bandcamp", "twitch", "vimeo", "youtube", "http"],
+    "plugins": [{"name": "youtube-plugin", "version": "1.18.1"}],
+}
+
+
+class FakeInfoNode:
+    def __init__(self, info=None, error=None):
+        self._info = info
+        self._error = error
+
+    async def get_info(self):
+        if self._error is not None:
+            raise self._error
+        return self._info
+
+
+class TestNodeInfo(unittest.TestCase):
+    def _service(self, expected_plugins=""):
+        config = Config(
+            lavalink_host="n", lavalink_password="p",
+            lavalink_expected_plugins=expected_plugins,
+        )
+        store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
+        return MusicService(FakeBot(), config, store)
+
+    def test_parses_real_node_info(self):
+        async def run():
+            service = self._service()
+            await service._refresh_node_info(FakeInfoNode(REAL_INFO))
+            self.assertEqual(service.node_plugins, {"youtube-plugin": "1.18.1"})
+            self.assertEqual(
+                service.node_sources,
+                frozenset({"soundcloud", "bandcamp", "twitch", "vimeo", "youtube", "http"}),
+            )
+            self.assertEqual(service.node_version, "4.2.1")
+
+        asyncio.run(run())
+
+    def test_accepts_string_version_and_missing_sections(self):
+        async def run():
+            service = self._service()
+            await service._refresh_node_info(
+                FakeInfoNode({"version": "4.0.0", "sourceManagers": ["youtube"]})
+            )
+            self.assertEqual(service.node_version, "4.0.0")
+            self.assertEqual(service.node_plugins, {})
+            self.assertEqual(service.node_sources, frozenset({"youtube"}))
+            await service._refresh_node_info(FakeInfoNode({}))
+            self.assertIsNone(service.node_sources)  # empty list -> unknown, use defaults
+
+        asyncio.run(run())
+
+    def test_node_info_failure_keeps_defaults(self):
+        async def run():
+            service = self._service()
+            await service._refresh_node_info(FakeInfoNode(error=RuntimeError("boom")))
+            self.assertEqual(service.node_plugins, {})
+            self.assertIsNone(service.node_sources)
+
+        asyncio.run(run())
+
+    def test_missing_plugins(self):
+        async def run():
+            service = self._service(
+                "youtube-plugin:1.18.1,chanom-plugin:1.0.6"
+            )
+            await service._refresh_node_info(FakeInfoNode(REAL_INFO))
+            # Loaded (any version) is not missing; only absent ones are.
+            self.assertEqual(service.missing_plugins(), ["chanom-plugin 1.0.6"])
+            service.node_plugins = {}
+            self.assertEqual(
+                service.missing_plugins(),
+                ["youtube-plugin 1.18.1", "chanom-plugin 1.0.6"],
+            )
+
+        asyncio.run(run())
+
+    def test_missing_plugins_without_versions(self):
+        async def run():
+            service = self._service("chanom-plugin")
+            await service._refresh_node_info(FakeInfoNode(REAL_INFO))
+            self.assertEqual(service.missing_plugins(), ["chanom-plugin"])
+
+        asyncio.run(run())
+
+    def test_plugins_label_is_compact_and_safe(self):
+        async def run():
+            service = self._service()
+            await service._refresh_node_info(FakeInfoNode(REAL_INFO))
+            self.assertEqual(service.plugins_label(), "youtube-plugin@1.18.1")
+            # Snapshot hashes are truncated, never dumped whole.
+            service.node_plugins = {
+                "youtube-plugin": "f45bbb7aebfcbc1c553769e04af6cd43afa8b7c3"
+            }
+            label = service.plugins_label()
+            self.assertEqual(label, "youtube-plugin@f45bbb7aebfc…")
+            self.assertNotIn("f45bbb7aebfcbc1c553769e04af6cd43afa8b7c3", label)
+
+        asyncio.run(run())
+
+    def test_plugins_label_none_when_empty(self):
+        self.assertIsNone(self._service().plugins_label())
+
+    def test_search_prefixes_gated_by_node_sources(self):
+        service = self._service()
+        self.assertEqual(service._search_prefixes(), ("ytsearch", "scsearch"))  # unknown node
+        service.node_sources = frozenset({"youtube", "soundcloud", "http"})
+        self.assertEqual(service._search_prefixes(), ("ytsearch", "ytmsearch", "scsearch"))
+        service.node_sources = frozenset({"soundcloud"})
+        self.assertEqual(service._search_prefixes(), ("scsearch",))
+        service.node_sources = frozenset({"http"})
+        self.assertEqual(service._search_prefixes(), ())
+
+
+# ---------------------------------------------------------------------------
+# Search source fallback (ytsearch -> ytmsearch -> scsearch, one pass)
+# ---------------------------------------------------------------------------
+
+
+class FakeSearchClient:
+    """get_tracks scripted per identifier, recording every query."""
+
+    def __init__(self, player, responses):
+        self.player = player
+        self.responses = responses
+        self.queries = []
+        self.player_manager = SimpleNamespace(
+            get=lambda gid: player,
+            create=lambda guild_id=None, **kw: player,
+        )
+        self.node_manager = SimpleNamespace(available_nodes=[object()])
+
+    async def get_tracks(self, identifier):
+        self.queries.append(identifier)
+        response = self.responses.get(identifier, FakeLoadResult(LoadType.EMPTY, []))
+        if isinstance(response, Exception):
+            raise response
+        return response
+
+
+class TestSearchFallback(unittest.TestCase):
+    def _service(self, player, responses, node_sources="unset"):
+        guild = MusicFlowGuild(player=player)
+        guild.player = player
+        config = Config(lavalink_host="n", lavalink_password="p")
+        store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
+        service = MusicService(MusicFlowBot(guild), config, store)
+        service.client = FakeSearchClient(player, responses)
+        if node_sources != "unset":
+            service.node_sources = node_sources
+        return service, guild
+
+    def _member(self, guild, **kwargs):
+        return MusicFlowMember(guild=guild, **kwargs)
+
+    def test_search_falls_back_to_soundcloud(self):
+        async def run():
+            player = FakeRealPlayer(channel_id=None)
+            service, guild = self._service(
+                player,
+                {
+                    "ytsearch:hello": FakeLoadResult(LoadType.EMPTY, []),
+                    "scsearch:hello": FakeLoadResult(LoadType.SEARCH, [make_track()]),
+                },
+            )
+            result = await service.play(guild, self._member(guild), "hello")
+            self.assertTrue(result.started)
+            self.assertEqual(
+                service.client.queries, ["ytsearch:hello", "scsearch:hello"]
+            )
+
+        asyncio.run(run())
+
+    def test_search_tries_ytmsearch_when_node_reports_youtube(self):
+        async def run():
+            player = FakeRealPlayer(channel_id=None)
+            service, guild = self._service(
+                player,
+                {
+                    "ytsearch:hello": FakeLoadResult(LoadType.EMPTY, []),
+                    "ytmsearch:hello": FakeLoadResult(LoadType.EMPTY, []),
+                    "scsearch:hello": FakeLoadResult(LoadType.SEARCH, [make_track()]),
+                },
+                node_sources=frozenset({"youtube", "soundcloud", "http"}),
+            )
+            await service.play(guild, self._member(guild), "hello")
+            self.assertEqual(
+                service.client.queries,
+                ["ytsearch:hello", "ytmsearch:hello", "scsearch:hello"],
+            )
+
+        asyncio.run(run())
+
+    def test_load_error_falls_through_to_next_source(self):
+        async def run():
+            player = FakeRealPlayer(channel_id=None)
+            service, guild = self._service(
+                player,
+                {
+                    "ytsearch:hello": FakeLoadResult(LoadType.ERROR, []),
+                    "scsearch:hello": FakeLoadResult(LoadType.SEARCH, [make_track()]),
+                },
+            )
+            result = await service.play(guild, self._member(guild), "hello")
+            self.assertTrue(result.started)
+            self.assertEqual(len(service.client.queries), 2)
+
+        asyncio.run(run())
+
+    def test_source_exception_falls_through_to_next_source(self):
+        async def run():
+            player = FakeRealPlayer(channel_id=None)
+            service, guild = self._service(
+                player,
+                {
+                    "ytsearch:hello": RuntimeError("node hiccup"),
+                    "scsearch:hello": FakeLoadResult(LoadType.SEARCH, [make_track()]),
+                },
+            )
+            result = await service.play(guild, self._member(guild), "hello")
+            self.assertTrue(result.started)
+            self.assertEqual(len(service.client.queries), 2)
+
+        asyncio.run(run())
+
+    def test_url_passes_through_without_source_fallback(self):
+        async def run():
+            player = FakeRealPlayer(channel_id=None)
+            url = "https://youtu.be/dQw4w9WgXcQ"
+            service, guild = self._service(
+                player, {url: FakeLoadResult(LoadType.TRACK, [make_track()])},
+                node_sources=frozenset(),  # even a source-less node gets URLs
+            )
+            result = await service.play(guild, self._member(guild), url)
+            self.assertTrue(result.started)
+            self.assertEqual(service.client.queries, [url])
+
+        asyncio.run(run())
+
+    def test_all_sources_empty_is_a_friendly_error(self):
+        async def run():
+            player = FakeRealPlayer(channel_id=None)
+            service, guild = self._service(player, {})
+            with self.assertRaisesRegex(MusicError, "couldn't find anything"):
+                await service.play(guild, self._member(guild), "hello")
+            self.assertEqual(
+                service.client.queries, ["ytsearch:hello", "scsearch:hello"]
+            )
+
+        asyncio.run(run())
+
+    def test_node_unreachable_is_a_friendly_error(self):
+        async def run():
+            player = FakeRealPlayer(channel_id=None)
+            service, guild = self._service(
+                player,
+                {
+                    "ytsearch:hello": RuntimeError("refused"),
+                    "scsearch:hello": RuntimeError("refused"),
+                },
+            )
+            with self.assertRaisesRegex(MusicError, "couldn't reach the music node"):
+                await service.play(guild, self._member(guild), "hello")
+
+        asyncio.run(run())
+
+    def test_url_load_error_is_a_friendly_error(self):
+        async def run():
+            player = FakeRealPlayer(channel_id=None)
+            url = "https://example.com/broken"
+            service, guild = self._service(
+                player, {url: FakeLoadResult(LoadType.ERROR, [])}
+            )
+            with self.assertRaisesRegex(MusicError, "didn't load"):
+                await service.play(guild, self._member(guild), url)
+            self.assertEqual(service.client.queries, [url])  # no fallback retries for URLs
+
+        asyncio.run(run())
+
+    def test_no_searchable_sources_is_a_friendly_error(self):
+        async def run():
+            player = FakeRealPlayer(channel_id=None)
+            service, guild = self._service(
+                player, {}, node_sources=frozenset({"http"})
+            )
+            with self.assertRaisesRegex(MusicError, "no searchable sources"):
+                await service.play(guild, self._member(guild), "hello")
+            self.assertEqual(service.client.queries, [])  # nothing was queried
+
+        asyncio.run(run())
+
+    def test_node_down_is_a_friendly_error(self):
+        async def run():
+            player = FakeRealPlayer(channel_id=None)
+            service, guild = self._service(player, {})
+            service.client.node_manager = SimpleNamespace(available_nodes=[])
+            with self.assertRaisesRegex(MusicError, "music is unavailable"):
+                await service.play(guild, self._member(guild), "hello")
+            with self.assertRaisesRegex(MusicError, "music is unavailable"):
+                await service.join(guild, self._member(guild))
+
+        asyncio.run(run())
 
 
 if __name__ == "__main__":
