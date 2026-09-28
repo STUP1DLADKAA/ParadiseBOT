@@ -110,6 +110,32 @@ def format_duration(ms: int) -> str:
     return f"{minutes}:{secs:02d}"
 
 
+_DURATION_CLOCK_RE = re.compile(r"^(?:(\d{1,3}):)?(\d{1,3}):(\d{1,2})$")
+
+
+def parse_duration(text: str) -> int | None:
+    """Parse ``[[h:]m:]s`` or plain seconds into milliseconds.
+
+    Returns ``None`` for anything that isn't a non-negative duration —
+    callers turn that into a friendly error instead of a crash.
+    """
+    text = (text or "").strip().lower()
+    if not text:
+        return None
+    if text.isdigit():  # plain seconds ("90" -> 1:30)
+        seconds = int(text)
+        return seconds * 1000 if seconds <= 24 * 3600 else None
+    match = _DURATION_CLOCK_RE.match(text)
+    if match is None:
+        return None
+    hours = int(match.group(1) or 0)
+    minutes = int(match.group(2))
+    secs = int(match.group(3))
+    if minutes > 59 or secs > 59:
+        return None
+    return (hours * 3600 + minutes * 60 + secs) * 1000
+
+
 def progress_bar(position_ms: int, duration_ms: int, width: int = 10) -> str:
     """A compact textual progress bar like ``▬▬▬●▬▬▬▬▬▬``."""
     if duration_ms <= 0:
@@ -117,6 +143,59 @@ def progress_bar(position_ms: int, duration_ms: int, width: int = 10) -> str:
     ratio = max(0.0, min(1.0, position_ms / duration_ms))
     filled = max(0, min(round(width * ratio), width - 1))
     return "▬" * filled + "●" + "▬" * (width - filled - 1)
+
+
+# --------------------------------------------------------------------------- 
+# Track-title normalization (autoplay duplicate protection, lyrics matching)
+# ---------------------------------------------------------------------------
+
+_NOISE_WORDS = frozenset({
+    # Dropped anywhere in a title/artist string. Deliberately excludes words
+    # that appear in real song titles ("Song 2", "Music", "Video Games").
+    "official", "video", "audio", "lyrics", "lyric", "lyricvideo",
+    "mv", "mve", "hd", "hq", "4k", "uhd", "cc",
+    "remastered", "remaster", "visualizer", "visualiser", "vevo", "topic",
+    "videoclip", "sub", "subs", "subtitulado", "esp", "letra",
+})
+# Inside brackets these words are almost always descriptive junk — a wider
+# net is safe there because real titles like "Song 2" are not bracketed.
+_BRACKET_NOISE = _NOISE_WORDS | {
+    "music", "song", "full", "version", "cd", "single", "ep", "lyric",
+    "official", "audio", "video",
+}
+_BRACKETED_RE = re.compile(r"[(\[{][^)\]}]*[)\]}]")
+_FEAT_RE = re.compile(
+    r"\s*[-–—]\s*(?:feat\.?|ft\.?|featuring)\s+\S.*$", re.IGNORECASE
+)
+_FEAT_BRACKET_RE = re.compile(
+    r"^\s*(?:feat\.?|ft\.?|featuring|with|prod\.?|prod by)\b", re.IGNORECASE
+)
+
+
+def strip_title_noise(value: str) -> str:
+    """Drop bracketed noise, feat credits and filler words from a title."""
+    def keep_bracket(match: re.Match) -> str:
+        inner = match.group(0)[1:-1]
+        if _FEAT_BRACKET_RE.match(inner):
+            return " "  # (feat. X) / (with Y) never changes the lyrics
+        words = re.split(r"[\s/|]+", inner.strip().lower())
+        # Keep segments that carry meaning (remix, live, acoustic …)
+        meaningful = any(word not in _BRACKET_NOISE and not word.isdigit() for word in words)
+        return match.group(0) if meaningful else " "
+
+    value = _BRACKETED_RE.sub(keep_bracket, value)
+    value = _FEAT_RE.sub(" ", value)
+    words = [word for word in re.split(r"[\s_]+", value) if word and word.lower() not in _NOISE_WORDS]
+    cleaned = " ".join(words)
+    return cleaned.strip(" -–—|,.") or value.strip()
+
+
+def normalize_track_key(title: str, author: str = "") -> str:
+    """A comparison key where ``Artist - Song (Official Video)`` equals
+    ``Artist - Song [Official Audio]``."""
+    cleaned = strip_title_noise(f"{author or ''} {title or ''}")
+    cleaned = re.sub(r"[^\w\s]", " ", cleaned.casefold())
+    return re.sub(r"\s+", " ", cleaned).strip()
 
 
 # ---------------------------------------------------------------------------

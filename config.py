@@ -55,9 +55,11 @@ class Config:
     # Music behaviour.
     music_max_volume: int = 150
     auto_disconnect_minutes: int = 10
+    music_history_limit: int = 50  # how far back /previous can reach
 
     # Optional integrations.
     lyrics_enabled: bool = True
+    genius_api_key: str = ""  # optional third lyrics provider; blank = skipped
 
     data_dir: str = "data"
 
@@ -111,7 +113,9 @@ class Config:
             tts_global_cooldown=_int(env.get("TTS_GLOBAL_COOLDOWN"), 8),
             music_max_volume=_int(env.get("MUSIC_MAX_VOLUME"), 150),
             auto_disconnect_minutes=_int(env.get("AUTO_DISCONNECT_MINUTES"), 10),
+            music_history_limit=_int(env.get("MUSIC_MAX_HISTORY"), 50),
             lyrics_enabled=_bool(env.get("LYRICS_ENABLED"), True),
+            genius_api_key=env.get("GENIUS_API_KEY", "").strip(),
             data_dir=env.get("PARADISE_DATA_DIR", "data").strip() or "data",
         )
 

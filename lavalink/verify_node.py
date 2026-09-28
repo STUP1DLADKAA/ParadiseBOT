@@ -312,6 +312,18 @@ def main() -> int:
             }
             log(f"/v4/info plugins: {reported_plugins or '(none)'}")
             log(f"/v4/info sources: {', '.join(info.get('sourceManagers') or []) or '(none)'}")
+            # The same report Paradise's /filter and Effects button trust.
+            raw_filters = info.get("filters")
+            if isinstance(raw_filters, (list, tuple)):
+                enabled_filters = [str(name) for name in raw_filters]
+            elif isinstance(raw_filters, dict):
+                enabled_filters = [str(name) for name, on in raw_filters.items() if on]
+            else:
+                enabled_filters = None
+            if enabled_filters is None:
+                log("/v4/info filters: not reported (older node — Paradise will probe)")
+            else:
+                log(f"/v4/info filters: {', '.join(enabled_filters) or '(none)'}")
 
         if version_status == 200:
             by_name["/version answers"].passed(f"Lavalink {str(version_body).strip()}")

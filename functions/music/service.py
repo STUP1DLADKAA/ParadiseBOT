@@ -2,6 +2,12 @@
 
 Slash commands, panel buttons, TTS playback and auto-disconnect all funnel
 through the methods on this class. Nothing else touches Lavalink directly.
+
+Beyond plain playback this service owns the Groove-inspired behaviour layers:
+per-guild playback history (real Previous support), loop modes (off / track /
+queue via Lavalink.py's native player loop), autoplay with duplicate
+protection, queue reordering, seeking, and audio-effect presets gated on what
+the node actually reports it supports.
 """
 
 from __future__ import annotations
@@ -11,7 +17,9 @@ import logging
 import random
 import re
 import time
-from typing import TYPE_CHECKING
+from collections import deque
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable
 
 import discord
 import lavalink
@@ -22,6 +30,14 @@ from lavalink.events import (
     TrackStartEvent,
     TrackStuckEvent,
 )
+from lavalink.filters import (
+    Equalizer,
+    Karaoke,
+    Rotation,
+    Timescale,
+    Tremolo,
+    Vibrato,
+)
 from lavalink.server import LoadType
 
 from functions import lyrics
@@ -29,8 +45,11 @@ from functions.helpers import (
     MusicError,
     NodePlaybackUnsupported,
     can_bypass_voice_check,
+    format_duration,
+    normalize_track_key,
     same_voice_channel,
     shorten,
+    strip_title_noise,
     voice_channel_name,
 )
 from functions.music.panel import (
@@ -38,6 +57,7 @@ from functions.music.panel import (
     MusicPanelView,
     PanelState,
     PlayResult,
+    PreviousResult,
     SkipResult,
     TrackInfo,
     button_states,
@@ -54,6 +74,16 @@ _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _PLAYLIST_CAP = 50
 _MAINTENANCE_INTERVAL = 15
 _LAST_ACTION_TTL = 45 * 60
+_DEFAULT_HISTORY_LIMIT = 50
+
+# Autoplay: small, deliberate batches — never a wall of tracks.
+_AUTOPLAY_BATCH = 3
+_AUTOPLAY_SCAN = 25  # how many playlist entries to consider when sampling
+_AUTOPLAY_MEMORY = 80  # remembered auto-added keys per guild
+
+_LOOP_VALUES = {"off": 0, "track": 1, "queue": 2}
+_LOOP_LABELS = {"off": "Loop Off", "track": "Loop: Track", "queue": "Loop: Queue"}
+_LOOP_NEXT = {"off": "track", "track": "queue", "queue": "off"}
 
 # Search prefixes Paradise may use for plain (non-URL) queries, in preference
 # order, mapped to the Lavalink source manager that must be loaded for the
@@ -68,6 +98,92 @@ _SEARCH_PREFIX_SOURCES: tuple[tuple[str, str], ...] = (
 _FALLBACK_SEARCH_PREFIXES = ("ytsearch", "scsearch")
 _MAX_PLUGIN_LABEL = 5
 
+_BASS_BANDS = (0.35, 0.30, 0.22, 0.14, 0.08, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+
+
+@dataclass(frozen=True, slots=True)
+class FilterPreset:
+    """One user-facing audio effect, mapped onto what the node supports."""
+
+    name: str
+    label: str
+    node_filter: str  # the Lavalink filter name / player.filters key
+    description: str
+    factory: Callable[[], lavalink.abc.Filter]
+
+
+# Only effects the pinned Lavalink v4 config actually enables. Each maps to a
+# real filter class; nothing here is faked. Support is re-checked against the
+# node's own /v4/info report before anything is applied.
+_FILTER_PRESETS: tuple[FilterPreset, ...] = (
+    FilterPreset(
+        "bassboost", "Bass Boost", "equalizer",
+        "punchier low end",
+        lambda: Equalizer(gains=_BASS_BANDS),
+    ),
+    FilterPreset(
+        "nightcore", "Nightcore", "timescale",
+        "sped up and pitched up",
+        lambda: Timescale(speed=1.25, pitch=1.25),
+    ),
+    FilterPreset(
+        "daycore", "Daycore", "timescale",
+        "slowed and reverb-ish",
+        lambda: Timescale(speed=0.85, pitch=0.85),
+    ),
+    FilterPreset(
+        "karaoke", "Karaoke", "karaoke",
+        "dials down the vocals",
+        lambda: Karaoke(level=1.0, mono_level=1.0, filter_band=220.0, filter_width=100.0),
+    ),
+    FilterPreset(
+        "tremolo", "Tremolo", "tremolo",
+        "volume wobble",
+        lambda: Tremolo(frequency=2.0, depth=0.3),
+    ),
+    FilterPreset(
+        "vibrato", "Vibrato", "vibrato",
+        "pitch wobble",
+        lambda: Vibrato(frequency=2.0, depth=0.3),
+    ),
+    FilterPreset(
+        "rotation", "Rotation", "rotation",
+        "8D-style spinning",
+        lambda: Rotation(rotation_hz=0.2),
+    ),
+)
+_FILTER_BY_NAME = {preset.name: preset for preset in _FILTER_PRESETS}
+
+
+@dataclass(slots=True)
+class HistoryEntry:
+    """One previously played track, kept as the original Lavalink object.
+
+    ``resume_ms`` remembers where the track was when the listener navigated
+    away from it manually, so Previous can land back at roughly that spot
+    instead of restarting or re-searching.
+    """
+
+    track: object
+    resume_ms: int | None = None
+
+
+def _track_identity(track) -> tuple:
+    """Stable identity for a track: the encoded track string when present,
+    otherwise identifier + title (covers decoded and fake tracks alike)."""
+    encoded = getattr(track, "track", None)
+    if encoded:
+        return ("t", encoded)
+    return (
+        "i",
+        str(getattr(track, "identifier", "") or ""),
+        str(getattr(track, "title", "") or ""),
+    )
+
+
+def _same_track(a, b) -> bool:
+    return _track_identity(a) == _track_identity(b)
+
 
 class GuildSession:
     """Per-guild music state that lives outside the Lavalink player."""
@@ -81,10 +197,19 @@ class GuildSession:
         "tts_active",
         "tts_text",
         "tts_stash",
+        "tts_loop_value",
         "transition_track",
         "transition_position",
+        "playback_history",
+        "history_index",
+        "history_intent",
+        "loop_mode",
+        "autoplay_enabled",
+        "autoplay_history",
+        "autoplay_retry_at",
+        "autoplay_failures",
+        "active_presets",
     )
-
     def __init__(self) -> None:
         self.volume: int = 100
         self.sticky: bool = False  # True when joined via /join: stay when alone
@@ -95,10 +220,31 @@ class GuildSession:
         self.tts_active: bool = False
         self.tts_text: str | None = None
         self.tts_stash: tuple | None = None  # (track, position_ms, queue, was_paused)
+        self.tts_loop_value: int = 0  # loop mode parked while TTS owns the player
         # Short-lived display context while Lavalink transitions between tracks.
         # QueueEnd clears it, so a genuinely finished session still becomes idle.
         self.transition_track: TrackInfo | None = None
         self.transition_position: int = 0
+        # Playback history: a bounded list of everything that has started
+        # playing, with a cursor. history_index points at the track that is
+        # (or was most recently) playing; anything past it was left behind by
+        # Previous navigation and gets truncated when normal playback resumes.
+        self.playback_history: list[HistoryEntry] = []
+        self.history_index: int = -1
+        self.history_intent: str | None = None  # "previous" while navigating back
+        # Loop mode mirrors the player's native loop setting for the panel.
+        self.loop_mode: str = "off"  # off | track | queue
+        # Autoplay: per-guild switch + a short memory of what was auto-added,
+        # so related-track search never loops the same picks over and over.
+        self.autoplay_enabled: bool = False
+        self.autoplay_history: deque[str] = deque(maxlen=_AUTOPLAY_MEMORY)
+        # Backoff for autoplay retries: never hammer the node when related
+        # searches keep coming back empty.
+        self.autoplay_retry_at: float = 0.0
+        self.autoplay_failures: int = 0
+        # Names of active audio-effect presets (the player owns the real state;
+        # this survives reconnects and feeds the panel).
+        self.active_presets: set[str] = set()
 
     def note(self, action: str) -> None:
         self.last_action = action
@@ -117,8 +263,18 @@ class GuildSession:
         self.tts_active = False
         self.tts_text = None
         self.tts_stash = None
+        self.tts_loop_value = 0
         self.transition_track = None
         self.transition_position = 0
+        self.playback_history = []
+        self.history_index = -1
+        self.history_intent = None
+        self.loop_mode = "off"
+        self.autoplay_enabled = False
+        self.autoplay_history.clear()
+        self.autoplay_retry_at = 0.0
+        self.autoplay_failures = 0
+        self.active_presets.clear()
         if not keep_volume:
             self.volume = 100
 
@@ -133,11 +289,13 @@ class MusicService:
         self.sessions: dict[int, GuildSession] = {}
         self._panel_messages: dict[int, discord.Message] = {}
         self._panel_locks: dict[int, asyncio.Lock] = {}
+        self._autoplay_locks: dict[int, asyncio.Lock] = {}
         self._maintenance_task: asyncio.Task | None = None
         self._closing = False
         # What the node reported about itself (refreshed on every node ready).
         self.node_plugins: dict[str, str] = {}
         self.node_sources: frozenset[str] | None = None
+        self.node_filters: frozenset[str] | None = None
         self.node_version: str | None = None
         # Deliberately separate transport readiness from /v4/info diagnostics.
         # An info request can fail transiently while the websocket is still up.
@@ -156,6 +314,9 @@ class MusicService:
         return session
 
     async def start(self) -> None:
+        # Wire optional provider credentials for the lyrics chain (Genius is
+        # skipped entirely when the key is unset).
+        lyrics.GENIUS_API_KEY = self.config.genius_api_key or None
         if not self.config.music_configured:
             self._node_state = "DISCONNECTED"
             log.info("Lavalink not configured — music and TTS stay offline.")
@@ -225,35 +386,50 @@ class MusicService:
 
     @lavalink.listener(TrackStartEvent)
     async def _on_track_start(self, event: TrackStartEvent) -> None:
+        self._record_history(event.player, event.track)
         await self.refresh_panel(event.player.guild_id)
 
     @lavalink.listener(QueueEndEvent)
     async def _on_queue_end(self, event: QueueEndEvent) -> None:
-        session = self.session(event.player.guild_id)
+        guild_id = event.player.guild_id
+        session = self.session(guild_id)
         if session.tts_active:
             return  # the TTS worker owns the next transition
+        if session.autoplay_enabled and not self._closing:
+            if await self._maybe_autoplay(event.player, session):
+                await self.refresh_panel(guild_id)
+                return
         session.last_action = None
         session.last_action_at = 0.0
         session.transition_track = None
         session.transition_position = 0
-        await self.refresh_panel(event.player.guild_id)
+        await self.refresh_panel(guild_id)
 
     @lavalink.listener(TrackExceptionEvent)
     async def _on_track_exception(self, event: TrackExceptionEvent) -> None:
         log.warning(
             "Track error in guild %s: %s", event.player.guild_id, getattr(event, "exception", "?")
         )
-        self.session(event.player.guild_id).note("last track errored — skipped it")
-        try:
-            await event.player.skip()
-        except Exception:
-            log.debug("Skip after track exception failed", exc_info=True)
+        # DefaultPlayer does not advance past an exception on its own, so the
+        # service owns the recovery — with the loop guard below so a track-loop
+        # can never turn one broken track into an exception loop.
+        await self._recover_player(
+            event.player,
+            f"**{shorten(getattr(event.track, 'title', 'the track'), 50)}** errored — moving on",
+            force=True,
+        )
         await self.refresh_panel(event.player.guild_id)
 
     @lavalink.listener(TrackStuckEvent)
     async def _on_track_stuck(self, event: TrackStuckEvent) -> None:
         log.warning("Track stuck in guild %s", event.player.guild_id)
-        self.session(event.player.guild_id).note("last track got stuck — moved on")
+        # DefaultPlayer already advances past stuck tracks — unless a track
+        # loop is on, in which case it would replay the stuck track forever.
+        # Only intervene in that case.
+        if (getattr(event.player, "loop", 0) or 0) == 1:
+            await self._recover_player(event.player, "last track got stuck — moved on", force=True)
+        else:
+            self.session(event.player.guild_id).note("last track got stuck — moved on")
         await self.refresh_panel(event.player.guild_id)
 
     @lavalink.listener(NodeReadyEvent)
@@ -291,6 +467,15 @@ class MusicService:
                 if entry.get("name")
             }
             sources = frozenset(str(name) for name in (info.get("sourceManagers") or []))
+            raw_filters = info.get("filters")
+            if isinstance(raw_filters, dict):  # {"equalizer": true, ...}
+                filters = frozenset(
+                    str(name) for name, enabled in raw_filters.items() if enabled
+                )
+            elif isinstance(raw_filters, (list, tuple)):  # ["equalizer", ...]
+                filters = frozenset(str(name) for name in raw_filters)
+            else:
+                filters = None  # node did not say — probe at runtime instead
             raw_version = info.get("version")
             if isinstance(raw_version, dict):  # {"semver": "4.2.1", ...}
                 version = str(raw_version.get("semver") or "") or None
@@ -300,6 +485,7 @@ class MusicService:
                 version = None
             self.node_plugins = plugins
             self.node_sources = sources or None
+            self.node_filters = filters
             self.node_version = version
             self._node_info_ok = True
             self._node_state = "READY" if self.node_ready else "DISCONNECTED"
@@ -313,6 +499,10 @@ class MusicService:
             len(self.node_sources or ()),
             len(plugins),
         )
+        if self.node_filters is not None:
+            log.info("Lavalink filters enabled: %s", ", ".join(sorted(self.node_filters)) or "(none)")
+        else:
+            log.info("Lavalink did not report filters — effects will be probed at runtime")
         if plugins:
             summary = ", ".join(f"{name}@{version}" for name, version in sorted(plugins.items()))
             log.info("Lavalink plugins loaded: %s", summary)
@@ -496,9 +686,15 @@ class MusicService:
             volume=session.volume,
             last_action=session.recent_action(),
             lyrics_enabled=self.config.lyrics_enabled,
+            loop_mode=session.loop_mode,
+            autoplay=session.autoplay_enabled,
+            filters=[preset.label for preset in self.active_filter_presets(guild_id)],
+            effects_available=self.node_filters is None
+            or any(preset.node_filter in self.node_filters for preset in _FILTER_PRESETS),
         )
         if not connected:
             return state
+        state.has_previous = session.history_index > 0
 
         state.voice_channel = voice_channel_name(guild, player.channel_id)
         state.status = "idle"
@@ -536,7 +732,7 @@ class MusicService:
                 state.lyrics_preview = next((line.strip() for line in text.splitlines() if line.strip()), None)
         return state
 
-    async def lyrics_for_guild(self, guild_id: int) -> tuple[TrackInfo, str | None]:
+    async def lyrics_for_guild(self, guild_id: int) -> tuple[TrackInfo, lyrics.LyricsResult | None]:
         """Fetch cached lyrics for the currently loaded music track.
 
         The active key is checked again after the provider returns, preventing a
@@ -550,11 +746,11 @@ class MusicService:
             raise MusicError("there isn't a loaded track to find lyrics for.")
         key = track.lyrics_key
         title, artist = lyrics.clean_query(track.title, track.author)
-        text = await lyrics.CACHE.get(key, artist, title)
+        result = await lyrics.CACHE.get(key, artist, title, track.duration_ms or None)
         current = self.panel_state(guild_id).active_track
         if current is None or current.lyrics_key != key:
             raise MusicError("the track changed while I was finding those lyrics. try again.")
-        return track, text
+        return track, result
 
     # ------------------------------------------------------------------
     # Panel management
@@ -696,12 +892,27 @@ class MusicService:
             log.exception("Voice connect failed")
             raise MusicError("couldn't join that channel. check my permissions.") from None
         player = self.client.player_manager.create(guild_id=guild.id)
-        session = self.session(guild.id)
-        if session.volume != 100:
-            try:
+        await self._apply_session_player_state(guild.id, player)
+
+    async def _apply_session_player_state(self, guild_id: int, player) -> None:
+        """Carry session-owned settings (volume, loop, effects) onto a player.
+
+        Called after every fresh connect so a rejoin doesn't silently drop
+        what the guild had configured.
+        """
+        session = self.session(guild_id)
+        try:
+            if session.volume != 100:
                 await player.set_volume(session.volume)
-            except Exception:
-                log.debug("Volume restore failed", exc_info=True)
+            if session.loop_mode != "off":
+                self._set_player_loop(player, _LOOP_VALUES[session.loop_mode])
+            for name in list(session.active_presets):
+                preset = _FILTER_BY_NAME.get(name)
+                if preset is not None and self.filter_supported(preset):
+                    await player.set_filter(preset.factory())
+        except Exception:
+            # State restore is best-effort; playback must never die for it.
+            log.debug("Session player-state restore failed", exc_info=True)
 
     async def join(self, guild: discord.Guild, member: discord.Member) -> JoinResult:
         self._require_ready()
@@ -782,6 +993,9 @@ class MusicService:
             raise MusicError("couldn't find anything for that.")
 
         session = self.session(guild.id)
+        # A human adding music re-arms autoplay after it gave up.
+        session.autoplay_failures = 0
+        session.autoplay_retry_at = 0.0
 
         if results.load_type is LoadType.PLAYLIST:
             tracks = results.tracks[:_PLAYLIST_CAP]
@@ -827,11 +1041,169 @@ class MusicService:
         self.require_connected_control(guild, member)
         if player.current is None:
             raise MusicError("nothing is playing right now.")
+        session = self.session(guild.id)
+        self._note_resume_position(player, session)
         skipped = TrackInfo.from_track(player.current)
         up_next = TrackInfo.from_track(player.queue[0]) if player.queue else None
-        await player.skip()
-        self.session(guild.id).note(f"skipped · {shorten(skipped.title, 60)}")
+        await self._advance(player)
+        session.note(f"skipped · {shorten(skipped.title, 60)}")
         return SkipResult(skipped, up_next)
+
+    async def previous(self, guild: discord.Guild, member: discord.Member) -> PreviousResult:
+        """Jump back to the last played track — the real object, not a re-search.
+
+        History navigation moves a cursor through :attr:`GuildSession.playback_history`;
+        it never rewrites the queue. Normal playback from anywhere past the
+        cursor truncates the abandoned branch, exactly like a music app.
+        """
+        player = self._require_connected(guild)
+        self.require_connected_control(guild, member)
+        session = self.session(guild.id)
+        if session.tts_active:
+            raise MusicError("hold on — I'm speaking. try previous right after.")
+        if session.history_index <= 0 or not session.playback_history:
+            raise MusicError("there isn't a previous track.")
+
+        self._note_resume_position(player, session)
+        session.history_index -= 1
+        entry = session.playback_history[session.history_index]
+        session.history_intent = "previous"
+
+        start = entry.resume_ms
+        if start is not None:
+            track_is_stream = bool(getattr(entry.track, "is_stream", False))
+            seekable = getattr(entry.track, "is_seekable", True)
+            duration = int(getattr(entry.track, "duration", 0) or 0)
+            if track_is_stream or not seekable or duration <= 0:
+                start = None
+            else:
+                start = max(0, min(start, duration - 1000))
+
+        loop_value = getattr(player, "loop", 0) or 0
+        if loop_value == 1:
+            # DefaultPlayer's track-loop would re-insert the outgoing track at
+            # the queue front on an explicit play(); Previous must not mutate
+            # the queue, so loop is parked for the duration of the jump.
+            self._set_player_loop(player, 0)
+        try:
+            if start:
+                await player.play(entry.track, start_time=start)
+            else:
+                await player.play(entry.track)
+        except (ValueError, TypeError):
+            # A node that refuses the start offset still gets the track.
+            log.debug("Previous with offset refused; replaying from 0", exc_info=True)
+            await player.play(entry.track)
+        finally:
+            if loop_value == 1:
+                self._set_player_loop(player, 1)
+        entry.resume_ms = None  # the saved offset has been consumed
+        session.note(f"back to · {shorten(str(getattr(entry.track, 'title', 'history')), 60)}")
+        return PreviousResult(TrackInfo.from_track(entry.track))
+
+    # -- playback history --------------------------------------------------
+
+    def _record_history(self, player, track) -> None:
+        """TrackStart hook: maintain the per-guild playback history.
+
+        Rules that keep the history honest:
+        * TTS clips never enter it (they are not music).
+        * A track replayed immediately (track loop, TTS restore) does not
+          create a second consecutive entry.
+        * Navigating back via Previous moves the cursor; starting any new
+          track afterwards truncates the abandoned branch.
+        """
+        guild_id = getattr(player, "guild_id", None)
+        if guild_id is None:
+            return
+        session = self.session(guild_id)
+        if session.tts_active or track is None:
+            return
+
+        if session.history_intent == "previous":
+            session.history_intent = None
+            if 0 <= session.history_index < len(session.playback_history):
+                entry = session.playback_history[session.history_index]
+                if _same_track(entry.track, track):
+                    entry.track = track  # keep the freshest decoded object
+                    return
+            # The node started something else than we asked for — fall through
+            # and record it as a normal start instead of corrupting the cursor.
+
+        if (
+            session.playback_history
+            and session.history_index == len(session.playback_history) - 1
+            and _same_track(session.playback_history[-1].track, track)
+        ):
+            return  # same track playing again right away — no duplicate entry
+
+        if session.history_index < len(session.playback_history) - 1:
+            del session.playback_history[session.history_index + 1 :]
+        session.playback_history.append(HistoryEntry(track))
+        session.history_index = len(session.playback_history) - 1
+
+        limit = max(5, self.config.music_history_limit or _DEFAULT_HISTORY_LIMIT)
+        if len(session.playback_history) > limit:
+            overflow = len(session.playback_history) - limit
+            del session.playback_history[:overflow]
+            session.history_index -= overflow
+
+    def _note_resume_position(self, player, session: GuildSession) -> None:
+        """Remember where the current track is, for a future Previous jump."""
+        if not (0 <= session.history_index < len(session.playback_history)):
+            return
+        current = getattr(player, "current", None)
+        if current is None:
+            return
+        entry = session.playback_history[session.history_index]
+        if not _same_track(entry.track, current):
+            return
+        if getattr(current, "is_stream", False):
+            return
+        duration = int(getattr(current, "duration", 0) or 0)
+        position = max(0, int(getattr(player, "position", 0) or 0))
+        if duration > 0:
+            position = min(position, duration - 500)
+        entry.resume_ms = position
+
+    async def _advance(self, player) -> None:
+        """Skip while keeping track-loop from replaying the skipped track."""
+        loop_value = getattr(player, "loop", 0) or 0
+        if loop_value == 1:
+            self._set_player_loop(player, 0)
+            try:
+                await player.skip()
+            finally:
+                self._set_player_loop(player, 1)
+        else:
+            await player.skip()
+
+    async def _recover_player(self, player, note: str, *, force: bool) -> None:
+        """Move past a broken track without letting track-loop resurrect it."""
+        guild_id = getattr(player, "guild_id", None)
+        if guild_id is not None:
+            self.session(guild_id).note(note)
+        loop_value = getattr(player, "loop", 0) or 0
+        if loop_value == 1:
+            self._set_player_loop(player, 0)
+            try:
+                await player.skip()
+            except Exception:
+                log.debug("Recovery skip failed", exc_info=True)
+            finally:
+                self._set_player_loop(player, 1)
+        elif force:
+            try:
+                await player.skip()
+            except Exception:
+                log.debug("Recovery skip failed", exc_info=True)
+
+    @staticmethod
+    def _set_player_loop(player, value: int) -> None:
+        try:
+            player.set_loop(value)
+        except (AttributeError, ValueError):
+            log.debug("Player loop could not be set to %s", value, exc_info=True)
 
     async def set_volume(self, guild: discord.Guild, member: discord.Member, volume: int) -> int:
         player = self._require_connected(guild)
@@ -866,6 +1238,365 @@ class MusicService:
         random.shuffle(player.queue)
         self.session(guild.id).note(f"shuffled {len(player.queue)} tracks")
         return len(player.queue)
+
+    def remove_track(self, guild: discord.Guild, member: discord.Member, position: int) -> TrackInfo:
+        """Remove one upcoming track by its 1-based queue position."""
+        player = self._require_connected(guild)
+        self.require_connected_control(guild, member)
+        if not isinstance(position, int) or isinstance(position, bool):
+            raise MusicError("position must be a whole number.")
+        if not player.queue:
+            raise MusicError("the queue is empty — nothing to remove.")
+        if not 1 <= position <= len(player.queue):
+            raise MusicError(
+                f"position must be between 1 and {len(player.queue)} — that's how "
+                "many tracks are queued."
+            )
+        track = player.queue.pop(position - 1)
+        self.session(guild.id).note(f"removed #{position} · {shorten(track.title, 50)}")
+        return TrackInfo.from_track(track)
+
+    def move_track(
+        self, guild: discord.Guild, member: discord.Member, source: int, target: int
+    ) -> TrackInfo:
+        """Move an upcoming track from one 1-based queue position to another."""
+        player = self._require_connected(guild)
+        self.require_connected_control(guild, member)
+        for value in (source, target):
+            if not isinstance(value, int) or isinstance(value, bool):
+                raise MusicError("positions must be whole numbers.")
+        size = len(player.queue)
+        if not size:
+            raise MusicError("the queue is empty — nothing to move.")
+        if not (1 <= source <= size and 1 <= target <= size):
+            raise MusicError(f"both positions must be between 1 and {size}.")
+        track = player.queue.pop(source - 1)
+        player.queue.insert(target - 1, track)
+        self.session(guild.id).note(
+            f"moved · {shorten(track.title, 50)} → position {target}"
+        )
+        return TrackInfo.from_track(track)
+
+    # -- loop / autoplay ----------------------------------------------------
+
+    async def set_loop(self, guild: discord.Guild, member: discord.Member, mode: str | None) -> str:
+        """Set the loop mode (off/track/queue), or cycle when mode is None.
+
+        Uses Lavalink.py's native player loop: track-mode replays the current
+        track on end, queue-mode re-appends it — no client-side queue juggling.
+        """
+        player = self._require_connected(guild)
+        self.require_connected_control(guild, member)
+        session = self.session(guild.id)
+        if mode is None:
+            mode = _LOOP_NEXT.get(session.loop_mode, "track")
+        mode = str(mode).strip().casefold()
+        if mode not in _LOOP_VALUES:
+            raise MusicError("loop mode must be **off**, **track** or **queue**.")
+        self._set_player_loop(player, _LOOP_VALUES[mode])
+        session.loop_mode = mode
+        session.note(f"{_LOOP_LABELS[mode].lower()}")
+        return mode
+
+    def set_autoplay(self, guild: discord.Guild, member: discord.Member, enabled: bool | None) -> bool:
+        """Toggle Groove-style autoplay: keep related music coming on queue end."""
+        self._require_connected(guild)  # validation only: autoplay needs a live player
+        self.require_connected_control(guild, member)
+        session = self.session(guild.id)
+        session.autoplay_enabled = (
+            not session.autoplay_enabled if enabled is None else bool(enabled)
+        )
+        session.note("autoplay on — I'll keep the music going" if session.autoplay_enabled else "autoplay off")
+        return session.autoplay_enabled
+
+    async def _maybe_autoplay(self, player, session: GuildSession) -> bool:
+        """QueueEnd hook: try to continue with related tracks. True = handled."""
+        guild_id = player.guild_id
+        lock = self._autoplay_locks.get(guild_id)
+        if lock is None:
+            lock = self._autoplay_locks[guild_id] = asyncio.Lock()
+        if lock.locked():
+            return True  # a fill is already running for this guild
+        async with lock:
+            if self._closing or session.tts_active or not session.autoplay_enabled:
+                return False
+            if getattr(player, "is_playing", False) or player.current is not None:
+                return False  # someone else took over the player meanwhile
+            if session.autoplay_failures >= 3:
+                return False  # gave up quietly; the next /play re-arms it
+            if time.monotonic() < session.autoplay_retry_at:
+                return False  # still inside the backoff window
+            tracks = await self._find_related_tracks(player, session)
+            if not tracks:
+                session.autoplay_failures += 1
+                session.autoplay_retry_at = time.monotonic() + 90 * min(session.autoplay_failures, 3)
+                if session.autoplay_failures >= 3:
+                    session.note("autoplay couldn't find anything related — add a track to keep going")
+                return False
+            session.autoplay_failures = 0
+            session.autoplay_retry_at = 0.0
+            for track in tracks:
+                player.add(track, requester=0)
+                self._remember_autoplay(session, track)
+            try:
+                if player.queue and not player.is_playing:
+                    await player.play()
+            except Exception:
+                log.exception("Autoplay could not start playback in guild %s", guild_id)
+                return False
+            first = shorten(str(getattr(tracks[0], "title", "something")), 40)
+            extra = f" +{len(tracks) - 1} more" if len(tracks) > 1 else ""
+            session.note(f"autoplay · {first}{extra}")
+            return True
+
+    async def _retry_autoplay(self, guild_id: int) -> None:
+        """Maintenance-side autoplay nudge (backed off inside _maybe_autoplay)."""
+        if self._closing or not self.node_ready:
+            return
+        player = self.player(guild_id)
+        if player is None or not player.is_connected:
+            return
+        session = self.session(guild_id)
+        if not session.autoplay_enabled or session.tts_active:
+            return
+        if player.current is not None or player.queue:
+            return
+        if await self._maybe_autoplay(player, session):
+            await self.refresh_panel(guild_id)
+
+    def _remember_autoplay(self, session: GuildSession, track) -> None:
+        key = normalize_track_key(
+            str(getattr(track, "title", "") or ""),
+            str(getattr(track, "author", "") or ""),
+        )
+        if key:
+            session.autoplay_history.append(key)
+        identifier = str(getattr(track, "identifier", "") or "")
+        if identifier:
+            session.autoplay_history.append(identifier)
+
+    async def _find_related_tracks(self, player, session: GuildSession) -> list:
+        """Search for a small batch of tracks related to what just played."""
+        last = None
+        if session.playback_history and session.history_index >= 0:
+            last = session.playback_history[session.history_index].track
+        if last is None:
+            last = getattr(player, "current", None)
+        if last is None:
+            return []
+
+        queries = self._autoplay_queries(last)
+        if not queries:
+            return []
+        excluded = self._autoplay_exclusions(player, session)
+        chosen: list = []
+        seen: set[str] = set()
+        for query in queries:
+            if len(chosen) >= _AUTOPLAY_BATCH:
+                break
+            try:
+                results = await self.client.get_tracks(query)
+            except Exception:
+                log.warning("Autoplay search failed for %r", query[:120], exc_info=True)
+                continue
+            if results is None or results.load_type is LoadType.ERROR or not results.tracks:
+                continue
+            candidates = list(results.tracks)
+            if results.load_type is LoadType.PLAYLIST and len(candidates) > _AUTOPLAY_SCAN:
+                candidates = random.sample(candidates, _AUTOPLAY_SCAN)
+            for track in candidates:
+                if len(chosen) >= _AUTOPLAY_BATCH:
+                    break
+                if getattr(track, "is_stream", False):
+                    continue  # live streams make poor autoplay neighbours
+                key = normalize_track_key(
+                    str(getattr(track, "title", "") or ""),
+                    str(getattr(track, "author", "") or ""),
+                )
+                if not key or key in seen or key in excluded:
+                    continue
+                identifier = str(getattr(track, "identifier", "") or "")
+                if identifier and identifier in excluded:
+                    continue
+                seen.add(key)
+                chosen.append(track)
+        return chosen
+
+    def _autoplay_queries(self, track) -> list[str]:
+        """Related-track queries for one track, gated on the node's sources."""
+        queries: list[str] = []
+        identifier = getattr(track, "identifier", None)
+        source = str(getattr(track, "source_name", "") or "").casefold()
+        if (
+            identifier
+            and source in {"youtube", "ytmusic"}
+            and (self.node_sources is None or "youtube" in self.node_sources)
+        ):
+            # YouTube's own radio mix for this exact track — the strongest
+            # related-music signal available without extra credentials.
+            queries.append(
+                f"https://www.youtube.com/watch?v={identifier}&list=RD{identifier}"
+            )
+        artist = strip_title_noise(str(getattr(track, "author", "") or ""))
+        if artist:
+            for prefix in self._search_prefixes():
+                queries.append(f"{prefix}:{artist}")
+        return queries[:4]
+
+    def _autoplay_exclusions(self, player, session: GuildSession) -> set[str]:
+        """Everything autoplay must not pick: queue, history, past auto-adds."""
+        excluded: set[str] = set()
+
+        def add(track) -> None:
+            key = normalize_track_key(
+                str(getattr(track, "title", "") or ""),
+                str(getattr(track, "author", "") or ""),
+            )
+            if key:
+                excluded.add(key)
+            identifier = str(getattr(track, "identifier", "") or "")
+            if identifier:
+                excluded.add(identifier)
+
+        for entry in session.playback_history:
+            add(entry.track)
+        for track in list(getattr(player, "queue", []) or []):
+            add(track)
+        excluded.update(session.autoplay_history)
+        excluded.discard("")
+        return excluded
+
+    # -- seeking -------------------------------------------------------------
+
+    def _seekable_current(self, player, guild: discord.Guild):
+        track = getattr(player, "current", None)
+        if track is None:
+            raise MusicError("nothing is playing right now.")
+        if getattr(track, "is_stream", False) or not getattr(track, "is_seekable", True):
+            raise MusicError("this track can't be seeked — live streams don't have a position.")
+        return track
+
+    async def seek(self, guild: discord.Guild, member: discord.Member, position_ms: int) -> int:
+        """Seek to an absolute position. Returns the position in ms."""
+        player = self._require_connected(guild)
+        self.require_connected_control(guild, member)
+        track = self._seekable_current(player, guild)
+        if not isinstance(position_ms, int) or isinstance(position_ms, bool):
+            raise MusicError("that position doesn't make sense — try something like 1:32.")
+        if position_ms < 0:
+            raise MusicError("positions can't be negative — use /forward or /backward.")
+        duration = int(getattr(track, "duration", 0) or 0)
+        if duration and position_ms >= duration:
+            raise MusicError(
+                f"that's past the end of the track — it's only {format_duration(duration)} long."
+            )
+        await player.seek(position_ms)
+        self.session(guild.id).note(f"seeked to {format_duration(position_ms)}")
+        return position_ms
+
+    async def nudge(self, guild: discord.Guild, member: discord.Member, delta_ms: int) -> int:
+        """Seek forward (positive) or backward (negative), clamped to the track."""
+        player = self._require_connected(guild)
+        self.require_connected_control(guild, member)
+        track = self._seekable_current(player, guild)
+        if not isinstance(delta_ms, int) or isinstance(delta_ms, bool) or delta_ms == 0:
+            raise MusicError("that amount doesn't make sense — try a number of seconds.")
+        duration = int(getattr(track, "duration", 0) or 0)
+        position = max(0, int(getattr(player, "position", 0) or 0))
+        target = position + delta_ms
+        if duration:
+            target = max(0, min(target, duration - 500))
+        await player.seek(int(target))
+        direction = "forward" if delta_ms > 0 else "back"
+        self.session(guild.id).note(f"jumped {direction} to {format_duration(target)}")
+        return int(target)
+
+    # -- audio effects ---------------------------------------------------------
+
+    def filter_presets(self) -> tuple[FilterPreset, ...]:
+        """Every effect Paradise knows how to build for this stack."""
+        return _FILTER_PRESETS
+
+    def filter_preset(self, name: str) -> FilterPreset:
+        preset = _FILTER_BY_NAME.get(str(name or "").strip().casefold())
+        if preset is None:
+            raise MusicError("I don't know that effect. try one from the list.")
+        return preset
+
+    def filter_supported(self, preset: FilterPreset) -> bool:
+        """True when the node's own report says this filter is enabled."""
+        return self.node_filters is None or preset.node_filter in self.node_filters
+
+    def unsupported_filter_names(self) -> list[str]:
+        if self.node_filters is None:
+            return []
+        return [
+            preset.label
+            for preset in _FILTER_PRESETS
+            if preset.node_filter not in self.node_filters
+        ]
+
+    def active_filter_presets(self, guild_id: int) -> list[FilterPreset]:
+        session = self.session(guild_id)
+        return [
+            preset for preset in _FILTER_PRESETS if preset.name in session.active_presets
+        ]
+
+    async def set_filter(self, guild: discord.Guild, member: discord.Member, name: str) -> str:
+        """Toggle one audio effect. Returns "applied" or "removed"."""
+        player = self._require_connected(guild)
+        self.require_connected_control(guild, member)
+        preset = self.filter_preset(name)
+        if not self.filter_supported(preset):
+            raise MusicError(
+                f"the music node doesn't support the **{preset.label}** effect — "
+                "it isn't enabled there."
+            )
+        session = self.session(guild.id)
+        try:
+            if preset.name in session.active_presets:
+                session.active_presets.discard(preset.name)
+                remaining = [
+                    self.filter_preset(other).factory()
+                    for other in session.active_presets
+                ]
+                await player.set_filters(*remaining, replace=True)
+                session.note(f"{preset.label} off")
+                return "removed"
+            # Presets that share a node filter (nightcore/daycore both use
+            # timescale) replace each other at the node — reflect that here.
+            for other in list(session.active_presets):
+                if self.filter_preset(other).node_filter == preset.node_filter:
+                    session.active_presets.discard(other)
+            await player.set_filter(preset.factory())
+            session.active_presets.add(preset.name)
+            session.note(f"{preset.label} on")
+            return "applied"
+        except MusicError:
+            raise
+        except Exception:
+            # The node rejected the filter update (older build, disabled
+            # filter, …) — never crash the player over an effect.
+            log.warning("Filter %s could not be applied", preset.name, exc_info=True)
+            raise MusicError(
+                f"the music node wouldn't take the **{preset.label}** effect — "
+                "it may not be enabled there."
+            ) from None
+
+    async def clear_filters(self, guild: discord.Guild, member: discord.Member) -> int:
+        player = self._require_connected(guild)
+        self.require_connected_control(guild, member)
+        session = self.session(guild.id)
+        removed = len(session.active_presets)
+        session.active_presets.clear()
+        try:
+            await player.clear_filters()
+        except Exception:
+            log.warning("Clearing filters failed", exc_info=True)
+            raise MusicError("couldn't clear the effects — the node didn't respond.") from None
+        if removed:
+            session.note("effects off")
+        return removed
 
     async def stop(self, guild: discord.Guild, member: discord.Member | None = None) -> None:
         """Stop playback, clear queues, disconnect, reset the panel."""
@@ -934,6 +1665,12 @@ class MusicService:
                 player.queue.clear()
             else:
                 session.tts_stash = None
+            # Park any loop mode while TTS owns the player: the library's
+            # loop logic would otherwise re-queue music around the clip and
+            # the clip's own end would start the next music track mid-speech.
+            session.tts_loop_value = getattr(player, "loop", 0) or 0
+            if session.tts_loop_value:
+                self._set_player_loop(player, 0)
         session.tts_text = text
         await player.play(track)
         return track
@@ -966,6 +1703,8 @@ class MusicService:
         stash = session.tts_stash
         session.tts_stash = None
         session.tts_text = None
+        parked_loop = session.tts_loop_value
+        session.tts_loop_value = 0
         player = self.player(guild_id)
         if player is None or not player.is_connected:
             return
@@ -989,6 +1728,8 @@ class MusicService:
                 await player.stop()
             except Exception:
                 log.debug("Stop after TTS failed", exc_info=True)
+        if parked_loop:
+            self._set_player_loop(player, parked_loop)
         await self.refresh_panel(guild_id)
 
     def abort_tts(self, guild_id: int) -> None:
@@ -997,6 +1738,7 @@ class MusicService:
         session.tts_active = False
         session.tts_stash = None
         session.tts_text = None
+        session.tts_loop_value = 0
 
     # ------------------------------------------------------------------
     # Maintenance loop: auto-disconnect + panel progress refresh
@@ -1034,6 +1776,7 @@ class MusicService:
             elif (
                 not session.sticky
                 and settings.auto_disconnect
+                and not session.tts_active
                 and now - session.alone_since >= threshold
             ):
                 log.info("Auto-disconnecting from guild %s (empty channel)", guild.id)
@@ -1044,6 +1787,11 @@ class MusicService:
 
             if session.tts_active or player.is_playing:
                 await self.refresh_panel(guild.id)
+            elif session.autoplay_enabled and player.current is None and not player.queue:
+                # Autoplay is on but nothing is queued or playing: the last
+                # fill found nothing. Give it one quiet retry per tick so a
+                # transient search failure doesn't end the session forever.
+                self._maybe_task(self._retry_autoplay(guild.id))
 
     @staticmethod
     def _humans_in_channel(guild: discord.Guild, channel_id: int | None) -> int:
