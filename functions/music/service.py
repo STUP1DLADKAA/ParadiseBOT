@@ -131,6 +131,10 @@ class MusicService:
         self.node_plugins: dict[str, str] = {}
         self.node_sources: frozenset[str] | None = None
         self.node_version: str | None = None
+        # Deliberately separate transport readiness from /v4/info diagnostics.
+        # An info request can fail transiently while the websocket is still up.
+        self._node_info_ok = False
+        self._node_state = "DISCONNECTED"
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -145,14 +149,23 @@ class MusicService:
 
     async def start(self) -> None:
         if not self.config.music_configured:
+            self._node_state = "DISCONNECTED"
             log.info("Lavalink not configured — music and TTS stay offline.")
             return
         if self.bot.user is None:
             raise RuntimeError("MusicService.start() called before login.")
 
+        self._node_state = "CONFIGURED"
         self.client = lavalink.Client(self.bot.user.id)
         self.bot.lavalink = self.client  # the voice bridge looks for this
+        protocol = "wss" if self.config.lavalink_secure else "ws"
+        log.info(
+            "Connecting to Lavalink %s://%s:%s (region=%s; password hidden)",
+            protocol, self.config.lavalink_host, self.config.lavalink_port,
+            self.config.lavalink_region,
+        )
         try:
+            self._node_state = "CONNECTING"
             self.client.add_node(
                 host=self.config.lavalink_host,
                 port=self.config.lavalink_port,
@@ -162,7 +175,10 @@ class MusicService:
                 ssl=self.config.lavalink_secure,
             )
         except Exception:
-            log.exception("Could not add the Lavalink node")
+            # add_node normally only schedules the websocket connection; errors
+            # here are configuration/constructor failures, not user errors.
+            self._node_state = "DISCONNECTED"
+            log.exception("Could not register Lavalink node (host/port/configuration failure)")
             self.client = None
             return
         self.client.add_event_hooks(self)
@@ -232,7 +248,8 @@ class MusicService:
 
     @lavalink.listener(NodeReadyEvent)
     async def _on_node_ready(self, event: NodeReadyEvent) -> None:
-        log.info("Lavalink node ready (%s)", getattr(event.node, "name", "node"))
+        self._node_state = "READY"
+        log.info("Lavalink websocket authenticated and node ready (%s)", getattr(event.node, "name", "node"))
         self._maybe_task(self._refresh_node_info(event.node))
 
     async def _refresh_node_info(self, node) -> None:
@@ -247,8 +264,13 @@ class MusicService:
         except asyncio.CancelledError:
             raise
         except Exception:
+            self._node_info_ok = False
+            # Do not turn a healthy websocket into an unavailable node merely
+            # because the diagnostic REST endpoint briefly failed.
+            self._node_state = "DEGRADED" if self.node_ready else "DISCONNECTED"
             log.warning(
-                "Could not fetch Lavalink node info — using default sources", exc_info=True
+                "Lavalink is ready but /v4/info failed; source diagnostics are unavailable "
+                "(music transport remains usable)", exc_info=True
             )
             return
 
@@ -269,6 +291,8 @@ class MusicService:
             self.node_plugins = plugins
             self.node_sources = sources or None
             self.node_version = version
+            self._node_info_ok = True
+            self._node_state = "READY" if self.node_ready else "DISCONNECTED"
         except Exception:
             log.warning("Malformed Lavalink node info — using default sources", exc_info=True)
             return
@@ -296,6 +320,8 @@ class MusicService:
                         "node config (see lavalink/README.md).",
                         name, actual, version,
                     )
+                else:
+                    log.info("Lavalink expected plugin present: %s%s", name, f"@{actual}" if actual else "")
                 continue
             wanted = f"{name}:{version}" if version else name
             log.warning(
@@ -333,7 +359,18 @@ class MusicService:
 
     @property
     def node_ready(self) -> bool:
-        return self.client is not None and bool(self.client.node_manager.available_nodes)
+        ready = self.client is not None and bool(self.client.node_manager.available_nodes)
+        if self.client is not None and not ready and self._node_state in {"READY", "DEGRADED"}:
+            # available_nodes is Lavalink.py's authoritative live connection
+            # view; this also makes temporary disconnects recover naturally.
+            self._node_state = "DISCONNECTED"
+        return ready
+
+    @property
+    def node_state(self) -> str:
+        """CONFIGURED, CONNECTING, READY, DEGRADED, or DISCONNECTED."""
+        self.node_ready
+        return self._node_state
 
     @property
     def configured(self) -> bool:
