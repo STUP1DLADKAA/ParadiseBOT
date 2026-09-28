@@ -166,6 +166,13 @@ class ParadiseBot(commands.Bot):
                 await self.music.handle_forced_disconnect(member.guild.id)
             except Exception:
                 log.exception("Forced-disconnect cleanup failed")
+        elif before.channel is not None and after.channel is not None and before.channel.id != after.channel.id:
+            # Someone dragged the bot to another channel: the panel's voice
+            # label and state should follow immediately.
+            try:
+                await self.music.refresh_panel(member.guild.id)
+            except Exception:
+                log.debug("Panel refresh after voice move failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Messages: AFK, TTS triggers, AI mentions, personality

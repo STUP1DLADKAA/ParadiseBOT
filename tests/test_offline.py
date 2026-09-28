@@ -20,6 +20,9 @@ import time
 import unittest
 from collections import Counter
 from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import discord
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -41,6 +44,7 @@ from functions.helpers import (  # noqa: E402
     progress_bar,
 )
 from functions.music.panel import (  # noqa: E402
+    MusicPanelView,
     PanelState,
     TrackInfo,
     button_states,
@@ -56,8 +60,9 @@ from lavalink.server import LoadType  # noqa: E402
 
 EXPECTED_COMMANDS = {
     "ping", "8ball", "coinflip", "choose",
-    "join", "play", "pause", "resume", "skip", "stop", "queue", "nowplaying",
-    "volume", "clearqueue", "shuffle", "leave", "lyrics",
+    "join", "play", "pause", "resume", "skip", "previous", "stop", "queue",
+    "nowplaying", "volume", "clearqueue", "shuffle", "leave", "lyrics",
+    "remove", "move", "seek", "forward", "backward", "loop", "autoplay", "filter",
     "remind", "poll", "afk", "translate", "define", "status", "settings",
     "say", "summarize", "help",
 }
@@ -71,8 +76,10 @@ def make_track(title="Never Gonna Give You Up", author="Rick Astley", **override
         uri="https://example.com",
         duration=212_000,
         is_stream=False,
+        is_seekable=True,
         requester=42,
         source_name="youtube",
+        identifier=f"id-{title}",
     )
     data.update(overrides)
     return SimpleNamespace(**data)
@@ -296,6 +303,31 @@ class TestHelpers(unittest.TestCase):
         self.assertFalse(is_hindi("hello everyone, kya haal hai"))
         self.assertFalse(is_hindi(""))
 
+    def test_parse_duration(self):
+        from functions.helpers import parse_duration
+
+        self.assertEqual(parse_duration("1:32"), 92_000)
+        self.assertEqual(parse_duration("  2:05 "), 125_000)
+        self.assertEqual(parse_duration("1:02:03"), 3_723_000)
+        self.assertEqual(parse_duration("15"), 15_000)
+        self.assertEqual(parse_duration("0:00"), 0)
+        self.assertIsNone(parse_duration("-5"))
+        self.assertIsNone(parse_duration(""))
+        self.assertIsNone(parse_duration("abc"))
+        self.assertIsNone(parse_duration("1:99"))
+        self.assertIsNone(parse_duration("100000"))  # > 24h is not a song position
+
+    def test_normalize_track_key(self):
+        from functions.helpers import normalize_track_key
+
+        base = normalize_track_key("Song", "Artist")
+        self.assertEqual(normalize_track_key("Artist - Song (Official Video)"), base)
+        self.assertEqual(normalize_track_key("Artist - Song [Official Audio]"), base)
+        self.assertEqual(normalize_track_key("Artist - Song"), base)
+        self.assertEqual(normalize_track_key("Song (feat. Someone)", "Artist"), base)
+        self.assertNotEqual(normalize_track_key("Song (Live at Wembley)", "Artist"), base)
+        self.assertNotEqual(normalize_track_key("Other Song", "Artist"), base)
+
     def test_resolve_language(self):
         self.assertEqual(resolve_language("Hindi"), "hi")
         self.assertEqual(resolve_language("english"), "en")
@@ -409,15 +441,62 @@ class TestPanelRendering(unittest.TestCase):
         self.assertTrue(disconnected["join"])
         self.assertFalse(disconnected["stop"])
         self.assertFalse(disconnected["pause"])
+        self.assertFalse(disconnected["previous"])
+        self.assertFalse(disconnected["loop"])
+        self.assertFalse(disconnected["autoplay"])
         playing = button_states(playing_state())
         self.assertTrue(playing["pause"])
         self.assertFalse(playing["resume"])
+        self.assertTrue(playing["loop"])
+        self.assertTrue(playing["autoplay"])
+        self.assertTrue(playing["effects"])
+        self.assertFalse(playing["previous"], "no history yet")
+        playing_with_history = button_states(playing_state(has_previous=True))
+        self.assertTrue(playing_with_history["previous"])
         paused = button_states(playing_state(status="paused"))
         self.assertFalse(paused["pause"])
         self.assertTrue(paused["resume"])
         speaking = button_states(playing_state(status="speaking", track=None))
         self.assertTrue(speaking["skip"])
         self.assertFalse(speaking["pause"])
+        no_effects = button_states(playing_state(effects_available=False))
+        self.assertFalse(no_effects["effects"])
+
+    def test_panel_state_chips_include_loop_and_autoplay(self):
+        from functions.music.panel import MusicPanelView
+
+        state = playing_state(loop_mode="queue", autoplay=True, filters=["Bass Boost"])
+        view = MusicPanelView(
+            SimpleNamespace(max_volume=150, panel_state=lambda gid: state),
+            1, button_states(state), state,
+        )
+        payload = str(view.to_components())
+        self.assertIn("Loop: Queue", payload)
+        self.assertIn("Autoplay", payload)
+        self.assertIn("Bass Boost", payload)
+
+    def test_panel_has_three_control_rows(self):
+        from functions.music.panel import MusicPanelView
+
+        state = playing_state(has_previous=True)
+        view = MusicPanelView(
+            SimpleNamespace(max_volume=150, panel_state=lambda gid: state),
+            1, button_states(state), state,
+        )
+        labels = set()
+
+        def collect(items):
+            for item in items:
+                if "label" in item:
+                    labels.add(item["label"])
+                collect(item.get("components", []))
+
+        collect(view.to_components())
+        for label in (
+            "Previous", "Pause", "Next", "Shuffle", "Queue", "Volume", "Lyrics",
+            "Stop", "Loop: Off", "Autoplay", "Effects", "Add Music",
+        ):
+            self.assertIn(label, labels, f"missing panel button {label}")
 
 
 class TestMusicServiceState(unittest.TestCase):
@@ -833,10 +912,19 @@ class TestLyrics(unittest.TestCase):
         self.assertEqual(title, "Never Gonna Give You Up")
         self.assertEqual(artist, "Rick Astley")
 
+    def test_clean_query_strips_noise_but_keeps_meaning(self):
+        title, _ = lyrics.clean_query("Song [Official Audio] (Lyric Video)", "Artist")
+        self.assertEqual(title, "Song")
+        title, _ = lyrics.clean_query("Song (Live at Wembley)", "Artist")
+        self.assertEqual(title, "Song (Live at Wembley)")
+        title, _ = lyrics.clean_query("Song (feat. Someone)", "Artist")
+        self.assertEqual(title, "Song")
+
     def test_paginate(self):
         text = "\n".join(f"line {i} " + "x" * 50 for i in range(200))
         pages = lyrics.paginate(text)
-        self.assertLessEqual(len(pages), 5)
+        self.assertGreater(len(pages), 1)
+        self.assertLessEqual(len(pages), 12)
         for page in pages:
             self.assertLessEqual(len(page), 1900)
 
@@ -848,13 +936,18 @@ class TestLyrics(unittest.TestCase):
             cache = lyrics.LyricsCache(ttl=60, missing_ttl=60)
             calls = 0
 
-            async def provider(artist, title):
+            async def provider(artist, title, duration_ms=None):
                 nonlocal calls
                 calls += 1
-                return "first line\nsecond line" if title == "song" else None
+                if title == "song":
+                    return lyrics.LyricsResult("first line\nsecond line", "LRCLIB")
+                return None
 
-            self.assertEqual(await cache.get("hit", "artist", "song", fetcher=provider), "first line\nsecond line")
-            self.assertEqual(await cache.get("hit", "artist", "song", fetcher=provider), "first line\nsecond line")
+            result = await cache.get("hit", "artist", "song", fetcher=provider)
+            self.assertEqual(result.text, "first line\nsecond line")
+            self.assertEqual(result.source, "LRCLIB")
+            again = await cache.get("hit", "artist", "song", fetcher=provider)
+            self.assertEqual(again.text, "first line\nsecond line")
             self.assertIsNone(await cache.get("miss", "artist", "missing", fetcher=provider))
             self.assertIsNone(await cache.get("miss", "artist", "missing", fetcher=provider))
             self.assertEqual(calls, 2)
@@ -866,20 +959,62 @@ class TestLyrics(unittest.TestCase):
             cache = lyrics.LyricsCache(ttl=60, missing_ttl=60)
             calls = 0
 
-            async def provider(artist, title):
+            async def provider(artist, title, duration_ms=None):
                 nonlocal calls
                 calls += 1
                 await asyncio.sleep(0)
                 if title == "broken":
                     raise asyncio.TimeoutError
-                return "lyrics"
+                return lyrics.LyricsResult("lyrics", "lyrics.ovh")
 
             values = await asyncio.gather(*[
                 cache.get("same", "artist", "song", fetcher=provider) for _ in range(4)
             ])
-            self.assertEqual(values, ["lyrics"] * 4)
+            self.assertEqual([value.text for value in values], ["lyrics"] * 4)
             self.assertEqual(calls, 1)
             self.assertIsNone(await cache.get("broken", "artist", "broken", fetcher=provider))
+
+        asyncio.run(run())
+
+    def test_fetch_lyrics_tries_providers_in_order(self):
+        async def run():
+            from unittest.mock import patch
+
+            async def lrclib(artist, title, duration_ms=None):
+                return lyrics.LyricsResult("from lrclib", "LRCLIB")
+
+            with patch.object(lyrics, "_fetch_lrclib", lrclib), \
+                 patch.object(lyrics, "_fetch_lyrics_ovh", AsyncMock()) as ovh:
+                result = await lyrics.fetch_lyrics("artist", "song")
+                self.assertEqual(result.source, "LRCLIB")
+                ovh.assert_not_called()
+
+            calls = []
+
+            async def failing(artist, title, duration_ms=None):
+                calls.append(title)
+                return None
+
+            async def working(artist, title, duration_ms=None):
+                calls.append(title)
+                return lyrics.LyricsResult("from ovh", "lyrics.ovh")
+
+            with patch.object(lyrics, "_fetch_lrclib", failing), \
+                 patch.object(lyrics, "_fetch_lyrics_ovh", working), \
+                 patch.object(lyrics, "_fetch_genius", failing):
+                result = await lyrics.fetch_lyrics("artist", "song")
+                self.assertEqual(result.source, "lyrics.ovh")
+                self.assertEqual(len(calls), 2)
+
+        asyncio.run(run())
+
+    def test_genius_skipped_without_key(self):
+        async def run():
+            # The real provider returns immediately when no key is configured
+            # (no network call, no exception) — that early return is the guard.
+            with patch.object(lyrics, "GENIUS_API_KEY", None):
+                result = await lyrics._fetch_genius("artist", "song")
+            self.assertIsNone(result)
 
         asyncio.run(run())
 
@@ -887,7 +1022,7 @@ class TestLyrics(unittest.TestCase):
         old = TrackInfo.from_track(make_track("old song", identifier="old"))
         current_raw = make_track("new song", identifier="new")
         current = TrackInfo.from_track(current_raw)
-        lyrics.CACHE._entries[old.lyrics_key] = lyrics.LyricsEntry("old words", time.monotonic() + 60)
+        lyrics.CACHE._entries[old.lyrics_key] = lyrics.LyricsEntry("old words", "LRCLIB", time.monotonic() + 60)
         guild = FakeGuild(id=1, voice_client=object())
         store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
         service = MusicService(FakeBot([guild]), Config(), store)
@@ -898,10 +1033,895 @@ class TestLyrics(unittest.TestCase):
         state = service.panel_state(1)
         self.assertFalse(state.lyrics_loaded)
         self.assertIsNone(state.lyrics_preview)
-        lyrics.CACHE._entries[current.lyrics_key] = lyrics.LyricsEntry("new words", time.monotonic() + 60)
+        lyrics.CACHE._entries[current.lyrics_key] = lyrics.LyricsEntry("new words", "LRCLIB", time.monotonic() + 60)
         state = service.panel_state(1)
         self.assertTrue(state.lyrics_loaded)
         self.assertEqual(state.lyrics_preview, "new words")
+
+
+# ---------------------------------------------------------------------------
+# Playback history + Previous (A → B → C → D, then back)
+# ---------------------------------------------------------------------------
+
+
+class TestPlaybackHistory(unittest.TestCase):
+    def _service(self, player, responses=None, **config_kwargs):
+        guild = MusicFlowGuild(player=player)
+        guild.player = player
+        guild.voice_client = FakeVoiceProtocol(guild, guild.channels[99])
+        config = Config(lavalink_host="n", lavalink_password="p", **config_kwargs)
+        store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
+        service = MusicService(MusicFlowBot(guild), config, store)
+        service.client = FakeSearchClient(player, responses or {})
+        return service, guild
+
+    def _member(self, guild):
+        return MusicFlowMember(guild=guild)
+
+    async def _play(self, service, player, track):
+        await player.play(track)
+        service._record_history(player, track)
+
+    def test_previous_walks_back_through_history(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+            for name in "ABCD":
+                await self._play(service, player, make_track(f"song {name}"))
+            session = service.session(guild.id)
+            self.assertEqual(session.history_index, 3)
+
+            result = await service.previous(guild, member)
+            self.assertEqual(result.track.title, "song C")
+            self.assertEqual(session.history_index, 2)
+
+            result = await service.previous(guild, member)
+            self.assertEqual(result.track.title, "song B")
+            self.assertEqual(session.history_index, 1)
+
+            result = await service.previous(guild, member)
+            self.assertEqual(result.track.title, "song A")
+            self.assertEqual(session.history_index, 0)
+
+            with self.assertRaisesRegex(MusicError, "isn't a previous track"):
+                await service.previous(guild, member)
+
+        asyncio.run(run())
+
+    def test_normal_playback_truncates_abandoned_branch(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+            for name in "ABC":
+                await self._play(service, player, make_track(f"song {name}"))
+            await service.previous(guild, member)   # C -> B
+            await service.previous(guild, member)   # B -> A
+            session = service.session(guild.id)
+            self.assertEqual(session.history_index, 0)
+            # Normal playback from here keeps A and drops the dead branch.
+            await self._play(service, player, make_track("song E"))
+            titles = [entry.track.title for entry in session.playback_history]
+            self.assertEqual(titles, ["song A", "song E"])
+            self.assertEqual(session.history_index, 1)
+
+        asyncio.run(run())
+
+    def test_consecutive_repeats_do_not_duplicate_history(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            track = make_track("on repeat")
+            await self._play(service, player, track)
+            await self._play(service, player, make_track("on repeat"))  # loop replay
+            session = service.session(guild.id)
+            self.assertEqual(len(session.playback_history), 1)
+            self.assertEqual(session.history_index, 0)
+
+        asyncio.run(run())
+
+    def test_tts_clips_never_enter_history(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            session = service.session(guild.id)
+            session.tts_active = True
+            service._record_history(player, make_track("voice clip"))
+            self.assertEqual(session.playback_history, [])
+            session.tts_active = False
+            service._record_history(player, make_track("real song"))
+            self.assertEqual(len(session.playback_history), 1)
+
+        asyncio.run(run())
+
+    def test_history_is_bounded(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player, music_history_limit=5)
+            for index in range(10):
+                await self._play(service, player, make_track(f"song {index}"))
+            session = service.session(guild.id)
+            self.assertEqual(len(session.playback_history), 5)
+            self.assertEqual(session.history_index, 4)
+            self.assertEqual(session.playback_history[0].track.title, "song 5")
+
+        asyncio.run(run())
+
+    def test_previous_preserves_resume_position(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+            track_a = make_track("song A")
+            track_b = make_track("song B")
+            await self._play(service, player, track_a)
+            await self._play(service, player, track_b)
+            player.position = 90_000
+            await service.previous(guild, member)  # back to A; B remembers 1:30
+            session = service.session(guild.id)
+            self.assertEqual(session.playback_history[1].resume_ms, 90_000)
+            # The original track object is preserved — no re-search happened.
+            self.assertIs(session.playback_history[1].track, track_b)
+            self.assertEqual(player.current.title, "song A")
+            self.assertNotIn(("play", track_b), [("p", t) for p, t, _ in player.calls])
+
+        asyncio.run(run())
+
+    def test_previous_uses_saved_offset_when_returning(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+            track_a = make_track("song A")
+            await self._play(service, player, track_a)
+            session = service.session(guild.id)
+            session.playback_history[0].resume_ms = 50_000
+            await self._play(service, player, make_track("song B"))
+            await service.previous(guild, member)
+            kind, track, kwargs = player.calls[-1]
+            self.assertEqual(kind, "play")
+            self.assertIs(track, track_a)
+            self.assertEqual(kwargs.get("start_time"), 50_000)
+
+        asyncio.run(run())
+
+    def test_previous_blocked_while_speaking(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+            await self._play(service, player, make_track("song A"))
+            await self._play(service, player, make_track("song B"))
+            service.session(guild.id).tts_active = True
+            with self.assertRaisesRegex(MusicError, "I'm speaking"):
+                await service.previous(guild, member)
+
+        asyncio.run(run())
+
+    def test_stop_clears_history(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+            await self._play(service, player, make_track("song"))
+            await service.stop(guild, member)
+            session = service.session(guild.id)
+            self.assertEqual(session.playback_history, [])
+            self.assertEqual(session.history_index, -1)
+            self.assertEqual(session.loop_mode, "off")
+            self.assertFalse(session.autoplay_enabled)
+
+        asyncio.run(run())
+
+
+def _history_entry(track, resume_ms=None):
+    from functions.music.service import HistoryEntry
+
+    return HistoryEntry(track, resume_ms)
+
+
+# ---------------------------------------------------------------------------
+# Panel buttons must call the same MusicService methods as the commands
+# ---------------------------------------------------------------------------
+
+
+class FakePanelMember:
+    """Stands in for discord.Member inside panel callback tests."""
+
+    def __init__(self, member_id=7, channel_id=99, move_members=False):
+        self.id = member_id
+        channel = SimpleNamespace(id=channel_id) if channel_id is not None else None
+        self.voice = SimpleNamespace(channel=channel)
+        self.guild_permissions = SimpleNamespace(
+            move_members=move_members, administrator=False
+        )
+
+
+class FakePanelInteraction:
+    """Just enough Interaction for MusicPanelView callbacks."""
+
+    def __init__(self, guild, member):
+        self.guild = guild
+        self.user = member
+        self.channel_id = None
+        self.responses = []
+        self.modals = []
+        self.response = SimpleNamespace(
+            is_done=lambda: False,
+            send_message=self._send,
+            defer=self._defer,
+            send_modal=self._modal,
+            edit_message=AsyncMock(),
+        )
+        self.followup = SimpleNamespace(send=self._send)
+
+    async def _send(self, text=None, *, ephemeral=None, view=None, **kwargs):
+        self.responses.append(text or view)
+
+    async def _defer(self, **kwargs):
+        pass
+
+    async def _modal(self, modal):
+        self.modals.append(modal)
+
+
+class TestPanelButtonsUseService(unittest.TestCase):
+    def _view_and_service(self):
+        player = FakeRealPlayer()
+        player.current = make_track()
+        player.queue = [make_track("next one"), make_track("after that")]
+        guild = MusicFlowGuild(player=player)
+        guild.player = player
+        guild.voice_client = FakeVoiceProtocol(guild, guild.channels[99])
+        config = Config(lavalink_host="n", lavalink_password="p")
+        store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
+        service = MusicService(MusicFlowBot(guild), config, store)
+        service.client = FakeSearchClient(player, {})
+        session = service.session(guild.id)
+        session.playback_history = [_history_entry(make_track("earlier"))]
+        session.history_index = 0
+        service._record_history(player, player.current)
+        service._panel_messages.pop(guild.id, None)
+        service.refresh_panel = AsyncMock()  # no Discord I/O in this test
+        state = service.panel_state(guild.id)
+        view = MusicPanelView(service, guild.id, button_states(state), state)
+        return view, service, guild
+
+    def _member(self, guild, **kwargs):
+        return FakePanelMember(**kwargs)
+
+    def test_previous_button_calls_service_previous(self):
+        async def run():
+            view, service, guild = self._view_and_service()
+            with patch.object(service, "previous", AsyncMock(return_value=SimpleNamespace(
+                track=TrackInfo.from_track(make_track("earlier")),
+            ))) as previous:
+                with patch.object(discord, "Member", FakePanelMember):
+                    await view._previous(FakePanelInteraction(guild, self._member(guild)))
+                previous.assert_awaited_once()
+                called_guild, called_member = previous.await_args.args
+                self.assertIs(called_guild, guild)
+                self.assertEqual(called_member.id, 7)
+
+        asyncio.run(run())
+
+    def test_loop_and_autoplay_buttons_call_service(self):
+        async def run():
+            view, service, guild = self._view_and_service()
+            interaction = FakePanelInteraction(guild, self._member(guild))
+            member_patch = patch.object(discord, "Member", FakePanelMember)
+            member_patch.start()
+            self.addCleanup(member_patch.stop)
+            with patch.object(service, "set_loop", AsyncMock(return_value="track")) as set_loop:
+                await view._loop(interaction)
+                set_loop.assert_awaited_once()
+                self.assertIsNone(set_loop.await_args.args[2], "no mode = cycle")
+            with patch.object(service, "set_autoplay", MagicMock(return_value=True)) as set_autoplay:
+                await view._autoplay(interaction)
+                set_autoplay.assert_called_once()
+                self.assertIsNone(set_autoplay.call_args.args[2], "no state = toggle")
+
+        asyncio.run(run())
+
+    def test_queue_button_requires_same_channel(self):
+        async def run():
+            view, service, guild = self._view_and_service()
+            outsider = FakePanelMember(channel_id=100)
+            with patch.object(discord, "Member", FakePanelMember):
+                interaction = FakePanelInteraction(guild, outsider)
+                await view._queue(interaction)
+            self.assertTrue(interaction.responses, "the permission error was surfaced")
+            self.assertIn("join", str(interaction.responses[0]))
+
+        asyncio.run(run())
+
+    def test_effects_button_requires_same_channel(self):
+        async def run():
+            view, service, guild = self._view_and_service()
+            outsider = FakePanelMember(channel_id=100)
+            with patch.object(discord, "Member", FakePanelMember):
+                interaction = FakePanelInteraction(guild, outsider)
+                await view._effects(interaction)
+            self.assertTrue(interaction.responses)
+            self.assertIn("join", str(interaction.responses[0]))
+
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# TTS interruption must not corrupt history, loop, autoplay or the queue
+# ---------------------------------------------------------------------------
+
+
+class TestTTSCompatibility(unittest.TestCase):
+    def _service(self, player, responses=None):
+        guild = MusicFlowGuild(player=player)
+        guild.player = player
+        guild.voice_client = FakeVoiceProtocol(guild, guild.channels[99])
+        config = Config(lavalink_host="n", lavalink_password="p")
+        store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
+        service = MusicService(MusicFlowBot(guild), config, store)
+        service.client = FakeSearchClient(player, responses or {})
+        return service, guild
+
+    def _member(self, guild):
+        return MusicFlowMember(guild=guild)
+
+    def test_tts_round_trip_preserves_music_state(self):
+        async def run():
+            player = FakeRealPlayer()
+            tts_url = "https://cdn.example/clip.mp3"
+            service, guild = self._service(
+                player,
+                {tts_url: FakeLoadResult(LoadType.TRACK, [make_track("voice clip", duration=2000)])},
+            )
+            member = self._member(guild)
+
+            # Music playing: A current, B and C queued, queue loop on.
+            track_a = make_track("song A")
+            track_b = make_track("song B")
+            track_c = make_track("song C")
+            await player.play(track_a)
+            service._record_history(player, track_a)
+            player.queue = [track_b, track_c]
+            await service.set_loop(guild, member, "queue")
+            session = service.session(guild.id)
+            session.autoplay_enabled = True
+
+            # TTS interrupts: music stashed, queue handed over.
+            await service.play_tts(guild.id, tts_url, "hello everyone")
+            self.assertTrue(session.tts_active)
+            self.assertEqual(session.tts_stash[0].title, "song A")
+            self.assertEqual(player.queue, [])
+            # The TTS clip must never enter playback history.
+            service._record_history(player, player.current)
+            self.assertEqual([e.track.title for e in session.playback_history], ["song A"])
+
+            # TTS finishes: music resumes exactly where it was.
+            await service.finish_tts(guild.id)
+            self.assertFalse(session.tts_active)
+            self.assertEqual(player.current.title, "song A")
+            self.assertEqual([t.title for t in player.queue], ["song B", "song C"])
+            self.assertEqual(session.loop_mode, "queue")
+            self.assertEqual(player.loop, 2, "loop mode survived the interruption")
+            self.assertTrue(session.autoplay_enabled)
+            # The restored track start does not duplicate history.
+            service._record_history(player, player.current)
+            self.assertEqual([e.track.title for e in session.playback_history], ["song A"])
+            self.assertEqual(session.history_index, 0)
+
+        asyncio.run(run())
+
+    def test_queue_end_during_tts_leaves_transition_to_tts_worker(self):
+        async def run():
+            player = FakeRealPlayer()
+            tts_url = "https://cdn.example/clip.mp3"
+            service, guild = self._service(
+                player,
+                {tts_url: FakeLoadResult(LoadType.TRACK, [make_track("voice clip", duration=2000)])},
+            )
+            last = make_track("song", "artist", identifier="abc")
+            service._record_history(player, last)
+            session = service.session(guild.id)
+            session.autoplay_enabled = True
+            await service.play_tts(guild.id, tts_url, "announcement")
+            # The clip ends and the (empty) queue fires QueueEnd — the TTS
+            # worker owns the next transition, autoplay must not hijack it.
+            await service._on_queue_end(SimpleNamespace(player=player))
+            self.assertEqual(player.queue, [])
+            self.assertEqual(len(service.client.queries), 1, "no autoplay search ran")
+
+        asyncio.run(run())
+
+    def test_autoplay_disabled_while_speaking_via_maintenance(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            session = service.session(guild.id)
+            session.tts_active = True
+            session.sticky = False
+            session.alone_since = time.monotonic() - 10**6
+            vc = guild.voice_client
+            await service._maintenance_tick()
+            self.assertEqual(vc.disconnected, 0, "never auto-disconnect mid-speech")
+
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Loop + autoplay
+# ---------------------------------------------------------------------------
+
+
+class TestLoopAndAutoplay(unittest.TestCase):
+    def _service(self, player, responses=None, node_sources="unset"):
+        guild = MusicFlowGuild(player=player)
+        guild.player = player
+        guild.voice_client = FakeVoiceProtocol(guild, guild.channels[99])
+        config = Config(lavalink_host="n", lavalink_password="p")
+        store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
+        service = MusicService(MusicFlowBot(guild), config, store)
+        service.client = FakeSearchClient(player, responses or {})
+        if node_sources != "unset":
+            service.node_sources = node_sources
+        return service, guild
+
+    def _member(self, guild):
+        return MusicFlowMember(guild=guild)
+
+    def test_set_loop_modes_and_cycling(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+
+            self.assertEqual(await service.set_loop(guild, member, "track"), "track")
+            self.assertEqual(player.loop, 1)
+            self.assertEqual(await service.set_loop(guild, member, "queue"), "queue")
+            self.assertEqual(player.loop, 2)
+            self.assertEqual(await service.set_loop(guild, member, "off"), "off")
+            self.assertEqual(player.loop, 0)
+
+            # Cycling: off → track → queue → off.
+            await service.set_loop(guild, member, None)
+            self.assertEqual(player.loop, 1)
+            await service.set_loop(guild, member, None)
+            self.assertEqual(player.loop, 2)
+            await service.set_loop(guild, member, None)
+            self.assertEqual(player.loop, 0)
+
+            with self.assertRaisesRegex(MusicError, "off.*track.*queue"):
+                await service.set_loop(guild, member, "sideways")
+
+        asyncio.run(run())
+
+    def test_skip_advances_even_under_track_loop(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+            player.current = make_track("current")
+            player.queue = [make_track("next")]
+            await service.set_loop(guild, member, "track")
+            await service.skip(guild, member)
+            self.assertEqual(player.current.title, "next")
+            self.assertEqual(player.loop, 1, "loop mode survives the skip")
+            # The outgoing track must not have been re-inserted into the queue.
+            self.assertEqual(len(player.queue), 0)
+
+        asyncio.run(run())
+
+    def test_autoplay_fills_queue_with_related_tracks(self):
+        async def run():
+            player = FakeRealPlayer()
+            mix_url = "https://www.youtube.com/watch?v=abc&list=RDabc"
+            related = [
+                make_track("Related One", "Rick Astley", identifier="r1"),
+                make_track("Related Two", "Rick Astley", identifier="r2"),
+                make_track("Related Three", "Rick Astley", identifier="r3"),
+                make_track("Related Four", "Rick Astley", identifier="r4"),
+            ]
+            service, guild = self._service(
+                player,
+                {mix_url: FakeLoadResult(LoadType.PLAYLIST, related)},
+                node_sources=frozenset({"youtube", "http"}),
+            )
+            last = make_track("Never Gonna Give You Up", "Rick Astley", identifier="abc")
+            session = service.session(guild.id)
+            service._record_history(player, last)
+            session.autoplay_enabled = True
+
+            self.assertTrue(await service._maybe_autoplay(player, session))
+            self.assertEqual(player.current.title, "Related One")
+            self.assertEqual(
+                len(player.queue), 2, "a small batch, not the whole mix (one already playing)"
+            )
+            self.assertTrue(all(call[0] != "stop" for call in player.calls))
+
+        asyncio.run(run())
+
+    def test_autoplay_filters_duplicates_and_recent_tracks(self):
+        async def run():
+            player = FakeRealPlayer()
+            mix_url = "https://www.youtube.com/watch?v=abc&list=RDabc"
+            candidates = [
+                make_track("Never Gonna Give You Up", "Rick Astley", identifier="abc"),
+                make_track("Never Gonna Give You Up (Official Video)", "Rick Astley", identifier="abc2"),
+                make_track("Brand New Track", "Someone Else", identifier="fresh"),
+            ]
+            service, guild = self._service(
+                player,
+                {mix_url: FakeLoadResult(LoadType.PLAYLIST, candidates)},
+                node_sources=frozenset({"youtube", "http"}),
+            )
+            last = make_track("Never Gonna Give You Up", "Rick Astley", identifier="abc")
+            session = service.session(guild.id)
+            service._record_history(player, last)
+            session.autoplay_enabled = True
+
+            self.assertTrue(await service._maybe_autoplay(player, session))
+            self.assertEqual(player.current.title, "Brand New Track")
+            self.assertEqual(player.queue, [], "the duplicates were filtered out")
+            # What autoplay added is remembered so it is never re-added.
+            self.assertTrue(
+                any("brand new track" in key for key in session.autoplay_history)
+            )
+
+        asyncio.run(run())
+
+    def test_autoplay_respects_recently_added_memory(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(
+                player,
+                {
+                    "ytsearch:Rick Astley": FakeLoadResult(
+                        LoadType.SEARCH,
+                        [make_track("Old Pick", "Rick Astley", identifier="old")],
+                    )
+                },
+            )
+            last = make_track("Never Gonna Give You Up", "Rick Astley", identifier="abc")
+            session = service.session(guild.id)
+            service._record_history(player, last)
+            session.autoplay_enabled = True
+            session.autoplay_history.append("rick astley old pick")
+            session.autoplay_history.append("old")
+
+            self.assertFalse(await service._maybe_autoplay(player, session))
+            self.assertEqual(player.queue, [])
+
+        asyncio.run(run())
+
+    def test_autoplay_disabled_leaves_queue_end_idle(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            last = make_track("song", "artist")
+            session = service.session(guild.id)
+            service._record_history(player, last)
+            session.autoplay_enabled = False
+
+            self.assertFalse(await service._maybe_autoplay(player, session))
+            self.assertEqual(player.queue, [])
+
+        asyncio.run(run())
+
+    def test_queue_end_triggers_autoplay(self):
+        async def run():
+            player = FakeRealPlayer()
+            mix_url = "https://www.youtube.com/watch?v=abc&list=RDabc"
+            service, guild = self._service(
+                player,
+                {mix_url: FakeLoadResult(LoadType.PLAYLIST, [make_track("Related", "Artist", identifier="r")])},
+                node_sources=frozenset({"youtube", "http"}),
+            )
+            last = make_track("song", "Artist", identifier="abc")
+            session = service.session(guild.id)
+            service._record_history(player, last)
+            session.autoplay_enabled = True
+            session.transition_track = TrackInfo.from_track(last)
+
+            event = SimpleNamespace(player=player)
+            await service._on_queue_end(event)
+            self.assertEqual(player.current.title, "Related")
+            self.assertIsNotNone(session.last_action)
+
+        asyncio.run(run())
+
+    def test_autoplay_gives_up_after_repeated_failures(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player, {})  # every search is empty
+            last = make_track("song", "artist", identifier="abc")
+            session = service.session(guild.id)
+            service._record_history(player, last)
+            session.autoplay_enabled = True
+
+            for _ in range(3):
+                session.autoplay_retry_at = 0.0  # skip the backoff in-test
+                self.assertFalse(await service._maybe_autoplay(player, session))
+            self.assertEqual(session.autoplay_failures, 3)
+            # After three failures autoplay stays quiet until a human plays.
+            self.assertFalse(await service._maybe_autoplay(player, session))
+            self.assertEqual(player.queue, [])
+
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Queue editing: remove / move
+# ---------------------------------------------------------------------------
+
+
+class TestQueueEditing(unittest.TestCase):
+    def _service(self, player):
+        guild = MusicFlowGuild(player=player)
+        guild.player = player
+        guild.voice_client = FakeVoiceProtocol(guild, guild.channels[99])
+        config = Config(lavalink_host="n", lavalink_password="p")
+        store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
+        service = MusicService(MusicFlowBot(guild), config, store)
+        service.client = FakeSearchClient(player, {})
+        return service, guild
+
+    def _member(self, guild):
+        return MusicFlowMember(guild=guild)
+
+    def test_remove_track(self):
+        async def run():
+            player = FakeRealPlayer()
+            player.current = make_track("current")
+            player.queue = [make_track(f"q{i}") for i in range(3)]
+            service, guild = self._service(player)
+            member = self._member(guild)
+
+            removed = service.remove_track(guild, member, 2)
+            self.assertEqual(removed.title, "q1")
+            self.assertEqual([t.title for t in player.queue], ["q0", "q2"])
+
+            with self.assertRaisesRegex(MusicError, "between 1 and 2"):
+                service.remove_track(guild, member, 3)
+            with self.assertRaisesRegex(MusicError, "whole number"):
+                service.remove_track(guild, member, True)
+
+        asyncio.run(run())
+
+    def test_remove_from_empty_queue_is_friendly(self):
+        async def run():
+            player = FakeRealPlayer()
+            player.current = make_track("current")
+            service, guild = self._service(player)
+            with self.assertRaisesRegex(MusicError, "queue is empty"):
+                service.remove_track(guild, self._member(guild), 1)
+
+        asyncio.run(run())
+
+    def test_move_track(self):
+        async def run():
+            player = FakeRealPlayer()
+            player.current = make_track("current")
+            player.queue = [make_track(f"q{i}") for i in range(4)]
+            service, guild = self._service(player)
+            member = self._member(guild)
+
+            moved = service.move_track(guild, member, 3, 1)
+            self.assertEqual(moved.title, "q2")
+            self.assertEqual([t.title for t in player.queue], ["q2", "q0", "q1", "q3"])
+
+            moved = service.move_track(guild, member, 1, 4)
+            self.assertEqual([t.title for t in player.queue], ["q0", "q1", "q3", "q2"])
+
+            with self.assertRaisesRegex(MusicError, "between 1 and 4"):
+                service.move_track(guild, member, 5, 1)
+            with self.assertRaisesRegex(MusicError, "whole numbers"):
+                service.move_track(guild, member, "one", 2)
+
+        asyncio.run(run())
+
+    def test_move_requires_queue(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            with self.assertRaisesRegex(MusicError, "queue is empty"):
+                service.move_track(guild, self._member(guild), 1, 1)
+
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Seeking
+# ---------------------------------------------------------------------------
+
+
+class TestSeeking(unittest.TestCase):
+    def _service(self, player):
+        guild = MusicFlowGuild(player=player)
+        guild.player = player
+        guild.voice_client = FakeVoiceProtocol(guild, guild.channels[99])
+        config = Config(lavalink_host="n", lavalink_password="p")
+        store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
+        service = MusicService(MusicFlowBot(guild), config, store)
+        service.client = FakeSearchClient(player, {})
+        return service, guild
+
+    def _member(self, guild):
+        return MusicFlowMember(guild=guild)
+
+    def test_seek_absolute(self):
+        async def run():
+            player = FakeRealPlayer()
+            player.current = make_track()
+            service, guild = self._service(player)
+            result = await service.seek(guild, self._member(guild), 92_000)
+            self.assertEqual(result, 92_000)
+            self.assertEqual(player.position, 92_000)
+
+        asyncio.run(run())
+
+    def test_seek_validation(self):
+        async def run():
+            player = FakeRealPlayer()
+            player.current = make_track()  # 212s long
+            service, guild = self._service(player)
+            member = self._member(guild)
+            with self.assertRaisesRegex(MusicError, "past the end"):
+                await service.seek(guild, member, 300_000)
+            with self.assertRaisesRegex(MusicError, "negative"):
+                await service.seek(guild, member, -1)
+            player.current = make_track(is_stream=True, is_seekable=False, duration=0)
+            with self.assertRaisesRegex(MusicError, "can't be seeked"):
+                await service.seek(guild, member, 1_000)
+            player.current = None
+            with self.assertRaisesRegex(MusicError, "nothing is playing"):
+                await service.seek(guild, member, 1_000)
+
+        asyncio.run(run())
+
+    def test_forward_and_backward_clamp(self):
+        async def run():
+            player = FakeRealPlayer()
+            player.current = make_track()  # 212s
+            player.position = 72_000
+            service, guild = self._service(player)
+            member = self._member(guild)
+
+            self.assertEqual(await service.nudge(guild, member, 15_000), 87_000)
+            self.assertEqual(await service.nudge(guild, member, -30_000), 57_000)
+            # Clamped at both ends.
+            self.assertEqual(await service.nudge(guild, member, 500_000), 211_500)
+            self.assertEqual(await service.nudge(guild, member, -500_000), 0)
+
+        asyncio.run(run())
+
+
+# ---------------------------------------------------------------------------
+# Audio effects (filters) — gated on what the node reports
+# ---------------------------------------------------------------------------
+
+
+class TestFilters(unittest.TestCase):
+    def _service(self, player, node_filters="unset"):
+        guild = MusicFlowGuild(player=player)
+        guild.player = player
+        guild.voice_client = FakeVoiceProtocol(guild, guild.channels[99])
+        config = Config(lavalink_host="n", lavalink_password="p")
+        store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
+        service = MusicService(MusicFlowBot(guild), config, store)
+        service.client = FakeSearchClient(player, {})
+        if node_filters != "unset":
+            service.node_filters = node_filters
+        return service, guild
+
+    def _member(self, guild):
+        return MusicFlowMember(guild=guild)
+
+    def test_every_preset_maps_to_a_real_lavalink_filter(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, _ = self._service(player)
+            known = {"equalizer", "timescale", "karaoke", "tremolo", "vibrato", "rotation"}
+            for preset in service.filter_presets():
+                self.assertIn(preset.node_filter, known, preset.name)
+                self.assertTrue(preset.label)
+            self.assertEqual(len(service.filter_presets()), 7)
+
+        asyncio.run(run())
+
+    def test_set_filter_toggles(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+
+            self.assertEqual(await service.set_filter(guild, member, "bassboost"), "applied")
+            self.assertIn("equalizer", player.filters)
+            self.assertEqual(
+                [p.label for p in service.active_filter_presets(guild.id)], ["Bass Boost"]
+            )
+
+            self.assertEqual(await service.set_filter(guild, member, "bassboost"), "removed")
+            self.assertEqual(player.filters, {})
+            self.assertEqual(service.active_filter_presets(guild.id), [])
+
+        asyncio.run(run())
+
+    def test_shared_node_filters_replace_each_other(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+            await service.set_filter(guild, member, "nightcore")
+            await service.set_filter(guild, member, "daycore")
+            names = {preset.name for preset in service.active_filter_presets(guild.id)}
+            self.assertEqual(names, {"daycore"})
+            self.assertEqual(list(player.filters), ["timescale"])
+
+        asyncio.run(run())
+
+    def test_filters_gated_on_node_report(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player, node_filters=frozenset({"volume"}))
+            member = self._member(guild)
+            with self.assertRaisesRegex(MusicError, "doesn't support"):
+                await service.set_filter(guild, member, "bassboost")
+            # Unknown effect names never reach the node.
+            with self.assertRaisesRegex(MusicError, "don't know that effect"):
+                await service.set_filter(guild, member, "fuzzwah")
+            # No report at all (older node): allow and let the node decide.
+            service.node_filters = None
+            self.assertEqual(await service.set_filter(guild, member, "rotation"), "applied")
+
+        asyncio.run(run())
+
+    def test_clear_filters(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+            await service.set_filter(guild, member, "karaoke")
+            await service.set_filter(guild, member, "tremolo")
+            self.assertEqual(await service.clear_filters(guild, member), 2)
+            self.assertEqual(player.filters, {})
+            self.assertEqual(await service.clear_filters(guild, member), 0)
+
+        asyncio.run(run())
+
+    def test_panel_state_surfaces_filters(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, guild = self._service(player)
+            member = self._member(guild)
+            await service.set_filter(guild, member, "nightcore")
+            guild.voice_client = FakeVoiceProtocol(guild, guild.channels[99])
+            state = service.panel_state(guild.id)
+            self.assertEqual(state.filters, ["Nightcore"])
+
+        asyncio.run(run())
+
+    def test_node_info_parses_filter_report(self):
+        async def run():
+            player = FakeRealPlayer()
+            service, _ = self._service(player)
+            info = dict(REAL_INFO)
+            info["filters"] = ["volume", "equalizer", "timescale", "rotation"]
+            await service._refresh_node_info(FakeInfoNode(info))
+            self.assertEqual(
+                service.node_filters,
+                frozenset({"volume", "equalizer", "timescale", "rotation"}),
+            )
+            self.assertEqual(service.unsupported_filter_names(), [
+                "Karaoke", "Tremolo", "Vibrato",
+            ])
+            # Dict-shaped report (defensive) is accepted too.
+            await service._refresh_node_info(
+                FakeInfoNode({"filters": {"equalizer": True, "karaoke": False}})
+            )
+            self.assertEqual(service.node_filters, frozenset({"equalizer"}))
+
+        asyncio.run(run())
 
 
 # ---------------------------------------------------------------------------
@@ -922,8 +1942,11 @@ class TestWiring(unittest.TestCase):
             ):
                 self.assertTrue(hasattr(bot, attribute), f"bot.{attribute} missing")
             for attribute in (
-                "join", "play", "pause", "resume", "skip", "stop", "set_volume",
-                "clear_queue", "shuffle_queue", "panel_state", "refresh_panel",
+                "join", "play", "pause", "resume", "skip", "previous", "stop",
+                "set_volume", "clear_queue", "shuffle_queue", "remove_track",
+                "move_track", "seek", "nudge", "set_loop", "set_autoplay",
+                "set_filter", "clear_filters", "filter_presets", "active_filter_presets",
+                "lyrics_for_guild", "panel_state", "refresh_panel",
                 "move_panel", "require_connected_control", "handle_forced_disconnect",
                 "lavalink_status", "node_ready", "configured", "max_volume", "player",
             ):
@@ -998,13 +2021,16 @@ class FakeLoadResult:
 class FakeRealPlayer:
     """Mimics lavalink.DefaultPlayer closely enough for the flows."""
 
-    def __init__(self, channel_id=99):
+    def __init__(self, channel_id=99, guild_id=1):
         self.channel_id = channel_id
+        self.guild_id = guild_id
         self.current = None
         self.queue = []
         self.paused = False
         self.volume = 100
         self.position = 0
+        self.loop = 0
+        self.filters = {}
         self.calls = []
 
     @property
@@ -1020,7 +2046,14 @@ class FakeRealPlayer:
         self.queue.append(track)
 
     async def play(self, track=None, **kwargs):
-        self.calls.append(("play", track))
+        self.calls.append(("play", track, kwargs))
+        if self.loop == 1 and self.current is not None:
+            if track is not None:
+                self.queue.insert(0, self.current)
+            else:
+                track = self.current
+        elif self.loop == 2 and self.current is not None:
+            self.queue.append(self.current)
         self.current = track or (self.queue.pop(0) if self.queue else None)
         self.paused = bool(kwargs.get("pause", False))
 
@@ -1030,13 +2063,36 @@ class FakeRealPlayer:
 
     async def skip(self):
         self.calls.append(("skip",))
-        self.current = self.queue.pop(0) if self.queue else None
+        await self.play()
+
+    def set_loop(self, loop):
+        if not 0 <= loop <= 2:
+            raise ValueError("Loop must be 0, 1 or 2.")
+        self.loop = loop
+
+    async def seek(self, position):
+        self.calls.append(("seek", position))
+        self.position = position
 
     async def set_pause(self, paused):
         self.paused = paused
 
     async def set_volume(self, volume):
         self.volume = volume
+
+    async def set_filter(self, filter_object, *, replace=False):
+        if replace:
+            self.filters.clear()
+        self.filters[type(filter_object).__name__.lower()] = filter_object
+
+    async def set_filters(self, *filters, replace=False):
+        if replace:
+            self.filters.clear()
+        for filter_object in filters:
+            self.filters[type(filter_object).__name__.lower()] = filter_object
+
+    async def clear_filters(self):
+        self.filters.clear()
 
 
 class FakeVoiceChannel:

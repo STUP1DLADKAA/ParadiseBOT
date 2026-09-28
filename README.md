@@ -30,15 +30,15 @@ Everything lives in `.env` (never committed). See `.env.example` for all options
 | Lavalink | `LAVALINK_HOST`, `LAVALINK_PORT`, `LAVALINK_PASSWORD`, `LAVALINK_SECURE`, `LAVALINK_REGION`, `LAVALINK_EXPECTED_PLUGINS` | any Lavalink v4 node; music and voice TTS are disabled without it. `lavalink/` contains a ready-made node config with the youtube-plugin pinned. |
 | AI | `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | any OpenAI-compatible endpoint (OpenAI, Groq, Gemini's compat layer, local Ollama). Optional |
 | TTS | `TTS_ENABLED`, `TTS_VOICE_HI`, `TTS_VOICE_EN`, `TTS_MAX_LENGTH`, `TTS_USER_COOLDOWN`, `TTS_GLOBAL_COOLDOWN` | free neural voices via edge-tts |
-| Music | `MUSIC_MAX_VOLUME`, `AUTO_DISCONNECT_MINUTES` | |
-| Lyrics | `LYRICS_ENABLED` | free provider; set `false` and `/lyrics` is not even registered |
+| Music | `MUSIC_MAX_VOLUME`, `MUSIC_MAX_HISTORY`, `AUTO_DISCONNECT_MINUTES` | history is how far `/previous` can reach (default 50) |
+| Lyrics | `LYRICS_ENABLED`, `GENIUS_API_KEY` | free providers (LRCLIB, lyrics.ovh) need no key; the optional Genius fallback only activates with a key |
 
 ## Commands
 
-27 commands, one `/ping`, no filler:
+36 commands, one `/ping`, no filler:
 
 - **Fun** — `/ping` (with the real latency), `/8ball`, `/coinflip` (animated), `/choose`
-- **Music** — `/join`, `/play`, `/pause`, `/resume`, `/skip`, `/stop`, `/queue`, `/nowplaying`, `/volume`, `/clearqueue`, `/shuffle`, `/leave`, `/lyrics`
+- **Music** — `/join`, `/play`, `/pause`, `/resume`, `/skip`, `/previous`, `/stop`, `/queue`, `/nowplaying`, `/remove`, `/move`, `/clearqueue`, `/shuffle`, `/seek`, `/forward`, `/backward`, `/loop`, `/autoplay`, `/filter`, `/volume`, `/leave`, `/lyrics`
 - **Useful** — `/remind`, `/poll`, `/afk`, `/translate`, `/define`, `/status`, `/settings`
 - **Voice** — `/say`
 - **AI** — `/summarize`, or just mention Paradise
@@ -51,7 +51,13 @@ Choices for `/choose` and `/poll` are separated with `|` or `,`:
 
 ### The music panel
 
-Every music command opens or updates one interactive panel per server (edit-in-place, no embed spam). The panel shows status, track, requester, progress, queue length, volume and voice channel, with buttons for **Play / Pause / Resume / Skip / Stop / Queue / Now Playing / Volume / Join**. Buttons run the exact same validation and service calls as the slash commands — they're the same code paths, not decorations. Panels survive restarts: Paradise re-binds them on startup.
+Every music command opens or updates one interactive panel per server (edit-in-place, no embed spam). The Components V2 panel shows the artwork, track, artist, source, requester, live progress bar, status, volume, voice channel, loop/autoplay/effects state and the next few queue entries, with three control rows: **Previous / Pause / Resume / Next**, **Shuffle / Queue / Volume / Lyrics / Stop** and **Loop / Autoplay / Effects / Add Music**. Buttons run the exact same validation and service calls as the slash commands — they're the same code paths, not decorations. Panels survive restarts: Paradise re-binds them on startup.
+
+**Previous** is real history navigation, not a re-search: the original Lavalink track objects are kept per guild (bounded by `MUSIC_MAX_HISTORY`), positions interrupted by Skip or Previous are remembered, and starting any new track after navigating back cleanly discards the abandoned branch.
+
+**Loop** uses Lavalink.py's native player loop (`off` / `track` / `queue`, cycling from the panel button). **Autoplay** kicks in when the queue ends: it builds related-track queries (the YouTube radio mix of the last track, then artist searches) through the sources the node actually reports, filters out anything recently played, queued, or a normalized-title duplicate, and adds a small batch — never a wall of tracks. **Effects** (`/filter`) exposes bass boost, nightcore, daycore, karaoke, tremolo, vibrato and rotation — each gated on the filter list the node reports via `/v4/info`, so unsupported effects are refused with a clear message instead of breaking the player.
+
+**Lyrics** come from a fallback chain (LRCLIB → lyrics.ovh → optional Genius) with title-noise cleaning, duration-aware matching, a TTL cache shared by the command and the panel, and a paginated Components V2 reader with a source credit.
 
 Voice rules, deliberately simple:
 
@@ -118,7 +124,7 @@ The offline suite needs no token, node, or network:
 python -m unittest discover -s tests -v
 ```
 
-It verifies the exact registered command set (and that removed commands stay gone), the ping format, coinflip randomness, TTS limits and cooldowns, panel rendering for every state, queue pagination, settings persistence, lyrics pagination, plugin/source diagnostics, the search-source fallback, and the full music flow (join/play/pause/skip/volume/clearqueue/shuffle/stop/auto-disconnect rules) against a fake Lavalink client.
+It verifies the exact registered command set (and that removed commands stay gone), the ping format, coinflip randomness, TTS limits and cooldowns, panel rendering for every state, queue pagination, settings persistence, lyrics provider chain/pagination/caching, playback-history navigation and resume offsets, loop modes, autoplay batching and duplicate protection, queue editing, seeking, filter gating on node reports, plugin/source diagnostics, the search-source fallback, the TTS interruption round-trip, and the full music flow (join/play/pause/skip/volume/clearqueue/shuffle/stop/auto-disconnect rules) against a fake Lavalink client.
 
 The Lavalink node itself is validated separately — see `lavalink/README.md`:
 
