@@ -24,6 +24,7 @@ from lavalink.events import (
 )
 from lavalink.server import LoadType
 
+from functions import lyrics
 from functions.helpers import (
     MusicError,
     NodePlaybackUnsupported,
@@ -40,7 +41,6 @@ from functions.music.panel import (
     SkipResult,
     TrackInfo,
     button_states,
-    render_panel,
 )
 from functions.music.voice import LavalinkVoiceClient
 
@@ -81,6 +81,8 @@ class GuildSession:
         "tts_active",
         "tts_text",
         "tts_stash",
+        "transition_track",
+        "transition_position",
     )
 
     def __init__(self) -> None:
@@ -93,6 +95,10 @@ class GuildSession:
         self.tts_active: bool = False
         self.tts_text: str | None = None
         self.tts_stash: tuple | None = None  # (track, position_ms, queue, was_paused)
+        # Short-lived display context while Lavalink transitions between tracks.
+        # QueueEnd clears it, so a genuinely finished session still becomes idle.
+        self.transition_track: TrackInfo | None = None
+        self.transition_position: int = 0
 
     def note(self, action: str) -> None:
         self.last_action = action
@@ -111,6 +117,8 @@ class GuildSession:
         self.tts_active = False
         self.tts_text = None
         self.tts_stash = None
+        self.transition_track = None
+        self.transition_position = 0
         if not keep_volume:
             self.volume = 100
 
@@ -226,6 +234,8 @@ class MusicService:
             return  # the TTS worker owns the next transition
         session.last_action = None
         session.last_action_at = 0.0
+        session.transition_track = None
+        session.transition_position = 0
         await self.refresh_panel(event.player.guild_id)
 
     @lavalink.listener(TrackExceptionEvent)
@@ -485,6 +495,7 @@ class MusicService:
             voice_channel=None,
             volume=session.volume,
             last_action=session.recent_action(),
+            lyrics_enabled=self.config.lyrics_enabled,
         )
         if not connected:
             return state
@@ -495,13 +506,55 @@ class MusicService:
             state.status = "speaking"
             state.spoken_text = session.tts_text
             if session.tts_stash is not None:
-                state.resumes_after = TrackInfo.from_track(session.tts_stash[0])
+                raw_track, saved_position, saved_queue, _was_paused = session.tts_stash
+                state.resumes_after = TrackInfo.from_track(raw_track)
+                state.position_ms = 0 if raw_track.is_stream else saved_position
+                # While TTS owns Lavalink's queue, expose the music queue from
+                # the stash. This keeps the panel stable through interruption.
+                state.upcoming = [TrackInfo.from_track(t) for t in saved_queue]
         elif player.current is not None:
             state.track = TrackInfo.from_track(player.current)
             state.position_ms = player.position if not player.current.is_stream else 0
             state.status = "paused" if player.paused else "playing"
-        state.upcoming = [TrackInfo.from_track(t) for t in player.queue]
+            session.transition_track = state.track
+            session.transition_position = state.position_ms
+        elif session.transition_track is not None:
+            # Lavalink briefly exposes current=None between end/start events.
+            # Keep the confirmed track context until TrackStart or QueueEnd
+            # settles the transition instead of flashing an empty player.
+            state.track = session.transition_track
+            state.position_ms = session.transition_position
+            state.status = "loading"
+        if not session.tts_active:
+            state.upcoming = [TrackInfo.from_track(t) for t in player.queue]
+
+        active = state.active_track
+        if active is not None and state.lyrics_enabled:
+            cached, text = lyrics.CACHE.peek(active.lyrics_key)
+            state.lyrics_loaded = cached and text is not None
+            if text:
+                state.lyrics_preview = next((line.strip() for line in text.splitlines() if line.strip()), None)
         return state
+
+    async def lyrics_for_guild(self, guild_id: int) -> tuple[TrackInfo, str | None]:
+        """Fetch cached lyrics for the currently loaded music track.
+
+        The active key is checked again after the provider returns, preventing a
+        slow response for the previous song from being shown after a transition.
+        """
+        if not self.config.lyrics_enabled:
+            raise MusicError("lyrics are disabled on this bot.")
+        state = self.panel_state(guild_id)
+        track = state.active_track
+        if track is None:
+            raise MusicError("there isn't a loaded track to find lyrics for.")
+        key = track.lyrics_key
+        title, artist = lyrics.clean_query(track.title, track.author)
+        text = await lyrics.CACHE.get(key, artist, title)
+        current = self.panel_state(guild_id).active_track
+        if current is None or current.lyrics_key != key:
+            raise MusicError("the track changed while I was finding those lyrics. try again.")
+        return track, text
 
     # ------------------------------------------------------------------
     # Panel management
@@ -519,21 +572,28 @@ class MusicService:
         guild = self.bot.get_guild(guild_id)
         if guild is None or self._closing:
             return
-        state = self.panel_state(guild_id)
-        embed = render_panel(state)
-        view = MusicPanelView(self, guild_id, button_states(state))
-
         async with self._panel_lock(guild_id):
+            # Build from fresh service state after acquiring the guild lock, so
+            # concurrent controls cannot overwrite a newer panel with stale UI.
+            state = self.panel_state(guild_id)
+            view = MusicPanelView(self, guild_id, button_states(state), state)
             message = self._panel_messages.get(guild_id)
             if message is not None:
                 try:
-                    await message.edit(embed=embed, view=view)
+                    # Explicitly clear the old embed when upgrading an existing
+                    # panel message to Components V2.
+                    await message.edit(embed=None, view=view)
                     return
                 except discord.NotFound:
                     self._panel_messages.pop(guild_id, None)
                     await self._forget_panel(guild_id)
+                except discord.Forbidden:
+                    self._panel_messages.pop(guild_id, None)
+                    await self._forget_panel(guild_id)
+                    log.debug("Panel became inaccessible in guild %s", guild_id)
+                    return
                 except discord.HTTPException:
-                    log.debug("Panel edit failed (rate limit?)", exc_info=True)
+                    log.debug("Panel edit failed", exc_info=True)
                     return
 
             settings = self.settings.get(guild_id)
@@ -548,7 +608,7 @@ class MusicService:
             if not _can_send(channel, guild):
                 return
             try:
-                message = await channel.send(embed=embed, view=view)
+                message = await channel.send(view=view)
             except discord.DiscordException:
                 log.debug("Panel send failed", exc_info=True)
                 return
@@ -1018,7 +1078,7 @@ def _can_send(channel: discord.abc.GuildChannel | None, guild: discord.Guild | N
     if me is None:
         return True
     perms = channel.permissions_for(me)
-    return bool(perms and perms.send_messages and perms.embed_links)
+    return bool(perms and perms.send_messages)
 
 
 def _log_load_error(identifier: str, results) -> None:

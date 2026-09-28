@@ -389,6 +389,20 @@ class TestPanelRendering(unittest.TestCase):
         embed = render_queue_page(state, 0)
         self.assertIn("queue is empty", embed.fields[0].value)
 
+    def test_v2_panel_handles_long_titles_and_missing_artwork(self):
+        from functions.music.panel import MusicPanelView
+
+        track = TrackInfo.from_track(make_track("x" * 500, artwork_url=None, source_name="http", identifier=None))
+        state = playing_state(track=track, upcoming=[])
+        service = SimpleNamespace(max_volume=150, panel_state=lambda gid: state)
+        view = MusicPanelView(service, 1, button_states(state), state)
+        payload = view.to_components()
+        self.assertEqual(payload[0]["type"], 17)
+        rendered = str(payload)
+        self.assertIn("Queue is empty", rendered)
+        self.assertNotIn("'type': 11", rendered)  # no broken thumbnail component
+        self.assertLess(len(rendered), 7000)
+
     def test_button_states(self):
         disconnected = button_states(PanelState(guild_id=1, status="disconnected", voice_channel=None))
         self.assertTrue(disconnected["play"])
@@ -443,6 +457,67 @@ class TestMusicServiceState(unittest.TestCase):
         state = service.panel_state(1)
         self.assertEqual(state.status, "speaking")
         self.assertEqual(state.spoken_text, "hello everyone")
+
+    def test_transition_keeps_previous_track_until_queue_end(self):
+        guild = FakeGuild(id=1, voice_client=object())
+        player = FakePlayer(current=make_track())
+        service = self._service(guild)
+        service.client = SimpleNamespace(
+            player_manager=SimpleNamespace(get=lambda gid: player),
+            node_manager=SimpleNamespace(available_nodes=[]),
+        )
+        playing = service.panel_state(1)
+        player.current = None
+        transitioning = service.panel_state(1)
+        self.assertEqual(transitioning.status, "loading")
+        self.assertEqual(transitioning.track.title, playing.track.title)
+        self.assertEqual(transitioning.position_ms, playing.position_ms)
+
+    def test_speaking_preserves_loaded_track_position_and_music_queue(self):
+        guild = FakeGuild(id=1, voice_client=object())
+        service = self._service(guild)
+        tts_track = make_track("voice clip", duration=2_000)
+        service.client = SimpleNamespace(
+            player_manager=SimpleNamespace(get=lambda gid: FakePlayer(current=tts_track, queue=[])),
+            node_manager=SimpleNamespace(available_nodes=[]),
+        )
+        session = service.session(1)
+        session.tts_active = True
+        session.tts_text = "announcement"
+        session.tts_stash = (make_track("saved music"), 61_000, [make_track("saved next")], True)
+        state = service.panel_state(1)
+        self.assertEqual(state.active_track.title, "saved music")
+        self.assertEqual(state.position_ms, 61_000)
+        self.assertEqual([track.title for track in state.upcoming], ["saved next"])
+        self.assertTrue(button_states(state)["lyrics"])
+
+    def test_refresh_panel_serializes_concurrent_edits(self):
+        async def run():
+            guild = FakeGuild(id=1)
+            service = self._service(guild)
+
+            class Message:
+                def __init__(self):
+                    self.calls = 0
+                    self.active = 0
+                    self.max_active = 0
+
+                async def edit(self, **kwargs):
+                    self.calls += 1
+                    self.active += 1
+                    self.max_active = max(self.max_active, self.active)
+                    self.assert_v2 = kwargs["view"].to_components()[0]["type"] == 17
+                    await asyncio.sleep(0)
+                    self.active -= 1
+
+            message = Message()
+            service._panel_messages[1] = message
+            await asyncio.gather(*(service.refresh_panel(1) for _ in range(8)))
+            self.assertEqual(message.calls, 8)
+            self.assertEqual(message.max_active, 1)
+            self.assertTrue(message.assert_v2)
+
+        asyncio.run(run())
 
     def test_lavalink_status(self):
         guild = FakeGuild(id=1)
@@ -768,6 +843,66 @@ class TestLyrics(unittest.TestCase):
     def test_short_lyrics_one_page(self):
         self.assertEqual(len(lyrics.paginate("la la la")), 1)
 
+    def test_cache_reuses_success_and_missing_results(self):
+        async def run():
+            cache = lyrics.LyricsCache(ttl=60, missing_ttl=60)
+            calls = 0
+
+            async def provider(artist, title):
+                nonlocal calls
+                calls += 1
+                return "first line\nsecond line" if title == "song" else None
+
+            self.assertEqual(await cache.get("hit", "artist", "song", fetcher=provider), "first line\nsecond line")
+            self.assertEqual(await cache.get("hit", "artist", "song", fetcher=provider), "first line\nsecond line")
+            self.assertIsNone(await cache.get("miss", "artist", "missing", fetcher=provider))
+            self.assertIsNone(await cache.get("miss", "artist", "missing", fetcher=provider))
+            self.assertEqual(calls, 2)
+
+        asyncio.run(run())
+
+    def test_cache_deduplicates_inflight_and_handles_provider_failure(self):
+        async def run():
+            cache = lyrics.LyricsCache(ttl=60, missing_ttl=60)
+            calls = 0
+
+            async def provider(artist, title):
+                nonlocal calls
+                calls += 1
+                await asyncio.sleep(0)
+                if title == "broken":
+                    raise asyncio.TimeoutError
+                return "lyrics"
+
+            values = await asyncio.gather(*[
+                cache.get("same", "artist", "song", fetcher=provider) for _ in range(4)
+            ])
+            self.assertEqual(values, ["lyrics"] * 4)
+            self.assertEqual(calls, 1)
+            self.assertIsNone(await cache.get("broken", "artist", "broken", fetcher=provider))
+
+        asyncio.run(run())
+
+    def test_track_key_prevents_stale_lyrics_preview(self):
+        old = TrackInfo.from_track(make_track("old song", identifier="old"))
+        current_raw = make_track("new song", identifier="new")
+        current = TrackInfo.from_track(current_raw)
+        lyrics.CACHE._entries[old.lyrics_key] = lyrics.LyricsEntry("old words", time.monotonic() + 60)
+        guild = FakeGuild(id=1, voice_client=object())
+        store = SettingsStore(os.path.join(tempfile.mkdtemp(), "settings.json"))
+        service = MusicService(FakeBot([guild]), Config(), store)
+        service.client = SimpleNamespace(
+            player_manager=SimpleNamespace(get=lambda gid: FakePlayer(current=current_raw)),
+            node_manager=SimpleNamespace(available_nodes=[]),
+        )
+        state = service.panel_state(1)
+        self.assertFalse(state.lyrics_loaded)
+        self.assertIsNone(state.lyrics_preview)
+        lyrics.CACHE._entries[current.lyrics_key] = lyrics.LyricsEntry("new words", time.monotonic() + 60)
+        state = service.panel_state(1)
+        self.assertTrue(state.lyrics_loaded)
+        self.assertEqual(state.lyrics_preview, "new words")
+
 
 # ---------------------------------------------------------------------------
 # Wiring: every attribute and method the commands/buttons actually call
@@ -813,10 +948,20 @@ class TestWiring(unittest.TestCase):
 
         service = SimpleNamespace(max_volume=150, panel_state=lambda gid: playing_state())
         view = MusicPanelView(service, 1, button_states(playing_state()))
-        children = {child.label for child in view.children if hasattr(child, "label")}
-        for label in ("Play", "Pause", "Resume", "Skip", "Stop", "Queue",
-                      "Now Playing", "Volume", "Join"):
-            self.assertIn(label, children)
+        payload = view.to_components()
+        labels = set()
+
+        def collect(items):
+            for item in items:
+                if "label" in item:
+                    labels.add(item["label"])
+                collect(item.get("components", []))
+
+        collect(payload)
+        for label in ("Previous", "Pause", "Next", "Stop", "Queue", "Volume", "Lyrics"):
+            self.assertIn(label, labels)
+        self.assertEqual(payload[0]["type"], 17, "panel must use a Components V2 container")
+        self.assertTrue(view.is_persistent())
         self.assertIsNone(view.timeout, "panel view must be persistent (timeout=None)")
         modal = PlayModal(service, 1)
         self.assertEqual(len(modal.children), 1)
