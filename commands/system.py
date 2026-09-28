@@ -196,6 +196,12 @@ class System(commands.Cog):
         embed.add_field(
             name="Lavalink", value=lavalink_label.get(lavalink, lavalink), inline=True
         )
+        if lavalink == "connected":
+            plugins = music.plugins_label() or "none loaded"
+            missing = music.missing_plugins()
+            if missing:
+                plugins += f"\n⚠️ missing: {', '.join(missing)}"
+            embed.add_field(name="Music plugins", value=plugins[:1000], inline=True)
         embed.add_field(name="TTS", value=bot.tts.status().split(" (")[0], inline=True)
         embed.add_field(
             name="AI", value="ready" if bot.ai.available else "not configured", inline=True

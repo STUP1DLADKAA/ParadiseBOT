@@ -55,6 +55,19 @@ _PLAYLIST_CAP = 50
 _MAINTENANCE_INTERVAL = 15
 _LAST_ACTION_TTL = 45 * 60
 
+# Search prefixes Paradise may use for plain (non-URL) queries, in preference
+# order, mapped to the Lavalink source manager that must be loaded for the
+# prefix to resolve. The node reports its loaded sources via /v4/info, so the
+# fallback only ever tries sources the node actually has — no blind retries,
+# no invented prefixes (see lavalink/README.md for the plugin setup).
+_SEARCH_PREFIX_SOURCES: tuple[tuple[str, str], ...] = (
+    ("ytsearch", "youtube"),  # provided by dev.lavalink.youtube:youtube-plugin
+    ("ytmsearch", "youtube"),  # YouTube Music catalog, same source manager
+    ("scsearch", "soundcloud"),  # Lavalink's built-in SoundCloud source
+)
+_FALLBACK_SEARCH_PREFIXES = ("ytsearch", "scsearch")
+_MAX_PLUGIN_LABEL = 5
+
 
 class GuildSession:
     """Per-guild music state that lives outside the Lavalink player."""
@@ -114,6 +127,10 @@ class MusicService:
         self._panel_locks: dict[int, asyncio.Lock] = {}
         self._maintenance_task: asyncio.Task | None = None
         self._closing = False
+        # What the node reported about itself (refreshed on every node ready).
+        self.node_plugins: dict[str, str] = {}
+        self.node_sources: frozenset[str] | None = None
+        self.node_version: str | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -216,6 +233,99 @@ class MusicService:
     @lavalink.listener(NodeReadyEvent)
     async def _on_node_ready(self, event: NodeReadyEvent) -> None:
         log.info("Lavalink node ready (%s)", getattr(event.node, "name", "node"))
+        self._maybe_task(self._refresh_node_info(event.node))
+
+    async def _refresh_node_info(self, node) -> None:
+        """Ask the node what plugins and sources it actually loaded.
+
+        This is the honest verification step: whatever ``/v4/info`` reports is
+        what /play can resolve. Missing expected plugins are logged clearly —
+        never faked, never fatal for the rest of the node connection.
+        """
+        try:
+            info = await node.get_info()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.warning(
+                "Could not fetch Lavalink node info — using default sources", exc_info=True
+            )
+            return
+
+        try:
+            plugins = {
+                str(entry.get("name")): str(entry.get("version"))
+                for entry in (info.get("plugins") or [])
+                if entry.get("name")
+            }
+            sources = frozenset(str(name) for name in (info.get("sourceManagers") or []))
+            raw_version = info.get("version")
+            if isinstance(raw_version, dict):  # {"semver": "4.2.1", ...}
+                version = str(raw_version.get("semver") or "") or None
+            elif isinstance(raw_version, str):
+                version = raw_version or None
+            else:
+                version = None
+            self.node_plugins = plugins
+            self.node_sources = sources or None
+            self.node_version = version
+        except Exception:
+            log.warning("Malformed Lavalink node info — using default sources", exc_info=True)
+            return
+
+        log.info(
+            "Lavalink node version %s (%s sources, %s plugins)",
+            self.node_version or "unknown",
+            len(self.node_sources or ()),
+            len(plugins),
+        )
+        if plugins:
+            summary = ", ".join(f"{name}@{version}" for name, version in sorted(plugins.items()))
+            log.info("Lavalink plugins loaded: %s", summary)
+        else:
+            log.info("Lavalink node reports no plugins (built-in sources only)")
+        if self.node_sources is not None:
+            log.info("Lavalink sources available: %s", ", ".join(sorted(self.node_sources)))
+
+        for name, version in self.config.expected_plugins:
+            if name in self.node_plugins:
+                actual = self.node_plugins[name]
+                if version and actual != version:
+                    log.warning(
+                        "Lavalink plugin '%s' is version %s, expected %s — update the "
+                        "node config (see lavalink/README.md).",
+                        name, actual, version,
+                    )
+                continue
+            wanted = f"{name}:{version}" if version else name
+            log.warning(
+                "Lavalink plugin '%s' is configured as expected (LAVALINK_EXPECTED_PLUGINS="
+                "%s) but the node did not report it as loaded — sources or features from "
+                "it will not resolve. Check the node's lavalink.plugins declarations "
+                "(lavalink/README.md).",
+                name, wanted,
+            )
+
+    def plugins_label(self) -> str | None:
+        """Compact, user-safe summary of the plugins the node has loaded."""
+        if not self.node_plugins:
+            return None
+        parts = []
+        for name, version in sorted(self.node_plugins.items()):
+            version = (version or "").strip()
+            parts.append(f"{name}@{version[:12]}…" if len(version) > 12 else f"{name}@{version}")
+        if len(parts) > _MAX_PLUGIN_LABEL:
+            parts = parts[:_MAX_PLUGIN_LABEL] + [f"+{len(parts) - _MAX_PLUGIN_LABEL} more"]
+        return ", ".join(parts)
+
+    def missing_plugins(self) -> list[str]:
+        """Expected plugins the node did not report as loaded."""
+        missing: list[str] = []
+        for name, version in self.config.expected_plugins:
+            if name in self.node_plugins:
+                continue
+            missing.append(f"{name} {version}" if version else name)
+        return missing
 
     # ------------------------------------------------------------------
     # State helpers
@@ -247,7 +357,65 @@ class MusicService:
         if self.client is None:
             raise MusicError("music isn't configured on this bot.")
         if not self.node_ready:
-            raise MusicError("can't reach the music node right now. give it a minute.")
+            raise MusicError(
+                "music is unavailable right now — the music node isn't responding. "
+                "give it a minute."
+            )
+
+    def _search_prefixes(self) -> tuple[str, ...]:
+        """Search prefixes for plain queries, limited to sources the node has.
+
+        Falls back to the classic defaults when the node hasn't reported its
+        sources (or couldn't) — YouTube via the youtube-plugin first, then
+        SoundCloud.
+        """
+        if self.node_sources is None:
+            return _FALLBACK_SEARCH_PREFIXES
+        return tuple(
+            prefix
+            for prefix, source in _SEARCH_PREFIX_SOURCES
+            if source in self.node_sources
+        )
+
+    async def _load_query(self, query: str):
+        """Resolve a query through the node's configured sources.
+
+        URLs go straight to the node. Plain queries try each available search
+        source once, in order, and stop at the first one that returns tracks.
+        Never retries, never loops, and never leaks node errors to the user —
+        they are logged with context instead.
+        """
+        if _URL_RE.match(query):
+            results = await self.client.get_tracks(query)
+            if results.load_type is LoadType.ERROR:
+                _log_load_error(query, results)
+            return results, True
+
+        prefixes = self._search_prefixes()
+        if not prefixes:
+            raise MusicError(
+                "the music node has no searchable sources configured — "
+                "check its plugins (see lavalink/README.md)."
+            )
+
+        reached_node = False
+        for prefix in prefixes:
+            identifier = f"{prefix}:{query}"
+            try:
+                results = await self.client.get_tracks(identifier)
+            except Exception:
+                log.warning("Search via %s failed", prefix, exc_info=True)
+                continue
+            reached_node = True
+            if results.load_type is LoadType.ERROR:
+                _log_load_error(identifier, results)
+                continue
+            if results.tracks:
+                return results, True
+        # Nothing found on any source. If we never got a single response the
+        # node is unreachable; if it responded with empty results the query
+        # genuinely has no matches anywhere.
+        return None, reached_node
 
     def _require_connected(self, guild: discord.Guild):
         player = self.player(guild.id)
@@ -498,13 +666,19 @@ class MusicService:
             self.require_connected_control(guild, member)
             player = self.client.player_manager.create(guild_id=guild.id)
 
-        identifier = query if _URL_RE.match(query) else f"ytsearch:{query}"
         try:
-            results = await self.client.get_tracks(identifier)
+            results, reached_node = await self._load_query(query)
+        except MusicError:
+            raise
         except Exception:
             log.exception("Track load failed for %r", query)
             raise MusicError("couldn't reach the music node for that one.") from None
 
+        if results is None:
+            # Every source was tried; nothing playable came back.
+            if not reached_node:
+                raise MusicError("couldn't reach the music node for that one.")
+            raise MusicError("couldn't find anything for that.")
         if results.load_type is LoadType.ERROR:
             raise MusicError("that didn't load. try a different link or search.")
         if not results.tracks or results.load_type is LoadType.EMPTY:
@@ -808,3 +982,10 @@ def _can_send(channel: discord.abc.GuildChannel | None, guild: discord.Guild | N
         return True
     perms = channel.permissions_for(me)
     return bool(perms and perms.send_messages and perms.embed_links)
+
+
+def _log_load_error(identifier: str, results) -> None:
+    """Log a node-side load failure privately; users only ever see a short note."""
+    error = getattr(results, "error", None)
+    detail = f" ({error})" if error else ""
+    log.warning("Lavalink could not load %r%s", identifier[:200], detail)

@@ -27,7 +27,7 @@ Everything lives in `.env` (never committed). See `.env.example` for all options
 | Group | Variables | Notes |
 | --- | --- | --- |
 | Discord | `DISCORD_TOKEN` | required |
-| Lavalink | `LAVALINK_HOST`, `LAVALINK_PORT`, `LAVALINK_PASSWORD`, `LAVALINK_SECURE`, `LAVALINK_REGION` | any Lavalink v4 node; music and voice TTS are disabled without it |
+| Lavalink | `LAVALINK_HOST`, `LAVALINK_PORT`, `LAVALINK_PASSWORD`, `LAVALINK_SECURE`, `LAVALINK_REGION`, `LAVALINK_EXPECTED_PLUGINS` | any Lavalink v4 node; music and voice TTS are disabled without it. `lavalink/` contains a ready-made node config with the youtube-plugin pinned. |
 | AI | `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | any OpenAI-compatible endpoint (OpenAI, Groq, Gemini's compat layer, local Ollama). Optional |
 | TTS | `TTS_ENABLED`, `TTS_VOICE_HI`, `TTS_VOICE_EN`, `TTS_MAX_LENGTH`, `TTS_USER_COOLDOWN`, `TTS_GLOBAL_COOLDOWN` | free neural voices via edge-tts |
 | Music | `MUSIC_MAX_VOLUME`, `AUTO_DISCONNECT_MINUTES` | |
@@ -91,7 +91,8 @@ config.py                 all environment configuration in one place
 commands/                 thin slash-command cogs (fun, music, utility, voice, ai, system)
 functions/
   music/service.py        MusicService — the single source of truth for player state,
-                          queue, panel lifecycle, auto-disconnect and TTS playback
+                          queue, panel lifecycle, auto-disconnect, TTS playback and
+                          source resolution (search fallback across the node's sources)
   music/panel.py          panel/queue rendering, buttons, modals, pagination
   music/voice.py          discord.py <-> Lavalink voice bridge
   tts.py                  TTS provider + cooldowns + per-guild speech queue
@@ -101,10 +102,13 @@ functions/
   helpers.py              shared errors, colours, parsing, formatting
   personality.py          rare unprompted reactions
   presence.py             slow presence rotation
+lavalink/                 the node-side half: application.yml (youtube-plugin pinned,
+                          built-in YouTube source off, http source on for TTS),
+                          docker-compose.yml and verify_node.py (startup validation)
 tests/test_offline.py     offline validation: exact command set, every flow, limits
 ```
 
-Design rules: one music service owns all state (buttons and commands share it), all user-facing errors are friendly strings (`MusicError` / `TTSError` / `ParadiseError`), raw provider or Lavalink errors never reach users — they're logged with context instead. Secrets only ever come from the environment.
+Design rules: one music service owns all state (buttons and commands share it), all user-facing errors are friendly strings (`MusicError` / `TTSError` / `ParadiseError`), raw provider or Lavalink errors never reach users — they're logged with context instead. Secrets only ever come from the environment. Music and TTS share one Lavalink connection and one voice connection, but nothing else: TTS plays through the node's `http` source and never depends on YouTube or any music source plugin, and `/join` never resolves tracks at all. `/play` resolves plain queries through the sources the node actually reports (`/v4/info`): `ytsearch:` → `ytmsearch:` → `scsearch:`, each tried once, with the youtube-plugin providing the YouTube ones. `LAVALINK_EXPECTED_PLUGINS` makes Paradise verify on connect that the node loaded the plugins you expect and show drift in `/status`.
 
 ## Testing
 
@@ -114,7 +118,15 @@ The offline suite needs no token, node, or network:
 python -m unittest discover -s tests -v
 ```
 
-It verifies the exact registered command set (and that removed commands stay gone), the ping format, coinflip randomness, TTS limits and cooldowns, panel rendering for every state, queue pagination, settings persistence, lyrics pagination, and the full music flow (join/play/pause/skip/volume/clearqueue/shuffle/stop/auto-disconnect rules) against a fake Lavalink client.
+It verifies the exact registered command set (and that removed commands stay gone), the ping format, coinflip randomness, TTS limits and cooldowns, panel rendering for every state, queue pagination, settings persistence, lyrics pagination, plugin/source diagnostics, the search-source fallback, and the full music flow (join/play/pause/skip/volume/clearqueue/shuffle/stop/auto-disconnect rules) against a fake Lavalink client.
+
+The Lavalink node itself is validated separately — see `lavalink/README.md`:
+
+```bash
+cd lavalink && python verify_node.py
+```
+
+It boots the real server with the real config and checks that every declared plugin actually loads (startup log **and** `/v4/info`), that no fatal plugin error occurs, and that the `http` source used by TTS decodes audio.
 
 ## Notes & limits
 

@@ -35,6 +35,9 @@ class Config:
     lavalink_password: str = ""
     lavalink_secure: bool = False
     lavalink_region: str = "in"
+    # Plugins Paradise should expect the node to have loaded, "name" or
+    # "name:version", comma separated. Diagnostic only — see lavalink/README.md.
+    lavalink_expected_plugins: str = ""
 
     # OpenAI-compatible chat completion endpoint (optional).
     ai_base_url: str = ""
@@ -63,6 +66,21 @@ class Config:
         return bool(self.lavalink_host and self.lavalink_password)
 
     @property
+    def expected_plugins(self) -> tuple[tuple[str, str | None], ...]:
+        """Parsed ``LAVALINK_EXPECTED_PLUGINS`` as ``(name, version|None)`` pairs."""
+        entries: list[tuple[str, str | None]] = []
+        for raw in self.lavalink_expected_plugins.split(","):
+            raw = raw.strip()
+            if not raw:
+                continue
+            name, _, version = raw.partition(":")
+            name = name.strip()
+            if not name:
+                continue
+            entries.append((name, version.strip() or None))
+        return tuple(entries)
+
+    @property
     def ai_configured(self) -> bool:
         # A base URL alone is enough for local providers (e.g. Ollama).
         return bool(self.ai_base_url and self.ai_model)
@@ -81,6 +99,7 @@ class Config:
             lavalink_password=env.get("LAVALINK_PASSWORD", "").strip(),
             lavalink_secure=_bool(env.get("LAVALINK_SECURE"), False),
             lavalink_region=env.get("LAVALINK_REGION", "in").strip() or "in",
+            lavalink_expected_plugins=env.get("LAVALINK_EXPECTED_PLUGINS", "").strip(),
             ai_base_url=env.get("AI_BASE_URL", "").strip().rstrip("/"),
             ai_api_key=env.get("AI_API_KEY", "").strip(),
             ai_model=env.get("AI_MODEL", "").strip(),

@@ -4,7 +4,6 @@ refreshes the interactive music panel — buttons use the same methods."""
 from __future__ import annotations
 
 import logging
-import re
 
 import discord
 from discord import app_commands
@@ -20,8 +19,6 @@ from functions.music.panel import (
 )
 
 log = logging.getLogger(__name__)
-
-_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
 def cooldown():
