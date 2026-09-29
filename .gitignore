@@ -4,8 +4,3 @@ __pycache__/
 .venv/
 venv/
 data/
-
-# Lavalink node runtime artifacts (downloaded jars, logs, scratch)
-lavalink/Lavalink.jar
-lavalink/plugins/
-lavalink/logs/

@@ -104,7 +104,7 @@ class AIService:
         self._channel_last[message.channel.id] = now
 
     def should_reply_to(self, message) -> bool:
-        """Mention or reply-to-Paradise, ignoring the music panel."""
+        """Mention or reply-to-Paradise."""
         if message.author.bot:
             return False
         mentioned = any(m.id == self.bot.user.id for m in message.mentions) if self.bot.user else False
@@ -115,11 +115,6 @@ class AIService:
             resolved = getattr(reference, "resolved", None)
             if resolved is not None and getattr(resolved, "author", None) is not None:
                 if resolved.author.id == self.bot.user.id:
-                    music = getattr(self.bot, "music", None)
-                    if music is not None and reference.message_id:
-                        settings = music.settings.get(message.guild.id) if message.guild else None
-                        if settings and settings.panel_message_id == reference.message_id:
-                            return False  # replies to the panel are UI, not chat
                     return True
         return False
 

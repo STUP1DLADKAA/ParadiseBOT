@@ -6,9 +6,6 @@ Everything here is dependency-light and safe to import from anywhere.
 from __future__ import annotations
 
 import re
-from typing import Iterable, Sequence
-
-import discord
 
 
 # ---------------------------------------------------------------------------
@@ -20,69 +17,18 @@ class ParadiseError(Exception):
     """An error whose message is safe and friendly to show to users."""
 
 
-class MusicError(ParadiseError):
-    """Raised by the music service; the message is shown to the user."""
-
-
-class NodePlaybackUnsupported(ParadiseError):
-    """The Lavalink node cannot play direct audio links (no http source)."""
-
-
-class TTSError(ParadiseError):
-    """Raised by the TTS service; the message is shown to the user."""
-
-
 # ---------------------------------------------------------------------------
 # Palette — muted, dark-Discord-native. No neon.
 # ---------------------------------------------------------------------------
 
 
 class Colour:
-    PLAYING = 0x2C8C64  # muted green
-    PAUSED = 0xB58B2A  # muted amber
-    IDLE = 0x6B7280  # neutral grey
-    DISCONNECTED = 0x4F545C  # discord grey
-    SPEAKING = 0x5B6EAE  # soft indigo
     ACCENT = 0x2E8B74  # general Paradise accent
 
 
 # ---------------------------------------------------------------------------
 # Text helpers
 # ---------------------------------------------------------------------------
-
-_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
-_EMOJI_RE = re.compile(
-    "["
-    "\U0001F000-\U0001FAFF"  # symbols, pictographs, emoji
-    "\U00002600-\U000027BF"  # misc symbols / dingbats
-    "\U00002B00-\U00002BFF"
-    "\U0001F1E6-\U0001F1FF"  # regional indicators
-    "\U00002190-\U000021FF"  # arrows
-    "\U0000FE0F\U0000200D"  # variation selector / ZWJ
-    "]",
-)
-_MENTION_RE = re.compile(r"<@[!&]?\d+>|<#\d+>|<a?:\w+:\d+>")
-_WHITESPACE_RE = re.compile(r"\s+")
-
-
-def clean_for_speech(text: str, max_length: int) -> str:
-    """Prepare raw chat text for text-to-speech."""
-    text = _MENTION_RE.sub(" ", text)
-    text = _URL_RE.sub(" ", text)
-    text = _EMOJI_RE.sub(" ", text)
-    text = _WHITESPACE_RE.sub(" ", text).strip()
-    return text[:max_length]
-
-
-def is_hindi(text: str) -> bool:
-    """True when a meaningful share of the text is Devanagari."""
-    if not text:
-        return False
-    letters = [ch for ch in text if ch.isalpha()]
-    if not letters:
-        return False
-    devanagari = sum("\u0900" <= ch <= "\u097F" for ch in letters)
-    return devanagari / len(letters) > 0.2
 
 
 def parse_options(raw: str, limit: int = 20) -> list[str]:
@@ -98,156 +44,3 @@ def parse_options(raw: str, limit: int = 20) -> list[str]:
 
 def shorten(text: str, width: int) -> str:
     return text if len(text) <= width else text[: width - 1].rstrip() + "…"
-
-
-def format_duration(ms: int) -> str:
-    """Format milliseconds as m:ss / h:mm:ss."""
-    seconds = max(0, int(ms // 1000))
-    hours, remainder = divmod(seconds, 3600)
-    minutes, secs = divmod(remainder, 60)
-    if hours:
-        return f"{hours}:{minutes:02d}:{secs:02d}"
-    return f"{minutes}:{secs:02d}"
-
-
-_DURATION_CLOCK_RE = re.compile(r"^(?:(\d{1,3}):)?(\d{1,3}):(\d{1,2})$")
-
-
-def parse_duration(text: str) -> int | None:
-    """Parse ``[[h:]m:]s`` or plain seconds into milliseconds.
-
-    Returns ``None`` for anything that isn't a non-negative duration —
-    callers turn that into a friendly error instead of a crash.
-    """
-    text = (text or "").strip().lower()
-    if not text:
-        return None
-    if text.isdigit():  # plain seconds ("90" -> 1:30)
-        seconds = int(text)
-        return seconds * 1000 if seconds <= 24 * 3600 else None
-    match = _DURATION_CLOCK_RE.match(text)
-    if match is None:
-        return None
-    hours = int(match.group(1) or 0)
-    minutes = int(match.group(2))
-    secs = int(match.group(3))
-    if minutes > 59 or secs > 59:
-        return None
-    return (hours * 3600 + minutes * 60 + secs) * 1000
-
-
-def progress_bar(position_ms: int, duration_ms: int, width: int = 10) -> str:
-    """A compact textual progress bar like ``▬▬▬●▬▬▬▬▬▬``."""
-    if duration_ms <= 0:
-        return "▬" * width
-    ratio = max(0.0, min(1.0, position_ms / duration_ms))
-    filled = max(0, min(round(width * ratio), width - 1))
-    return "▬" * filled + "●" + "▬" * (width - filled - 1)
-
-
-# --------------------------------------------------------------------------- 
-# Track-title normalization (autoplay duplicate protection, lyrics matching)
-# ---------------------------------------------------------------------------
-
-_NOISE_WORDS = frozenset({
-    # Dropped anywhere in a title/artist string. Deliberately excludes words
-    # that appear in real song titles ("Song 2", "Music", "Video Games").
-    "official", "video", "audio", "lyrics", "lyric", "lyricvideo",
-    "mv", "mve", "hd", "hq", "4k", "uhd", "cc",
-    "remastered", "remaster", "visualizer", "visualiser", "vevo", "topic",
-    "videoclip", "sub", "subs", "subtitulado", "esp", "letra",
-})
-# Inside brackets these words are almost always descriptive junk — a wider
-# net is safe there because real titles like "Song 2" are not bracketed.
-_BRACKET_NOISE = _NOISE_WORDS | {
-    "music", "song", "full", "version", "cd", "single", "ep", "lyric",
-    "official", "audio", "video",
-}
-_BRACKETED_RE = re.compile(r"[(\[{][^)\]}]*[)\]}]")
-_FEAT_RE = re.compile(
-    r"\s*[-–—]\s*(?:feat\.?|ft\.?|featuring)\s+\S.*$", re.IGNORECASE
-)
-_FEAT_BRACKET_RE = re.compile(
-    r"^\s*(?:feat\.?|ft\.?|featuring|with|prod\.?|prod by)\b", re.IGNORECASE
-)
-
-
-def strip_title_noise(value: str) -> str:
-    """Drop bracketed noise, feat credits and filler words from a title."""
-    def keep_bracket(match: re.Match) -> str:
-        inner = match.group(0)[1:-1]
-        if _FEAT_BRACKET_RE.match(inner):
-            return " "  # (feat. X) / (with Y) never changes the lyrics
-        words = re.split(r"[\s/|]+", inner.strip().lower())
-        # Keep segments that carry meaning (remix, live, acoustic …)
-        meaningful = any(word not in _BRACKET_NOISE and not word.isdigit() for word in words)
-        return match.group(0) if meaningful else " "
-
-    value = _BRACKETED_RE.sub(keep_bracket, value)
-    value = _FEAT_RE.sub(" ", value)
-    words = [word for word in re.split(r"[\s_]+", value) if word and word.lower() not in _NOISE_WORDS]
-    cleaned = " ".join(words)
-    return cleaned.strip(" -–—|,.") or value.strip()
-
-
-def normalize_track_key(title: str, author: str = "") -> str:
-    """A comparison key where ``Artist - Song (Official Video)`` equals
-    ``Artist - Song [Official Audio]``."""
-    cleaned = strip_title_noise(f"{author or ''} {title or ''}")
-    cleaned = re.sub(r"[^\w\s]", " ", cleaned.casefold())
-    return re.sub(r"\s+", " ", cleaned).strip()
-
-
-# ---------------------------------------------------------------------------
-# Voice / permission helpers
-# ---------------------------------------------------------------------------
-
-
-def human_voice_members(guild: discord.Guild, channel_id: int) -> list[discord.Member]:
-    """Humans currently in a voice channel (uses live voice states, not cache)."""
-    members = []
-    for member, state in guild.voice_states.items():
-        if state.channel and state.channel.id == channel_id and not member.bot:
-            members.append(member)
-    return members
-
-
-def member_in_voice(member: discord.Member) -> bool:
-    return member.voice is not None and member.voice.channel is not None
-
-
-def same_voice_channel(member: discord.Member, channel_id: int | None) -> bool:
-    return (
-        channel_id is not None
-        and member.voice is not None
-        and member.voice.channel is not None
-        and member.voice.channel.id == channel_id
-    )
-
-
-def can_bypass_voice_check(member: discord.Member) -> bool:
-    """Server permissions that reasonably allow remote voice control."""
-    return member.guild_permissions.move_members or member.guild_permissions.administrator
-
-
-def voice_channel_name(guild: discord.Guild, channel_id: int | None) -> str | None:
-    if channel_id is None:
-        return None
-    channel = guild.get_channel(channel_id)
-    return channel.name if channel else None
-
-
-async def send_ephemeral(interaction: discord.Interaction, text: str) -> None:
-    """Best-effort ephemeral reply that never raises."""
-    try:
-        if interaction.response.is_done():
-            await interaction.followup.send(text, ephemeral=True)
-        else:
-            await interaction.response.send_message(text, ephemeral=True)
-    except discord.DiscordException:
-        pass
-
-
-def chunks(items: Sequence, size: int) -> Iterable[list]:
-    for index in range(0, len(items), size):
-        yield list(items[index : index + size])
