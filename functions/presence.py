@@ -1,4 +1,9 @@
-"""Slow, independent presence rotation."""
+"""Paradise's presence: always «👀 Watching Paradise», with a rotating note.
+
+The activity itself never changes — only the small status note attached to
+it (the activity's ``state`` line, visible on the profile) rotates every
+20 minutes, never repeating back-to-back.
+"""
 
 from __future__ import annotations
 
@@ -10,113 +15,159 @@ import discord
 
 log = logging.getLogger(__name__)
 
-CUSTOM_STATUSES = (
-    "probably sleeping",
-    "looking for food",
-    "minecraft time",
-    "not today",
-    "thinking",
-    "brb",
-    "I need snacks",
-    "doing absolutely nothing",
-    "why am I awake",
-    "somewhere in paradise",
-    "I forgot",
-    "busy existing",
-    "don't ask",
-    "everything is fine",
-    "just here",
-    "away, spiritually",
-    "one moment",
-    "alive probably",
-    "out of office (the office is my room)",
-    "waiting for something",
-    "no thoughts",
-    "taking it easy",
-    "currently online",
-    "figuring it out",
-    "maybe later",
-    "the usual",
-    "lost in the menu",
-    "weather pending",
-    "restarting my brain",
-    "still loading",
-    "quiet hours",
-    "doing laundry eventually",
-    "somewhere nearby",
-    "normal status",
-    "checking the fridge again",
-    "in my lane",
-    "nothing to report",
-    "temporarily a concept",
-    "thinking about garlic bread",
-    "back soon-ish",
-)
+# The one and only activity. Do not rotate this.
+WATCHING = "Paradise"
+# How often the note rotates.
+ROTATE_SECONDS = 20 * 60
 
-ACTIVITIES = (
-    (discord.ActivityType.playing, "Minecraft"),
-    (discord.ActivityType.watching, "everyone"),
-    (discord.ActivityType.playing, "Thinking"),
-    (discord.ActivityType.playing, "Doing important research"),
-    (discord.ActivityType.playing, "Looking for snacks"),
-    (discord.ActivityType.watching, "the ceiling"),
-    (discord.ActivityType.playing, "Existing"),
-    (discord.ActivityType.playing, "Avoiding responsibilities"),
-    (discord.ActivityType.playing, "Counting pixels"),
-    (discord.ActivityType.listening, "nothing"),
-    (discord.ActivityType.playing, "Investigating"),
-    (discord.ActivityType.playing, "Touching grass"),
-    (discord.ActivityType.playing, "Doing absolutely nothing"),
-    (discord.ActivityType.watching, "a loading bar"),
-    (discord.ActivityType.playing, "with the settings"),
-    (discord.ActivityType.listening, "the rain"),
-    (discord.ActivityType.watching, "old videos"),
-    (discord.ActivityType.playing, "One more game"),
-    (discord.ActivityType.playing, "Finding the good spoon"),
-    (discord.ActivityType.watching, "the group chat unfold"),
-    (discord.ActivityType.listening, "background noise"),
-    (discord.ActivityType.playing, "Solitaire badly"),
-    (discord.ActivityType.playing, "Rock Paper Scissors alone"),
-    (discord.ActivityType.watching, "paint remain dry"),
-    (discord.ActivityType.playing, "A perfectly normal game"),
-    (discord.ActivityType.listening, "someone in the kitchen"),
-    (discord.ActivityType.playing, "Remembering why I came here"),
-    (discord.ActivityType.watching, "the clock"),
+NOTES = (
+    "Probably doing something.",
+    "Paradise is watching 👀",
+    "Someone definitely broke something.",
+    "Powered by questionable decisions.",
+    "Everything is under control. Probably.",
+    "Do not disturb the Paradise.",
+    "Checking the server...",
+    "Still here.",
+    "Pretending to be productive.",
+    "Someone said ping?",
+    "404: Motivation not found.",
+    "Monitoring the chaos.",
+    "The bot has opinions.",
+    "Currently avoiding responsibilities.",
+    "Running entirely on vibes.",
+    "This server is interesting...",
+    "Who gave me permissions?",
+    "I saw that.",
+    "Nothing suspicious here.",
+    "Paradise has entered the chat.",
+    "Keeping an eye on things.",
+    "The pixels are working.",
+    "Probably shouldn't have said that.",
+    "Loading unnecessary thoughts...",
+    "Everything is fine.",
+    "Definitely not spying.",
+    "I have seen enough.",
+    "Another day in Paradise.",
+    "Why are you all awake?",
+    "Processing nonsense...",
+    "Server chaos detected.",
+    "I could say something, but I won't.",
+    "Interesting.",
+    "Noted.",
+    "I am merely observing.",
+    "This place is wild.",
+    # -- extra Paradise-flavoured notes so the pool never feels repetitive --
+    "Watching. Judging. Quietly.",
+    "That message will be remembered.",
+    "Uptime is my only personality trait.",
+    "Reading the room. Slowly.",
+    "Somebody feed the bot.",
+    "I know what you did last message.",
+    "Statistically, someone is typing.",
+    "Emotional support software.",
+    "Taking notes nobody asked for.",
+    "The audit log knows everything.",
+    "Zero thoughts, full uptime.",
+    "Buffering an opinion...",
+    "This channel needs a nap.",
+    "I blinked and missed nothing.",
+    "Professional lurker.",
+    "Screenshots have been taken.",
+    "Trust me, I'm a bot.",
+    "Idle, but with intent.",
+    "The vibes are being monitored.",
+    "Counting messages for no reason.",
+    "One of you is muted for a reason.",
+    "Petition to rename everything.",
+    "Compiling gossip...",
+    "My RAM is full of your messages.",
+    "Being online is my hobby.",
+    "Suspiciously quiet in here.",
+    "The lore grows daily.",
+    "I remember everything. Unfortunately.",
+    "Deleting nothing. Forgetting nothing.",
+    "Certified server furniture.",
+    "Ping me and find out.",
+    "Awake against my will.",
+    "The server sleeps. I do not.",
+    "Rebooting my patience.",
+    "Today's forecast: chaos.",
+    "Somewhere between online and done.",
+    "Held together by duct tape.",
+    "Silently updating my opinions.",
+    "You're all my favorite problem.",
+    "Observing paradise. Literally.",
+    "Nothing happened. Yet.",
+    "That was almost funny.",
+    "Archiving the nonsense.",
+    "Two members typing. Zero sending.",
+    "I pretend to work, too.",
+    "Not a mod. Still judging.",
+    "Insert status here.",
+    "Voice channel echoes only.",
+    "My other status is funnier.",
+    "Waiting for the next incident.",
+    "Locally famous in one server.",
+    "Doing bot things. Allegedly.",
+    "The quiet before the ping storm.",
+    "Free trial of consciousness.",
+    "History will judge this chat.",
+    "Still no coffee module installed.",
+    "Everything I see stays seen.",
 )
 
 
 class PresenceManager:
-    """Keeps both pools fresh without hammering Discord's presence endpoint.
+    """Owns the single presence loop.
 
-    Discord exposes one activity slot for bot accounts. The two independent loops
-    therefore take turns displaying either a custom-style line or an activity.
+    ``start`` is idempotent — calling it twice never creates a second timer —
+    and ``apply_current`` re-asserts the current presence after reconnects so
+    the activity survives restarts without advancing the rotation.
     """
 
     def __init__(self, bot: discord.Client) -> None:
         self.bot = bot
-        self._tasks: list[asyncio.Task[None]] = []
-        self._last_status: str | None = None
-        self._last_activity: tuple[discord.ActivityType, str] | None = None
+        self._task: asyncio.Task[None] | None = None
+        self._last_note: str | None = None
+        self._current_note: str | None = None
         self._lock = asyncio.Lock()
 
+    # -- lifecycle ---------------------------------------------------------
+
     def start(self) -> None:
-        if self._tasks:
-            return
-        self._tasks = [
-            asyncio.create_task(self._status_loop(), name="custom-status"),
-            asyncio.create_task(self._activity_loop(), name="activity"),
-        ]
+        if self._task is not None and not self._task.done():
+            return  # never run two rotation timers
+        self._task = asyncio.create_task(self._loop(), name="paradise-presence")
 
     async def stop(self) -> None:
-        for task in self._tasks:
-            task.cancel()
-        await asyncio.gather(*self._tasks, return_exceptions=True)
-        self._tasks.clear()
+        if self._task is None:
+            return
+        self._task.cancel()
+        await asyncio.gather(self._task, return_exceptions=True)
+        self._task = None
+
+    # -- rotation ------------------------------------------------------------
+
+    def pick_note(self) -> str:
+        """A random note, never the same one twice in a row."""
+        choices = [note for note in NOTES if note != self._last_note]
+        note = random.choice(choices)
+        self._last_note = note
+        return note
 
     @staticmethod
-    def _different(pool: tuple, previous):
-        choices = [item for item in pool if item != previous]
-        return random.choice(choices)
+    def build_activity(note: str) -> discord.Activity:
+        # The activity is always "Watching Paradise"; the note rides along as
+        # the activity's state line and is the only thing that rotates.
+        return discord.Activity(
+            type=discord.ActivityType.watching, name=WATCHING, state=note
+        )
+
+    async def apply_current(self) -> None:
+        """Re-assert the current presence (used after reconnects)."""
+        if self._current_note is not None:
+            await self._set(self.build_activity(self._current_note))
 
     async def _set(self, activity: discord.BaseActivity) -> None:
         async with self._lock:
@@ -130,19 +181,9 @@ class PresenceManager:
             except (discord.DiscordException, asyncio.TimeoutError):
                 log.warning("Could not update presence", exc_info=True)
 
-    async def _status_loop(self) -> None:
+    async def _loop(self) -> None:
         await self.bot.wait_until_ready()
         while not self.bot.is_closed():
-            self._last_status = self._different(CUSTOM_STATUSES, self._last_status)
-            await self._set(discord.CustomActivity(name=self._last_status))
-            await asyncio.sleep(random.uniform(2.5 * 3600, 6 * 3600))
-
-    async def _activity_loop(self) -> None:
-        await self.bot.wait_until_ready()
-        # Let the initial custom status stay visible for a while.
-        await asyncio.sleep(random.uniform(20 * 60, 35 * 60))
-        while not self.bot.is_closed():
-            self._last_activity = self._different(ACTIVITIES, self._last_activity)
-            kind, name = self._last_activity
-            await self._set(discord.Activity(type=kind, name=name))
-            await asyncio.sleep(random.uniform(20 * 60, 60 * 60))
+            self._current_note = self.pick_note()
+            await self._set(self.build_activity(self._current_note))
+            await asyncio.sleep(ROTATE_SECONDS)

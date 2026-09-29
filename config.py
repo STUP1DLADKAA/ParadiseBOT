@@ -1,7 +1,7 @@
 """Central environment configuration for Paradise.
 
-Every secret or external service credential lives here and only here.
-A safe template is provided in ``.env.example``.
+Every secret, external service credential and tuning knob lives here and
+only here. A safe template is provided in ``.env.example``.
 """
 
 from __future__ import annotations
@@ -23,100 +23,82 @@ def _int(raw: str | None, default: int) -> int:
         return default
 
 
+def _float(raw: str | None, default: float) -> float:
+    try:
+        return float(str(raw).strip())
+    except (TypeError, ValueError):
+        return default
+
+
+def _chance(raw: str | None, default: float) -> float:
+    """A probability in [0, 1]; anything unparsable or out of range snaps back."""
+    value = _float(raw, default)
+    return value if 0.0 <= value <= 1.0 else default
+
+
+@dataclass(frozen=True, slots=True)
+class PersonalityConfig:
+    """Tuning for Paradise's rare passive personality (see functions/personality.py).
+
+    All chances are rolled only on messages that actually match a known
+    pattern — most messages never even qualify. Keep these conservative:
+    the goal is "LMAO why did Paradise just say that?", never spam.
+    """
+
+    enabled: bool = True
+    # Chance to add a contextual reaction to a matching message.
+    reaction_chance: float = 0.045
+    # Chance to send a short contextual reply instead (rarer; never both).
+    reply_chance: float = 0.015
+    # Seconds between ANY two personality actions, bot-wide.
+    global_cooldown: int = 45
+    # Seconds between personality actions in the same channel.
+    channel_cooldown: int = 120
+    # Extra spacing for replies in the same channel (replies are the rare treat).
+    reply_channel_cooldown: int = 600
+
+    @classmethod
+    def from_env(cls, env) -> "PersonalityConfig":
+        return cls(
+            enabled=_bool(env.get("PERSONALITY_ENABLED"), True),
+            reaction_chance=_chance(env.get("PERSONALITY_REACTION_CHANCE"), 0.045),
+            reply_chance=_chance(env.get("PERSONALITY_REPLY_CHANCE"), 0.015),
+            global_cooldown=_int(env.get("PERSONALITY_GLOBAL_COOLDOWN"), 45),
+            channel_cooldown=_int(env.get("PERSONALITY_CHANNEL_COOLDOWN"), 120),
+            reply_channel_cooldown=_int(
+                env.get("PERSONALITY_REPLY_CHANNEL_COOLDOWN"), 600
+            ),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     """Everything Paradise reads from the environment."""
 
     token: str = ""
 
-    # Lavalink node (music + voice playback). Music is disabled when unset.
-    lavalink_host: str = ""
-    lavalink_port: int = 2333
-    lavalink_password: str = ""
-    lavalink_secure: bool = False
-    lavalink_region: str = "in"
-    # Plugins Paradise should expect the node to have loaded, "name" or
-    # "name:version", comma separated. Diagnostic only — see lavalink/README.md.
-    lavalink_expected_plugins: str = ""
-
     # OpenAI-compatible chat completion endpoint (optional).
     ai_base_url: str = ""
     ai_api_key: str = ""
     ai_model: str = ""
 
-    # Text-to-speech (edge-tts neural voices, free).
-    tts_enabled: bool = True
-    tts_voice_hi: str = "hi-IN-MadhurNeural"
-    tts_voice_en: str = "en-IN-PrabhatNeural"
-    tts_max_length: int = 220
-    tts_user_cooldown: int = 30
-    tts_global_cooldown: int = 8
-
-    # Music behaviour.
-    music_max_volume: int = 150
-    auto_disconnect_minutes: int = 10
-    music_history_limit: int = 50  # how far back /previous can reach
-
-    # Optional integrations.
-    lyrics_enabled: bool = True
-    genius_api_key: str = ""  # optional third lyrics provider; blank = skipped
-
-    data_dir: str = "data"
-
-    @property
-    def music_configured(self) -> bool:
-        return bool(self.lavalink_host and self.lavalink_password)
-
-    @property
-    def expected_plugins(self) -> tuple[tuple[str, str | None], ...]:
-        """Parsed ``LAVALINK_EXPECTED_PLUGINS`` as ``(name, version|None)`` pairs."""
-        entries: list[tuple[str, str | None]] = []
-        for raw in self.lavalink_expected_plugins.split(","):
-            raw = raw.strip()
-            if not raw:
-                continue
-            name, _, version = raw.partition(":")
-            name = name.strip()
-            if not name:
-                continue
-            entries.append((name, version.strip() or None))
-        return tuple(entries)
+    # Rare passive personality (reactions / short replies).
+    personality: PersonalityConfig = PersonalityConfig()
 
     @property
     def ai_configured(self) -> bool:
         # A base URL alone is enough for local providers (e.g. Ollama).
         return bool(self.ai_base_url and self.ai_model)
 
-    @property
-    def tts_configured(self) -> bool:
-        return self.tts_enabled and self.music_configured
-
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Config":
         env = os.environ if environ is None else environ
         return cls(
             token=env.get("DISCORD_TOKEN", "").strip(),
-            lavalink_host=env.get("LAVALINK_HOST", "").strip(),
-            lavalink_port=_int(env.get("LAVALINK_PORT"), 2333),
-            lavalink_password=env.get("LAVALINK_PASSWORD", "").strip(),
-            lavalink_secure=_bool(env.get("LAVALINK_SECURE"), False),
-            lavalink_region=env.get("LAVALINK_REGION", "in").strip() or "in",
-            lavalink_expected_plugins=env.get("LAVALINK_EXPECTED_PLUGINS", "").strip(),
             ai_base_url=env.get("AI_BASE_URL", "").strip().rstrip("/"),
             ai_api_key=env.get("AI_API_KEY", "").strip(),
             ai_model=env.get("AI_MODEL", "").strip(),
-            tts_enabled=_bool(env.get("TTS_ENABLED"), True),
-            tts_voice_hi=env.get("TTS_VOICE_HI", "hi-IN-MadhurNeural").strip(),
-            tts_voice_en=env.get("TTS_VOICE_EN", "en-IN-PrabhatNeural").strip(),
-            tts_max_length=_int(env.get("TTS_MAX_LENGTH"), 220),
-            tts_user_cooldown=_int(env.get("TTS_USER_COOLDOWN"), 30),
-            tts_global_cooldown=_int(env.get("TTS_GLOBAL_COOLDOWN"), 8),
-            music_max_volume=_int(env.get("MUSIC_MAX_VOLUME"), 150),
-            auto_disconnect_minutes=_int(env.get("AUTO_DISCONNECT_MINUTES"), 10),
-            music_history_limit=_int(env.get("MUSIC_MAX_HISTORY"), 50),
-            lyrics_enabled=_bool(env.get("LYRICS_ENABLED"), True),
-            genius_api_key=env.get("GENIUS_API_KEY", "").strip(),
-            data_dir=env.get("PARADISE_DATA_DIR", "data").strip() or "data",
+            personality=PersonalityConfig.from_env(env),
         )
 
 

@@ -1,4 +1,4 @@
-"""Fun commands: ping, 8ball, coinflip, choose."""
+"""Fun commands: ping, coinflip, choose."""
 
 from __future__ import annotations
 
@@ -24,23 +24,6 @@ PING_QUIPS = (
     "present, more or less.",
     "still online somehow.",
     "reporting for duty, loosely.",
-)
-
-BALL_ANSWERS = (
-    "yeah, probably.",
-    "absolutely not.",
-    "ask again when the vibes improve.",
-    "signs point to yes.",
-    "I wouldn't bet on it.",
-    "weirdly, yes.",
-    "that's between you and the universe.",
-    "give it a minute.",
-    "nope.",
-    "the council says maybe.",
-    "outlook: suspicious.",
-    "I have no idea, but now I'm curious.",
-    "yes, and honestly? good for you.",
-    "the orb is buffering. try later.",
 )
 
 COIN_FLAVOURS = (
@@ -78,21 +61,6 @@ class Fun(commands.Cog):
     async def ping(self, interaction: discord.Interaction) -> None:
         await interaction.response.send_message(
             build_ping_message(self.bot.latency),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-    @app_commands.command(name="8ball", description="Ask the questionably mystical orb")
-    @app_commands.describe(question="The thing keeping you awake")
-    @cooldown()
-    async def eight_ball(self, interaction: discord.Interaction, question: str) -> None:
-        question = question.strip()
-        if not question:
-            await interaction.response.send_message(
-                "you do have to ask something.", ephemeral=True
-            )
-            return
-        await interaction.response.send_message(
-            f"🎱 {random.choice(BALL_ANSWERS)}",
             allowed_mentions=discord.AllowedMentions.none(),
         )
 
