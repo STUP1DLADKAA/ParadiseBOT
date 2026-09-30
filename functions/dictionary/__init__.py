@@ -31,13 +31,17 @@ from .models import (
     WordForm,
 )
 from .normalize import (
+    FuzzyMatch,
     base_forms,
     candidate_forms,
     edit_distance,
+    fuzzy_confidence,
     is_lookupable,
     match_text_request,
     normalize_query,
+    rank_fuzzy_matches,
     rank_suggestions,
+    should_auto_correct,
 )
 from .playback import PlaybackSupport, PlaybackUnavailable, VoicePlayback, playback_support
 from .pronounce import (
@@ -50,11 +54,13 @@ from .pronounce import (
 )
 from .render import (
     DEFAULT_THEME,
+    LIGHT_THEME,
     RenderUnavailable,
     Theme,
     card_signature,
     plan_card,
     render_card,
+    resolve_theme,
     renderer_available,
 )
 from .service import DictionaryService, WordDetails
@@ -68,12 +74,14 @@ from .sources import (
 
 __all__ = [
     "DEFAULT_THEME",
+    "LIGHT_THEME",
     "Clip",
     "DatamuseProvider",
     "DictionaryFeature",
     "DictionaryService",
     "Enrichment",
     "FreeDictionaryProvider",
+    "FuzzyMatch",
     "HttpClient",
     "HttpError",
     "LookupResult",
@@ -103,6 +111,7 @@ __all__ = [
     "candidate_forms",
     "card_signature",
     "edit_distance",
+    "fuzzy_confidence",
     "is_lookupable",
     "match_text_request",
     "normalize_query",
@@ -110,7 +119,10 @@ __all__ = [
     "parse_free_dictionary",
     "plan_card",
     "playback_support",
+    "rank_fuzzy_matches",
     "rank_suggestions",
     "render_card",
+    "resolve_theme",
+    "should_auto_correct",
     "renderer_available",
 ]

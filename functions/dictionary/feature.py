@@ -17,7 +17,14 @@ from .http import HttpClient
 from .models import LookupResult, WordEntry
 from .playback import PlaybackSupport, VoicePlayback, playback_support
 from .pronounce import NeuralSpeechProvider, PronunciationOutcome, PronunciationService
-from .render import RenderUnavailable, card_signature, render_card, renderer_available
+from .render import (
+    RenderUnavailable,
+    Theme,
+    card_signature,
+    render_card,
+    renderer_available,
+    resolve_theme,
+)
 from .service import DictionaryService, WordDetails
 from . import fonts
 
@@ -58,6 +65,7 @@ class DictionaryFeature:
         self.playback = VoicePlayback(
             enabled=bool(getattr(config, "voice_playback", False))
         )
+        self.card_theme: Theme = resolve_theme(getattr(config, "card_theme", "dark"))
         self._cards: TTLCache[str, bytes] = TTLCache(
             max_items=CARD_CACHE_ITEMS,
             ttl=CARD_TTL,
@@ -81,7 +89,11 @@ class DictionaryFeature:
 
     def describe(self) -> str:
         bits = [
-            "cards: " + ("on" if self.images_available else "off (text fallback)"),
+            "cards: " + (
+                f"on ({self.card_theme.name} Material surface)"
+                if self.images_available
+                else "off (text fallback)"
+            ),
             fonts.describe(),
             self.pronunciation.describe(),
         ]
@@ -95,8 +107,10 @@ class DictionaryFeature:
     # The three operations
     # ------------------------------------------------------------------
 
-    async def lookup(self, query: str, *, language: str = "en") -> LookupResult:
-        return await self.service.lookup(query, language=language)
+    async def lookup(
+        self, query: str, *, language: str = "en", fuzzy: bool = True
+    ) -> LookupResult:
+        return await self.service.lookup(query, language=language, fuzzy=fuzzy)
 
     async def details(self, entry: WordEntry) -> WordDetails:
         return await self.service.details(entry)
@@ -105,7 +119,7 @@ class DictionaryFeature:
         """PNG bytes for an entry, or None when images aren't possible."""
         if not self.images_available:
             return None
-        key = card_signature(entry)
+        key = card_signature(entry, self.card_theme)
         cached = self._cards.get(key)
         if cached is not None:
             return cached
@@ -114,7 +128,8 @@ class DictionaryFeature:
             try:
                 async with self._render_gate:
                     data = await asyncio.wait_for(
-                        asyncio.to_thread(render_card, entry), timeout=RENDER_TIMEOUT
+                        asyncio.to_thread(render_card, entry, self.card_theme),
+                        timeout=RENDER_TIMEOUT,
                     )
             except RenderUnavailable as error:
                 log.warning("Card rendering unavailable: %s", error)

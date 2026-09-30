@@ -18,8 +18,19 @@ from __future__ import annotations
 
 import re
 import unicodedata
+from dataclasses import dataclass
 
 from .models import WordForm
+
+# RapidFuzz is a small, well-tested native implementation of the distance
+# metric used by the typo matcher.  Keeping the pure-Python implementation
+# below as a fallback means the dictionary still starts cleanly in minimal
+# installations (and makes this module portable), but normal installs use
+# RapidFuzz through requirements.txt.
+try:  # pragma: no cover - exercised when the optional wheel is installed
+    from rapidfuzz.distance import DamerauLevenshtein as _RapidDamerauLevenshtein
+except ImportError:  # pragma: no cover - the fallback is covered instead
+    _RapidDamerauLevenshtein = None
 
 MAX_TERM_LENGTH = 48
 MAX_WORDS_QUOTED = 4
@@ -391,13 +402,24 @@ def common_prefix_probe(word: str) -> str:
 
 
 def edit_distance(left: str, right: str, *, limit: int = 4) -> int:
-    """Damerau-Levenshtein distance, capped at ``limit`` for speed."""
+    """Damerau-Levenshtein distance, capped at ``limit`` for speed.
+
+    Adjacent transpositions are important for real spelling mistakes
+    (``recieve`` → ``receive``).  RapidFuzz performs this efficiently when
+    available; the bounded implementation below keeps the feature dependable
+    when dependencies have deliberately been installed without extras.
+    """
     left = left.casefold()
     right = right.casefold()
     if left == right:
         return 0
     if abs(len(left) - len(right)) > limit:
         return limit + 1
+    if _RapidDamerauLevenshtein is not None:
+        distance = _RapidDamerauLevenshtein.distance(
+            left, right, score_cutoff=limit
+        )
+        return int(distance) if distance <= limit else limit + 1
 
     previous_previous: list[int] = []
     previous = list(range(len(right) + 1))
@@ -465,3 +487,125 @@ def rank_suggestions(
         scored.append((distance, -common_prefix_length(target, key), -float(score or 0), clean))
     scored.sort()
     return tuple(word for _, _, _, word in scored[:limit])
+
+
+@dataclass(frozen=True, slots=True)
+class FuzzyMatch:
+    """One spelling candidate, with enough signal to make a safe UX choice."""
+
+    word: str
+    distance: int
+    similarity: float
+    prefix: int
+    provider_score: float = 0.0
+
+
+def rank_fuzzy_matches(
+    query: str,
+    candidates: list[tuple[str, float]],
+    *,
+    limit: int = 4,
+    max_distance: int = 4,
+) -> tuple[FuzzyMatch, ...]:
+    """Rank dictionary candidates for correction, rather than just display.
+
+    Candidate discovery is delegated to Datamuse's large lexical index; this
+    function only evaluates the spelling relationship.  Damerau-Levenshtein
+    catches insertions, omissions, repeated letters and swapped neighbours,
+    while the prefix and provider score make otherwise equal candidates
+    deterministic.  It deliberately rejects distant sound-alikes.
+    """
+    target = normalize_query(query).casefold()
+    if not target:
+        return ()
+    # A four-edit match to a short word is a guess, not a correction.  Longer
+    # words can tolerate a little more noise without becoming unsafe.
+    allowed_distance = min(max_distance, max(1, len(target) // 3))
+    scored: list[FuzzyMatch] = []
+    seen: set[str] = {target}
+    for word, raw_score in candidates:
+        clean = normalize_query(word)
+        key = clean.casefold()
+        if not clean or key in seen or not is_lookupable(clean, allow_phrase=False):
+            continue
+        distance = edit_distance(target, key, limit=allowed_distance)
+        if distance > allowed_distance:
+            continue
+        seen.add(key)
+        try:
+            provider_score = float(raw_score or 0)
+        except (TypeError, ValueError):
+            provider_score = 0.0
+        longest = max(len(target), len(key), 1)
+        scored.append(
+            FuzzyMatch(
+                word=clean,
+                distance=distance,
+                similarity=1.0 - (distance / longest),
+                prefix=common_prefix_length(target, key),
+                provider_score=provider_score,
+            )
+        )
+
+    scored.sort(
+        key=lambda match: (
+            match.distance,
+            -match.prefix,
+            -match.provider_score,
+            match.word.casefold(),
+        )
+    )
+    return tuple(scored[:limit])
+
+
+def fuzzy_confidence(
+    match: FuzzyMatch,
+    runner_up: FuzzyMatch | None = None,
+) -> float:
+    """Return a conservative confidence score for an *already ranked* match.
+
+    It is intentionally hard to reach the automatic-correction band.  A
+    one-edit, reasonably long and clearly better spelling can be corrected
+    quietly; a tie or a larger edit is surfaced as a question instead.  This
+    keeps words such as ``adress`` from being silently changed when more than
+    one legitimate answer may fit.
+    """
+    if match.distance == 0:
+        return 1.0
+
+    # The base values favour common typo shapes but never let a short word
+    # become an automatic correction: one character is too much of ``cat``.
+    if match.distance == 1 and len(match.word) >= 5 and match.similarity >= 0.80:
+        confidence = 0.96
+    elif match.distance == 1 and match.similarity >= 0.70:
+        confidence = 0.78
+    elif match.distance == 2 and match.similarity >= 0.78:
+        confidence = 0.66
+    elif match.distance == 2 and match.similarity >= 0.65:
+        confidence = 0.52
+    else:
+        confidence = 0.0
+
+    if runner_up is not None:
+        if runner_up.distance <= match.distance:
+            # Datamuse gives an explicit "misspelling of …" lexical signal a
+            # very large score boost. That is stronger evidence than spelling
+            # alone, so it can resolve otherwise tied candidates such as
+            # ``recieve`` → ``receive`` over ``relieve``. Without that signal,
+            # a same-distance candidate remains a question for the user.
+            lexical_correction = (
+                match.provider_score - runner_up.provider_score >= 100_000
+            )
+            if not lexical_correction:
+                confidence = min(confidence, 0.72)
+        elif runner_up.distance == match.distance + 1:
+            confidence = min(confidence, 0.91)
+    return round(confidence, 2)
+
+
+def should_auto_correct(
+    match: FuzzyMatch,
+    runner_up: FuzzyMatch | None = None,
+) -> bool:
+    """Whether a candidate clears the strict no-confirmation threshold."""
+    return fuzzy_confidence(match, runner_up) >= 0.90

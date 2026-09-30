@@ -13,7 +13,8 @@ order of attempts:
    and say so in the result;
 6. if the primary provider is *down* rather than empty, fall back to
    Datamuse definitions and mark the answer as partial;
-7. if there is still nothing, return the closest spellings instead.
+7. if there is still nothing, rank close lexical spellings with
+   Damerau-Levenshtein: verify a high-confidence correction, otherwise ask.
 
 Failures are contained: a dead provider degrades the answer, it never
 raises into the cog, and nothing unverified is ever invented to fill a gap.
@@ -32,12 +33,15 @@ from .http import HttpClient, HttpError, NotFoundError, ThrottledError
 from .models import LookupResult, WordEntry, WordForm
 from .normalize import (
     MAX_TERM_LENGTH,
+    FuzzyMatch,
     base_forms,
     cache_key,
     candidate_forms,
     is_lookupable,
     normalize_query,
-    rank_suggestions,
+    fuzzy_confidence,
+    rank_fuzzy_matches,
+    should_auto_correct,
 )
 from .sources import DatamuseProvider, Enrichment, FreeDictionaryProvider
 
@@ -116,17 +120,39 @@ class DictionaryService:
             raise ParadiseError(BAD_QUERY_MESSAGE)
         return term
 
-    async def lookup(self, raw: str, *, language: str = "en") -> LookupResult:
-        """Look a word up. Never raises for provider problems."""
+    async def lookup(
+        self, raw: str, *, language: str = "en", fuzzy: bool = True
+    ) -> LookupResult:
+        """Look a word up, optionally stopping before spelling correction.
+
+        ``fuzzy=False`` powers the explicit "Search exactly what I typed"
+        action.  It has a distinct cache key so a user's deliberate exact
+        search can never be answered with an earlier automatic correction.
+        """
         term = self.validate(raw)
-        key = cache_key(term, language)
+        base_key = cache_key(term, language)
+        key = base_key + ("" if fuzzy else "#exact")
 
         cached = self._cache.get(key)
         if cached is not None:
             return cached
+        if not fuzzy:
+            # A canonical direct hit may already have been fetched for another
+            # user. Reuse it before making a second provider request, while
+            # never reusing an auto-corrected result for "exactly what I
+            # typed" (that would defeat the button's purpose).
+            canonical = self._cache.get(base_key)
+            if (
+                canonical is not None
+                and canonical.found
+                and canonical.entry is not None
+                and not canonical.auto_corrected
+                and canonical.entry.word.casefold() == term.casefold()
+            ):
+                return canonical
 
         async def run() -> LookupResult:
-            result = await self._lookup_uncached(term, language)
+            result = await self._lookup_uncached(term, language, fuzzy=fuzzy)
             ttl = ENTRY_TTL if result.found else MISS_TTL
             if result.found and result.partial:
                 ttl = PARTIAL_TTL
@@ -163,7 +189,11 @@ class DictionaryService:
     # Internals
     # ------------------------------------------------------------------
 
-    async def _lookup_uncached(self, term: str, language: str) -> LookupResult:
+    async def _lookup_uncached(
+        self, term: str, language: str, *, fuzzy: bool = True
+    ) -> LookupResult:
+        # This first pass is always exact (after input normalisation).  Fuzzy
+        # work is deliberately held until it has genuinely missed.
         entry, enrichment, primary_failed = await self._primary_with_enrichment(term, language)
         resolved_from = ""
         partial = False
@@ -183,11 +213,18 @@ class DictionaryService:
             providers.append(getattr(self.primary, "name", "primary"))
 
         if entry is None:
-            suggestions = await self._suggest(term)
+            if fuzzy:
+                return await self._fuzzy_result(
+                    term,
+                    language,
+                    partial=primary_failed,
+                    providers=tuple(providers),
+                )
+            # A user can explicitly decline the correction. Do not make a
+            # second spelling request or offer the same guess again.
             return LookupResult(
                 query=term,
                 entry=None,
-                suggestions=suggestions,
                 partial=primary_failed,
                 providers=tuple(providers),
             )
@@ -248,14 +285,77 @@ class DictionaryService:
                 return entry, term
         return None, ""
 
-    async def _suggest(self, term: str) -> tuple[str, ...]:
+    async def _fuzzy_result(
+        self,
+        term: str,
+        language: str,
+        *,
+        partial: bool,
+        providers: tuple[str, ...],
+    ) -> LookupResult:
+        """Turn close spellings into either a verified result or a question.
+
+        Datamuse supplies a broad, real-word candidate pool.  The top match is
+        only used automatically after it clears our conservative confidence
+        gate *and* a normal exact lookup verifies that a dictionary entry is
+        available.  That makes a correction useful without silently inventing
+        a meaning for an ambiguous query.
+        """
+        matches = await self._fuzzy_matches(term)
+        if not matches:
+            return LookupResult(query=term, partial=partial, providers=providers)
+
+        top = matches[0]
+        runner_up = matches[1] if len(matches) > 1 else None
+        confidence = fuzzy_confidence(top, runner_up)
+        suggestions = tuple(match.word for match in matches[:MAX_SUGGESTIONS])
+
+        if should_auto_correct(top, runner_up):
+            # This reuses the same provider/cache pipeline as a normal search.
+            # The strict mode prevents a bad candidate from cascading into a
+            # second correction if the primary source does not recognise it.
+            corrected = await self.lookup(top.word, language=language, fuzzy=False)
+            if corrected.found and corrected.entry is not None:
+                # Promote the verified canonical result as well. A later
+                # direct lookup of the corrected word is now a pure cache hit.
+                self._cache.put(
+                    cache_key(top.word, language),
+                    corrected,
+                    ttl=PARTIAL_TTL if corrected.partial else ENTRY_TTL,
+                )
+                return LookupResult(
+                    query=term,
+                    entry=corrected.entry,
+                    suggestions=suggestions,
+                    suggested_word=top.word,
+                    suggestion_confidence=confidence,
+                    auto_corrected=True,
+                    resolved_from=term,
+                    partial=partial or corrected.partial,
+                    providers=corrected.providers or providers,
+                )
+
+        # A medium confidence candidate earns a focused confirmation prompt;
+        # lower-confidence candidates remain ordinary alternatives, not a
+        # misleading "Did you mean" claim.
+        suggested_word = top.word if confidence >= 0.52 else ""
+        return LookupResult(
+            query=term,
+            suggestions=suggestions,
+            suggested_word=suggested_word,
+            suggestion_confidence=confidence,
+            partial=partial,
+            providers=providers,
+        )
+
+    async def _fuzzy_matches(self, term: str) -> tuple[FuzzyMatch, ...]:
         suggest = getattr(self.secondary, "suggest", None)
         if suggest is None:
             return ()
         candidates = await self._safe(self._call(suggest(term)))
         if not candidates:
             return ()
-        return rank_suggestions(term, candidates, limit=MAX_SUGGESTIONS)
+        return rank_fuzzy_matches(term, candidates, limit=MAX_SUGGESTIONS)
 
     async def _fetch_details(self, entry: WordEntry) -> WordDetails:
         wanted = candidate_forms(entry.word, entry.parts_of_speech)

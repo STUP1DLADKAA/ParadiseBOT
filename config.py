@@ -87,6 +87,9 @@ class DictionaryConfig:
     # Looked-up words are cached; these bound that cache.
     cache_ttl: int = 6 * 3600
     cache_size: int = 512
+    # Image attachments cannot read Discord's viewer theme; choose the card
+    # surface deliberately ("dark" is the Discord-friendly default).
+    card_theme: str = "dark"
 
     # Prefer the dictionary's own human recording over synthesised speech.
     prefer_native_audio: bool = True
@@ -106,11 +109,13 @@ class DictionaryConfig:
 
     @classmethod
     def from_env(cls, env) -> "DictionaryConfig":
+        card_theme = str(env.get("DICTIONARY_CARD_THEME", "dark") or "dark").strip().lower()
         return cls(
             text_triggers=_bool(env.get("DICTIONARY_TEXT_TRIGGERS"), True),
             timeout=max(2.0, _float(env.get("DICTIONARY_TIMEOUT"), 8.0)),
             cache_ttl=max(60, _int(env.get("DICTIONARY_CACHE_TTL"), 6 * 3600)),
             cache_size=max(16, _int(env.get("DICTIONARY_CACHE_SIZE"), 512)),
+            card_theme=card_theme if card_theme in {"dark", "light"} else "dark",
             prefer_native_audio=_bool(env.get("PRONUNCIATION_PREFER_NATIVE"), True),
             voice_playback=_bool(env.get("PRONUNCIATION_VOICE_PLAYBACK"), False),
             speech_base_url=env.get("SPEECH_BASE_URL", "").strip().rstrip("/"),

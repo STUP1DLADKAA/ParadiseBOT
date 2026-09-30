@@ -52,47 +52,89 @@ class RenderUnavailable(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class Theme:
-    """Every colour and measurement in one place."""
+    """A compact Material Expressive token set for one rendered card.
+
+    Discord gives image attachments no information about the viewer's app
+    theme, so dark is the safe default next to Discord's surfaces.  The same
+    layout also accepts :data:`LIGHT_THEME` for installations that prefer a
+    light card; neither mode is a screenshot or a web-page imitation.
+    """
 
     width: int = 1080
     padding: int = 72
-    radius: int = 40
-    min_height: int = 380
-    max_height: int = 1180
+    radius: int = 48
+    min_height: int = 420
+    max_height: int = 1240
 
-    background: tuple[int, int, int, int] = (16, 22, 20, 255)
-    surface_edge: tuple[int, int, int, int] = (34, 46, 42, 255)
-    surface_highlight: tuple[int, int, int, int] = (46, 62, 56, 110)
-    accent: tuple[int, int, int, int] = (63, 169, 141, 255)
-    accent_soft: tuple[int, int, int, int] = (63, 169, 141, 60)
-    hairline: tuple[int, int, int, int] = (32, 43, 39, 255)
+    # Material-style surface and tonal-container tokens.
+    background: tuple[int, int, int, int] = (18, 25, 22, 255)
+    surface_edge: tuple[int, int, int, int] = (55, 71, 63, 255)
+    surface_highlight: tuple[int, int, int, int] = (91, 112, 101, 100)
+    surface_container: tuple[int, int, int, int] = (29, 39, 35, 255)
+    surface_container_edge: tuple[int, int, int, int] = (56, 73, 64, 255)
+    shadow: tuple[int, int, int, int] = (0, 0, 0, 72)
 
-    text: tuple[int, int, int, int] = (242, 246, 244, 255)
-    text_secondary: tuple[int, int, int, int] = (170, 185, 179, 255)
-    text_muted: tuple[int, int, int, int] = (113, 128, 122, 255)
+    accent: tuple[int, int, int, int] = (122, 226, 193, 255)
+    accent_soft: tuple[int, int, int, int] = (122, 226, 193, 52)
+    accent_container: tuple[int, int, int, int] = (18, 82, 65, 255)
+    shape_primary: tuple[int, int, int, int] = (93, 212, 178, 28)
+    shape_secondary: tuple[int, int, int, int] = (165, 196, 255, 18)
+    hairline: tuple[int, int, int, int] = (52, 67, 60, 255)
 
-    chip_fill: tuple[int, int, int, int] = (24, 33, 30, 255)
-    chip_edge: tuple[int, int, int, int] = (40, 53, 48, 255)
-    chip_text: tuple[int, int, int, int] = (196, 210, 204, 255)
+    text: tuple[int, int, int, int] = (245, 249, 246, 255)
+    text_secondary: tuple[int, int, int, int] = (193, 207, 199, 255)
+    text_muted: tuple[int, int, int, int] = (144, 161, 151, 255)
+
+    chip_fill: tuple[int, int, int, int] = (36, 48, 43, 255)
+    chip_edge: tuple[int, int, int, int] = (67, 84, 75, 255)
+    chip_text: tuple[int, int, int, int] = (218, 230, 222, 255)
 
     # Type ramp
     label_size: int = 15
-    word_sizes: tuple[int, ...] = (86, 78, 70, 62, 54, 48, 42, 36, 32)
-    ipa_size: int = 30
-    pos_size: int = 19
-    definition_size: int = 30
-    example_size: int = 26
-    chip_size: int = 21
-    footer_size: int = 18
+    word_sizes: tuple[int, ...] = (92, 84, 76, 68, 60, 54, 48, 42, 36, 32)
+    ipa_size: int = 29
+    pos_size: int = 18
+    definition_size: int = 29
+    example_size: int = 25
+    chip_size: int = 20
+    footer_size: int = 17
 
-    # Limits that keep the card compact
+    # Limits that keep the card compact inside a Discord message.
     max_definition_lines: int = 4
     max_example_lines: int = 2
     max_synonyms: int = 6
     max_antonyms: int = 4
+    max_related: int = 4
+    name: str = "dark"
 
 
 DEFAULT_THEME = Theme()
+LIGHT_THEME = Theme(
+    name="light",
+    background=(250, 253, 250, 255),
+    surface_edge=(204, 217, 208, 255),
+    surface_highlight=(255, 255, 255, 180),
+    surface_container=(237, 246, 240, 255),
+    surface_container_edge=(197, 218, 205, 255),
+    shadow=(22, 39, 29, 36),
+    accent=(0, 105, 79, 255),
+    accent_soft=(0, 105, 79, 26),
+    accent_container=(190, 244, 221, 255),
+    shape_primary=(0, 140, 104, 20),
+    shape_secondary=(61, 93, 168, 17),
+    hairline=(207, 220, 211, 255),
+    text=(25, 34, 29, 255),
+    text_secondary=(65, 78, 69, 255),
+    text_muted=(101, 116, 106, 255),
+    chip_fill=(228, 239, 232, 255),
+    chip_edge=(193, 210, 199, 255),
+    chip_text=(39, 54, 45, 255),
+)
+
+
+def resolve_theme(name: str | None) -> Theme:
+    """Resolve a user-facing card theme without exposing renderer internals."""
+    return LIGHT_THEME if str(name or "").strip().casefold() == "light" else DEFAULT_THEME
 
 # Pillow's FreeType objects are shared across renders; serialise painting.
 _RENDER_LOCK = threading.Lock()
@@ -302,6 +344,22 @@ def plan_card(entry: WordEntry, theme: Theme = DEFAULT_THEME) -> CardLayout:
     ipa_font = library.get("regular", theme.ipa_size)
     variants = entry.phonetic_variants[:2]
     if variants:
+        pronunciation_label = "PRONUNCIATION"
+        blocks.append(
+            Block(
+                kind="pronunciation-label",
+                x=left,
+                y=y,
+                width=text_width(label_font, pronunciation_label, 1.8),
+                height=line_height(label_font, 1.15),
+                text=pronunciation_label,
+                role="semibold",
+                size=theme.label_size - 1,
+                colour=theme.text_muted,
+                tracking=1.8,
+            )
+        )
+        y = blocks[-1].bottom + 8
         row_height = line_height(ipa_font, 1.25)
         x = left
         for index, variant in enumerate(variants):
@@ -340,90 +398,141 @@ def plan_card(entry: WordEntry, theme: Theme = DEFAULT_THEME) -> CardLayout:
     )
     y += 33
 
-    # -- part of speech + definition --------------------------------------
+    # -- meaning surface --------------------------------------------------
+    # A tonal container makes the primary meaning feel like a Material
+    # component within the card, rather than a paragraph on a flat page.
     sense = entry.primary
-    if sense is not None and sense.part_of_speech:
-        pill = _chip_block(
-            library,
-            theme,
-            sense.part_of_speech.upper(),
-            left,
-            y,
-            size=theme.pos_size,
-            fill=theme.accent_soft,
-            edge=(0, 0, 0, 0),
-            colour=theme.accent,
-            tracking=1.6,
-            kind="pos",
-            pad_x=18,
-            pad_y=9,
-        )
-        blocks.append(pill)
-        y = pill.bottom + 22
-
-    if sense is not None and sense.definition:
-        definition_font = library.get("regular", theme.definition_size)
-        lines = wrap_text(
-            definition_font, sense.definition, content_width, theme.max_definition_lines
-        )
-        step = line_height(definition_font, 1.42)
-        for index, text in enumerate(lines):
-            blocks.append(
-                Block(
-                    kind="definition",
-                    x=left,
-                    y=y + index * step,
-                    width=text_width(definition_font, text),
-                    height=step,
-                    text=text,
-                    role="regular",
-                    size=theme.definition_size,
-                    colour=theme.text,
-                )
-            )
-        if lines:
-            y += len(lines) * step + 12
-
-    # -- example ----------------------------------------------------------
     example = sense.example if sense is not None else ""
     if not example:
         example = entry.examples[0] if entry.examples else ""
-    if example:
-        example_font = library.get("italic", theme.example_size)
-        indent = 26.0
-        lines = wrap_text(
-            example_font, example, content_width - indent, theme.max_example_lines
+    has_meaning = bool(sense is not None and (sense.definition or example))
+    if has_meaning:
+        surface_top = y - 16
+        surface = Block(
+            kind="meaning-surface",
+            x=left - 20,
+            y=surface_top,
+            width=content_width + 20,
+            height=1,  # resolved after the text has been measured
+            meta={"radius": 32},
         )
-        if lines:
-            step = line_height(example_font, 1.4)
-            block_height = len(lines) * step
-            blocks.append(
-                Block(
-                    kind="example-rule",
-                    x=left,
-                    y=y + 6,
-                    width=3,
-                    height=block_height - 8,
-                    colour=theme.accent_soft,
-                )
+        blocks.append(surface)
+        y += 12
+
+        definition_label = "DEFINITION"
+        definition_label_block = Block(
+            kind="definition-label",
+            x=left,
+            y=y,
+            width=text_width(label_font, definition_label, 1.8),
+            height=line_height(label_font, 1.15),
+            text=definition_label,
+            role="semibold",
+            size=theme.label_size - 1,
+            colour=theme.text_muted,
+            tracking=1.8,
+        )
+        blocks.append(definition_label_block)
+        row_bottom = definition_label_block.bottom
+        if sense is not None and sense.part_of_speech:
+            pill = _chip_block(
+                library,
+                theme,
+                sense.part_of_speech.upper(),
+                definition_label_block.right + 18,
+                y - 8,
+                size=theme.pos_size,
+                fill=theme.accent_container,
+                edge=(0, 0, 0, 0),
+                colour=theme.accent,
+                tracking=1.4,
+                kind="pos",
+                pad_x=16,
+                pad_y=8,
             )
+            if pill.right <= left + content_width:
+                blocks.append(pill)
+                row_bottom = max(row_bottom, pill.bottom)
+        y = row_bottom + 19
+
+        if sense is not None and sense.definition:
+            definition_font = library.get("regular", theme.definition_size)
+            lines = wrap_text(
+                definition_font, sense.definition, content_width, theme.max_definition_lines
+            )
+            step = line_height(definition_font, 1.42)
             for index, text in enumerate(lines):
                 blocks.append(
                     Block(
-                        kind="example",
-                        x=left + indent,
+                        kind="definition",
+                        x=left,
                         y=y + index * step,
-                        width=text_width(example_font, text),
+                        width=text_width(definition_font, text),
                         height=step,
                         text=text,
-                        role="italic",
-                        size=theme.example_size,
-                        colour=theme.text_secondary,
+                        role="regular",
+                        size=theme.definition_size,
+                        colour=theme.text,
                     )
                 )
-            y += block_height + 22
+            if lines:
+                y += len(lines) * step + 12
 
-    # -- synonyms / antonyms ---------------------------------------------
+        if example:
+            context_label = "IN CONTEXT"
+            blocks.append(
+                Block(
+                    kind="example-label",
+                    x=left,
+                    y=y,
+                    width=text_width(label_font, context_label, 1.8),
+                    height=line_height(label_font, 1.15),
+                    text=context_label,
+                    role="semibold",
+                    size=theme.label_size - 1,
+                    colour=theme.text_muted,
+                    tracking=1.8,
+                )
+            )
+            y = blocks[-1].bottom + 8
+            example_font = library.get("italic", theme.example_size)
+            indent = 26.0
+            lines = wrap_text(
+                example_font, example, content_width - indent, theme.max_example_lines
+            )
+            if lines:
+                step = line_height(example_font, 1.4)
+                block_height = len(lines) * step
+                blocks.append(
+                    Block(
+                        kind="example-rule",
+                        x=left,
+                        y=y + 6,
+                        width=3,
+                        height=max(4, block_height - 8),
+                        colour=theme.accent,
+                    )
+                )
+                for index, text in enumerate(lines):
+                    blocks.append(
+                        Block(
+                            kind="example",
+                            x=left + indent,
+                            y=y + index * step,
+                            width=text_width(example_font, text),
+                            height=step,
+                            text=text,
+                            role="italic",
+                            size=theme.example_size,
+                            colour=theme.text_secondary,
+                        )
+                    )
+                y += block_height + 4
+
+        surface.height = y - surface_top + 18
+        y = surface.bottom + 28
+
+    # -- related word families -------------------------------------------
     y = _plan_chip_row(
         blocks, library, theme, "SYNONYMS",
         entry.all_synonyms(theme.max_synonyms), left, y, content_width, "synonym",
@@ -431,6 +540,10 @@ def plan_card(entry: WordEntry, theme: Theme = DEFAULT_THEME) -> CardLayout:
     y = _plan_chip_row(
         blocks, library, theme, "ANTONYMS",
         entry.all_antonyms(theme.max_antonyms), left, y, content_width, "antonym",
+    )
+    y = _plan_chip_row(
+        blocks, library, theme, "RELATED",
+        entry.related[:theme.max_related], left, y, content_width, "related",
     )
 
     # -- footer -----------------------------------------------------------
@@ -626,7 +739,9 @@ def paint(layout: CardLayout) -> "Image.Image":
     image = Image.new("RGBA", (layout.width, layout.height), (0, 0, 0, 0))
     draw = ImageDraw.Draw(image)
 
-    # Card surface: fill, hairline edge, and a barely-there top highlight.
+    # Card surface, edge and highlight use a Material tonal hierarchy. The
+    # organic shapes beneath it stay deliberately quiet: this is a dictionary
+    # component, not an infographic.
     draw.rounded_rectangle(
         (0, 0, layout.width - 1, layout.height - 1),
         radius=theme.radius,
@@ -636,16 +751,53 @@ def paint(layout: CardLayout) -> "Image.Image":
     )
     draw.rounded_rectangle(
         (1, 1, layout.width - 2, layout.height - 2),
-        radius=theme.radius - 1,
+        radius=max(1, theme.radius - 1),
         outline=theme.surface_highlight,
         width=1,
     )
-    # A single accent stroke along the top edge: the one flourish on the card.
+
+    # The restrained shape placement is deterministic per headword, which
+    # keeps card caching valid while avoiding a repetitive static template.
+    word_block = layout.find("word")
+    word = word_block.text if word_block is not None else ""
+    drift = int(hashlib.sha256(word.encode("utf-8")).hexdigest()[:4], 16) % 96
+    ornament = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    ornament_draw = ImageDraw.Draw(ornament)
+    ornament_draw.ellipse((-170 + drift, -210, 300 + drift, 230), fill=theme.shape_primary)
+    ornament_draw.ellipse(
+        (
+            layout.width - 260 - drift // 2,
+            layout.height - 190,
+            layout.width + 180 - drift // 2,
+            layout.height + 170,
+        ),
+        fill=theme.shape_secondary,
+    )
+    image.alpha_composite(ornament)
+    draw = ImageDraw.Draw(image)
+    # A compact accent capsule is the one top-level flourish.
     draw.rounded_rectangle(
-        (theme.padding, 0, theme.padding + 96, 3), radius=2, fill=theme.accent
+        (theme.padding, 0, theme.padding + 118, 5), radius=3, fill=theme.accent
     )
 
     for block in layout.blocks:
+        if block.kind == "meaning-surface":
+            radius = block.meta.get("radius", 28)
+            # Two offset layers suggest elevation while remaining crisp in a
+            # PNG attachment (no huge soft blur that turns muddy on mobile).
+            draw.rounded_rectangle(
+                (block.x + 3, block.y + 7, block.right + 3, block.bottom + 7),
+                radius=radius,
+                fill=theme.shadow,
+            )
+            draw.rounded_rectangle(
+                (block.x, block.y, block.right, block.bottom),
+                radius=radius,
+                fill=theme.surface_container,
+                outline=theme.surface_container_edge,
+                width=1,
+            )
+            continue
         if block.kind == "rule":
             draw.rectangle(
                 (block.x, block.y, block.right, block.y + block.height - 1),
@@ -659,7 +811,7 @@ def paint(layout: CardLayout) -> "Image.Image":
                 fill=block.colour,
             )
             continue
-        if block.kind in ("chip", "synonym", "antonym", "pos", "region"):
+        if block.kind in ("chip", "synonym", "antonym", "related", "pos", "region"):
             fill = block.meta.get("fill")
             edge = block.meta.get("edge")
             draw.rounded_rectangle(
@@ -714,9 +866,10 @@ def card_signature(entry: WordEntry, theme: Theme = DEFAULT_THEME) -> str:
         "|".join(p.label for p in entry.phonetic_variants[:2]),
         "|".join(entry.all_synonyms(theme.max_synonyms)),
         "|".join(entry.all_antonyms(theme.max_antonyms)),
+        "|".join(entry.related[:theme.max_related]),
         _footer_text(entry),
         _extra_note(entry),
-        f"{theme.width}x{theme.radius}",
+        f"{theme.name}:{theme.width}x{theme.radius}",
     ]
     digest = hashlib.sha256("\u241f".join(parts).encode("utf-8")).hexdigest()
     return digest[:32]
