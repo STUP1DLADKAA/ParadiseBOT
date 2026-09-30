@@ -65,6 +65,7 @@ from functions.dictionary.pronounce import (  # noqa: E402
 )
 from functions.dictionary.render import (  # noqa: E402
     DEFAULT_THEME,
+    LIGHT_THEME,
     fit_text,
     text_width,
     wrap_text,
@@ -681,6 +682,73 @@ class TestLookupPipeline(unittest.TestCase):
         self.assertEqual(result.suggestions[0], "receive")
         self.assertEqual(secondary.suggest_calls, 1)
 
+    def test_high_confidence_fuzzy_match_is_verified_then_automatic(self):
+        # Each of these is one Damerau-Levenshtein edit from the real word:
+        # a substitution, an insertion/deletion or a repeated-letter mistake.
+        corrections = {
+            "definately": "definitely",
+            "accomodate": "accommodate",
+            "seperate": "separate",
+            "enviroment": "environment",
+        }
+        primary = FakePrimary({word: entry_for(word) for word in corrections.values()})
+        secondary = FakeSecondary(
+            suggestions=[(word, 100.0) for word in corrections.values()]
+        )
+        service = make_service(primary, secondary)
+        for typed, corrected in corrections.items():
+            with self.subTest(typed=typed):
+                # Give each typo only its intended candidate. A real provider
+                # supplies this candidate list from its lexical index.
+                secondary.suggestions = [(corrected, 100.0)]
+                result = run(service.lookup(typed))
+                self.assertTrue(result.found)
+                self.assertEqual(result.entry.word, corrected)
+                self.assertTrue(result.auto_corrected)
+                self.assertEqual(result.resolved_from, typed)
+
+    def test_lexical_misspelling_signal_resolves_a_tied_transposition(self):
+        primary = FakePrimary({"receive": entry_for("receive")})
+        # Datamuse adds one million to a row which explicitly says
+        # "misspelling of receive". A merely similar real word must not make
+        # that correction look ambiguous.
+        secondary = FakeSecondary(
+            suggestions=[("receive", 1_000_100.0), ("relieve", 100.0)]
+        )
+        result = run(make_service(primary, secondary).lookup("recieve"))
+        self.assertTrue(result.found)
+        self.assertEqual(result.entry.word, "receive")
+        self.assertTrue(result.auto_corrected)
+
+    def test_verified_correction_promotes_the_canonical_cache_entry(self):
+        primary = FakePrimary({"definitely": entry_for("definitely")})
+        secondary = FakeSecondary(suggestions=[("definitely", 100.0)])
+        service = make_service(primary, secondary)
+        self.assertTrue(run(service.lookup("definately")).found)
+        calls_after_correction = len(primary.calls)
+        self.assertGreaterEqual(calls_after_correction, 2)
+        self.assertTrue(run(service.lookup("definitely")).found)
+        self.assertEqual(
+            len(primary.calls), calls_after_correction, "canonical entry came from cache"
+        )
+
+    def test_ambiguous_match_requires_confirmation(self):
+        primary = FakePrimary({"address": entry_for("address"), "dress": entry_for("dress")})
+        secondary = FakeSecondary(suggestions=[("address", 100.0), ("dress", 90.0)])
+        result = run(make_service(primary, secondary).lookup("adress"))
+        self.assertFalse(result.found)
+        self.assertEqual(result.suggested_word, "address")
+        self.assertFalse(result.auto_corrected)
+
+    def test_exact_search_never_restarts_fuzzy_matching(self):
+        primary = FakePrimary({"definitely": entry_for("definitely")})
+        secondary = FakeSecondary(suggestions=[("definitely", 100.0)])
+        service = make_service(primary, secondary)
+        result = run(service.lookup("definately", fuzzy=False))
+        self.assertFalse(result.found)
+        self.assertEqual(result.suggestions, ())
+        self.assertEqual(secondary.suggest_calls, 0)
+
     def test_primary_outage_falls_back_to_the_secondary(self):
         from functions.dictionary import HttpError
 
@@ -919,6 +987,14 @@ class TestRenderer(unittest.TestCase):
     def test_render_is_deterministic(self):
         entry = entry_for()
         self.assertEqual(render_card(entry), render_card(entry))
+
+    def test_material_hierarchy_has_a_meaning_surface_and_light_variant(self):
+        entry = entry_for().with_extras(related=["oath"])
+        layout = plan_card(entry)
+        kinds = set(layout.kinds())
+        for kind in ("word", "pronunciation-label", "pos", "definition", "example", "synonym", "related", "meaning-surface"):
+            self.assertIn(kind, kinds)
+        self.assertNotEqual(render_card(entry), render_card(entry, LIGHT_THEME))
 
     def test_signature_tracks_content(self):
         first = entry_for()
@@ -1386,17 +1462,19 @@ class TestSlashCommandFlow(unittest.TestCase):
         self.assertTrue(interaction.response.messages[0]["ephemeral"])
         run(cog.cog_unload())
 
-    def test_unknown_word_offers_suggestions(self):
+    def test_unknown_word_offers_a_confirmed_correction(self):
         cog = make_cog(entries={}, suggestions=[("receive", 100.0), ("relieve", 10.0)])
         interaction = FakeInteraction()
         run(cog._run_command(interaction, "recieve"))
         view = interaction.original_edits[0]["view"]
         self.assertIsInstance(view, NotFoundView)
-        self.assertIn("Couldn't find", text_of(view))
-        self.assertIn("receive", buttons_of(view))
+        self.assertIn("Did you mean", text_of(view))
+        labels = buttons_of(view)
+        self.assertIn("Yes, search receive", labels)
+        self.assertIn("Search exactly what I typed", labels)
         run(cog.cog_unload())
 
-    def test_suggestion_button_reruns_the_lookup(self):
+    def test_high_confidence_misspelling_is_corrected_before_rendering(self):
         cog = make_cog(
             entries={"receive": entry_for("receive")},
             suggestions=[("receive", 100.0)],
@@ -1404,19 +1482,15 @@ class TestSlashCommandFlow(unittest.TestCase):
         interaction = FakeInteraction()
         run(cog._run_command(interaction, "recieve"))
         view = interaction.original_edits[0]["view"]
-        button = buttons_of(view)["receive"]
-
-        clicker = FakeInteraction(user_id=1)
-        run(button.callback(clicker))
-        self.assertIsInstance(clicker.response.edits[0]["view"], LoadingView)
-        self.assertIsInstance(clicker.original_edits[0]["view"], ResultView)
+        self.assertIsInstance(view, ResultView)
+        self.assertIn("corrected from", text_of(view))
         run(cog.cog_unload())
 
-    def test_suggestion_button_belongs_to_the_asker(self):
+    def test_correction_button_belongs_to_the_asker(self):
         cog = make_cog(entries={}, suggestions=[("receive", 100.0)])
         interaction = FakeInteraction(user_id=1)
         run(cog._run_command(interaction, "recieve"))
-        button = buttons_of(interaction.original_edits[0]["view"])["receive"]
+        button = buttons_of(interaction.original_edits[0]["view"])["Yes, search receive"]
         stranger = FakeInteraction(user_id=2)
         run(button.callback(stranger))
         self.assertEqual(stranger.response.edits, [])
@@ -1767,6 +1841,7 @@ class TestConfigPlumbing(unittest.TestCase):
             timeout=3.5,
             cache_ttl=111.0,
             cache_size=7,
+            card_theme="light",
             prefer_native_audio=False,
             voice_playback=True,
             speech_base_url="https://example.invalid/v1",
@@ -1780,6 +1855,7 @@ class TestConfigPlumbing(unittest.TestCase):
             self.assertEqual(feature.service.timeout, 3.5)
             self.assertEqual(feature.service._cache._ttl, 111.0)
             self.assertEqual(feature.service._cache._max_items, 7)
+            self.assertEqual(feature.card_theme.name, "light")
             self.assertFalse(feature.pronunciation.prefer_native)
             self.assertTrue(feature.playback.enabled)
             neural = next(
@@ -1826,6 +1902,7 @@ class TestConfigPlumbing(unittest.TestCase):
             "DICTIONARY_TIMEOUT": "12",
             "DICTIONARY_CACHE_TTL": "900",
             "DICTIONARY_CACHE_SIZE": "64",
+            "DICTIONARY_CARD_THEME": "light",
             "PRONUNCIATION_PREFER_NATIVE": "no",
             "PRONUNCIATION_VOICE_PLAYBACK": "yes",
             "SPEECH_BASE_URL": "https://example.invalid/v1/",
@@ -1838,6 +1915,7 @@ class TestConfigPlumbing(unittest.TestCase):
         self.assertEqual(settings.timeout, 12.0)
         self.assertEqual(settings.cache_ttl, 900)
         self.assertEqual(settings.cache_size, 64)
+        self.assertEqual(settings.card_theme, "light")
         self.assertFalse(settings.prefer_native_audio)
         self.assertTrue(settings.voice_playback)
         self.assertEqual(settings.speech_base_url, "https://example.invalid/v1")

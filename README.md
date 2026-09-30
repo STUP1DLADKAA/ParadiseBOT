@@ -29,7 +29,7 @@ Everything lives in `.env` (never committed). See `.env.example` for all options
 | Discord | `DISCORD_TOKEN` | required |
 | AI | `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | any OpenAI-compatible endpoint (OpenAI, Groq, Gemini's compat layer, local Ollama). Optional |
 | Personality | `PERSONALITY_ENABLED`, `PERSONALITY_REACTION_CHANCE`, `PERSONALITY_REPLY_CHANCE`, `PERSONALITY_GLOBAL_COOLDOWN`, `PERSONALITY_CHANNEL_COOLDOWN`, `PERSONALITY_REPLY_CHANNEL_COOLDOWN` | tuning for the rare reactions/replies; defaults are deliberately conservative |
-| Dictionary | `DICTIONARY_TEXT_TRIGGERS`, `DICTIONARY_TIMEOUT`, `DICTIONARY_CACHE_TTL`, `DICTIONARY_CACHE_SIZE` | all optional — the dictionary needs no keys and works out of the box |
+| Dictionary | `DICTIONARY_TEXT_TRIGGERS`, `DICTIONARY_TIMEOUT`, `DICTIONARY_CACHE_TTL`, `DICTIONARY_CACHE_SIZE`, `DICTIONARY_CARD_THEME` | all optional — the dictionary needs no keys and works out of the box |
 | Pronunciation | `PRONUNCIATION_PREFER_NATIVE`, `PRONUNCIATION_VOICE_PLAYBACK`, `SPEECH_BASE_URL`, `SPEECH_API_KEY`, `SPEECH_MODEL`, `SPEECH_VOICE` | optional. `SPEECH_*` adds a neural voice for words with no human recording; without it a free voice is used |
 
 ## Commands
@@ -47,7 +47,7 @@ Choices for `/choose` and `/poll` are separated with `|` or `,`:
 
 ## Dictionary
 
-`/dictionary promise` (or `/define`, or just **`define promise`** in chat) answers with a rendered card instead of a wall of text.
+`/dictionary promise` (or `/define`, or just **`define promise`** in chat) answers with a rendered Material Expressive card instead of a wall of text.
 
 ![The dictionary card for "hello"](assets/dictionary-card.png)
 
@@ -59,10 +59,10 @@ what does serendipity mean?
 
 - **No API key, no external service.** Word data comes from two free, key-less sources: [dictionaryapi.dev](https://dictionaryapi.dev) (Wiktionary-backed definitions, IPA and human recordings) and [Datamuse](https://www.datamuse.com/api/) (synonyms, antonyms, related words, spelling correction). If the first is down the second still produces a usable card, clearly marked as partial.
 - **Asked in plain English.** `define hello`, `dictionary hello`, `Define "hello"`, `meaning of hello`, `what does hello mean?` — case and quotes don't matter. Ordinary conversation is left alone: "I need to define a function" is not a lookup. Set `DICTIONARY_TEXT_TRIGGERS=false` for slash-commands-only.
-- **A real card, drawn per word.** Nothing is a static template: the layout measures every string and grows or shrinks to fit, so a one-line definition and a twelve-synonym entry both look deliberate. Long words shrink to fit on one line, text is wrapped and clipped rather than allowed to overflow, and IPA renders properly (`/həˈləʊ/`) thanks to a bundled Inter subset with full phonetic coverage. Without Pillow installed the card degrades to clean formatted text.
+- **A real Material Expressive card, drawn per word.** Nothing is a static template: the layout measures every string and grows or shrinks to fit, so a one-line definition and a twelve-synonym entry both look deliberate. The headword is the focal point; pronunciation, part of speech, definition, example, word families and source information each have their own calm visual layer. Tonal containers, organic background shapes and restrained elevation keep it polished without turning it into an infographic. Dark is tuned for Discord by default; set `DICTIONARY_CARD_THEME=light` for a light surface. Long words shrink to fit on one line, text is wrapped and clipped rather than allowed to overflow, and IPA renders properly (`/həˈləʊ/`) thanks to a bundled Inter subset with full phonetic coverage. Without Pillow installed the card degrades to clean formatted text.
 - **🔊 Pronounce speaks the word** — never the definition. It prefers the dictionary's own human recording (UK/US/AU where available) and falls back to a synthesised voice, optionally your own neural endpoint via `SPEECH_*`. Audio arrives as a private attachment; with PyNaCl and ffmpeg installed, `PRONUNCIATION_VOICE_PLAYBACK=true` makes Paradise join your voice channel, say the word and leave.
 - **Everything else on demand.** The card stays uncluttered; **📚 More** adds all meanings, every pronunciation variant, inflected forms, synonyms, antonyms, related words and etymology, and **📖 Examples** shows the example sentences. Navigation belongs to whoever asked; 🔊 works for everyone.
-- **Honest when it doesn't know.** A miss says so and offers the closest real words as buttons (`recieve` → **receive**). Nothing is ever invented: missing fields are omitted or labelled, never filled in.
+- **Spelling-aware, but never presumptuous.** Inputs are trimmed, normalised and checked exactly first. On a miss, RapidFuzz Damerau-Levenshtein matching ranks real candidates from Datamuse, handling transposed, missing, extra and repeated letters (`definately` → **definitely**, `recieve` → **receive**). A clear one-edit match is verified through the normal dictionary pipeline and opens its card immediately; an ambiguous match asks **Did you mean…?** with **Yes, search _word_** and **Search exactly what I typed**. Nothing is ever invented: missing fields are omitted or labelled, never filled in.
 - **Built to not fall over.** Lookups, rendered cards and audio clips are cached with bounded, expiring caches; identical simultaneous requests are coalesced into one fetch; everything has a deadline; and a failure in any layer (API, renderer, voice) is contained — you still get whatever the other layers produced.
 
 ## Recipes

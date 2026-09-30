@@ -65,8 +65,23 @@ def loading_text(term: str) -> str:
     return f"## 🔎 Looking up “{discord.utils.escape_markdown(term)}”…"
 
 
-def not_found_text(query: str, suggestions: tuple[str, ...]) -> str:
+def not_found_text(
+    query: str,
+    suggestions: tuple[str, ...],
+    suggested_word: str = "",
+) -> str:
+    """Copy for a miss, with a deliberately different ambiguous-match state."""
     safe = discord.utils.escape_markdown(query)
+    if suggested_word:
+        suggestion = discord.utils.escape_markdown(suggested_word)
+        return "\n".join(
+            [
+                f"## ✦ Did you mean “{suggestion}”?",
+                "",
+                f"Couldn't find an exact entry for “{safe}”, so I left the choice with you.",
+            ]
+        )
+
     lines = [f"## 🔎 Couldn't find “{safe}”.", ""]
     if suggestions:
         lines.append("Did you mean one of these?")
@@ -556,13 +571,18 @@ def _result_notice(result: LookupResult) -> str:
     if result.resolved_from and result.entry is not None:
         shown = discord.utils.escape_markdown(result.entry.word)
         asked = discord.utils.escape_markdown(result.resolved_from)
-        bits.append(f"-# Showing **{shown}** — the base form of “{asked}”.")
+        if result.auto_corrected:
+            bits.append(f"-# Showing **{shown}** — corrected from “{asked}”.")
+        else:
+            bits.append(f"-# Showing **{shown}** — the base form of “{asked}”.")
     if result.partial:
         bits.append("-# Some sources were unavailable, so this entry is a little thin.")
     return "\n".join(bits)
 
 
 class SuggestionButton(discord.ui.Button["NotFoundView"]):
+    """A regular alternate word — it starts the normal fuzzy-aware pipeline."""
+
     def __init__(self, cog: "Dictionary", word: str, invoker_id: int) -> None:
         super().__init__(label=shorten(word, 24), style=discord.ButtonStyle.secondary)
         self.cog = cog
@@ -591,14 +611,80 @@ class SuggestionButton(discord.ui.Button["NotFoundView"]):
         )
 
 
+class CorrectedSearchButton(SuggestionButton):
+    """The affirmative side of a deliberately non-destructive correction."""
+
+    def __init__(self, cog: "Dictionary", word: str, invoker_id: int) -> None:
+        super().__init__(cog, word, invoker_id)
+        self.label = shorten(f"Yes, search {word}", 80)
+        self.style = discord.ButtonStyle.primary
+
+
+class ExactSearchButton(discord.ui.Button["NotFoundView"]):
+    """Let the asker opt out of fuzzy matching without a correction loop."""
+
+    def __init__(self, cog: "Dictionary", query: str, invoker_id: int) -> None:
+        super().__init__(
+            label="Search exactly what I typed",
+            style=discord.ButtonStyle.secondary,
+        )
+        self.cog = cog
+        self.query = query
+        self.invoker_id = invoker_id
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.invoker_id:
+            await _safe_respond(
+                interaction, "run `/dictionary` to start your own lookup."
+            )
+            return
+        try:
+            await interaction.response.edit_message(
+                view=LoadingView(self.query), attachments=[]
+            )
+        except discord.NotFound:
+            return
+        except discord.HTTPException:
+            log.debug("Could not show exact-search loading state", exc_info=True)
+            return
+        await self.cog.deliver(
+            self.query,
+            Editor(interaction=interaction),
+            invoker_id=self.invoker_id,
+            fuzzy=False,
+        )
+
+
 class NotFoundView(discord.ui.LayoutView):
     def __init__(
-        self, cog: "Dictionary", query: str, suggestions: tuple[str, ...], invoker_id: int
+        self,
+        cog: "Dictionary",
+        query: str,
+        suggestions: tuple[str, ...],
+        invoker_id: int,
+        *,
+        suggested_word: str = "",
     ) -> None:
         super().__init__(timeout=VIEW_TIMEOUT)
         container = discord.ui.Container(accent_colour=Colour.ACCENT)
-        container.add_item(discord.ui.TextDisplay(not_found_text(query, suggestions)))
-        if suggestions:
+        container.add_item(
+            discord.ui.TextDisplay(not_found_text(query, suggestions, suggested_word))
+        )
+        if suggested_word:
+            confirmation = discord.ui.ActionRow()
+            confirmation.add_item(CorrectedSearchButton(cog, suggested_word, invoker_id))
+            confirmation.add_item(ExactSearchButton(cog, query, invoker_id))
+            container.add_item(confirmation)
+
+            # Keep genuinely different alternatives available without making
+            # the focused two-button decision look like a noisy menu.
+            alternatives = tuple(word for word in suggestions if word != suggested_word)
+            if alternatives:
+                row = discord.ui.ActionRow()
+                for word in alternatives[:3]:
+                    row.add_item(SuggestionButton(cog, word, invoker_id))
+                container.add_item(row)
+        elif suggestions:
             row = discord.ui.ActionRow()
             for word in suggestions[:4]:
                 row.add_item(SuggestionButton(cog, word, invoker_id))
@@ -730,10 +816,17 @@ class Dictionary(commands.Cog):
 
     # -- the shared pipeline ----------------------------------------------
 
-    async def deliver(self, term: str, editor: Editor, *, invoker_id: int) -> None:
-        """Look the word up and replace the loading state with the answer."""
+    async def deliver(
+        self,
+        term: str,
+        editor: Editor,
+        *,
+        invoker_id: int,
+        fuzzy: bool = True,
+    ) -> None:
+        """Look a word up and replace the loading state with the answer."""
         try:
-            result = await self.feature.lookup(term)
+            result = await self.feature.lookup(term, fuzzy=fuzzy)
         except ParadiseError as error:
             await editor.edit(view=NoticeView(f"## 🔎 {error}"), attachments=[])
             return
@@ -745,7 +838,13 @@ class Dictionary(commands.Cog):
             return
 
         if not result.found or result.entry is None:
-            view = NotFoundView(self, term, result.suggestions, invoker_id)
+            view = NotFoundView(
+                self,
+                term,
+                result.suggestions,
+                invoker_id,
+                suggested_word=result.suggested_word,
+            )
             await editor.edit(view=view, attachments=[])
             return
 

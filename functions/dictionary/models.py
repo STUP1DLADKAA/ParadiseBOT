@@ -221,11 +221,21 @@ class WordEntry:
 
 @dataclass(frozen=True, slots=True)
 class LookupResult:
-    """The outcome of a lookup: an entry, or the closest words to it."""
+    """The outcome of a lookup: an entry, or the closest words to it.
+
+    ``suggested_word`` is intentionally separate from ``suggestions``.  It is
+    the one candidate the fuzzy matcher considers plausible enough to put in
+    a focused "Did you mean…" interaction; it is *not* an assertion that the
+    user meant that word.  ``auto_corrected`` is only true after that candidate
+    was verified by the normal dictionary lookup pipeline.
+    """
 
     query: str
     entry: WordEntry | None = None
     suggestions: tuple[str, ...] = ()
+    suggested_word: str = ""
+    suggestion_confidence: float = 0.0
+    auto_corrected: bool = False
     # Set when we answered a different word than asked, e.g. running → run.
     resolved_from: str = ""
     # True when a provider failed and the answer is thinner than usual.
