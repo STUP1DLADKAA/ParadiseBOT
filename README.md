@@ -33,7 +33,7 @@ Everything lives in `.env` (never committed). See `.env.example` for all options
 ## Commands
 
 - **Fun** — `/ping` (with the real latency), `/coinflip` (animated), `/choose`
-- **Useful** — `/remind`, `/poll`, `/afk`, `/translate`, `/define`
+- **Useful** — `/remind`, `/poll`, `/afk`, `/translate`, `/define`, `/recipe`
 - **AI** — `/summarize`, or just mention Paradise
 - `/help` lists exactly what is registered — nothing more
 
@@ -42,6 +42,21 @@ Choices for `/choose` and `/poll` are separated with `|` or `,`:
 ```text
 /choose options:pizza | burgers | something responsible
 ```
+
+## Recipes
+
+`/recipe` turns "here's what's in my kitchen" into something to actually cook. Give it a plain list of ingredients and Paradise suggests the recipes you can realistically make, in a small Components V2 interface that behaves like a cooking app inside Discord.
+
+```text
+/recipe ingredients: chicken, rice, onion, tomato, garlic
+```
+
+- **No API key, no external service.** Matching runs entirely on a bundled recipe book (`functions/recipes/recipes.json`) — it works the moment you clone and run. AI is *not* required; it stays an optional future enhancement.
+- **Understands messy input.** Quantities and units are stripped (`2 eggs`, `4 slices of bread`, `one tomato`), plurals and spellings are folded together, and common Hindi/Hinglish names are recognised (`aloo`→potato, `pyaaz`→onion, `tamatar`→tomato, `hari mirchi`→green chilli, `anda`→egg, `dahi`→yogurt, `lahsun`→garlic, `adrak`→ginger…). All of this vocabulary lives in `functions/recipes/ingredients.json`, easy to expand.
+- **Smart matching.** For every recipe Paradise works out what you have, what's missing, and what's optional, then ranks by how much of your stuff it uses and how little you'd need to buy. Pantry staples (salt, water, oil, basic spices — configurable in `ingredients.json`) are assumed on hand and never counted as missing; unusual items (soy sauce, cheese, cream, coconut milk) are.
+- **Interactive.** The suggestion list has a picker plus **📖 View recipe**, **🔄 Another** and **🧺 Missing ingredients**. The detail view shows time, servings, difficulty, descriptive tags (High protein, Vegetable-rich, Lower-oil, Quick, Balanced — never medical claims), a *You have / Missing* breakdown, quantities and numbered steps. The missing-ingredients view lists only what you lack, with conservative substitution suggestions where they make sense. Cycling and picking reuse the original results — no repeated searching.
+- **Optional filters:** `diet` (vegetarian / vegan / non-veg), `cuisine` (indian / chinese / italian / …) and `max_time` (minutes). All optional — the bare `ingredients` form is always the easiest.
+- **Graceful when nothing fits.** Instead of a flat "no recipes found", Paradise explains what you gave it, suggests how to broaden the search, and lists the closest near-misses from what you have.
 
 ## Presence
 
@@ -96,6 +111,14 @@ functions/
   helpers.py              shared errors, colours, parsing, formatting
   personality.py          rare contextual reactions and short replies
   presence.py             fixed «Watching Paradise» activity + rotating note
+  recipes/                recipe engine (no discord, no AI, unit-testable)
+    normalize.py            ingredient parsing/normalization (aliases, units, Hinglish)
+    engine.py               matching, ranking, filters, substitutions, fallbacks
+    source.py               recipe source abstraction + bundled loader
+    models.py               Recipe / MatchResult data models
+    ingredients.json        aliases, pantry staples, substitutions (data, editable)
+    recipes.json            the bundled recipe book (data, editable)
+commands/recipe.py        /recipe command + Components V2 recipe UI
 tests/test_offline.py     offline validation: exact command set, every flow, limits
 ```
 

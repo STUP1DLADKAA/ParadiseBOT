@@ -1,0 +1,1049 @@
+[
+  {
+    "id": "aloo-pyaaz-sabzi",
+    "name": "Aloo Pyaaz ki Sabzi",
+    "emoji": "🥔",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["vegetable-rich", "lower-oil", "quick", "balanced"],
+    "time_minutes": 25,
+    "servings": 3,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "potato", "quantity": "3 medium, cubed"},
+      {"name": "onion", "quantity": "2, sliced"},
+      {"name": "tomato", "quantity": "2, chopped"},
+      {"name": "green chilli", "quantity": "2, slit", "optional": true},
+      {"name": "ginger", "quantity": "1 tsp, grated", "optional": true},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "cumin seeds", "quantity": "1 tsp"},
+      {"name": "coriander powder", "quantity": "1 tsp"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "coriander leaves", "quantity": "a small handful", "optional": true}
+    ],
+    "instructions": [
+      "Heat the oil and crackle the cumin seeds.",
+      "Add onions and fry until soft and golden.",
+      "Add tomatoes, turmeric, coriander powder and salt; cook until the tomatoes break down.",
+      "Add the potatoes, stir to coat, then add a splash of water.",
+      "Cover and cook on low heat until the potatoes are tender, about 15 minutes.",
+      "Finish with fresh coriander and serve with roti or rice."
+    ]
+  },
+  {
+    "id": "aloo-tamatar-curry",
+    "name": "Aloo Tamatar Curry",
+    "emoji": "🍲",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["vegetable-rich", "balanced"],
+    "time_minutes": 30,
+    "servings": 3,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "potato", "quantity": "4 medium, boiled and cubed"},
+      {"name": "tomato", "quantity": "3, pureed"},
+      {"name": "onion", "quantity": "1, finely chopped", "optional": true},
+      {"name": "ginger", "quantity": "1 tsp"},
+      {"name": "garlic", "quantity": "3 cloves", "optional": true},
+      {"name": "cumin seeds", "quantity": "1 tsp"},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "red chilli powder", "quantity": "1/2 tsp"},
+      {"name": "garam masala", "quantity": "1/2 tsp"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Temper cumin seeds in hot oil.",
+      "Add ginger and garlic, then the tomato puree and spices.",
+      "Cook the masala until the oil separates.",
+      "Add the boiled potatoes and 1.5 cups water; simmer for 10 minutes.",
+      "Lightly mash a few potatoes to thicken the gravy.",
+      "Sprinkle garam masala and serve hot with puri or rice."
+    ]
+  },
+  {
+    "id": "jeera-aloo",
+    "name": "Jeera Aloo",
+    "emoji": "🥔",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["quick", "lower-oil"],
+    "time_minutes": 20,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "potato", "quantity": "3, boiled and cubed"},
+      {"name": "cumin seeds", "quantity": "1.5 tsp"},
+      {"name": "green chilli", "quantity": "1, chopped", "optional": true},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "oil", "quantity": "1 tbsp"},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "coriander leaves", "quantity": "for garnish", "optional": true}
+    ],
+    "instructions": [
+      "Heat oil and add cumin seeds until they sizzle.",
+      "Add green chilli and turmeric.",
+      "Toss in the boiled potatoes with salt.",
+      "Stir-fry on medium heat for 5-7 minutes until edges crisp.",
+      "Garnish with coriander and serve."
+    ]
+  },
+  {
+    "id": "egg-bhurji",
+    "name": "Egg Bhurji",
+    "emoji": "🍳",
+    "cuisine": "indian",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "quick"],
+    "time_minutes": 15,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "egg", "quantity": "4, beaten"},
+      {"name": "onion", "quantity": "1, finely chopped"},
+      {"name": "tomato", "quantity": "1, chopped"},
+      {"name": "green chilli", "quantity": "1, chopped", "optional": true},
+      {"name": "turmeric", "quantity": "1/4 tsp"},
+      {"name": "oil", "quantity": "1 tbsp"},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "coriander leaves", "quantity": "a handful", "optional": true}
+    ],
+    "instructions": [
+      "Heat oil and saute the onion until soft.",
+      "Add tomato, green chilli, turmeric and salt; cook for 2 minutes.",
+      "Pour in the beaten eggs.",
+      "Scramble on medium heat until just set, keeping it soft.",
+      "Garnish with coriander and serve with bread or roti."
+    ]
+  },
+  {
+    "id": "bread-omelette",
+    "name": "Bread Omelette",
+    "emoji": "🍞",
+    "cuisine": "indian",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "quick"],
+    "time_minutes": 10,
+    "servings": 1,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "egg", "quantity": "2"},
+      {"name": "bread", "quantity": "2 slices"},
+      {"name": "onion", "quantity": "1/2, finely chopped"},
+      {"name": "tomato", "quantity": "1/2, chopped", "optional": true},
+      {"name": "green chilli", "quantity": "1, chopped", "optional": true},
+      {"name": "oil", "quantity": "1 tbsp"},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "black pepper", "quantity": "a pinch"}
+    ],
+    "instructions": [
+      "Beat the eggs with onion, tomato, chilli, salt and pepper.",
+      "Heat a little oil in a pan and pour in the egg mixture.",
+      "Place the bread slices on top while the egg is still runny.",
+      "Flip so the bread soaks up the egg and turns golden.",
+      "Fold and serve hot with ketchup."
+    ]
+  },
+  {
+    "id": "masala-omelette",
+    "name": "Masala Omelette",
+    "emoji": "🍳",
+    "cuisine": "indian",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "quick"],
+    "time_minutes": 10,
+    "servings": 1,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "egg", "quantity": "3"},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "tomato", "quantity": "1, chopped", "optional": true},
+      {"name": "green chilli", "quantity": "1, chopped", "optional": true},
+      {"name": "coriander leaves", "quantity": "a handful", "optional": true},
+      {"name": "oil", "quantity": "1 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Whisk the eggs with all the chopped vegetables and salt.",
+      "Heat oil in a non-stick pan.",
+      "Pour in the mixture and spread evenly.",
+      "Cook until the base sets, then fold and cook the other side.",
+      "Serve hot with toast."
+    ]
+  },
+  {
+    "id": "french-toast",
+    "name": "French Toast",
+    "emoji": "🍞",
+    "cuisine": "continental",
+    "diet": ["non-veg"],
+    "categories": ["quick", "balanced"],
+    "time_minutes": 12,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "bread", "quantity": "4 slices"},
+      {"name": "egg", "quantity": "2"},
+      {"name": "milk", "quantity": "1/4 cup"},
+      {"name": "sugar", "quantity": "1 tbsp"},
+      {"name": "butter", "quantity": "1 tbsp", "optional": true},
+      {"name": "cinnamon", "quantity": "a pinch", "optional": true}
+    ],
+    "instructions": [
+      "Whisk the eggs with milk, sugar and cinnamon.",
+      "Dip each bread slice so both sides are coated.",
+      "Melt a little butter in a pan on medium heat.",
+      "Cook each slice until golden on both sides.",
+      "Serve warm, with honey or fruit if you like."
+    ]
+  },
+  {
+    "id": "chicken-tomato-rice",
+    "name": "Chicken Tomato Rice",
+    "emoji": "🍗",
+    "cuisine": "indian",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "balanced"],
+    "time_minutes": 30,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "chicken", "quantity": "250 g, cubed"},
+      {"name": "rice", "quantity": "1 cup"},
+      {"name": "tomato", "quantity": "2, chopped"},
+      {"name": "onion", "quantity": "1, sliced"},
+      {"name": "garlic", "quantity": "4 cloves"},
+      {"name": "ginger", "quantity": "1 tsp"},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "garam masala", "quantity": "1 tsp"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "coriander leaves", "quantity": "to garnish", "optional": true}
+    ],
+    "instructions": [
+      "Rinse the rice and soak for 15 minutes.",
+      "Fry onion in oil until golden, then add ginger and garlic.",
+      "Add the chicken and sear until it changes colour.",
+      "Stir in tomatoes and spices; cook until pulpy.",
+      "Add the rice and 2 cups water, season, and bring to a boil.",
+      "Cover and cook on low until the rice is fluffy, about 15 minutes.",
+      "Rest for 5 minutes, garnish and serve."
+    ]
+  },
+  {
+    "id": "chicken-fried-rice",
+    "name": "Chicken Fried Rice",
+    "emoji": "🍚",
+    "cuisine": "chinese",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "quick"],
+    "time_minutes": 20,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "rice", "quantity": "2 cups, cooked and cooled"},
+      {"name": "chicken", "quantity": "150 g, diced"},
+      {"name": "egg", "quantity": "2"},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "garlic", "quantity": "3 cloves, minced"},
+      {"name": "soy sauce", "quantity": "2 tbsp"},
+      {"name": "capsicum", "quantity": "1/2, diced", "optional": true},
+      {"name": "spring onion", "quantity": "2 stalks", "optional": true},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "black pepper", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Heat oil on high and stir-fry the chicken until cooked.",
+      "Push aside, scramble the eggs in the same pan.",
+      "Add garlic, onion and capsicum; toss for a minute.",
+      "Add the cold rice and soy sauce; stir-fry on high heat.",
+      "Season with salt and pepper, mix in spring onion and serve."
+    ]
+  },
+  {
+    "id": "one-pan-chicken-rice",
+    "name": "One-Pan Chicken & Rice",
+    "emoji": "🥘",
+    "cuisine": "continental",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "balanced"],
+    "time_minutes": 35,
+    "servings": 3,
+    "difficulty": "Medium",
+    "ingredients": [
+      {"name": "chicken", "quantity": "400 g, pieces"},
+      {"name": "rice", "quantity": "1.5 cups"},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "garlic", "quantity": "4 cloves"},
+      {"name": "carrot", "quantity": "1, diced", "optional": true},
+      {"name": "peas", "quantity": "1/2 cup", "optional": true},
+      {"name": "black pepper", "quantity": "1 tsp"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Brown the chicken pieces in oil, then set aside.",
+      "Saute onion, garlic and carrot in the same pan.",
+      "Add the rice and toast for a minute.",
+      "Pour in 3 cups water, season, and return the chicken.",
+      "Cover and simmer for 18-20 minutes until the rice is done.",
+      "Stir through the peas at the end and rest before serving."
+    ]
+  },
+  {
+    "id": "chicken-curry",
+    "name": "Home-Style Chicken Curry",
+    "emoji": "🍛",
+    "cuisine": "indian",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "balanced"],
+    "time_minutes": 40,
+    "servings": 4,
+    "difficulty": "Medium",
+    "ingredients": [
+      {"name": "chicken", "quantity": "600 g"},
+      {"name": "onion", "quantity": "2, finely chopped"},
+      {"name": "tomato", "quantity": "3, pureed"},
+      {"name": "garlic", "quantity": "6 cloves"},
+      {"name": "ginger", "quantity": "1 tbsp"},
+      {"name": "yogurt", "quantity": "1/2 cup", "optional": true},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "red chilli powder", "quantity": "1 tsp"},
+      {"name": "garam masala", "quantity": "1 tsp"},
+      {"name": "oil", "quantity": "3 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Fry onions in oil until deep golden.",
+      "Add ginger-garlic and cook off the raw smell.",
+      "Add tomato puree and spices; cook until oil separates.",
+      "Add chicken and sear, then stir in yogurt.",
+      "Add 1.5 cups water, cover and simmer for 25 minutes.",
+      "Finish with garam masala and serve with rice or roti."
+    ]
+  },
+  {
+    "id": "chicken-pulao",
+    "name": "Chicken Pulao",
+    "emoji": "🍚",
+    "cuisine": "indian",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "balanced"],
+    "time_minutes": 45,
+    "servings": 4,
+    "difficulty": "Medium",
+    "ingredients": [
+      {"name": "chicken", "quantity": "500 g"},
+      {"name": "rice", "quantity": "2 cups"},
+      {"name": "onion", "quantity": "2, sliced"},
+      {"name": "tomato", "quantity": "1, chopped", "optional": true},
+      {"name": "garlic", "quantity": "5 cloves"},
+      {"name": "ginger", "quantity": "1 tbsp"},
+      {"name": "yogurt", "quantity": "1/2 cup", "optional": true},
+      {"name": "garam masala", "quantity": "1 tsp"},
+      {"name": "bay leaf", "quantity": "1"},
+      {"name": "oil", "quantity": "3 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Soak the rice for 20 minutes.",
+      "Fry onions until golden, reserve some for garnish.",
+      "Add ginger-garlic, chicken and spices; brown well.",
+      "Stir in yogurt and tomato, then the drained rice.",
+      "Add 3.5 cups water and salt; bring to a boil.",
+      "Cover and cook on low for 15 minutes, then rest and fluff."
+    ]
+  },
+  {
+    "id": "veg-fried-rice",
+    "name": "Vegetable Fried Rice",
+    "emoji": "🍚",
+    "cuisine": "chinese",
+    "diet": ["vegetarian", "vegan"],
+    "categories": ["vegetable-rich", "quick"],
+    "time_minutes": 20,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "rice", "quantity": "2 cups, cooked"},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "carrot", "quantity": "1, diced"},
+      {"name": "capsicum", "quantity": "1, diced"},
+      {"name": "peas", "quantity": "1/2 cup", "optional": true},
+      {"name": "garlic", "quantity": "3 cloves"},
+      {"name": "soy sauce", "quantity": "2 tbsp"},
+      {"name": "spring onion", "quantity": "2 stalks", "optional": true},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Heat oil on high and fry the garlic.",
+      "Add the vegetables and stir-fry for 2-3 minutes to keep them crunchy.",
+      "Add the cold rice and soy sauce.",
+      "Toss on high heat until well combined.",
+      "Finish with spring onion and serve hot."
+    ]
+  },
+  {
+    "id": "tomato-rice",
+    "name": "Tomato Rice",
+    "emoji": "🍅",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["quick", "balanced"],
+    "time_minutes": 25,
+    "servings": 3,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "rice", "quantity": "1.5 cups, cooked"},
+      {"name": "tomato", "quantity": "3, chopped"},
+      {"name": "onion", "quantity": "1, sliced"},
+      {"name": "garlic", "quantity": "3 cloves", "optional": true},
+      {"name": "mustard seeds", "quantity": "1 tsp"},
+      {"name": "curry leaves", "quantity": "a sprig", "optional": true},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Temper mustard seeds and curry leaves in hot oil.",
+      "Add onion and garlic; fry until soft.",
+      "Add tomatoes and turmeric; cook to a thick masala.",
+      "Fold in the cooked rice and salt gently.",
+      "Warm through and serve with raita or papad."
+    ]
+  },
+  {
+    "id": "veg-pulao",
+    "name": "Vegetable Pulao",
+    "emoji": "🥕",
+    "cuisine": "indian",
+    "diet": ["vegetarian", "vegan"],
+    "categories": ["vegetable-rich", "balanced"],
+    "time_minutes": 30,
+    "servings": 3,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "rice", "quantity": "1.5 cups"},
+      {"name": "onion", "quantity": "1, sliced"},
+      {"name": "carrot", "quantity": "1, diced"},
+      {"name": "peas", "quantity": "1/2 cup"},
+      {"name": "potato", "quantity": "1, cubed", "optional": true},
+      {"name": "garlic", "quantity": "3 cloves", "optional": true},
+      {"name": "garam masala", "quantity": "1 tsp"},
+      {"name": "bay leaf", "quantity": "1"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Soak the rice for 15 minutes.",
+      "Saute onion and whole spices in oil.",
+      "Add the vegetables and toss for a couple of minutes.",
+      "Add the drained rice, 3 cups water and salt.",
+      "Cover and cook on low for 15 minutes; rest and fluff."
+    ]
+  },
+  {
+    "id": "paneer-bhurji",
+    "name": "Paneer Bhurji",
+    "emoji": "🧀",
+    "cuisine": "indian",
+    "diet": ["vegetarian"],
+    "categories": ["high-protein", "quick"],
+    "time_minutes": 15,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "paneer", "quantity": "200 g, crumbled"},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "tomato", "quantity": "1, chopped"},
+      {"name": "green chilli", "quantity": "1", "optional": true},
+      {"name": "turmeric", "quantity": "1/4 tsp"},
+      {"name": "garam masala", "quantity": "1/2 tsp"},
+      {"name": "oil", "quantity": "1 tbsp"},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "coriander leaves", "quantity": "a handful", "optional": true}
+    ],
+    "instructions": [
+      "Saute onion until translucent.",
+      "Add tomato, chilli and spices; cook for 2 minutes.",
+      "Add the crumbled paneer and salt.",
+      "Stir gently for 3-4 minutes so it stays soft.",
+      "Garnish with coriander and serve with roti."
+    ]
+  },
+  {
+    "id": "palak-paneer",
+    "name": "Palak Paneer",
+    "emoji": "🥬",
+    "cuisine": "indian",
+    "diet": ["vegetarian"],
+    "categories": ["vegetable-rich", "high-protein", "balanced"],
+    "time_minutes": 35,
+    "servings": 3,
+    "difficulty": "Medium",
+    "ingredients": [
+      {"name": "spinach", "quantity": "1 large bunch"},
+      {"name": "paneer", "quantity": "200 g, cubed"},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "tomato", "quantity": "1, chopped"},
+      {"name": "garlic", "quantity": "4 cloves"},
+      {"name": "ginger", "quantity": "1 tsp"},
+      {"name": "garam masala", "quantity": "1/2 tsp"},
+      {"name": "cream", "quantity": "2 tbsp", "optional": true},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Blanch the spinach briefly, then blend to a puree.",
+      "Saute onion, ginger and garlic in oil.",
+      "Add tomato and cook until soft.",
+      "Add the spinach puree, salt and garam masala; simmer 5 minutes.",
+      "Fold in paneer and cream; warm through and serve."
+    ]
+  },
+  {
+    "id": "matar-paneer",
+    "name": "Matar Paneer",
+    "emoji": "🟢",
+    "cuisine": "indian",
+    "diet": ["vegetarian"],
+    "categories": ["high-protein", "balanced"],
+    "time_minutes": 35,
+    "servings": 3,
+    "difficulty": "Medium",
+    "ingredients": [
+      {"name": "paneer", "quantity": "200 g, cubed"},
+      {"name": "peas", "quantity": "1 cup"},
+      {"name": "onion", "quantity": "1, pureed"},
+      {"name": "tomato", "quantity": "2, pureed"},
+      {"name": "ginger", "quantity": "1 tsp"},
+      {"name": "garlic", "quantity": "3 cloves"},
+      {"name": "garam masala", "quantity": "1 tsp"},
+      {"name": "cream", "quantity": "2 tbsp", "optional": true},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Fry the onion puree in oil until golden.",
+      "Add ginger-garlic and tomato puree; cook until thick.",
+      "Add spices, peas and 1 cup water; simmer until peas are done.",
+      "Add paneer and cream; simmer 5 more minutes.",
+      "Serve hot with naan or rice."
+    ]
+  },
+  {
+    "id": "dal-tadka",
+    "name": "Dal Tadka",
+    "emoji": "🍲",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["high-protein", "lower-oil", "balanced"],
+    "time_minutes": 35,
+    "servings": 4,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "lentils", "quantity": "1 cup"},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "tomato", "quantity": "1, chopped"},
+      {"name": "garlic", "quantity": "4 cloves"},
+      {"name": "ginger", "quantity": "1 tsp", "optional": true},
+      {"name": "cumin seeds", "quantity": "1 tsp"},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "red chilli powder", "quantity": "1/2 tsp"},
+      {"name": "ghee", "quantity": "1 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Boil the lentils with turmeric and salt until soft.",
+      "In another pan, heat ghee and crackle cumin seeds.",
+      "Add garlic, onion and ginger; fry until golden.",
+      "Add tomato and chilli powder; cook to a paste.",
+      "Pour the tempering over the cooked dal and simmer 5 minutes.",
+      "Serve with rice or roti."
+    ]
+  },
+  {
+    "id": "chana-masala",
+    "name": "Chana Masala",
+    "emoji": "🍛",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["high-protein", "balanced"],
+    "time_minutes": 30,
+    "servings": 3,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "chickpeas", "quantity": "2 cups, boiled"},
+      {"name": "onion", "quantity": "2, chopped"},
+      {"name": "tomato", "quantity": "2, pureed"},
+      {"name": "garlic", "quantity": "4 cloves"},
+      {"name": "ginger", "quantity": "1 tsp"},
+      {"name": "garam masala", "quantity": "1 tsp"},
+      {"name": "red chilli powder", "quantity": "1/2 tsp"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Fry onion until golden, then add ginger-garlic.",
+      "Add tomato puree and spices; cook until oil separates.",
+      "Add the boiled chickpeas and a cup of water.",
+      "Simmer for 15 minutes, mashing a few chickpeas to thicken.",
+      "Serve with rice, bhatura or bread."
+    ]
+  },
+  {
+    "id": "rajma-masala",
+    "name": "Rajma Masala",
+    "emoji": "🫘",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["high-protein", "balanced"],
+    "time_minutes": 40,
+    "servings": 4,
+    "difficulty": "Medium",
+    "ingredients": [
+      {"name": "kidney beans", "quantity": "1.5 cups, soaked overnight"},
+      {"name": "onion", "quantity": "2, chopped"},
+      {"name": "tomato", "quantity": "3, pureed"},
+      {"name": "garlic", "quantity": "5 cloves"},
+      {"name": "ginger", "quantity": "1 tbsp"},
+      {"name": "garam masala", "quantity": "1 tsp"},
+      {"name": "cumin seeds", "quantity": "1 tsp"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Pressure-cook the soaked kidney beans until soft.",
+      "Fry cumin, then onion until golden.",
+      "Add ginger-garlic and tomato puree; cook well.",
+      "Add spices and the cooked beans with their water.",
+      "Simmer 15-20 minutes until thick; serve with rice."
+    ]
+  },
+  {
+    "id": "veg-curry",
+    "name": "Mixed Vegetable Curry",
+    "emoji": "🥘",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["vegetable-rich", "balanced"],
+    "time_minutes": 35,
+    "servings": 4,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "potato", "quantity": "2, cubed"},
+      {"name": "carrot", "quantity": "1, diced"},
+      {"name": "peas", "quantity": "1/2 cup"},
+      {"name": "cauliflower", "quantity": "1 cup florets", "optional": true},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "tomato", "quantity": "2, pureed"},
+      {"name": "garlic", "quantity": "3 cloves"},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "garam masala", "quantity": "1 tsp"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Saute onion and garlic in oil.",
+      "Add tomato puree and spices; cook to a masala.",
+      "Add all the vegetables and stir to coat.",
+      "Add 1.5 cups water, cover, and simmer until tender.",
+      "Adjust seasoning and serve with roti or rice."
+    ]
+  },
+  {
+    "id": "aloo-gobi",
+    "name": "Aloo Gobi",
+    "emoji": "🥦",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["vegetable-rich", "lower-oil"],
+    "time_minutes": 30,
+    "servings": 3,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "potato", "quantity": "2, cubed"},
+      {"name": "cauliflower", "quantity": "1 small, florets"},
+      {"name": "onion", "quantity": "1, chopped", "optional": true},
+      {"name": "tomato", "quantity": "1, chopped"},
+      {"name": "ginger", "quantity": "1 tsp"},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "cumin seeds", "quantity": "1 tsp"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Crackle cumin in hot oil, add ginger.",
+      "Add potato and cauliflower; toss with turmeric and salt.",
+      "Add tomato, cover and cook on low, stirring occasionally.",
+      "Cook until both vegetables are tender, about 20 minutes.",
+      "Finish with a sprinkle of garam masala if you like."
+    ]
+  },
+  {
+    "id": "veg-pasta",
+    "name": "Veg Tomato Pasta",
+    "emoji": "🍝",
+    "cuisine": "italian",
+    "diet": ["vegetarian"],
+    "categories": ["vegetable-rich", "quick", "balanced"],
+    "time_minutes": 25,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "pasta", "quantity": "200 g"},
+      {"name": "tomato", "quantity": "3, pureed"},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "garlic", "quantity": "4 cloves"},
+      {"name": "capsicum", "quantity": "1, diced", "optional": true},
+      {"name": "cheese", "quantity": "to top", "optional": true},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "black pepper", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Boil the pasta in salted water until al dente; drain.",
+      "Saute garlic and onion in oil.",
+      "Add tomato puree and capsicum; simmer into a sauce.",
+      "Season with salt and pepper.",
+      "Toss the pasta through the sauce and top with cheese."
+    ]
+  },
+  {
+    "id": "garlic-butter-noodles",
+    "name": "Garlic Butter Noodles",
+    "emoji": "🍜",
+    "cuisine": "asian",
+    "diet": ["vegetarian"],
+    "categories": ["quick"],
+    "time_minutes": 15,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "noodles", "quantity": "2 portions"},
+      {"name": "garlic", "quantity": "6 cloves, minced"},
+      {"name": "butter", "quantity": "2 tbsp"},
+      {"name": "soy sauce", "quantity": "1 tbsp"},
+      {"name": "spring onion", "quantity": "2 stalks", "optional": true},
+      {"name": "black pepper", "quantity": "to taste"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Boil the noodles, drain and set aside.",
+      "Melt butter and gently fry the garlic until fragrant.",
+      "Add soy sauce and pepper.",
+      "Toss the noodles until well coated.",
+      "Top with spring onion and serve."
+    ]
+  },
+  {
+    "id": "veg-noodles",
+    "name": "Hakka Veg Noodles",
+    "emoji": "🍜",
+    "cuisine": "chinese",
+    "diet": ["vegetarian", "vegan"],
+    "categories": ["vegetable-rich", "quick"],
+    "time_minutes": 20,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "noodles", "quantity": "2 portions"},
+      {"name": "cabbage", "quantity": "1 cup, shredded"},
+      {"name": "carrot", "quantity": "1, julienned"},
+      {"name": "capsicum", "quantity": "1, sliced"},
+      {"name": "garlic", "quantity": "4 cloves"},
+      {"name": "soy sauce", "quantity": "2 tbsp"},
+      {"name": "spring onion", "quantity": "2 stalks", "optional": true},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Boil and drain the noodles; toss with a little oil.",
+      "Stir-fry garlic and all the vegetables on high heat.",
+      "Add soy sauce and salt.",
+      "Add the noodles and toss until combined.",
+      "Finish with spring onion and serve hot."
+    ]
+  },
+  {
+    "id": "scrambled-eggs-toast",
+    "name": "Scrambled Eggs on Toast",
+    "emoji": "🍳",
+    "cuisine": "continental",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "quick", "balanced"],
+    "time_minutes": 10,
+    "servings": 1,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "egg", "quantity": "3"},
+      {"name": "bread", "quantity": "2 slices"},
+      {"name": "butter", "quantity": "1 tbsp"},
+      {"name": "milk", "quantity": "2 tbsp", "optional": true},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "black pepper", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Whisk the eggs with milk, salt and pepper.",
+      "Toast the bread and butter it.",
+      "Melt butter in a pan on low heat.",
+      "Add the eggs and stir gently until just set and creamy.",
+      "Pile onto the toast and serve immediately."
+    ]
+  },
+  {
+    "id": "veg-omelette",
+    "name": "Loaded Veggie Omelette",
+    "emoji": "🍳",
+    "cuisine": "continental",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "vegetable-rich", "quick"],
+    "time_minutes": 12,
+    "servings": 1,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "egg", "quantity": "3"},
+      {"name": "onion", "quantity": "1/2, chopped"},
+      {"name": "tomato", "quantity": "1/2, chopped"},
+      {"name": "capsicum", "quantity": "1/4, chopped", "optional": true},
+      {"name": "cheese", "quantity": "2 tbsp, grated", "optional": true},
+      {"name": "oil", "quantity": "1 tbsp"},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "black pepper", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Beat the eggs with salt and pepper.",
+      "Lightly soften the vegetables in a little oil.",
+      "Pour the eggs over and let the base set.",
+      "Scatter cheese on one half and fold over.",
+      "Slide onto a plate and serve warm."
+    ]
+  },
+  {
+    "id": "tomato-soup",
+    "name": "Fresh Tomato Soup",
+    "emoji": "🍅",
+    "cuisine": "continental",
+    "diet": ["vegetarian"],
+    "categories": ["vegetable-rich", "lower-oil", "quick"],
+    "time_minutes": 25,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "tomato", "quantity": "5, chopped"},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "garlic", "quantity": "3 cloves"},
+      {"name": "butter", "quantity": "1 tbsp", "optional": true},
+      {"name": "black pepper", "quantity": "to taste"},
+      {"name": "salt", "quantity": "to taste"},
+      {"name": "sugar", "quantity": "1 tsp", "optional": true}
+    ],
+    "instructions": [
+      "Simmer tomato, onion and garlic with 2 cups water until soft.",
+      "Blend smooth and strain if you like it silky.",
+      "Return to the pan with butter, salt, pepper and sugar.",
+      "Simmer for 5 minutes.",
+      "Serve hot, ideally with toast."
+    ]
+  },
+  {
+    "id": "masala-maggi",
+    "name": "Veggie Masala Maggi",
+    "emoji": "🍜",
+    "cuisine": "indian",
+    "diet": ["vegetarian", "vegan"],
+    "categories": ["quick", "vegetable-rich"],
+    "time_minutes": 12,
+    "servings": 1,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "noodles", "quantity": "1 packet"},
+      {"name": "onion", "quantity": "1/2, chopped"},
+      {"name": "tomato", "quantity": "1/2, chopped"},
+      {"name": "peas", "quantity": "2 tbsp", "optional": true},
+      {"name": "carrot", "quantity": "2 tbsp, diced", "optional": true},
+      {"name": "turmeric", "quantity": "a pinch"},
+      {"name": "oil", "quantity": "1 tsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Saute onion, tomato and vegetables in oil for 2 minutes.",
+      "Add 1.5 cups water and bring to a boil.",
+      "Add the noodles and the masala.",
+      "Cook for 2-3 minutes until the water is mostly absorbed.",
+      "Serve hot."
+    ]
+  },
+  {
+    "id": "poha",
+    "name": "Kanda Poha",
+    "emoji": "🍚",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["quick", "lower-oil", "balanced"],
+    "time_minutes": 20,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "flattened rice", "quantity": "2 cups"},
+      {"name": "onion", "quantity": "1, chopped"},
+      {"name": "potato", "quantity": "1, diced", "optional": true},
+      {"name": "green chilli", "quantity": "1", "optional": true},
+      {"name": "mustard seeds", "quantity": "1 tsp"},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "peanut", "quantity": "2 tbsp", "optional": true},
+      {"name": "lemon", "quantity": "1/2", "optional": true},
+      {"name": "oil", "quantity": "1 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Rinse the flattened rice and drain; keep aside.",
+      "Temper mustard seeds and peanuts in oil.",
+      "Add onion, potato and chilli; cook until soft.",
+      "Add turmeric and salt, then fold in the flattened rice.",
+      "Warm through, squeeze lemon on top and serve."
+    ]
+  },
+  {
+    "id": "besan-chilla",
+    "name": "Besan Chilla",
+    "emoji": "🥞",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["high-protein", "lower-oil", "quick"],
+    "time_minutes": 20,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "gram flour", "quantity": "1 cup"},
+      {"name": "onion", "quantity": "1, finely chopped"},
+      {"name": "tomato", "quantity": "1, finely chopped"},
+      {"name": "green chilli", "quantity": "1", "optional": true},
+      {"name": "turmeric", "quantity": "1/4 tsp"},
+      {"name": "oil", "quantity": "for cooking"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Whisk gram flour with water into a smooth, pourable batter.",
+      "Stir in the vegetables, turmeric and salt.",
+      "Heat a pan and lightly oil it.",
+      "Pour a ladle of batter and spread into a thin pancake.",
+      "Cook both sides until golden and serve with chutney."
+    ]
+  },
+  {
+    "id": "veg-grilled-sandwich",
+    "name": "Veg Grilled Sandwich",
+    "emoji": "🥪",
+    "cuisine": "continental",
+    "diet": ["vegetarian"],
+    "categories": ["quick", "vegetable-rich"],
+    "time_minutes": 15,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "bread", "quantity": "4 slices"},
+      {"name": "potato", "quantity": "1, boiled and sliced", "optional": true},
+      {"name": "onion", "quantity": "1, sliced"},
+      {"name": "tomato", "quantity": "1, sliced"},
+      {"name": "cucumber", "quantity": "1/2, sliced", "optional": true},
+      {"name": "cheese", "quantity": "2 slices", "optional": true},
+      {"name": "butter", "quantity": "for spreading"},
+      {"name": "black pepper", "quantity": "to taste"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Butter the bread slices on the outside.",
+      "Layer potato, onion, tomato, cucumber and cheese.",
+      "Season with salt and pepper.",
+      "Close the sandwich and grill or toast until golden.",
+      "Cut and serve with ketchup."
+    ]
+  },
+  {
+    "id": "fish-fry",
+    "name": "Pan Fish Fry",
+    "emoji": "🐟",
+    "cuisine": "indian",
+    "diet": ["non-veg"],
+    "categories": ["high-protein", "quick", "lower-oil"],
+    "time_minutes": 25,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "fish", "quantity": "4 fillets"},
+      {"name": "garlic", "quantity": "4 cloves, paste"},
+      {"name": "ginger", "quantity": "1 tsp"},
+      {"name": "turmeric", "quantity": "1/2 tsp"},
+      {"name": "red chilli powder", "quantity": "1 tsp"},
+      {"name": "lemon", "quantity": "1"},
+      {"name": "oil", "quantity": "3 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Marinate the fish with ginger-garlic, spices, lemon and salt for 20 minutes.",
+      "Heat oil in a pan.",
+      "Fry the fish on medium heat until golden on both sides.",
+      "Drain on paper and squeeze over more lemon.",
+      "Serve hot with onion rings."
+    ]
+  },
+  {
+    "id": "mushroom-masala",
+    "name": "Mushroom Masala",
+    "emoji": "🍄",
+    "cuisine": "indian",
+    "diet": ["vegan", "vegetarian"],
+    "categories": ["vegetable-rich", "balanced"],
+    "time_minutes": 30,
+    "servings": 3,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "mushroom", "quantity": "300 g, sliced"},
+      {"name": "onion", "quantity": "2, chopped"},
+      {"name": "tomato", "quantity": "2, pureed"},
+      {"name": "garlic", "quantity": "4 cloves"},
+      {"name": "ginger", "quantity": "1 tsp"},
+      {"name": "garam masala", "quantity": "1 tsp"},
+      {"name": "oil", "quantity": "2 tbsp"},
+      {"name": "salt", "quantity": "to taste"}
+    ],
+    "instructions": [
+      "Saute onion until golden, add ginger-garlic.",
+      "Add tomato puree and spices; cook until thick.",
+      "Add the mushrooms and salt.",
+      "Cook uncovered until the mushrooms release and reabsorb their liquid.",
+      "Serve with roti or rice."
+    ]
+  },
+  {
+    "id": "banana-oat-pancakes",
+    "name": "Banana Oat Pancakes",
+    "emoji": "🥞",
+    "cuisine": "continental",
+    "diet": ["vegetarian"],
+    "categories": ["balanced", "quick"],
+    "time_minutes": 20,
+    "servings": 2,
+    "difficulty": "Easy",
+    "ingredients": [
+      {"name": "banana", "quantity": "2, ripe"},
+      {"name": "oats", "quantity": "1 cup"},
+      {"name": "egg", "quantity": "2"},
+      {"name": "milk", "quantity": "1/4 cup", "optional": true},
+      {"name": "honey", "quantity": "to drizzle", "optional": true},
+      {"name": "butter", "quantity": "for cooking", "optional": true}
+    ],
+    "instructions": [
+      "Blend banana, oats, eggs and milk into a batter.",
+      "Rest for 5 minutes to thicken.",
+      "Heat a lightly buttered pan on medium.",
+      "Pour small rounds and cook until bubbles form, then flip.",
+      "Serve warm drizzled with honey."
+    ]
+  }
+]

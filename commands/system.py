@@ -21,12 +21,13 @@ HELP_BLURBS = {
     "afk": "temporary AFK status",
     "translate": "translate a short text",
     "define": "what does that word mean",
+    "recipe": "recipes from ingredients you have",
     "summarize": "recap recent chat in this channel",
 }
 
 HELP_GROUPS = {
     "🎲 fun": ("ping", "coinflip", "choose"),
-    "🧰 useful": ("remind", "poll", "afk", "translate", "define"),
+    "🧰 useful": ("remind", "poll", "afk", "translate", "define", "recipe"),
     "🤖 ai": ("summarize",),
 }
 
