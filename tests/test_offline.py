@@ -36,7 +36,8 @@ from functions.presence import NOTES, ROTATE_SECONDS, WATCHING, PresenceManager 
 
 EXPECTED_COMMANDS = {
     "ping", "coinflip", "choose",
-    "remind", "poll", "afk", "translate", "dictionary", "define", "recipe",
+    "remind", "poll", "afk", "translate", "search", "weather", "convert",
+    "time", "settimezone", "vc", "dictionary", "define", "recipe",
     "summarize", "help",
 }
 

@@ -21,6 +21,7 @@ log = logging.getLogger("paradise")
 EXTENSIONS = (
     "commands.fun",
     "commands.utility",
+    "commands.vc",
     "commands.dictionary",
     "commands.recipe",
     "commands.ai",
@@ -61,6 +62,7 @@ class ParadiseBot(commands.Bot):
     def __init__(self, config: Config) -> None:
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.voice_states = True
         super().__init__(
             command_prefix=commands.when_mentioned,
             intents=intents,
@@ -115,12 +117,18 @@ class ParadiseBot(commands.Bot):
             self._ready_logged = True
         else:
             log.info("Paradise reconnected")
-            # Re-assert the presence after a reconnect; the rotation timer
-            # itself keeps running and is never duplicated.
             try:
                 await self.presence_manager.apply_current()
             except Exception:
                 log.debug("Presence re-apply failed", exc_info=True)
+
+        # Reconcile voice sessions after connect / reconnect
+        voice_cog = self.get_cog("Voice") or self.get_cog("vc")
+        if voice_cog and hasattr(voice_cog, "tracker"):
+            try:
+                await voice_cog.tracker.reconcile_guilds()
+            except Exception:
+                log.exception("Voice startup reconciliation failed")
 
     # ------------------------------------------------------------------
     # Messages: AFK, AI mentions, personality
@@ -137,8 +145,6 @@ class ParadiseBot(commands.Bot):
         except Exception:
             log.exception("AFK handling failed")
 
-        # "define hello" and friends are answered before anything else looks
-        # at the message, so the AI and the personality never double up on it.
         try:
             if await self._maybe_dictionary(message):
                 return
@@ -153,7 +159,6 @@ class ParadiseBot(commands.Bot):
         try:
             await self.personality.handle(message)
         except Exception:
-            # Personality is optional; a bad message should never take down the client.
             log.exception("Personality handler failed")
 
     # -- AFK ----------------------------------------------------------------
@@ -200,7 +205,6 @@ class ParadiseBot(commands.Bot):
     # -- Dictionary -----------------------------------------------------------
 
     async def _maybe_dictionary(self, message: discord.Message) -> bool:
-        """Answer plain-chat dictionary requests. False means "not one"."""
         cog = self.get_cog("Dictionary")
         handler = getattr(cog, "handle_message", None)
         if handler is None:
@@ -226,7 +230,7 @@ class ParadiseBot(commands.Bot):
             return
 
         if self.ai.cooldown_remaining(message) > 0:
-            return  # stay quiet rather than nag
+            return
 
         try:
             answer = await asyncio.wait_for(self.ai.respond(message), timeout=60)
@@ -234,7 +238,6 @@ class ParadiseBot(commands.Bot):
             log.warning("AI answer timed out")
             return
         except Exception as error:
-            # ParadiseError messages are safe to show; anything else stays quiet.
             from functions.helpers import ParadiseError
 
             if isinstance(error, ParadiseError):
@@ -266,7 +269,6 @@ def main() -> int:
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     )
-    # discord.py's HTTP logger can include request details; warnings are enough here.
     logging.getLogger("discord.http").setLevel(logging.WARNING)
 
     config = load_config()
