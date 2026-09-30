@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 from collections import Counter
 from dataclasses import dataclass
@@ -28,7 +29,7 @@ from functions.time import (
     resolve_timezone,
 )
 from functions.voice.database import VoiceDatabase
-from functions.weather import OpenMeteoWeatherService, build_weather_embed
+from functions.weather import OpenMeteoWeatherService, build_weather_embed, render_weather_card
 
 log = logging.getLogger(__name__)
 
@@ -176,8 +177,17 @@ class Utility(commands.Cog):
             )
             return
 
-        embed = build_weather_embed(data)
-        await interaction.followup.send(embed=embed)
+        # Rendering is isolated from the Discord event loop and has a defensive
+        # text fallback so optional font/image failures never break the command.
+        try:
+            image = await asyncio.to_thread(render_weather_card, data)
+            await interaction.followup.send(
+                content=f"Weather for {data.location.name}",
+                file=discord.File(io.BytesIO(image), filename="weather.png"),
+            )
+        except Exception as err:
+            log.warning("Weather card rendering failed: %s", err, exc_info=True)
+            await interaction.followup.send(embed=build_weather_embed(data))
 
     # -- convert ----------------------------------------------------------
 
