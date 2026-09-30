@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 
 @dataclass(slots=True)
@@ -12,7 +13,7 @@ class LocationInfo:
 
     name: str
     country: str = ""
-    admin1: str = ""  # State/Region/Province
+    admin1: str = ""
     latitude: float = 0.0
     longitude: float = 0.0
     timezone: str = "UTC"
@@ -29,7 +30,7 @@ class LocationInfo:
 
 @dataclass(slots=True)
 class WeatherData:
-    """Full weather report for a location."""
+    """A provider-shaped weather report. Optional values stay ``None`` when absent."""
 
     location: LocationInfo
     temp_c: float
@@ -48,6 +49,18 @@ class WeatherData:
     uv_index: float | None = None
     forecast_text: str = ""
     updated_at: datetime = field(default_factory=datetime.utcnow)
+    weather_code: int = 0
+    local_time: str | None = None
+    local_date: str | None = None
+    precipitation_mm: float | None = None
+    precipitation_probability: int | None = None
+    pressure_hpa: float | None = None
+    dew_point_c: float | None = None
+    cloud_cover: int | None = None
+    wind_gusts_kmh: float | None = None
+    hourly_forecast: list[dict[str, Any]] = field(default_factory=list)
+    daily_forecast: list[dict[str, Any]] = field(default_factory=list)
+    air_quality: dict[str, Any] | None = None
 
     @property
     def temp_f(self) -> float:
@@ -71,6 +84,4 @@ class WeatherData:
 
     @property
     def visibility_miles(self) -> float | None:
-        if self.visibility_km is None:
-            return None
-        return self.visibility_km * 0.621371
+        return None if self.visibility_km is None else self.visibility_km * 0.621371

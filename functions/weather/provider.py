@@ -6,7 +6,9 @@ import asyncio
 import logging
 import math
 import time
+from datetime import datetime
 from typing import Any, Protocol
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from rapidfuzz import process, fuzz
@@ -206,8 +208,9 @@ class OpenMeteoWeatherService:
             params = {
                 "latitude": f"{location.latitude:.4f}",
                 "longitude": f"{location.longitude:.4f}",
-                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m,visibility",
-                "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max",
+                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,precipitation,rain,showers,snowfall,pressure_msl,surface_pressure,dew_point_2m,cloud_cover",
+                "hourly": "temperature_2m,apparent_temperature,weather_code,precipitation_probability,precipitation,wind_speed_10m,wind_direction_10m",
+                "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max",
                 "timezone": location.timezone or "auto",
             }
             headers = {"User-Agent": USER_AGENT}
@@ -224,74 +227,47 @@ class OpenMeteoWeatherService:
         # Resilient offline/fallback generation if network is unreachable
         return self._generate_fallback_weather(location)
 
-    def _parse_open_meteo_response(
-        self, location: LocationInfo, data: dict[str, Any]
-    ) -> WeatherData:
-        current = data.get("current", {})
-        daily = data.get("daily", {})
-
-        temp_c = float(current.get("temperature_2m", 20.0))
-        feels_like_c = float(current.get("apparent_temperature", temp_c))
+    def _parse_open_meteo_response(self, location: LocationInfo, data: dict[str, Any]) -> WeatherData:
+        current, daily, hourly = data.get("current", {}), data.get("daily", {}), data.get("hourly", {})
+        num = lambda key, default=None: (float(current[key]) if current.get(key) is not None else default)
+        temp_c = num("temperature_2m", 20.0)
+        feels_like_c = num("apparent_temperature", temp_c)
         humidity = int(current.get("relative_humidity_2m", 50))
-        wind_speed = float(current.get("wind_speed_10m", 10.0))
+        wind_speed = num("wind_speed_10m", 10.0)
         wind_deg = int(current.get("wind_direction_10m", 0))
-        wind_dir = _degrees_to_cardinal(wind_deg)
         code = int(current.get("weather_code", 0))
-
         condition, emoji = WMO_CODES.get(code, ("Fair", "🌤️"))
-
-        visibility_m = current.get("visibility")
-        visibility_km = (float(visibility_m) / 1000.0) if visibility_m is not None else None
-
-        # Daily high/low and sun times
-        temp_max_c = temp_c
-        temp_min_c = temp_c
-        sunrise_str = None
-        sunset_str = None
-        uv_index = None
-
-        if daily:
-            max_list = daily.get("temperature_2m_max", [])
-            min_list = daily.get("temperature_2m_min", [])
-            sunrises = daily.get("sunrise", [])
-            sunsets = daily.get("sunset", [])
-            uv_list = daily.get("uv_index_max", [])
-
-            if max_list:
-                temp_max_c = float(max_list[0])
-            if min_list:
-                temp_min_c = float(min_list[0])
-            if sunrises and sunrises[0]:
-                # Extract HH:MM from ISO string
-                sunrise_str = sunrises[0].split("T")[-1][:5]
-            if sunsets and sunsets[0]:
-                sunset_str = sunsets[0].split("T")[-1][:5]
-            if uv_list and uv_list[0] is not None:
-                uv_index = float(uv_list[0])
-
-        forecast_text = (
-            f"{condition} with a high of {round(temp_max_c)}°C ({round(temp_max_c * 9/5 + 32)}°F) "
-            f"and a low of {round(temp_min_c)}°C ({round(temp_min_c * 9/5 + 32)}°F)."
-        )
-
-        return WeatherData(
-            location=location,
-            temp_c=temp_c,
-            feels_like_c=feels_like_c,
-            condition=condition,
-            condition_emoji=emoji,
-            humidity=humidity,
-            wind_speed_kmh=wind_speed,
-            wind_direction=wind_dir,
-            wind_deg=wind_deg,
-            temp_min_c=temp_min_c,
-            temp_max_c=temp_max_c,
-            visibility_km=visibility_km,
-            sunrise=sunrise_str,
-            sunset=sunset_str,
-            uv_index=uv_index,
-            forecast_text=forecast_text,
-        )
+        visibility_km = num("visibility")
+        if visibility_km is not None: visibility_km /= 1000
+        maxes, mins = daily.get("temperature_2m_max", []), daily.get("temperature_2m_min", [])
+        temp_max_c = float(maxes[0]) if maxes and maxes[0] is not None else temp_c
+        temp_min_c = float(mins[0]) if mins and mins[0] is not None else temp_c
+        first = lambda key: daily.get(key, [None])[0]
+        sunrise = first("sunrise"); sunset = first("sunset")
+        sunrise = sunrise.split("T")[-1][:5] if sunrise else None
+        sunset = sunset.split("T")[-1][:5] if sunset else None
+        uv = first("uv_index_max")
+        hourly_rows = []
+        keys = ("time", "temperature_2m", "weather_code", "precipitation_probability", "wind_speed_10m", "wind_direction_10m")
+        for i, stamp in enumerate(hourly.get("time", [])[:24]):
+            row = {k: hourly.get(k, [None] * len(hourly.get("time", [])))[i] for k in keys}
+            hourly_rows.append(row)
+        daily_rows = []
+        for i, date in enumerate(daily.get("time", [])[:7]):
+            get_day = lambda key: daily.get(key, [None] * 7)[i] if i < len(daily.get(key, [])) else None
+            daily_rows.append({"date": date, "code": get_day("weather_code"), "high": get_day("temperature_2m_max"), "low": get_day("temperature_2m_min"), "precipitation_probability": get_day("precipitation_probability_max")})
+        local_time = current.get("time")
+        current_probability = None
+        if hourly_rows and hourly_rows[0].get("precipitation_probability") is not None:
+            current_probability = int(hourly_rows[0]["precipitation_probability"])
+        return WeatherData(location=location, temp_c=temp_c, feels_like_c=feels_like_c, condition=condition,
+            condition_emoji=emoji, humidity=humidity, wind_speed_kmh=wind_speed, wind_direction=_degrees_to_cardinal(wind_deg),
+            wind_deg=wind_deg, temp_min_c=temp_min_c, temp_max_c=temp_max_c, visibility_km=visibility_km, sunrise=sunrise, sunset=sunset,
+            uv_index=float(uv) if uv is not None else None, forecast_text=f"{condition} with a high of {round(temp_max_c)}°C and a low of {round(temp_min_c)}°C.",
+            weather_code=code, local_time=local_time, local_date=local_time.split("T")[0] if local_time else None,
+            precipitation_mm=num("precipitation"), precipitation_probability=current_probability, pressure_hpa=num("pressure_msl", num("surface_pressure")), dew_point_c=num("dew_point_2m"),
+            cloud_cover=int(current["cloud_cover"]) if current.get("cloud_cover") is not None else None,
+            wind_gusts_kmh=num("wind_gusts_10m"), hourly_forecast=hourly_rows, daily_forecast=daily_rows)
 
     def _generate_fallback_weather(self, location: LocationInfo) -> WeatherData:
         """Deterministic seasonal fallback for offline operation."""
@@ -301,12 +277,19 @@ class OpenMeteoWeatherService:
         condition = "Partly cloudy"
         emoji = "⛅"
 
+        try:
+            local_now = datetime.now(ZoneInfo(location.timezone or "UTC"))
+        except Exception:
+            local_now = datetime.utcnow()
         return WeatherData(
             location=location,
             temp_c=round(temp_c, 1),
             feels_like_c=round(temp_c + 1.0, 1),
             condition=condition,
             condition_emoji=emoji,
+            weather_code=2,
+            local_time=local_now.isoformat(timespec="minutes"),
+            local_date=local_now.date().isoformat(),
             humidity=55,
             wind_speed_kmh=12.0,
             wind_direction="NE",
