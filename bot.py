@@ -21,6 +21,7 @@ log = logging.getLogger("paradise")
 EXTENSIONS = (
     "commands.fun",
     "commands.utility",
+    "commands.dictionary",
     "commands.recipe",
     "commands.ai",
     "commands.system",
@@ -136,6 +137,14 @@ class ParadiseBot(commands.Bot):
         except Exception:
             log.exception("AFK handling failed")
 
+        # "define hello" and friends are answered before anything else looks
+        # at the message, so the AI and the personality never double up on it.
+        try:
+            if await self._maybe_dictionary(message):
+                return
+        except Exception:
+            log.exception("Dictionary handling failed")
+
         try:
             await self._maybe_ai(message)
         except Exception:
@@ -187,6 +196,16 @@ class ParadiseBot(commands.Bot):
             except (discord.DiscordException, asyncio.TimeoutError):
                 log.debug("Could not post AFK notice", exc_info=True)
             return
+
+    # -- Dictionary -----------------------------------------------------------
+
+    async def _maybe_dictionary(self, message: discord.Message) -> bool:
+        """Answer plain-chat dictionary requests. False means "not one"."""
+        cog = self.get_cog("Dictionary")
+        handler = getattr(cog, "handle_message", None)
+        if handler is None:
+            return False
+        return bool(await handler(message))
 
     # -- AI -------------------------------------------------------------------
 

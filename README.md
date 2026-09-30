@@ -29,11 +29,13 @@ Everything lives in `.env` (never committed). See `.env.example` for all options
 | Discord | `DISCORD_TOKEN` | required |
 | AI | `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | any OpenAI-compatible endpoint (OpenAI, Groq, Gemini's compat layer, local Ollama). Optional |
 | Personality | `PERSONALITY_ENABLED`, `PERSONALITY_REACTION_CHANCE`, `PERSONALITY_REPLY_CHANCE`, `PERSONALITY_GLOBAL_COOLDOWN`, `PERSONALITY_CHANNEL_COOLDOWN`, `PERSONALITY_REPLY_CHANNEL_COOLDOWN` | tuning for the rare reactions/replies; defaults are deliberately conservative |
+| Dictionary | `DICTIONARY_TEXT_TRIGGERS`, `DICTIONARY_TIMEOUT`, `DICTIONARY_CACHE_TTL`, `DICTIONARY_CACHE_SIZE` | all optional — the dictionary needs no keys and works out of the box |
+| Pronunciation | `PRONUNCIATION_PREFER_NATIVE`, `PRONUNCIATION_VOICE_PLAYBACK`, `SPEECH_BASE_URL`, `SPEECH_API_KEY`, `SPEECH_MODEL`, `SPEECH_VOICE` | optional. `SPEECH_*` adds a neural voice for words with no human recording; without it a free voice is used |
 
 ## Commands
 
 - **Fun** — `/ping` (with the real latency), `/coinflip` (animated), `/choose`
-- **Useful** — `/remind`, `/poll`, `/afk`, `/translate`, `/define`, `/recipe`
+- **Useful** — `/remind`, `/poll`, `/afk`, `/translate`, `/dictionary` (or `/define`), `/recipe`
 - **AI** — `/summarize`, or just mention Paradise
 - `/help` lists exactly what is registered — nothing more
 
@@ -42,6 +44,26 @@ Choices for `/choose` and `/poll` are separated with `|` or `,`:
 ```text
 /choose options:pizza | burgers | something responsible
 ```
+
+## Dictionary
+
+`/dictionary promise` (or `/define`, or just **`define promise`** in chat) answers with a rendered card instead of a wall of text.
+
+![The dictionary card for "hello"](assets/dictionary-card.png)
+
+```text
+/dictionary word: serendipity
+define serendipity          ← plain chat works too
+what does serendipity mean?
+```
+
+- **No API key, no external service.** Word data comes from two free, key-less sources: [dictionaryapi.dev](https://dictionaryapi.dev) (Wiktionary-backed definitions, IPA and human recordings) and [Datamuse](https://www.datamuse.com/api/) (synonyms, antonyms, related words, spelling correction). If the first is down the second still produces a usable card, clearly marked as partial.
+- **Asked in plain English.** `define hello`, `dictionary hello`, `Define "hello"`, `meaning of hello`, `what does hello mean?` — case and quotes don't matter. Ordinary conversation is left alone: "I need to define a function" is not a lookup. Set `DICTIONARY_TEXT_TRIGGERS=false` for slash-commands-only.
+- **A real card, drawn per word.** Nothing is a static template: the layout measures every string and grows or shrinks to fit, so a one-line definition and a twelve-synonym entry both look deliberate. Long words shrink to fit on one line, text is wrapped and clipped rather than allowed to overflow, and IPA renders properly (`/həˈləʊ/`) thanks to a bundled Inter subset with full phonetic coverage. Without Pillow installed the card degrades to clean formatted text.
+- **🔊 Pronounce speaks the word** — never the definition. It prefers the dictionary's own human recording (UK/US/AU where available) and falls back to a synthesised voice, optionally your own neural endpoint via `SPEECH_*`. Audio arrives as a private attachment; with PyNaCl and ffmpeg installed, `PRONUNCIATION_VOICE_PLAYBACK=true` makes Paradise join your voice channel, say the word and leave.
+- **Everything else on demand.** The card stays uncluttered; **📚 More** adds all meanings, every pronunciation variant, inflected forms, synonyms, antonyms, related words and etymology, and **📖 Examples** shows the example sentences. Navigation belongs to whoever asked; 🔊 works for everyone.
+- **Honest when it doesn't know.** A miss says so and offers the closest real words as buttons (`recieve` → **receive**). Nothing is ever invented: missing fields are omitted or labelled, never filled in.
+- **Built to not fall over.** Lookups, rendered cards and audio clips are cached with bounded, expiring caches; identical simultaneous requests are coalesced into one fetch; everything has a deadline; and a failure in any layer (API, renderer, voice) is contained — you still get whatever the other layers produced.
 
 ## Recipes
 
@@ -111,6 +133,19 @@ functions/
   helpers.py              shared errors, colours, parsing, formatting
   personality.py          rare contextual reactions and short replies
   presence.py             fixed «Watching Paradise» activity + rotating note
+  dictionary/             dictionary engine (pure data/render; only playback.py
+                          touches discord, because it drives a voice client)
+    models.py               WordEntry / Sense / Pronunciation / Clip data models
+    normalize.py            query cleaning, chat-trigger patterns, edit distance
+    http.py                 one shared aiohttp session, retries, deadlines
+    sources.py              provider interface + dictionaryapi.dev and Datamuse
+    service.py              lookup pipeline: cache → coalesce → fetch → merge
+    cache.py                bounded TTL cache + single-flight helper
+    render.py               the card renderer: measure, lay out, paint (Pillow)
+    fonts.py                font discovery and glyph fallback (IPA coverage)
+    pronounce.py            speech providers: native recording → neural → free
+    playback.py             optional voice-channel playback (join, speak, leave)
+    feature.py              the façade the cog talks to; owns every cache
   recipes/                recipe engine (no discord, no AI, unit-testable)
     normalize.py            ingredient parsing/normalization (aliases, units, Hinglish)
     engine.py               matching, ranking, filters, substitutions, fallbacks
@@ -119,7 +154,10 @@ functions/
     ingredients.json        aliases, pantry staples, substitutions (data, editable)
     recipes.json            the bundled recipe book (data, editable)
 commands/recipe.py        /recipe command + Components V2 recipe UI
+commands/dictionary.py    /dictionary + /define, chat triggers, card UI, buttons
+assets/fonts/             bundled Inter subset (Latin + IPA) for the card
 tests/test_offline.py     offline validation: exact command set, every flow, limits
+tests/test_dictionary.py  the dictionary: parsing, pipeline, renderer, cog flows
 ```
 
 Design rules: all user-facing errors are friendly strings (`ParadiseError`), raw provider errors never reach users — they're logged with context instead. Secrets only ever come from the environment.
@@ -134,8 +172,12 @@ python -m unittest discover -s tests -v
 
 It verifies the exact registered command set (and that the removed music/TTS commands stay gone from source and registration), the ping format, coinflip randomness, config parsing, the presence note pool and rotation rules (20-minute cadence, no back-to-back repeats, no duplicate timers), and the personality system: pattern matching, ignore rules for bots/webhooks/commands/spam, cooldowns, the never-react-and-reply guarantee, and reply variety.
 
+`tests/test_dictionary.py` covers the dictionary end to end without a network or a gateway: recorded API payloads through the real parsers, the cache/coalescing/fallback pipeline, spelling suggestions, every renderer edge case (very long words, many synonyms, missing fields, Unicode and IPA — asserting no text ever overflows), the pronunciation provider chain, and the cog itself — slash command, chat triggers, buttons, permissions, cooldowns, expired interactions and concurrency — driven with fake interactions.
+
 ## Notes & limits
 
 - Reminders and AFK states live in memory; a restart clears them.
 - The free translation and dictionary providers are best-effort; failures return clean "couldn't find" messages.
+- Dictionary cards need [Pillow](https://pypi.org/project/Pillow/) (in `requirements.txt`); without it the feature still works and answers with formatted text.
+- Voice-channel pronunciation additionally needs PyNaCl (`pip install "discord.py[voice]"`) and ffmpeg on `PATH`. Without them it stays off and the audio is attached to the reply instead.
 - Presence: Discord gives bot accounts one visible activity slot; Paradise keeps it on «Watching Paradise» and rotates only the attached note.
