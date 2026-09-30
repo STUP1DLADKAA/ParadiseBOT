@@ -126,6 +126,21 @@ class DictionaryConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class VoiceConfig:
+    """Voice activity tracking and daily DM reports configuration."""
+
+    db_path: str = ""
+    dm_reports_enabled: bool = True
+
+    @classmethod
+    def from_env(cls, env) -> "VoiceConfig":
+        return cls(
+            db_path=env.get("VOICE_DB_PATH", "").strip(),
+            dm_reports_enabled=_bool(env.get("VOICE_DM_REPORTS_ENABLED"), True),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     """Everything Paradise reads from the environment."""
 
@@ -142,6 +157,9 @@ class Config:
     # Dictionary lookups, cards and pronunciation.
     dictionary: DictionaryConfig = DictionaryConfig()
 
+    # Voice activity tracking and statistics.
+    voice: VoiceConfig = VoiceConfig()
+
     @property
     def ai_configured(self) -> bool:
         # A base URL alone is enough for local providers (e.g. Ollama).
@@ -157,6 +175,7 @@ class Config:
             ai_model=env.get("AI_MODEL", "").strip(),
             personality=PersonalityConfig.from_env(env),
             dictionary=DictionaryConfig.from_env(env),
+            voice=VoiceConfig.from_env(env),
         )
 
 

@@ -1,8 +1,4 @@
-"""Useful commands: remind, poll, afk, translate.
-
-`/define` used to live here; it now shares the full dictionary pipeline in
-`commands/dictionary.py` (rendered card, pronunciation, extras).
-"""
+"""Useful commands: remind, poll, afk, translate, search, weather, convert, time, settimezone."""
 
 from __future__ import annotations
 
@@ -17,7 +13,22 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from functions.helpers import parse_options, shorten
+from functions.conversion import (
+    ConversionEngine,
+    build_conversion_embed,
+    parse_conversion_query,
+)
+from functions.helpers import Colour, ParadiseError, parse_options, shorten
+from functions.search import SearchEngine, SearchPaginationView, build_search_embed
+from functions.time import (
+    CITY_TIMEZONES,
+    TZ_ABBREVIATIONS,
+    build_time_embed,
+    get_current_time_for_zone,
+    resolve_timezone,
+)
+from functions.voice.database import VoiceDatabase
+from functions.weather import OpenMeteoWeatherService, build_weather_embed
 
 log = logging.getLogger(__name__)
 
@@ -34,6 +45,13 @@ LANGUAGE_CODES = {
     "vietnamese": "vi", "polish": "pl", "ukrainian": "uk", "swedish": "sv",
     "nepali": "ne", "sinhala": "si",
 }
+
+POPULAR_TIMEZONES = [
+    "Asia/Kolkata", "Europe/London", "America/New_York", "America/Los_Angeles",
+    "America/Chicago", "Europe/Paris", "Europe/Berlin", "Asia/Tokyo",
+    "Asia/Dubai", "Asia/Singapore", "Australia/Sydney", "America/Toronto",
+    "Asia/Hong_Kong", "UTC",
+]
 
 
 @dataclass(slots=True)
@@ -59,6 +77,38 @@ def resolve_language(raw: str) -> str | None:
     return None
 
 
+async def timezone_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    """Autocomplete for timezone names and cities."""
+    current_clean = current.strip().lower()
+    choices: list[app_commands.Choice[str]] = []
+
+    # Match popular first if empty
+    if not current_clean:
+        for tz in POPULAR_TIMEZONES[:15]:
+            choices.append(app_commands.Choice(name=tz, value=tz))
+        return choices
+
+    # Check city matches
+    for city, tz in CITY_TIMEZONES.items():
+        if current_clean in city or current_clean in tz.lower():
+            label = f"{city.title()} ({tz})"
+            choices.append(app_commands.Choice(name=label[:100], value=tz))
+            if len(choices) >= 20:
+                return choices
+
+    # Check standard timezone names
+    for tz in POPULAR_TIMEZONES:
+        if current_clean in tz.lower() and not any(c.value == tz for c in choices):
+            choices.append(app_commands.Choice(name=tz, value=tz))
+            if len(choices) >= 25:
+                return choices
+
+    return choices[:25]
+
+
 class Utility(commands.Cog):
     MAX_REMINDERS = 200
     MAX_PER_USER = 5
@@ -69,10 +119,215 @@ class Utility(commands.Cog):
         self.reminders: dict[int, asyncio.Task[None]] = {}
         self.reminder_owners: Counter[int] = Counter()
         self._next_reminder = 0
+        self.search_engine = SearchEngine()
+        self.weather_service = OpenMeteoWeatherService()
+        self.conversion_engine = ConversionEngine()
+        self.db = VoiceDatabase()
 
     def cog_unload(self) -> None:
         for task in self.reminders.values():
             task.cancel()
+
+    # -- search -----------------------------------------------------------
+
+    @app_commands.command(description="Search the web cleanly")
+    @app_commands.describe(query="What to search for")
+    @cooldown(5)
+    async def search(
+        self,
+        interaction: discord.Interaction,
+        query: app_commands.Range[str, 1, 300],
+    ) -> None:
+        await interaction.response.defer()
+        try:
+            response = await self.search_engine.search(query, limit=8)
+        except Exception as err:
+            log.warning("Search failed: %s", err, exc_info=True)
+            await interaction.followup.send(
+                "the search engine is not responding right now. give it a moment."
+            )
+            return
+
+        embed = build_search_embed(response, current_index=0)
+        view = SearchPaginationView(response, author_id=interaction.user.id)
+        msg = await interaction.followup.send(embed=embed, view=view)
+        view.message = msg
+
+    # -- weather ----------------------------------------------------------
+
+    @app_commands.command(description="Check current weather and forecast for any location")
+    @app_commands.describe(location="City, region, or country (e.g. Delhi, London, Tokyo)")
+    @cooldown(5)
+    async def weather(
+        self,
+        interaction: discord.Interaction,
+        location: app_commands.Range[str, 1, 100],
+    ) -> None:
+        await interaction.response.defer()
+        try:
+            data = await self.weather_service.get_weather(location)
+        except ParadiseError as err:
+            await interaction.followup.send(str(err))
+            return
+        except Exception as err:
+            log.warning("Weather fetch failed: %s", err, exc_info=True)
+            await interaction.followup.send(
+                "the weather service is unavailable right now. try again in a bit."
+            )
+            return
+
+        embed = build_weather_embed(data)
+        await interaction.followup.send(embed=embed)
+
+    # -- convert ----------------------------------------------------------
+
+    @app_commands.command(description="Convert units or live currency exchange rates")
+    @app_commands.describe(
+        query="Natural query, e.g. '10 km to miles', '100 USD to INR', '25 celsius to fahrenheit'",
+        value="Optional direct number value",
+        from_unit="Optional source unit/currency",
+        to_unit="Optional target unit/currency",
+    )
+    @cooldown(3)
+    async def convert(
+        self,
+        interaction: discord.Interaction,
+        query: str | None = None,
+        value: float | None = None,
+        from_unit: str | None = None,
+        to_unit: str | None = None,
+    ) -> None:
+        if query is None and (value is None or from_unit is None or to_unit is None):
+            await interaction.response.send_message(
+                "give me something to convert, e.g.:\n"
+                "• `/convert query: 10 km to miles`\n"
+                "• `/convert query: 100 USD to INR`\n"
+                "• `/convert query: 25 celsius to fahrenheit`\n"
+                "• `/convert query: 5 kg to lb`",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer()
+        try:
+            if value is not None and from_unit is not None and to_unit is not None:
+                result = await self.conversion_engine.convert(value, from_unit, to_unit)
+            elif query:
+                result = await self.conversion_engine.convert_query(query)
+            else:
+                raise ParadiseError("Please provide all conversion units.")
+        except ParadiseError as err:
+            await interaction.followup.send(str(err))
+            return
+        except Exception as err:
+            log.warning("Conversion failed: %s", err, exc_info=True)
+            await interaction.followup.send("couldn't perform that conversion.")
+            return
+
+        embed = build_conversion_embed(result)
+        await interaction.followup.send(embed=embed)
+
+    # -- time -------------------------------------------------------------
+
+    @app_commands.command(description="Check current local time for a location or member")
+    @app_commands.describe(
+        location="City, timezone, or region (e.g. Delhi, London, New York)",
+        member="Optional server member to check configured time for",
+    )
+    @app_commands.autocomplete(location=timezone_autocomplete)
+    @cooldown(3)
+    async def time(
+        self,
+        interaction: discord.Interaction,
+        location: str | None = None,
+        member: discord.Member | None = None,
+    ) -> None:
+        if member is not None:
+            # Check configured timezone for member
+            tz_str = self.db.get_user_timezone(member.id)
+            if not tz_str:
+                if member.id == interaction.user.id:
+                    await interaction.response.send_message(
+                        "You haven't set your timezone yet. Set it with `/settimezone <timezone>`.",
+                        ephemeral=True,
+                    )
+                else:
+                    await interaction.response.send_message(
+                        f"**{member.display_name}** hasn't configured their timezone yet.\n"
+                        "They can set it using `/settimezone`.",
+                        ephemeral=True,
+                    )
+                return
+            try:
+                info = get_current_time_for_zone(tz_str, label=member.display_name)
+            except ParadiseError as err:
+                await interaction.response.send_message(str(err), ephemeral=True)
+                return
+            embed = build_time_embed(info, user_target=member)
+            await interaction.response.send_message(embed=embed)
+            return
+
+        if not location:
+            # If no location or member provided, check if the caller has set their own timezone
+            user_tz = self.db.get_user_timezone(interaction.user.id)
+            if user_tz:
+                info = get_current_time_for_zone(user_tz, label=interaction.user.display_name)
+                embed = build_time_embed(info, user_target=interaction.user)
+                await interaction.response.send_message(embed=embed)
+                return
+            await interaction.response.send_message(
+                "provide a location, timezone, or @member (e.g. `/time Delhi`, `/time London`, `/time @User`).",
+                ephemeral=True,
+            )
+            return
+
+        resolved_tz = resolve_timezone(location)
+        if not resolved_tz:
+            await interaction.response.send_message(
+                f"I don't recognize the timezone or location **{location}**.\n"
+                "Try a major city name like `Delhi`, `London`, `Tokyo`, `New York`, or an IANA timezone like `Asia/Kolkata`.",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            info = get_current_time_for_zone(resolved_tz, label=location.title())
+        except ParadiseError as err:
+            await interaction.response.send_message(str(err), ephemeral=True)
+            return
+
+        embed = build_time_embed(info)
+        await interaction.response.send_message(embed=embed)
+
+    # -- settimezone ------------------------------------------------------
+
+    @app_commands.command(description="Set your personal timezone for /time and reports")
+    @app_commands.describe(timezone="Your timezone or city (e.g. Asia/Kolkata, London, EST)")
+    @app_commands.autocomplete(timezone=timezone_autocomplete)
+    @cooldown(3)
+    async def settimezone(
+        self,
+        interaction: discord.Interaction,
+        timezone: str,
+    ) -> None:
+        resolved = resolve_timezone(timezone)
+        if not resolved:
+            await interaction.response.send_message(
+                f"Couldn't recognize timezone `{timezone}`. Try selecting one from the autocomplete list.",
+                ephemeral=True,
+            )
+            return
+
+        self.db.set_user_timezone(interaction.user.id, resolved)
+        info = get_current_time_for_zone(resolved, label=interaction.user.display_name)
+        await interaction.response.send_message(
+            f"✅ Timezone set to **{resolved}** (`{info.utc_offset}`).\n"
+            f"Your current local time is **{info.formatted_12h}** ({info.formatted_date}).\n"
+            "-# Other members can now check your local time with `/time member:@{}`".format(
+                interaction.user.display_name
+            ),
+            ephemeral=True,
+        )
 
     # -- remind -----------------------------------------------------------
 
@@ -217,7 +472,6 @@ class Utility(commands.Cog):
                 "AFK only really makes sense in a server.", ephemeral=True
             )
             return
-        # Old entries are disposable; AFK state is deliberately temporary.
         cutoff = datetime.now(UTC) - timedelta(days=7)
         stale = [key for key, entry in afk.items() if entry.since < cutoff]
         for key in stale:

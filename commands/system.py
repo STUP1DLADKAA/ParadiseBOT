@@ -20,6 +20,12 @@ HELP_BLURBS = {
     "poll": "reaction poll",
     "afk": "temporary AFK status",
     "translate": "translate a short text",
+    "search": "clean web search results",
+    "weather": "current weather and forecast",
+    "convert": "units and live currency exchange rates",
+    "time": "local time anywhere or for a member",
+    "settimezone": "configure your personal timezone",
+    "vc": "voice activity tracking and leaderboard card",
     "dictionary": "meaning, pronunciation, synonyms — as a card",
     "define": "same thing, shorter name",
     "recipe": "recipes from ingredients you have",
@@ -28,7 +34,21 @@ HELP_BLURBS = {
 
 HELP_GROUPS = {
     "🎲 fun": ("ping", "coinflip", "choose"),
-    "🧰 useful": ("remind", "poll", "afk", "translate", "dictionary", "define", "recipe"),
+    "🧰 useful": (
+        "remind",
+        "poll",
+        "afk",
+        "translate",
+        "search",
+        "weather",
+        "convert",
+        "time",
+        "settimezone",
+        "dictionary",
+        "define",
+        "recipe",
+    ),
+    "🎙️ voice": ("vc",),
     "🤖 ai": ("summarize",),
 }
 
