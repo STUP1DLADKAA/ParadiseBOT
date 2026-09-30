@@ -1,4 +1,8 @@
-"""Useful commands: remind, poll, afk, translate, define."""
+"""Useful commands: remind, poll, afk, translate.
+
+`/define` used to live here; it now shares the full dictionary pipeline in
+`commands/dictionary.py` (rendered card, pronunciation, extras).
+"""
 
 from __future__ import annotations
 
@@ -302,62 +306,6 @@ class Utility(commands.Cog):
         await interaction.followup.send(
             f"> {shorten(translated, 900)}\n\n-# {detected} → {target_code} · Google Translate"
         )
-
-    # -- define ------------------------------------------------------------
-
-    @app_commands.command(description="Look up what a word means")
-    @app_commands.describe(word="The word to define")
-    @cooldown()
-    async def define(self, interaction: discord.Interaction, word: str) -> None:
-        word = word.strip()[:60]
-        if not word or " " in word:
-            await interaction.response.send_message(
-                "one word at a time. no spaces.", ephemeral=True
-            )
-            return
-        await interaction.response.defer()
-        url = f"https://api.dictionaryapi.dev/api/v2/entries/en/{word}"
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as session:
-                async with session.get(url) as response:
-                    if response.status == 404:
-                        await interaction.followup.send(
-                            f"no dictionary entry for **{word}**. might not be a real word."
-                        )
-                        return
-                    if response.status != 200:
-                        raise aiohttp.ClientResponseError(
-                            response.request_info, (), status=response.status
-                        )
-                    data = await response.json(content_type=None)
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-            log.debug("Dictionary lookup failed", exc_info=True)
-            await interaction.followup.send(
-                "the dictionary isn't responding right now."
-            )
-            return
-
-        try:
-            entry = data[0]
-            phonetic = entry.get("phonetic") or next(
-                (p.get("text") for p in entry.get("phonetics", []) if p.get("text")), ""
-            )
-            lines = [f"**{entry.get('word', word)}**{f' {phonetic}' if phonetic else ''}", ""]
-            for meaning in entry.get("meanings", [])[:2]:
-                part = meaning.get("partOfSpeech", "")
-                definition = meaning.get("definitions", [{}])[0]
-                lines.append(f"*{part}* — {definition.get('definition', '')}")
-                example = definition.get("example")
-                if example:
-                    lines.append(f"> {shorten(example, 140)}")
-                lines.append("")
-            text = "\n".join(lines).strip() or "no definitions came back for that."
-        except (TypeError, IndexError, AttributeError):
-            await interaction.followup.send("that came back weird. try again?")
-            return
-        await interaction.followup.send(shorten(text, 1900))
 
 
 async def setup(bot: commands.Bot) -> None:

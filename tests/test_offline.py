@@ -36,7 +36,7 @@ from functions.presence import NOTES, ROTATE_SECONDS, WATCHING, PresenceManager 
 
 EXPECTED_COMMANDS = {
     "ping", "coinflip", "choose",
-    "remind", "poll", "afk", "translate", "define", "recipe",
+    "remind", "poll", "afk", "translate", "dictionary", "define", "recipe",
     "summarize", "help",
 }
 
@@ -632,12 +632,15 @@ class TestWiring(unittest.TestCase):
         self.assertNotIn("commands.music", EXTENSIONS)
         self.assertNotIn("commands.voice", EXTENSIONS)
 
+    def test_dictionary_extension_is_loaded(self):
+        self.assertIn("commands.dictionary", EXTENSIONS)
+
     def test_modules_have_no_dead_music_imports(self):
         # Importing every remaining module must not pull removed ones in.
         for name in (
             "bot", "config", "commands.fun", "commands.utility", "commands.ai",
-            "commands.system", "functions.ai", "functions.helpers",
-            "functions.personality", "functions.presence",
+            "commands.system", "commands.dictionary", "functions.ai",
+            "functions.helpers", "functions.personality", "functions.presence",
         ):
             __import__(name)
         for gone in (

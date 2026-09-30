@@ -72,6 +72,55 @@ class PersonalityConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class DictionaryConfig:
+    """The /dictionary feature (see functions/dictionary/).
+
+    Works with zero configuration: the lookup providers and the fallback
+    pronunciation voice are all free and key-less. Everything below is
+    optional tuning or an opt-in upgrade.
+    """
+
+    # Answer plain-chat requests like "define hello" as well as the command.
+    text_triggers: bool = True
+    # Per-request deadline for every outbound dictionary/audio call.
+    timeout: float = 8.0
+    # Looked-up words are cached; these bound that cache.
+    cache_ttl: int = 6 * 3600
+    cache_size: int = 512
+
+    # Prefer the dictionary's own human recording over synthesised speech.
+    prefer_native_audio: bool = True
+    # Speak the word in the asker's voice channel (needs PyNaCl + ffmpeg;
+    # falls back to an audio attachment whenever it can't).
+    voice_playback: bool = False
+
+    # Optional neural voice: any OpenAI-compatible /audio/speech endpoint.
+    speech_base_url: str = ""
+    speech_api_key: str = ""
+    speech_model: str = ""
+    speech_voice: str = ""
+
+    @property
+    def speech_configured(self) -> bool:
+        return bool(self.speech_base_url and self.speech_model)
+
+    @classmethod
+    def from_env(cls, env) -> "DictionaryConfig":
+        return cls(
+            text_triggers=_bool(env.get("DICTIONARY_TEXT_TRIGGERS"), True),
+            timeout=max(2.0, _float(env.get("DICTIONARY_TIMEOUT"), 8.0)),
+            cache_ttl=max(60, _int(env.get("DICTIONARY_CACHE_TTL"), 6 * 3600)),
+            cache_size=max(16, _int(env.get("DICTIONARY_CACHE_SIZE"), 512)),
+            prefer_native_audio=_bool(env.get("PRONUNCIATION_PREFER_NATIVE"), True),
+            voice_playback=_bool(env.get("PRONUNCIATION_VOICE_PLAYBACK"), False),
+            speech_base_url=env.get("SPEECH_BASE_URL", "").strip().rstrip("/"),
+            speech_api_key=env.get("SPEECH_API_KEY", "").strip(),
+            speech_model=env.get("SPEECH_MODEL", "").strip(),
+            speech_voice=env.get("SPEECH_VOICE", "").strip(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     """Everything Paradise reads from the environment."""
 
@@ -84,6 +133,9 @@ class Config:
 
     # Rare passive personality (reactions / short replies).
     personality: PersonalityConfig = PersonalityConfig()
+
+    # Dictionary lookups, cards and pronunciation.
+    dictionary: DictionaryConfig = DictionaryConfig()
 
     @property
     def ai_configured(self) -> bool:
@@ -99,6 +151,7 @@ class Config:
             ai_api_key=env.get("AI_API_KEY", "").strip(),
             ai_model=env.get("AI_MODEL", "").strip(),
             personality=PersonalityConfig.from_env(env),
+            dictionary=DictionaryConfig.from_env(env),
         )
 
 
