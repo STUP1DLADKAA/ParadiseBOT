@@ -21,6 +21,7 @@ log = logging.getLogger("paradise")
 EXTENSIONS = (
     "commands.fun",
     "commands.utility",
+    "commands.recipe",
     "commands.ai",
     "commands.system",
 )

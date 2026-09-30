@@ -36,7 +36,7 @@ from functions.presence import NOTES, ROTATE_SECONDS, WATCHING, PresenceManager 
 
 EXPECTED_COMMANDS = {
     "ping", "coinflip", "choose",
-    "remind", "poll", "afk", "translate", "define",
+    "remind", "poll", "afk", "translate", "define", "recipe",
     "summarize", "help",
 }
 
@@ -649,6 +649,144 @@ class TestWiring(unittest.TestCase):
     def test_pattern_and_note_modules_expose_config(self):
         self.assertTrue(hasattr(personality_module, "PATTERNS"))
         self.assertTrue(hasattr(presence_module, "NOTES"))
+
+
+# ---------------------------------------------------------------------------
+# Recipe assistant — normalization, matching, ranking (all offline)
+# ---------------------------------------------------------------------------
+
+
+from functions.recipes import (  # noqa: E402
+    RecipeFilters,
+    get_default_source,
+    get_ingredient_data,
+    near_misses,
+    normalize_input,
+    rank_recipes,
+    suggest_substitution,
+)
+
+
+class TestRecipeData(unittest.TestCase):
+    def test_dataset_loads_and_is_valid(self):
+        recipes = get_default_source().all_recipes()
+        self.assertGreaterEqual(len(recipes), 20, "expected a real recipe book")
+        ids = [r.id for r in recipes]
+        self.assertEqual(len(ids), len(set(ids)), "duplicate recipe ids")
+        for recipe in recipes:
+            self.assertTrue(recipe.name)
+            self.assertTrue(recipe.ingredients, f"{recipe.id} has no ingredients")
+            self.assertTrue(recipe.instructions, f"{recipe.id} has no instructions")
+            self.assertGreater(recipe.time_minutes, 0, f"{recipe.id} missing time")
+
+    def test_pantry_and_aliases_present(self):
+        data = get_ingredient_data()
+        self.assertIn("salt", data.pantry)
+        self.assertIn("water", data.pantry)
+        self.assertTrue(data.aliases, "alias table should not be empty")
+
+
+class TestIngredientNormalization(unittest.TestCase):
+    def test_basic_list(self):
+        self.assertEqual(
+            normalize_input("chicken, rice, onion"), ["chicken", "rice", "onion"]
+        )
+
+    def test_quantities_and_units_are_stripped(self):
+        self.assertEqual(
+            normalize_input("2 eggs, 4 slices of bread, one tomato"),
+            ["egg", "bread", "tomato"],
+        )
+
+    def test_hinglish_names(self):
+        self.assertEqual(
+            normalize_input("aloo, pyaaz, tamatar"), ["potato", "onion", "tomato"]
+        )
+        self.assertEqual(normalize_input("hari mirchi"), ["green chilli"])
+        self.assertEqual(normalize_input("anda, dahi, paneer"), ["egg", "yogurt", "paneer"])
+        self.assertEqual(normalize_input("lahsun aur adrak"), ["garlic", "ginger"])
+
+    def test_plurals_and_spelling(self):
+        self.assertEqual(normalize_input("potatoes"), ["potato"])
+        self.assertEqual(normalize_input("tomatos"), ["tomato"])
+        self.assertEqual(normalize_input("aaloo"), ["potato"])
+
+    def test_deduplicates(self):
+        self.assertEqual(normalize_input("egg, eggs, anda"), ["egg"])
+
+    def test_empty_and_junk(self):
+        self.assertEqual(normalize_input(""), [])
+        self.assertEqual(normalize_input("   ,  , "), [])
+
+
+class TestRecipeMatching(unittest.TestCase):
+    def test_finds_matches_for_common_input(self):
+        results = rank_recipes(normalize_input("chicken, rice, tomato, onion, garlic"))
+        self.assertTrue(results)
+        names = [r.recipe.name for r in results]
+        self.assertIn("Chicken Tomato Rice", names)
+
+    def test_pantry_items_never_counted_missing(self):
+        results = rank_recipes(normalize_input("egg, bread, onion"))
+        for result in results:
+            self.assertNotIn("salt", result.missing)
+            self.assertNotIn("oil", result.missing)
+            self.assertNotIn("water", result.missing)
+
+    def test_missing_ingredients_reported(self):
+        # We have all of Chicken Fried Rice except egg + soy sauce.
+        results = rank_recipes(normalize_input("chicken, rice, onion, garlic"))
+        fried = next((r for r in results if r.recipe.id == "chicken-fried-rice"), None)
+        self.assertIsNotNone(fried, "chicken fried rice should be a candidate")
+        self.assertIn("egg", fried.missing)
+        self.assertIn("soy sauce", fried.missing)
+        self.assertNotIn("chicken", fried.missing)
+
+    def test_everything_available_has_no_missing(self):
+        results = rank_recipes(normalize_input("potato, onion, tomato"))
+        top = results[0]
+        self.assertEqual(top.recipe.id, "aloo-pyaaz-sabzi")
+        self.assertEqual(top.missing, [])
+
+    def test_ranking_prefers_more_matches(self):
+        results = rank_recipes(normalize_input("chicken, rice, onion, garlic, tomato"))
+        # The top result should use most of what the user has.
+        self.assertGreaterEqual(results[0].have_count, 4)
+
+    def test_no_strong_match_returns_empty(self):
+        self.assertEqual(rank_recipes(normalize_input("saffron, caviar, truffle")), [])
+
+    def test_diet_filter(self):
+        results = rank_recipes(
+            normalize_input("chicken, rice, onion, garlic, tomato"),
+            filters=RecipeFilters(diet="vegetarian"),
+        )
+        for result in results:
+            self.assertIn("vegetarian", result.recipe.diet)
+
+    def test_max_time_filter(self):
+        results = rank_recipes(
+            normalize_input("egg, bread, onion"),
+            filters=RecipeFilters(max_time=12),
+        )
+        for result in results:
+            self.assertLessEqual(result.recipe.time_minutes, 12)
+
+    def test_match_label_shape(self):
+        results = rank_recipes(normalize_input("egg, bread, onion"))
+        self.assertRegex(results[0].match_label, r"^\d+/\d+ ingredients$")
+
+
+class TestRecipeFallbacks(unittest.TestCase):
+    def test_near_misses_when_partial(self):
+        # Only one recognised ingredient that appears in recipes.
+        misses = near_misses(normalize_input("paneer"))
+        self.assertTrue(misses)
+        self.assertTrue(all(m.have_count >= 1 for m in misses))
+
+    def test_substitutions_are_conservative(self):
+        self.assertIsNotNone(suggest_substitution("soy sauce"))
+        self.assertIsNone(suggest_substitution("chicken"))
 
 
 if __name__ == "__main__":

@@ -1,0 +1,387 @@
+{
+  "_comment": "Ingredient knowledge for the /recipe feature. Everything here is plain data so it can be expanded without touching code. 'aliases' maps any spelling/language/plural to a canonical ingredient name. 'pantry' are staples assumed to be on hand (never counted as missing). 'substitutions' are conservative, sensible swaps only.",
+
+  "aliases": {
+    "aloo": "potato",
+    "aaloo": "potato",
+    "alu": "potato",
+    "potatoes": "potato",
+    "potato": "potato",
+    "spud": "potato",
+
+    "pyaaz": "onion",
+    "pyaz": "onion",
+    "pyaj": "onion",
+    "kanda": "onion",
+    "onions": "onion",
+
+    "tamatar": "tomato",
+    "tamaatar": "tomato",
+    "tomatoes": "tomato",
+    "tomatos": "tomato",
+
+    "lahsun": "garlic",
+    "lasun": "garlic",
+    "lehsun": "garlic",
+    "garlic cloves": "garlic",
+    "garlic clove": "garlic",
+
+    "adrak": "ginger",
+    "ginger root": "ginger",
+
+    "anda": "egg",
+    "ande": "egg",
+    "eggs": "egg",
+    "egg white": "egg",
+    "egg whites": "egg",
+
+    "dahi": "yogurt",
+    "curd": "yogurt",
+    "yoghurt": "yogurt",
+    "yogurt": "yogurt",
+
+    "paneer": "paneer",
+    "cottage cheese": "paneer",
+    "indian cottage cheese": "paneer",
+
+    "mirch": "chilli",
+    "mirchi": "chilli",
+    "chili": "chilli",
+    "chilli": "chilli",
+    "chillies": "chilli",
+    "chilies": "chilli",
+    "chile": "chilli",
+    "red chilli": "red chilli",
+    "red chili": "red chilli",
+    "lal mirch": "red chilli",
+    "dry red chilli": "red chilli",
+
+    "hari mirch": "green chilli",
+    "hari mirchi": "green chilli",
+    "green chili": "green chilli",
+    "green chillies": "green chilli",
+    "green chilies": "green chilli",
+    "green chilly": "green chilli",
+
+    "chawal": "rice",
+    "chaawal": "rice",
+    "basmati": "rice",
+    "basmati rice": "rice",
+    "cooked rice": "rice",
+    "boiled rice": "rice",
+    "rice": "rice",
+
+    "murgh": "chicken",
+    "murga": "chicken",
+    "chicken breast": "chicken",
+    "chicken thigh": "chicken",
+    "chicken thighs": "chicken",
+    "boneless chicken": "chicken",
+
+    "mutton": "mutton",
+    "gosht": "mutton",
+    "lamb": "mutton",
+    "goat": "mutton",
+
+    "machli": "fish",
+    "machhli": "fish",
+    "fish fillet": "fish",
+
+    "keema": "minced meat",
+    "mince": "minced meat",
+    "minced meat": "minced meat",
+    "ground beef": "minced meat",
+    "minced mutton": "minced meat",
+
+    "bread slice": "bread",
+    "bread slices": "bread",
+    "slice bread": "bread",
+    "slices bread": "bread",
+    "sandwich bread": "bread",
+    "loaf": "bread",
+    "pav": "bread",
+    "bun": "bread",
+    "buns": "bread",
+
+    "atta": "wheat flour",
+    "gehu ka atta": "wheat flour",
+    "whole wheat flour": "wheat flour",
+    "chapati flour": "wheat flour",
+
+    "maida": "flour",
+    "all purpose flour": "flour",
+    "all-purpose flour": "flour",
+    "plain flour": "flour",
+    "refined flour": "flour",
+
+    "besan": "gram flour",
+    "gram flour": "gram flour",
+    "chickpea flour": "gram flour",
+
+    "doodh": "milk",
+    "dudh": "milk",
+
+    "makhan": "butter",
+    "makkhan": "butter",
+    "salted butter": "butter",
+    "unsalted butter": "butter",
+
+    "malai": "cream",
+    "fresh cream": "cream",
+    "heavy cream": "cream",
+    "whipping cream": "cream",
+
+    "cheese slice": "cheese",
+    "cheese slices": "cheese",
+    "cheddar": "cheese",
+    "mozzarella": "cheese",
+    "processed cheese": "cheese",
+
+    "palak": "spinach",
+    "spinach leaves": "spinach",
+
+    "matar": "peas",
+    "mutter": "peas",
+    "green peas": "peas",
+    "frozen peas": "peas",
+    "peas": "peas",
+
+    "gajar": "carrot",
+    "carrots": "carrot",
+
+    "shimla mirch": "capsicum",
+    "capsicum": "capsicum",
+    "bell pepper": "capsicum",
+    "bell peppers": "capsicum",
+    "green pepper": "capsicum",
+
+    "patta gobhi": "cabbage",
+    "patta gobi": "cabbage",
+    "cabbage": "cabbage",
+
+    "gobhi": "cauliflower",
+    "gobi": "cauliflower",
+    "phool gobhi": "cauliflower",
+    "cauliflower": "cauliflower",
+
+    "mushrooms": "mushroom",
+    "button mushroom": "mushroom",
+    "khumb": "mushroom",
+
+    "bhutta": "corn",
+    "makai": "corn",
+    "sweet corn": "corn",
+    "sweetcorn": "corn",
+    "corn kernels": "corn",
+
+    "dal": "lentils",
+    "daal": "lentils",
+    "toor dal": "lentils",
+    "arhar dal": "lentils",
+    "moong dal": "lentils",
+    "masoor dal": "lentils",
+    "red lentils": "lentils",
+    "lentil": "lentils",
+
+    "chana": "chickpeas",
+    "chole": "chickpeas",
+    "kabuli chana": "chickpeas",
+    "garbanzo": "chickpeas",
+    "garbanzo beans": "chickpeas",
+    "chickpea": "chickpeas",
+
+    "rajma": "kidney beans",
+    "kidney bean": "kidney beans",
+
+    "black beans": "black beans",
+    "sabut urad": "black lentils",
+    "urad dal": "black lentils",
+    "black lentils": "black lentils",
+
+    "noodle": "noodles",
+    "maggi": "noodles",
+    "hakka noodles": "noodles",
+    "instant noodles": "noodles",
+
+    "spaghetti": "pasta",
+    "macaroni": "pasta",
+    "penne": "pasta",
+    "pasta": "pasta",
+
+    "soya sauce": "soy sauce",
+    "soy sauce": "soy sauce",
+    "soyasauce": "soy sauce",
+
+    "tomato ketchup": "ketchup",
+    "ketchup": "ketchup",
+    "tomato sauce": "ketchup",
+
+    "nimbu": "lemon",
+    "neembu": "lemon",
+    "lime": "lemon",
+    "lemon juice": "lemon",
+
+    "nariyal": "coconut",
+    "coconut milk": "coconut milk",
+    "coconut cream": "coconut milk",
+
+    "dhania": "coriander leaves",
+    "dhaniya": "coriander leaves",
+    "cilantro": "coriander leaves",
+    "coriander leaf": "coriander leaves",
+    "fresh coriander": "coriander leaves",
+
+    "pudina": "mint",
+    "mint leaves": "mint",
+
+    "kaju": "cashew",
+    "cashews": "cashew",
+    "cashew nuts": "cashew",
+
+    "hara pyaz": "spring onion",
+    "hara pyaaz": "spring onion",
+    "spring onions": "spring onion",
+    "scallion": "spring onion",
+    "scallions": "spring onion",
+    "green onion": "spring onion",
+
+    "kheera": "cucumber",
+    "kakdi": "cucumber",
+    "cucumbers": "cucumber",
+
+    "tofu": "tofu",
+    "bean curd": "tofu",
+
+    "sausage": "sausage",
+    "sausages": "sausage",
+    "bacon": "bacon",
+
+    "oats": "oats",
+    "oatmeal": "oats",
+    "rolled oats": "oats",
+
+    "kela": "banana",
+    "bananas": "banana",
+
+    "shahad": "honey",
+    "honey": "honey",
+
+    "moongfali": "peanut",
+    "peanuts": "peanut",
+    "groundnut": "peanut",
+
+    "sabudana": "sago",
+    "poha": "flattened rice",
+    "chura": "flattened rice",
+    "flattened rice": "flattened rice",
+
+    "suji": "semolina",
+    "sooji": "semolina",
+    "rava": "semolina",
+    "semolina": "semolina",
+
+    "french beans": "green beans",
+    "green beans": "green beans",
+    "beans": "green beans",
+
+    "baingan": "eggplant",
+    "brinjal": "eggplant",
+    "aubergine": "eggplant",
+    "eggplant": "eggplant",
+
+    "bhindi": "okra",
+    "okra": "okra",
+    "ladyfinger": "okra",
+    "lady finger": "okra",
+
+    "kaddu": "pumpkin",
+    "pumpkin": "pumpkin",
+
+    "lauki": "bottle gourd",
+    "ghiya": "bottle gourd",
+    "bottle gourd": "bottle gourd"
+  },
+
+  "pantry": [
+    "salt",
+    "water",
+    "oil",
+    "cooking oil",
+    "vegetable oil",
+    "ghee",
+    "clarified butter",
+    "black pepper",
+    "pepper",
+    "sugar",
+    "turmeric",
+    "haldi",
+    "cumin",
+    "jeera",
+    "cumin seeds",
+    "mustard seeds",
+    "rai",
+    "red chilli powder",
+    "coriander powder",
+    "dhania powder",
+    "garam masala",
+    "curry leaves",
+    "bay leaf",
+    "cinnamon",
+    "cardamom",
+    "cloves",
+    "asafoetida",
+    "hing",
+    "baking soda",
+    "baking powder",
+    "vinegar"
+  ],
+
+  "substitutions": {
+    "soy sauce": "a pinch of salt with a splash of vinegar (flavour won't be identical)",
+    "butter": "an equal amount of oil or ghee",
+    "cream": "whole milk with a little butter, or a spoon of yogurt",
+    "yogurt": "a splash of lemon juice stirred into milk",
+    "paneer": "firm tofu, cut the same way",
+    "cheese": "a little paneer for texture, or simply leave it out",
+    "coconut milk": "regular milk with a spoon of cream (taste will be milder)",
+    "lemon": "a small splash of vinegar",
+    "milk": "water for cooking, or diluted cream",
+    "capsicum": "any colour of bell pepper",
+    "spring onion": "a little regular onion plus fresh herbs",
+    "green chilli": "a pinch of red chilli powder",
+    "ketchup": "tomato paste with a pinch of sugar",
+    "cashew": "blanched almonds or a spoon of cream for richness",
+    "ginger": "a small pinch of dry ginger powder",
+    "garlic": "a small pinch of garlic powder",
+    "cream": "whole milk simmered with a little butter"
+  },
+
+  "units": [
+    "g", "gram", "grams", "kg", "kilogram", "kilograms",
+    "ml", "l", "litre", "litres", "liter", "liters",
+    "cup", "cups", "tbsp", "tablespoon", "tablespoons",
+    "tsp", "teaspoon", "teaspoons", "pinch", "pinches",
+    "slice", "slices", "piece", "pieces", "clove", "cloves",
+    "can", "cans", "tin", "tins", "packet", "packets", "pack",
+    "bunch", "bunches", "handful", "handfuls", "stalk", "stalks",
+    "sprig", "sprigs", "glass", "glasses", "bowl", "bowls",
+    "oz", "ounce", "ounces", "lb", "lbs", "pound", "pounds",
+    "dozen", "small", "medium", "large", "big", "half", "quarter"
+  ],
+
+  "quantity_words": {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+    "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10,
+    "couple": 2, "few": 3, "some": 1, "half": 1, "dozen": 12
+  },
+
+  "descriptors": [
+    "fresh", "frozen", "dried", "dry", "ripe", "raw", "cooked", "boiled",
+    "chopped", "diced", "sliced", "minced", "grated", "shredded", "crushed",
+    "peeled", "washed", "cleaned", "roasted", "fried", "steamed", "mashed",
+    "finely", "roughly", "thinly", "thickly", "of", "the", "and", "with",
+    "into", "to", "taste", "leftover", "extra", "little", "bit", "lots",
+    "plenty", "optional", "approx", "about", "around", "more", "less",
+    "hot", "cold", "warm", "boneless", "skinless", "plain", "whole"
+  ]
+}
