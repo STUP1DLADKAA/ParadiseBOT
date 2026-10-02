@@ -63,6 +63,10 @@ class ParadiseBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
+        # Server Members intent: without it the member cache stays empty and
+        # voice leaderboards cannot resolve names/avatars (shows "User <id>").
+        # Must also be enabled in the Discord Developer Portal for this bot.
+        intents.members = True
         super().__init__(
             command_prefix=commands.when_mentioned,
             intents=intents,

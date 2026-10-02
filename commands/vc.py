@@ -100,7 +100,9 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
 
         await interaction.response.defer()
 
-        members = self.tracker.get_live_leaderboard(interaction.guild, selected_period)
+        members = await self.tracker.get_live_leaderboard(
+            interaction.guild, selected_period
+        )
         view = LeaderboardView(
             tracker=self.tracker,
             guild=interaction.guild,
@@ -153,7 +155,7 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
             return
 
         target = member or interaction.user
-        stats_data = self.tracker.get_live_user_stats(interaction.guild, target.id)
+        stats_data = await self.tracker.get_live_user_stats(interaction.guild, target.id)
         embed = build_user_stats_embed(interaction.guild, target, stats_data)
         await interaction.response.send_message(embed=embed)
 

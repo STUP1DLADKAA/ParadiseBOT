@@ -162,7 +162,7 @@ class LeaderboardView(discord.ui.View):
 
     async def update_view(self, interaction: discord.Interaction) -> None:
         """Re-render response according to current state."""
-        members = self.tracker.get_live_leaderboard(self.guild, self.period)
+        members = await self.tracker.get_live_leaderboard(self.guild, self.period)
         total_pages = max(1, (len(members) + self.page_size - 1) // self.page_size)
         self.page = max(1, min(self.page, total_pages))
         self.prev_btn.disabled = self.page <= 1
