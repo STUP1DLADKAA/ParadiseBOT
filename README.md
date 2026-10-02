@@ -57,7 +57,9 @@ Choices for `/choose` and `/poll` are separated with `|` or `,`:
 
 Paradise automatically tracks voice channel sessions with zero database spam and high resilience:
 
-- **Session Tracking**: Tracks join, leave, channel move, and disconnects safely. Recovers on bot restart.
+- **Session Tracking**: Tracks join, leave, channel move, and disconnects safely.
+- **Restart- & Crash-Safe**: In-progress sessions are persisted with periodic heartbeats. Someone still in VC through a bot restart keeps their *original* join time (nothing is re-counted from zero); if a user left while the bot was down, their session is closed at the last confirmed heartbeat.
+- **Real Names, Always**: Member names/avatars are remembered in the database and refreshed opportunistically, so the leaderboard renders real identities even after restarts, cold member caches, or members leaving voice (requires the **Server Members Intent**).
 - **Midnight Splitting**: Long sessions spanning across midnight are accurately split across days (e.g. 23:50 → 00:20 becomes 10m on Day 1, 20m on Day 2).
 - **Daily DM Reports**: Automatically sends each active member their own personal daily VC summary at day's end.
 - **Rendered Leaderboard Card**: Programmatic Pillow renderer producing Material Expressive statistics cards with podium highlights (#1 gold, #2 silver, #3 bronze), Discord avatars, time duration pills, and percentage shares.
