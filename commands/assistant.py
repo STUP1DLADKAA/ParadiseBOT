@@ -381,7 +381,8 @@ class Assistant(commands.Cog):
         ai = self.bot.ai
         if not ai.available:
             now = time.monotonic()
-            if now - self._fallback_last.get(message.channel.id, 0.0) < _FALLBACK_NOTE_COOLDOWN:
+            last = self._fallback_last.get(message.channel.id)
+            if last is not None and now - last < _FALLBACK_NOTE_COOLDOWN:
                 return True
             self._fallback_last[message.channel.id] = now
             await self._quiet_reply(
@@ -413,7 +414,10 @@ class Assistant(commands.Cog):
 
     async def _maybe_hint(self, message: discord.Message) -> bool:
         now = time.monotonic()
-        if now - self._hint_last.get(message.channel.id, 0.0) < _HINT_COOLDOWN:
+        # None = never shown (0.0 would silently block hints for the first
+        # minutes after the host booted, since monotonic time starts at 0).
+        last = self._hint_last.get(message.channel.id)
+        if last is not None and now - last < _HINT_COOLDOWN:
             return True
         self._hint_last[message.channel.id] = now
         await self._quiet_reply(message, ASK_HINT)
@@ -421,9 +425,11 @@ class Assistant(commands.Cog):
 
     def _cooled(self, message: discord.Message) -> bool:
         now = time.monotonic()
-        if now - self._user_last.get(message.author.id, 0.0) < _USER_COOLDOWN:
+        user_last = self._user_last.get(message.author.id)
+        if user_last is not None and now - user_last < _USER_COOLDOWN:
             return False
-        if now - self._channel_last.get(message.channel.id, 0.0) < _CHANNEL_COOLDOWN:
+        channel_last = self._channel_last.get(message.channel.id)
+        if channel_last is not None and now - channel_last < _CHANNEL_COOLDOWN:
             return False
         self._user_last[message.author.id] = now
         self._channel_last[message.channel.id] = now

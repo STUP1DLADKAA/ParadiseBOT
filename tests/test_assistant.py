@@ -265,6 +265,20 @@ class TestAssistantDispatch(unittest.IsolatedAsyncioTestCase):
         # No Entertainment cog registered → search answer instead of silence.
         self.assertIn("searching the web", message.replies[0]["content"].casefold())
 
+    def test_never_used_is_never_cooled(self):
+        """Regression: monotonic time starts at 0 at boot — "never seen" must
+        not read as "seen 0 seconds ago" and silence the very first mention."""
+        import commands.assistant as assistant_module
+
+        assistant, _ = make_assistant()
+        message = mention("anything")
+        original = assistant_module.time.monotonic
+        assistant_module.time.monotonic = lambda: 1.0  # one second after boot
+        try:
+            self.assertTrue(assistant._cooled(message))
+        finally:
+            assistant_module.time.monotonic = original
+
 
 class TestEntertainmentCardButtons(unittest.TestCase):
     """The card buttons surface: trailer link is always safe & keyless."""
