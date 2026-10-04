@@ -173,12 +173,64 @@ class EntertainmentConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class GeminiConfig:
+    """Google Gemini — the optional AI reasoning layer (see functions/gemini.py).
+
+    Entirely optional: with no key the bot still answers definitions,
+    conversions, calculations, weather, time, search, entertainment and
+    more — AI is strictly the last-resort reasoning layer.
+
+    The key is only ever sent to Gemini's API in a header. It is never
+    logged in full, never shown in bot messages and never committed.
+    """
+
+    enabled: bool = True
+    api_key: str = ""
+    # Model is configurable — only a default is provided.
+    model: str = "gemini-2.5-flash"
+    # Check the key against the API at startup (never fatal on error).
+    validate_on_start: bool = True
+    # Per-request deadline for Gemini calls.
+    timeout: float = 30.0
+    # Let Gemini polish complex web-search summaries (grounded in
+    # retrieved facts; deterministic summaries remain the default).
+    synthesize_search: bool = True
+
+    @property
+    def configured(self) -> bool:
+        """True when a key is present and the owner hasn't disabled Gemini."""
+        return self.enabled and bool(self.api_key.strip())
+
+    @property
+    def masked_key(self) -> str:
+        """A log-safe rendering of the key — never the full secret."""
+        key = self.api_key.strip()
+        if len(key) <= 8:
+            return "…"
+        return f"{key[:2]}…{key[-2:]}"
+
+    @classmethod
+    def from_env(cls, env) -> "GeminiConfig":
+        return cls(
+            enabled=_bool(env.get("GEMINI_ENABLED"), True),
+            api_key=env.get("GEMINI_API_KEY", "").strip(),
+            model=(env.get("GEMINI_MODEL", "") or "").strip() or "gemini-2.5-flash",
+            validate_on_start=_bool(env.get("GEMINI_VALIDATE_ON_START"), True),
+            timeout=max(5.0, _float(env.get("GEMINI_TIMEOUT"), 30.0)),
+            synthesize_search=_bool(env.get("GEMINI_SYNTHESIZE_SEARCH"), True),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     """Everything Paradise reads from the environment."""
 
     token: str = ""
 
-    # OpenAI-compatible chat completion endpoint (optional).
+    # Gemini API key support (optional AI reasoning layer).
+    gemini: GeminiConfig = GeminiConfig()
+
+    # OpenAI-compatible chat completion endpoint (optional fallback provider).
     ai_base_url: str = ""
     ai_api_key: str = ""
     ai_model: str = ""
@@ -197,14 +249,16 @@ class Config:
 
     @property
     def ai_configured(self) -> bool:
-        # A base URL alone is enough for local providers (e.g. Ollama).
-        return bool(self.ai_base_url and self.ai_model)
+        # Gemini is the primary provider; an OpenAI-compatible endpoint is a
+        # fallback (a base URL alone is enough for local providers e.g. Ollama).
+        return self.gemini.configured or bool(self.ai_base_url and self.ai_model)
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Config":
         env = os.environ if environ is None else environ
         return cls(
             token=env.get("DISCORD_TOKEN", "").strip(),
+            gemini=GeminiConfig.from_env(env),
             ai_base_url=env.get("AI_BASE_URL", "").strip().rstrip("/"),
             ai_api_key=env.get("AI_API_KEY", "").strip(),
             ai_model=env.get("AI_MODEL", "").strip(),

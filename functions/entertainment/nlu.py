@@ -64,6 +64,58 @@ _RECOMMEND_LIKE = re.compile(
     r"(?:like|similar to|after|in the vein of)\s+(?P<subject>[a-z0-9:'!\- .&]{2,60})",
     re.IGNORECASE,
 )
+# "find anime like Naruto" — an explicit find/search verb needs the media
+# word, so plain-chat "find my keys like always" never matches.
+_FIND_LIKE = re.compile(
+    r"^(?:find|search(?:\s+for)?|look\s?up|discover)\s+(?:me\s+)?"
+    r"(?P<kind>anime|movies?|films?|shows?|series|web\s?series)\s+"
+    r"(?:like|similar to|in the vein of)\s+(?P<subject>[a-z0-9:'!\- .&]{2,60})\s*[?!.]*$",
+    re.IGNORECASE,
+)
+# "what should I watch tonight", "what movie should we watch" — whole
+# message only, so chat like "what should I watch out for" never matches.
+_WHAT_WATCH = re.compile(
+    r"^what\s+(?P<kind>(?:anime|movies?|films?|shows?|series|web\s?series)\s+)?"
+    r"(?:should|can|do)\s+(?:i|we)\s+watch"
+    r"(?:\s+(?P<era>tonight|today|now|later|this\s+(?:week|weekend|month)))?\s*[?!.]*$",
+    re.IGNORECASE,
+)
+# "movies with mind-blowing endings" — a media word leading a with/about
+# phrase counts as a vibe request.
+_WITH_VIBE = re.compile(
+    r"^(?:some\s+)?(?P<kind>anime|movies?|films?|shows?|series|web\s?series)\s+"
+    r"(?:with|about|that have)\s+(?P<vibe>[a-z][a-z0-9'\- ]{3,60})\s*[?!.]*$",
+    re.IGNORECASE,
+)
+# "short anime under 24 episodes" — a recognised vibe word + media word,
+# with only qualifier-style additions allowed afterwards.
+_VIBE_STARTERS = (
+    "short", "long", "underrated", "overlooked", "dark", "uplifting",
+    "feel-good", "feel good", "funny", "sad", "wholesome", "scary", "light",
+    "easy", "gritty", "stylish", "classic", "new", "recent", "top-rated",
+    "top rated", "highly rated", "acclaimed",
+)
+_VIBE_BARE = re.compile(
+    r"^(?P<vibe>" + "|".join(word.replace(" ", r"\s+") for word in _VIBE_STARTERS) + r")\s+"
+    r"(?P<kind>anime|movies?|films?|shows?|series|web\s?series)"
+    r"(?P<tail>(?:\s+(?:under\s+\d{1,3}\s*episodes?|from\s+\d{4}|this\s+(?:year|month|week)|"
+    r"recently|please|right\s+now|these\s+days|to\s+watch))*)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+# "latest Netflix shows", "newest anime" — freshness + media word.
+_LATEST_MEDIA = re.compile(
+    r"^(?:latest|newest)\s+(?:(?P<platform>[a-z][a-z .+]{2,20}?)\s+)?"
+    r"(?P<kind>anime|movies?|films?|shows?|series|web\s?series)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+# "give me something underrated" — recommend verb + "something" + vibe word.
+_SOMETHING_VIBE = re.compile(
+    r"^(?:recommend|suggest|give me|find me)\s+(?:me\s+)?something\s+"
+    r"(?P<vibe>underrated|good|new|different|short|dark|uplifting|wholesome|"
+    r"scary|funny|sad|light|easy|classic|weird|hidden|obscure)"
+    r"(?:\s+(?:to\s+watch))?\s*[?!.]*$",
+    re.IGNORECASE,
+)
 _WATCH_AFTER = re.compile(
     r"what\s+(?:(?:good|new)\s+)?(?P<kind>anime|movies?|films?|shows?|series|web\s?series)?\s*"
     r"(?:should|can|do)\s+i\s+watch\s+(?:after|next|now)\s+"
@@ -198,7 +250,13 @@ class ChatIntent:
 
     @property
     def is_actionable(self) -> bool:
-        if self.kind in (RECOMMEND, STREAMING, RATING) and not self.subject and not self.media_type:
+        # Vibe-only recommendations ("what should I watch tonight?") carry no
+        # subject or type and are still perfectly answerable.
+        if self.kind == RECOMMEND:
+            return True
+        if self.kind in (STREAMING, RATING) and not (
+            self.subject or self.media_type or self.genre
+        ):
             return False
         return True
 
@@ -417,7 +475,31 @@ def match_entertainment_request(text: str) -> ChatIntent | None:
                 break
         return intent
 
+    # "latest Netflix shows" / "newest anime" — freshness + media word.
+    match = _LATEST_MEDIA.match(lowered)
+    if match:
+        intent = ChatIntent(kind=TRENDING, raw=message, confidence=0.8)
+        intent.media_type = _category_of(match.group("kind") or "")
+        intent.era = "recent"
+        platform = (match.group("platform") or "").strip()
+        if platform and platform in STREAMING_PLATFORMS:
+            intent.platform = platform
+        return intent
+
     # --- recommendations -------------------------------------------------------
+    match = _FIND_LIKE.search(lowered)
+    if match:
+        subject = _clean_subject(match.group("subject"))
+        if subject and not _is_generic(subject):
+            intent = ChatIntent(
+                kind=RECOMMEND,
+                subject=subject,
+                media_type=_category_of(match.group("kind") or ""),
+                raw=message,
+                confidence=0.9,
+            )
+            _apply_qualifiers(lowered, intent)
+            return intent
     match = _RECOMMEND_LIKE.search(lowered)
     if match:
         subject = _clean_subject(match.group("subject"))
@@ -456,6 +538,62 @@ def match_entertainment_request(text: str) -> ChatIntent | None:
                 break
         for genre in _GENRES:
             if genre in chunk:
+                intent.genre = genre
+                break
+        if "underrated" in chunk:
+            intent.tone = "underrated"
+        _apply_qualifiers(lowered, intent)
+        return intent
+
+    # "what should I watch tonight?" — vibe recommendation, no seed title.
+    match = _WHAT_WATCH.match(lowered)
+    if match:
+        intent = ChatIntent(kind=RECOMMEND, raw=message, confidence=0.8)
+        kind = (match.group("kind") or "").strip()
+        if kind:
+            intent.media_type = _category_of(kind)
+        if match.group("era") and "now" not in match.group("era"):
+            intent.era = match.group("era")
+        _apply_qualifiers(lowered, intent)
+        return intent
+
+    # "something underrated" style vibes ("give me something dark").
+    match = _SOMETHING_VIBE.match(lowered)
+    if match:
+        chunk = match.group("vibe").strip()
+        intent = ChatIntent(kind=RECOMMEND, raw=message, confidence=0.75)
+        for genre in _GENRES:
+            if re.search(rf"\b{re.escape(genre)}\b", chunk):
+                intent.genre = genre
+                break
+        if "underrated" in chunk or "hidden" in chunk or "obscure" in chunk:
+            intent.tone = "underrated"
+        _apply_qualifiers(lowered, intent)
+        return intent
+
+    # "short anime under 24 episodes" — vibe word + media word, no verb.
+    match = _VIBE_BARE.match(lowered)
+    if match:
+        intent = ChatIntent(kind=RECOMMEND, raw=message, confidence=0.75)
+        intent.media_type = _category_of(match.group("kind") or "")
+        vibe = match.group("vibe")
+        if vibe.replace(" ", "-") in {"underrated", "overlooked"} or vibe in {"underrated", "overlooked"}:
+            intent.tone = "underrated"
+        if "short" in vibe:
+            intent.tone = intent.tone or "short"
+        _apply_qualifiers(lowered, intent)
+        if "recently" in lowered or "this year" in lowered:
+            intent.era = intent.era or "recent"
+        return intent
+
+    # "movies with mind-blowing endings" — media word + with/about phrase.
+    match = _WITH_VIBE.match(lowered)
+    if match:
+        chunk = match.group("vibe").strip()
+        intent = ChatIntent(kind=RECOMMEND, raw=message, confidence=0.65)
+        intent.media_type = _category_of(match.group("kind") or "")
+        for genre in _GENRES:
+            if re.search(rf"\b{re.escape(genre)}\b", chunk):
                 intent.genre = genre
                 break
         if "underrated" in chunk:
