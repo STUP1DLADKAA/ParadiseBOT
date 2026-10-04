@@ -266,5 +266,60 @@ class TestAssistantDispatch(unittest.IsolatedAsyncioTestCase):
         self.assertIn("searching the web", message.replies[0]["content"].casefold())
 
 
+class TestEntertainmentCardButtons(unittest.TestCase):
+    """The card buttons surface: trailer link is always safe & keyless."""
+
+    def test_trailer_button_present_and_wellformed(self):
+        from commands.entertainment import CardButtons
+        from functions.entertainment.models import Identity, MediaKind
+
+        identity = Identity(title="Naruto", kind=MediaKind.ANIME, year=2002)
+        view = CardButtons(service=None, identity=identity)
+
+        link_buttons = [
+            item for item in view.children
+            if getattr(item, "style", None) == discord.ButtonStyle.link
+        ]
+        self.assertTrue(link_buttons, "expected a trailer link button")
+        urls = {item.url for item in link_buttons}
+        self.assertTrue(any("youtube.com/results" in url for url in urls))
+        self.assertTrue(any("Naruto" in url and "official%20trailer" in url for url in urls))
+
+    def test_person_identity_gets_no_trailer_button(self):
+        from commands.entertainment import CardButtons
+        from functions.entertainment.models import Identity, MediaKind
+
+        identity = Identity(title="Hayao Miyazaki", kind=MediaKind.PERSON)
+        view = CardButtons(service=None, identity=identity)
+        link_buttons = [
+            item for item in view.children
+            if getattr(item, "style", None) == discord.ButtonStyle.link
+        ]
+        self.assertEqual(link_buttons, [])
+
+
+class TestSearchAnswerView(unittest.TestCase):
+    def test_view_disables_browse_without_results(self):
+        from functions.search import SearchAnswerView
+
+        answer = SearchAnswer(query="q", direct_answer="answer text here")
+        view = SearchAnswerView(answer, None, author_id=1)
+        browse = [i for i in view.children if getattr(i, "label", "") == "📑 Browse results"]
+        self.assertTrue(browse)
+        self.assertTrue(browse[0].disabled)
+
+        # link buttons only appear for real sources (max two)
+        answer2 = SearchAnswer(
+            query="q",
+            sources=[SearchResult(f"S{i}", f"https://s{i}.example/", "…") for i in range(4)],
+        )
+        view2 = SearchAnswerView(answer2, None, author_id=1)
+        links = [
+            i for i in view2.children
+            if getattr(i, "style", None) == discord.ButtonStyle.link
+        ]
+        self.assertEqual(len(links), 2)
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
