@@ -29,6 +29,10 @@ HELP_BLURBS = {
     "dictionary": "meaning, pronunciation, synonyms — as a card",
     "define": "same thing, shorter name",
     "recipe": "recipes from ingredients you have",
+    "example": "look up any movie, anime or series — live, no keys",
+    "trending": "what's trending / popular / top-rated right now",
+    "upcoming": "upcoming releases with honest dates",
+    "recommend": "personal picks with reasons ('like Interstellar')",
     "summarize": "recap recent chat in this channel",
 }
 
@@ -48,6 +52,7 @@ HELP_GROUPS = {
         "define",
         "recipe",
     ),
+    "🍿 entertainment": ("example", "trending", "upcoming", "recommend"),
     "🎙️ voice": ("vc",),
     "🤖 ai": ("summarize",),
 }

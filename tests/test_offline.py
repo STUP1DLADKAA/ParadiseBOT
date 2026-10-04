@@ -38,6 +38,7 @@ EXPECTED_COMMANDS = {
     "ping", "coinflip", "choose",
     "remind", "poll", "afk", "translate", "search", "weather", "convert",
     "time", "settimezone", "vc", "dictionary", "define", "recipe",
+    "example", "trending", "upcoming", "recommend",
     "summarize", "help",
 }
 
@@ -635,6 +636,10 @@ class TestWiring(unittest.TestCase):
 
     def test_dictionary_extension_is_loaded(self):
         self.assertIn("commands.dictionary", EXTENSIONS)
+
+    def test_entertainment_extension_is_loaded(self):
+        self.assertIn("commands.entertainment", EXTENSIONS)
+        self.assertIn("functions.entertainment", sys.modules)
 
     def test_modules_have_no_dead_music_imports(self):
         # Importing every remaining module must not pull removed ones in.
