@@ -24,6 +24,7 @@ EXTENSIONS = (
     "commands.vc",
     "commands.dictionary",
     "commands.recipe",
+    "commands.entertainment",
     "commands.ai",
     "commands.system",
 )
@@ -156,6 +157,12 @@ class ParadiseBot(commands.Bot):
             log.exception("Dictionary handling failed")
 
         try:
+            if await self._maybe_entertainment(message):
+                return
+        except Exception:
+            log.exception("Entertainment handling failed")
+
+        try:
             await self._maybe_ai(message)
         except Exception:
             log.exception("AI handling failed")
@@ -210,6 +217,15 @@ class ParadiseBot(commands.Bot):
 
     async def _maybe_dictionary(self, message: discord.Message) -> bool:
         cog = self.get_cog("Dictionary")
+        handler = getattr(cog, "handle_message", None)
+        if handler is None:
+            return False
+        return bool(await handler(message))
+
+    # -- Entertainment ----------------------------------------------------------
+
+    async def _maybe_entertainment(self, message: discord.Message) -> bool:
+        cog = self.get_cog("Entertainment")
         handler = getattr(cog, "handle_message", None)
         if handler is None:
             return False
