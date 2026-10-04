@@ -12,7 +12,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import Config, load_config
-from functions.ai import FALLBACK_UNAVAILABLE, AIService
+from functions.ai import AIService
 from functions.personality import Personality
 from functions.presence import PresenceManager
 
@@ -27,9 +27,8 @@ EXTENSIONS = (
     "commands.entertainment",
     "commands.ai",
     "commands.system",
+    "commands.assistant",
 )
-
-_FALLBACK_NOTE_COOLDOWN = 15 * 60
 
 
 class ParadiseTree(app_commands.CommandTree):
@@ -80,7 +79,6 @@ class ParadiseBot(commands.Bot):
         self.ai = AIService(self, config)
         self.afk_states: dict = {}
         self._afk_notice_last: dict[tuple[int, int], float] = {}
-        self._ai_fallback_last: dict[int, float] = {}
         self._ready_logged = False
 
     # ------------------------------------------------------------------
@@ -99,7 +97,18 @@ class ParadiseBot(commands.Bot):
             # Existing registered commands still work; a sync failure is not fatal.
             log.warning("Could not sync slash commands", exc_info=True)
 
+        log.info("AI provider: %s", self.ai.describe())
+        # Validate the Gemini key (if any) in the background — validation is
+        # never fatal: an unreachable network simply skips it.
+        self.loop.create_task(self._validate_ai())
+
         self.presence_manager.start()
+
+    async def _validate_ai(self) -> None:
+        try:
+            await asyncio.wait_for(self.ai.validate_startup(), timeout=20)
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
+            log.debug("AI startup validation skipped", exc_info=True)
 
     async def close(self) -> None:
         try:
@@ -162,10 +171,12 @@ class ParadiseBot(commands.Bot):
         except Exception:
             log.exception("Entertainment handling failed")
 
+        # Mentions/replies route through the assistant: tools first, AI last.
         try:
-            await self._maybe_ai(message)
+            if await self._maybe_assistant(message):
+                return
         except Exception:
-            log.exception("AI handling failed")
+            log.exception("Assistant handling failed")
 
         try:
             await self.personality.handle(message)
@@ -231,57 +242,14 @@ class ParadiseBot(commands.Bot):
             return False
         return bool(await handler(message))
 
-    # -- AI -------------------------------------------------------------------
+    # -- Assistant (mentions → tools first, AI last) ----------------------------
 
-    async def _maybe_ai(self, message: discord.Message) -> None:
-        if not self.ai.should_reply_to(message):
-            return
-        if not self.ai.available:
-            if time.monotonic() - self._ai_fallback_last.get(message.channel.id, 0.0) < _FALLBACK_NOTE_COOLDOWN:
-                return
-            self._ai_fallback_last[message.channel.id] = time.monotonic()
-            try:
-                await asyncio.wait_for(
-                    message.reply(FALLBACK_UNAVAILABLE, mention_author=False),
-                    timeout=10,
-                )
-            except (discord.DiscordException, asyncio.TimeoutError):
-                log.debug("AI fallback note failed", exc_info=True)
-            return
-
-        if self.ai.cooldown_remaining(message) > 0:
-            return
-
-        try:
-            answer = await asyncio.wait_for(self.ai.respond(message), timeout=60)
-        except asyncio.TimeoutError:
-            log.warning("AI answer timed out")
-            return
-        except Exception as error:
-            from functions.helpers import ParadiseError
-
-            if isinstance(error, ParadiseError):
-                try:
-                    await asyncio.wait_for(
-                        message.reply(str(error), mention_author=False),
-                        timeout=10,
-                    )
-                except (discord.DiscordException, asyncio.TimeoutError):
-                    pass
-                return
-            log.error("AI answer failed: %s", error, exc_info=error)
-            return
-        if not answer:
-            return
-        try:
-            await asyncio.wait_for(
-                message.reply(
-                    answer, mention_author=False, allowed_mentions=discord.AllowedMentions.none()
-                ),
-                timeout=10,
-            )
-        except (discord.DiscordException, asyncio.TimeoutError):
-            log.debug("AI reply send failed", exc_info=True)
+    async def _maybe_assistant(self, message: discord.Message) -> bool:
+        cog = self.get_cog("Assistant")
+        handler = getattr(cog, "handle_message", None)
+        if handler is None:
+            return False
+        return bool(await handler(message))
 
 
 def main() -> int:

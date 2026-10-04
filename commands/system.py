@@ -75,10 +75,23 @@ class System(commands.Cog):
         embed = discord.Embed(
             title="🌴 Paradise",
             description=(
-                "a small bot for a small server.\n"
-                "mention me any time to talk — I answer when it makes sense."
+                "part search engine, part toolbox, part movie-buff.\n"
+                "**the easiest way: just mention me.** tools answer first, "
+                "AI only when something genuinely needs it."
             ),
             colour=Colour.ACCENT,
+        )
+        embed.add_field(
+            name="💬 mention me like…",
+            value=(
+                "`@Paradise define photosynthesis`\n"
+                "`@Paradise what's 15% of 500` · `@Paradise 100 USD to INR`\n"
+                "`@Paradise weather in Delhi` · `@Paradise time in Tokyo`\n"
+                "`@Paradise latest Minecraft news` · `@Paradise search Mars photos`\n"
+                "`@Paradise recommend a movie like Interstellar`\n"
+                "`@Paradise translate hello into Japanese`"
+            ),
+            inline=False,
         )
         for group, names in HELP_GROUPS.items():
             lines = []
@@ -90,7 +103,7 @@ class System(commands.Cog):
                 continue
             value = "\n".join(lines)
             if group == "🤖 ai":
-                value += "\ntalk to me naturally by mentioning me."
+                value += "\nmention me to talk naturally (needs an AI key set by the owner)."
             embed.add_field(name=group, value=value, inline=False)
         embed.set_footer(text="quiet by design · it watches, occasionally comments")
         await interaction.response.send_message(embed=embed)

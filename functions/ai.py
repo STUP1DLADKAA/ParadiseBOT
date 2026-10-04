@@ -1,10 +1,19 @@
-"""Paradise's AI brain.
+"""Paradise's AI brain — the strictly *last-resort* reasoning layer.
 
-- OpenAI-compatible chat endpoint, fully configurable (OpenAI, Groq,
-  Gemini's compat layer, local Ollama, …). No hard-coded credentials.
+Provider priority:
+
+1. **Gemini** (native, ``GEMINI_API_KEY``/``GEMINI_MODEL``) — the owner's key,
+   used only for reasoning/explanations no deterministic tool can answer.
+2. **OpenAI-compatible** endpoint (``AI_BASE_URL``/``AI_MODEL``…) — optional
+   fallback/first-party provider (OpenAI, Groq, local Ollama, …).
+3. **None** — the bot stays fully functional; conversational AI replies are
+   simply unavailable. AI is never a hard dependency.
+
 - Activated only when invoked: mentions, replies, or explicit commands.
 - Keeps a tiny per-channel context window locally; nothing is sent to
-  the provider unless Paradise was actually addressed.
+  any provider unless Paradise was actually addressed.
+- ``reason()`` is the grounded synthesis path: retrieved, verified facts
+  in → explanation out. The AI layer never gets to invent facts.
 """
 
 from __future__ import annotations
@@ -16,6 +25,7 @@ from collections import defaultdict, deque
 
 import aiohttp
 
+from functions.gemini import GeminiService
 from functions.helpers import ParadiseError
 
 log = logging.getLogger(__name__)
@@ -58,6 +68,31 @@ class AIService:
         self._user_last: dict[tuple[int, int], float] = {}
         self._channel_last: dict[int, float] = {}
         self._failure_until: float = 0.0
+        # Gemini is the primary reasoning provider (may be unconfigured).
+        self.gemini = GeminiService(getattr(config, "gemini", None))
+
+    # ------------------------------------------------------------------
+    # Providers
+    # ------------------------------------------------------------------
+
+    @property
+    def provider_name(self) -> str:
+        """Which provider would answer right now: gemini / openai-compatible / none."""
+        if self.gemini.available:
+            return "gemini"
+        if self.config.ai_base_url and self.config.ai_model:
+            return "openai-compatible"
+        return "none"
+
+    def describe(self) -> str:
+        if self.gemini.configured:
+            base = f"gemini ({self.gemini.describe()})"
+            if self.config.ai_base_url and self.config.ai_model:
+                base += " + openai-compatible fallback"
+            return base
+        if self.config.ai_base_url and self.config.ai_model:
+            return f"openai-compatible ({self.config.ai_model})"
+        return "not configured (non-AI features unaffected)"
 
     # ------------------------------------------------------------------
     # Context memory (local only, tiny)
@@ -139,9 +174,44 @@ class AIService:
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
             await self._session.close()
+        try:
+            await self.gemini.close()
+        except Exception:  # noqa: BLE001 - shutdown is best effort
+            log.debug("Gemini shutdown failed", exc_info=True)
 
     async def chat(self, messages: list[dict], *, max_tokens: int = 400) -> str:
+        """Chat completion through the best available provider."""
         if not self.available:
+            raise ParadiseError(FALLBACK_UNAVAILABLE)
+        if self.gemini.available:
+            try:
+                return await self._chat_gemini(messages, max_tokens=max_tokens)
+            except ParadiseError:
+                # A rejected key / outage must not kill the fallback provider.
+                if not (self.config.ai_base_url and self.config.ai_model):
+                    raise
+                log.warning("Gemini failed — falling back to the OpenAI-compatible provider")
+        return await self._chat_openai(messages, max_tokens=max_tokens)
+
+    async def _chat_gemini(self, messages: list[dict], *, max_tokens: int = 400) -> str:
+        system = ""
+        parts: list[str] = []
+        for message in messages:
+            role = message.get("role", "user")
+            content = str(message.get("content", "")).strip()
+            if not content:
+                continue
+            if role == "system":
+                system = content
+            elif role == "assistant":
+                parts.append(f"Paradise: {content}")
+            else:
+                parts.append(content)
+        prompt = "\n\n".join(parts)
+        return await self.gemini.generate(prompt, system=system, max_tokens=max_tokens)
+
+    async def _chat_openai(self, messages: list[dict], *, max_tokens: int = 400) -> str:
+        if not (self.config.ai_base_url and self.config.ai_model):
             raise ParadiseError(FALLBACK_UNAVAILABLE)
         if time.monotonic() < self._failure_until:
             raise ParadiseError("the AI is being moody. give it a minute.")
@@ -203,6 +273,53 @@ class AIService:
         self._touch(message)
         self._remember_exchange(message.channel.id, question, answer)
         return answer[:1900] or "…I have nothing."
+
+    async def reason(
+        self, question: str, facts: list[str] | str, *, max_tokens: int = 500
+    ) -> str:
+        """Grounded synthesis: answer *question* strictly from retrieved *facts*.
+
+        Used by the search pipeline (and any other deterministic tool that
+        needs natural-language reasoning over verified data). The AI never
+        gets to invent facts — it only explains the ones we retrieved.
+        Falls back across providers the same way ``chat`` does.
+        """
+        if not self.available:
+            raise ParadiseError(FALLBACK_UNAVAILABLE)
+        if isinstance(facts, (list, tuple)):
+            fact_text = "\n".join(f"- {f}" for f in facts if str(f).strip()) or "(none)"
+        else:
+            fact_text = str(facts).strip() or "(none)"
+
+        if self.gemini.available:
+            try:
+                return await self.gemini.reason(question, fact_text, max_tokens=max_tokens)
+            except ParadiseError:
+                if not (self.config.ai_base_url and self.config.ai_model):
+                    raise
+                log.warning("Gemini reasoning failed — trying the fallback provider")
+
+        prompt = (
+            "You are answering for a Discord bot using ONLY the verified facts "
+            "provided. Never invent numbers, dates, names or events. If the "
+            "facts conflict, say so. Be concise.\n\n"
+            f"VERIFIED FACTS:\n{fact_text}\n\nQUESTION: {question.strip()}"
+        )
+        return await self._chat_openai(
+            [{"role": "user", "content": prompt}], max_tokens=max_tokens
+        )
+
+    async def validate_startup(self) -> bool:
+        """Best-effort startup validation of the configured key (never fatal)."""
+        gemini_cfg = getattr(self.config, "gemini", None)
+        if gemini_cfg is None or not gemini_cfg.configured:
+            if not self.available:
+                log.info("No AI provider configured — running fully tool-first.")
+            return False
+        if getattr(gemini_cfg, "validate_on_start", True):
+            return await self.gemini.validate()
+        log.info("Gemini configured (key %s) — validation skipped", self.gemini.masked_key)
+        return False
 
     async def summarize(self, lines: list[str], channel_name: str) -> str:
         transcript = "\n".join(lines)

@@ -612,14 +612,21 @@ class TestWiring(unittest.TestCase):
                 await bot.load_extension(extension)
             for attribute in (
                 "config", "personality", "presence_manager", "ai",
-                "afk_states", "started_at", "_afk_notice_last", "_ai_fallback_last",
+                "afk_states", "started_at", "_afk_notice_last",
             ):
                 self.assertTrue(hasattr(bot, attribute), f"bot.{attribute} missing")
             for attribute in (
                 "respond", "summarize", "record", "should_reply_to",
                 "cooldown_remaining", "close", "available",
+                "reason", "gemini", "describe", "provider_name",
+                "validate_startup",
             ):
                 self.assertTrue(hasattr(bot.ai, attribute), f"ai.{attribute} missing")
+            # The assistant cog owns mention routing (tools first, AI last).
+            assistant = bot.get_cog("Assistant")
+            self.assertIsNotNone(assistant, "Assistant cog missing")
+            for attribute in ("handle_message",):
+                self.assertTrue(hasattr(assistant, attribute), f"assistant.{attribute} missing")
             for attribute in ("start", "stop", "apply_current", "pick_note"):
                 self.assertTrue(
                     hasattr(bot.presence_manager, attribute),

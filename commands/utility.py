@@ -9,7 +9,6 @@ from collections import Counter
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -20,7 +19,7 @@ from functions.conversion import (
     parse_conversion_query,
 )
 from functions.helpers import Colour, ParadiseError, parse_options, shorten
-from functions.search import SearchEngine, SearchPaginationView, build_search_embed
+from functions.search import AnswerEngine, SearchEngine, SearchAnswerView, build_answer_embed
 from functions.time import (
     CITY_TIMEZONES,
     TZ_ABBREVIATIONS,
@@ -28,24 +27,14 @@ from functions.time import (
     get_current_time_for_zone,
     resolve_timezone,
 )
+from functions.translate import resolve_language, translate_text
+from functions.translate import LANGUAGE_CODES  # noqa: F401 - re-exported for compatibility
 from functions.voice.database import VoiceDatabase
 from functions.weather import OpenMeteoWeatherService, build_weather_embed, render_weather_card
 
 log = logging.getLogger(__name__)
 
 POLL_EMOJIS = ("1️⃣", "2️⃣", "3️⃣", "4️⃣", "5️⃣", "6️⃣", "7️⃣", "8️⃣", "9️⃣", "🔟")
-
-LANGUAGE_CODES = {
-    "hindi": "hi", "english": "en", "spanish": "es", "french": "fr",
-    "german": "de", "japanese": "ja", "korean": "ko", "chinese": "zh-CN",
-    "arabic": "ar", "russian": "ru", "portuguese": "pt", "italian": "it",
-    "turkish": "tr", "urdu": "ur", "punjabi": "pa", "marathi": "mr",
-    "tamil": "ta", "telugu": "te", "bengali": "bn", "gujarati": "gu",
-    "kannada": "kn", "malayalam": "ml", "dutch": "nl", "greek": "el",
-    "hebrew": "he", "persian": "fa", "indonesian": "id", "thai": "th",
-    "vietnamese": "vi", "polish": "pl", "ukrainian": "uk", "swedish": "sv",
-    "nepali": "ne", "sinhala": "si",
-}
 
 POPULAR_TIMEZONES = [
     "Asia/Kolkata", "Europe/London", "America/New_York", "America/Los_Angeles",
@@ -63,19 +52,6 @@ class AfkEntry:
 
 def cooldown(seconds: float = 5):
     return app_commands.checks.cooldown(1, seconds, key=lambda i: (i.guild_id, i.user.id))
-
-
-def resolve_language(raw: str) -> str | None:
-    raw = raw.strip().lower()
-    if not raw:
-        return None
-    if raw in LANGUAGE_CODES:
-        return LANGUAGE_CODES[raw]
-    if raw in LANGUAGE_CODES.values() or raw in ("zh-cn", "zh-tw", "zh"):
-        return raw
-    if len(raw) == 2 and raw.isalpha():
-        return raw
-    return None
 
 
 async def timezone_autocomplete(
@@ -121,6 +97,11 @@ class Utility(commands.Cog):
         self.reminder_owners: Counter[int] = Counter()
         self._next_reminder = 0
         self.search_engine = SearchEngine()
+        self.answer_engine = AnswerEngine(
+            self.search_engine,
+            ai=getattr(bot, "ai", None),
+            synthesize=getattr(getattr(bot.config, "gemini", None), "synthesize_search", True),
+        )
         self.weather_service = OpenMeteoWeatherService()
         self.conversion_engine = ConversionEngine()
         self.db = VoiceDatabase()
@@ -131,7 +112,7 @@ class Utility(commands.Cog):
 
     # -- search -----------------------------------------------------------
 
-    @app_commands.command(description="Search the web cleanly")
+    @app_commands.command(description="Search the web — answer first, sources as evidence")
     @app_commands.describe(query="What to search for")
     @cooldown(5)
     async def search(
@@ -141,16 +122,17 @@ class Utility(commands.Cog):
     ) -> None:
         await interaction.response.defer()
         try:
+            answer = await asyncio.wait_for(self.answer_engine.answer(query), timeout=25)
             response = await self.search_engine.search(query, limit=8)
         except Exception as err:
             log.warning("Search failed: %s", err, exc_info=True)
             await interaction.followup.send(
-                "the search engine is not responding right now. give it a moment."
+                "⚠️ I couldn't retrieve reliable information right now. Try again in a moment."
             )
             return
 
-        embed = build_search_embed(response, current_index=0)
-        view = SearchPaginationView(response, author_id=interaction.user.id)
+        embed = build_answer_embed(answer)
+        view = SearchAnswerView(answer, response, author_id=interaction.user.id)
         msg = await interaction.followup.send(embed=embed, view=view)
         view.message = msg
 
@@ -530,45 +512,14 @@ class Utility(commands.Cog):
         source_code = resolve_language(source) or "auto"
 
         await interaction.response.defer()
-        params = {
-            "client": "gtx",
-            "sl": source_code,
-            "tl": target_code,
-            "dt": "t",
-            "q": text,
-        }
-        try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=15)
-            ) as session:
-                async with session.get(
-                    "https://translate.googleapis.com/translate_a/single", params=params
-                ) as response:
-                    if response.status != 200:
-                        raise aiohttp.ClientResponseError(
-                            response.request_info, (), status=response.status
-                        )
-                    data = await response.json(content_type=None)
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-            log.debug("Translation failed", exc_info=True)
+        result = await translate_text(text, target_code, source_code)
+        if result is None:
             await interaction.followup.send(
                 "the translation service isn't responding right now."
             )
             return
-
-        try:
-            translated = "".join(part[0] for part in data[0] if part and part[0])
-            detected = data[2] if len(data) > 2 and isinstance(data[2], str) else source_code
-        except (TypeError, IndexError):
-            await interaction.followup.send(
-                "that translation came back weird. try again?"
-            )
-            return
-        if not translated:
-            await interaction.followup.send("couldn't translate that one.")
-            return
         await interaction.followup.send(
-            f"> {shorten(translated, 900)}\n\n-# {detected} → {target_code} · Google Translate"
+            f"> {shorten(result.text, 900)}\n\n-# {result.source} → {target_code} · Google Translate"
         )
 
 

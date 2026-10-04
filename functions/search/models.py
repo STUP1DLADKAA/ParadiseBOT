@@ -44,3 +44,34 @@ class SearchResponse:
     @property
     def total_count(self) -> int:
         return len(self.results)
+
+
+@dataclass(slots=True)
+class SearchAnswer:
+    """A search engine answer: summary first, sources as evidence.
+
+    The whole point of the upgraded search UX: a user gets the answer
+    *before* needing to open a link. ``summary``/``key_points`` are built
+    deterministically from retrieved snippets, optionally polished by
+    Gemini — never invented.
+    """
+
+    query: str
+    direct_answer: str = ""        # encyclopedic instant answer, when found
+    summary: str = ""              # the short synthesized paragraph
+    key_points: list[str] = field(default_factory=list)
+    sources: list[SearchResult] = field(default_factory=list)
+    warnings: list[str] = field(default_factory=list)  # conflicts / staleness
+    answer_source: str = ""        # where the direct answer came from
+    generated_by: str = "local"    # "local" (deterministic) or "gemini"
+    engine: str = "Web"
+    fresh: bool = False
+    cached: bool = False
+
+    @property
+    def has_answer(self) -> bool:
+        return bool(self.direct_answer or self.summary or self.key_points)
+
+    @property
+    def has_sources(self) -> bool:
+        return bool(self.sources)

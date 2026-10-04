@@ -86,13 +86,28 @@ def _title_embed(title: MediaTitle) -> discord.Embed:
 
 
 class CardButtons(discord.ui.View):
-    """The two follow-up actions on a title card — open to everyone."""
+    """Follow-up actions on a title card — open to everyone."""
 
     def __init__(self, service: EntertainmentService, identity: Identity) -> None:
         super().__init__(timeout=VIEW_TIMEOUT)
         self.service = service
         self.identity = identity
         self._busy: set[int] = set()
+        # 🎬 Trailer: a deterministic, key-less link (YouTube search for the
+        # official trailer) — always available for media identities.
+        if identity.is_media and identity.title:
+            query = f"{identity.title}" + (f" {identity.year}" if identity.year else "") + " official trailer"
+            from urllib.parse import quote
+
+            self.add_item(
+                discord.ui.Button(
+                    label="Trailer",
+                    emoji="🎬",
+                    style=discord.ButtonStyle.link,
+                    url=f"https://www.youtube.com/results?search_query={quote(query)}",
+                    row=0,
+                )
+            )
 
     async def on_timeout(self) -> None:
         for item in self.children:
@@ -444,6 +459,45 @@ class Entertainment(commands.Cog):
         message = await _edit(interaction, embed=embed, view=view)
         if view is not None and message is not None:
             view.message = message
+
+    # -- mention triggers (via the assistant router) ------------------------------
+
+    async def handle_mention(self, message: discord.Message, text: str) -> bool:
+        """True when an addressed entertainment request was answered.
+
+        Called by the assistant router after it classified the mention as
+        entertainment (its NLU already ran; we re-parse here because the
+        intent object isn't carried across cogs).
+        """
+        if message.guild is None:
+            return False
+        intent = self.service.parse_chat(text)
+        if intent is None or not intent.is_actionable:
+            return False
+
+        channel = message.channel
+        permissions = channel.permissions_for(message.guild.me)
+        if not permissions.send_messages:
+            return False
+
+        try:
+            placeholder = await message.reply(
+                embed=_embed(
+                    "🔎 Searching…",
+                    loading_line(intent.subject or intent.raw or "that"),
+                ),
+                mention_author=False,
+            )
+        except discord.HTTPException:
+            log.debug("Could not post entertainment loading state", exc_info=True)
+            return False
+
+        embed = await self._answer_intent(intent, placeholder)
+        try:
+            await placeholder.edit(embed=embed)
+        except discord.HTTPException:
+            log.debug("Could not deliver entertainment answer", exc_info=True)
+        return True
 
     # -- plain-chat triggers ------------------------------------------------------
 
