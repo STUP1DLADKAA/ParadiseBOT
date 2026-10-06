@@ -287,13 +287,6 @@ class TestAssistantDispatch(unittest.IsolatedAsyncioTestCase):
         await assistant.handle_message(message)
         self.assertIn("don't know the language", message.replies[0]["content"])
 
-    async def test_entertainment_falls_back_to_search_when_cog_gone(self):
-        assistant, _ = make_assistant()
-        message = mention("upcoming anime")
-        await assistant.handle_message(message)
-        # No Entertainment cog registered → search answer instead of silence.
-        self.assertIn("searching the web", message.replies[0]["content"].casefold())
-
     def test_never_used_is_never_cooled(self):
         """Regression: monotonic time starts at 0 at boot — "never seen" must
         not read as "seen 0 seconds ago" and silence the very first mention."""
@@ -714,38 +707,6 @@ class TestIntentRefinement(unittest.IsolatedAsyncioTestCase):
         ):
             refined = await assistant._refine(route, "hmm")
         self.assertIs(refined, route)
-
-
-class TestEntertainmentCardButtons(unittest.TestCase):
-    """The card buttons surface: trailer link is always safe & keyless."""
-
-    def test_trailer_button_present_and_wellformed(self):
-        from commands.entertainment import CardButtons
-        from functions.entertainment.models import Identity, MediaKind
-
-        identity = Identity(title="Naruto", kind=MediaKind.ANIME, year=2002)
-        view = CardButtons(service=None, identity=identity)
-
-        link_buttons = [
-            item for item in view.children
-            if getattr(item, "style", None) == discord.ButtonStyle.link
-        ]
-        self.assertTrue(link_buttons, "expected a trailer link button")
-        urls = {item.url for item in link_buttons}
-        self.assertTrue(any("youtube.com/results" in url for url in urls))
-        self.assertTrue(any("Naruto" in url and "official%20trailer" in url for url in urls))
-
-    def test_person_identity_gets_no_trailer_button(self):
-        from commands.entertainment import CardButtons
-        from functions.entertainment.models import Identity, MediaKind
-
-        identity = Identity(title="Hayao Miyazaki", kind=MediaKind.PERSON)
-        view = CardButtons(service=None, identity=identity)
-        link_buttons = [
-            item for item in view.children
-            if getattr(item, "style", None) == discord.ButtonStyle.link
-        ]
-        self.assertEqual(link_buttons, [])
 
 
 class TestSearchAnswerView(unittest.TestCase):

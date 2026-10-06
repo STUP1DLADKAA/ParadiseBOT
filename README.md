@@ -1,6 +1,6 @@
 # Paradise Bot
 
-A small private Discord bot for a friends-only server — part search engine, part utility toolbox, part entertainment guide, with an *optional* AI reasoning layer on top.
+A small private Discord bot for a friends-only server — part search engine, part utility toolbox, with an *optional* AI reasoning layer on top.
 
 Paradise answers when addressed, quietly watches the server, and every once in a while reacts to or comments on a message — rarely enough that it feels like an Easter egg. It is intentionally not a moderation suite, dashboard, music player, or AI wrapper.
 
@@ -16,18 +16,15 @@ intent router (deterministic, ~microseconds)
 can a native tool answer?      calculator · define · convert · image · weather · time · translate
    ├── YES → specialised tool, zero AI
    └── NO
-        can the entertainment engine answer?   movies · anime · series · trending · upcoming · recommendations
-        ├── YES → verified cards, zero AI
+        can web search answer?            → answer + key points + sources (never bare links)
+        ├── YES → native sourced answer (AI may explain the sources, never invent them)
         └── NO
-             can web search answer?            → answer + key points + sources (never bare links)
-             ├── YES → native sourced answer (AI may explain the sources, never invent them)
-             └── NO
-                  still ambiguous?             → one tiny Gemini JSON label, then re-route
-                  needs real reasoning?        → Gemini (or the OpenAI-compatible fallback)
-                  └── everything else         → asks what you meant
+             still ambiguous?             → one tiny Gemini JSON label, then re-route
+             needs real reasoning?        → Gemini (or the OpenAI-compatible fallback)
+             └── everything else         → asks what you meant
 ```
 
-AI is strictly the last resort: `"25% of 800"`, `"100 USD to INR"`, `"weather in Delhi"`, `"a picture of a red panda"` or `"upcoming anime"` never touch an AI model. When the AI *is* used over web results it only ever explains retrieved evidence — it never supplies facts of its own, and a failed live lookup is reported honestly instead of being guessed. With **no API key at all** the bot is fully functional — only free-form conversation and `/summarize` are off.
+AI is strictly the last resort: `"25% of 800"`, `"100 USD to INR"`, `"weather in Delhi"`, `"a picture of a red panda"` never touch an AI model. When the AI *is* used over web results it only ever explains retrieved evidence — it never supplies facts of its own, and a failed live lookup is reported honestly instead of being guessed. With **no API key at all** the bot is fully functional — only free-form conversation and `/summarize` are off.
 
 ## Run it
 
@@ -79,9 +76,6 @@ The easiest interface is a plain mention. The deterministic router picks the rig
 @Paradise what's the date              → date in your timezone
 @Paradise translate hello into Japanese
 @Paradise latest Minecraft news        → web answer + key points + sources
-@Paradise upcoming anime               → the entertainment engine
-@Paradise recommend a movie like Interstellar
-@Paradise what's trending in anime
 @Paradise explain why One Piece is so popular   → AI (the reasoning layer)
 @Paradise help                         → quick cheat-sheet
 ```
@@ -140,7 +134,6 @@ Mentions like `@Paradise 25% of 800` understand everyday math: percent (`25% of 
   - `/settimezone` — set your personal timezone for `/time` and reports
   - `/remind`, `/poll`, `/afk`, `/translate`, `/dictionary` (or `/define`), `/recipe`
 - **Voice** — `/vc leaderboard` (rendered stats card or text list for Today, Yesterday, Week, Month, All-Time), `/vc stats`, `/vc dmreports`
-- **Entertainment** — `/example` (movie/anime/web-series info card with live autocomplete), `/trending`, `/upcoming`, `/recommend`
 - **AI** — `/summarize`, or just mention Paradise (needs `GEMINI_API_KEY` or an OpenAI-compatible endpoint; everything else works regardless)
 - `/help` lists exactly what is registered — nothing more
 
@@ -182,29 +175,6 @@ what does serendipity mean?
 
 - **No API key, no external service.** Word data comes from two free, key-less sources: [dictionaryapi.dev](https://dictionaryapi.dev) (Wiktionary-backed definitions, IPA and human recordings) and [Datamuse](https://www.datamuse.com/api/) (synonyms, antonyms, related words, spelling correction). If the first is down the second still produces a usable card, clearly marked as partial.
 
-## Movies, Anime & Web Series Discovery
-
-`/example` (with live autocomplete while you type) and natural chat questions answer with a clean card: title, ⭐ ratings *per named source* (IMDb, MyAnimeList, Rotten Tomatoes, AniList, Kitsu… shown separately, never blended), 📅 release dates, 🎭 genres, 🎞️ episodes/seasons, ⏱️ runtime, 🎬 director, 🌟 cast, 🏭 studio, 📡 where to watch, and 🍿 similar titles.
-
-```text
-/example name:Interstellar
-/example naruto          ← autocomplete kicks in after 2 characters
-/trending category:anime mode:trending
-/upcoming category:movies days:30
-/recommend query:anime like Jujutsu Kaisen
-
-what's trending right now?          ← plain chat works too
-where can I watch Oppenheimer in India?
-is Chainsaw Man season 2 coming?
-give me 5 anime like Jujutsu Kaisen
-```
-
-- **Zero setup.** No API keys, accounts, or datasets. Every source is a key-less public API — IMDb suggestions, TVMaze, Kitsu, AniList, Jikan (MyAnimeList), Wikipedia/Wikidata, the Wikimedia pageview charts — with automatic fallback between them; the movie/TV/anime layer also reuses the bot's web search engine for streaming availability and ratings cross-checks. No single point of failure.
-- **Fresh over stored.** Stable facts (synopsis, cast, genres) cache for a day; volatile facts (ratings, trending, streaming, release dates) refresh every ~45 minutes. If every source is unreachable the bot says so honestly instead of guessing — a stale card is served clearly labelled as stale.
-- **Honest dates.** "2027" (a year-only announcement) is never dressed up as an exact day; approximate windows are labelled as windows.
-- **Trending ≠ popular ≠ highest rated** — three separate engines, each with its own live signals (Wikimedia most-read charts, AniList trending scores, TVMaze schedule premieres, Wikidata future release dates).
-- **Typo-tolerant everywhere** — `naurto` still finds Naruto; Japanese romaji and English titles are interchangeable (`shingeki no kyojin` ↔ `Attack on Titan`); ambiguous short queries like `it` offer a disambiguation of buttons instead of guessing.
-
 ## Architecture
 
 ```
@@ -216,14 +186,13 @@ commands/
   vc.py                   /vc leaderboard, /vc stats, /vc dmreports, voice state listeners
   dictionary.py           /dictionary + /define, chat triggers, card UI, buttons
   recipe.py               /recipe command + Components V2 recipe UI
-  entertainment.py        /example /trending /upcoming /recommend + chat & mention triggers
   ai.py                   /summarize command
   system.py               /help command
   assistant.py            mention router: "@Paradise <anything>" → tools first, AI last;
                           combined multi-tool replies, grounded search synthesis
 functions/
   router.py               deterministic intent router (no AI): calc/define/convert/image/
-                          weather/time/translate/entertainment/search/AI priority chain,
+                          weather/time/translate/search/AI priority chain,
                           plus conservative splitting of multi-tool requests
   intent.py               stage-2 fallback: one tiny Gemini JSON label when the
                           deterministic router is genuinely unsure
@@ -244,9 +213,6 @@ functions/
   time/                   IANA timezone resolver, city maps, time formatting
   voice/                  voice activity tracker, SQLite persistence, midnight splitting,
                           daily DM reporter, programmatic Pillow leaderboard card renderer
-  entertainment/          movies/anime/web-series discovery: search & resolver, details
-                          builder, verification, recommendation/trending/upcoming engines,
-                          autocomplete, NLU chat parser, cache layer, response formatter
   helpers.py              shared errors, colours, parsing, formatting
   personality.py          rare contextual reactions and short replies
   presence.py             fixed «Watching Paradise» activity + rotating note
@@ -267,4 +233,4 @@ pytest
 # or: python -m unittest discover -s tests -v
 ```
 
-All 560+ test cases run completely offline and validate every subsystem: search (raw engine *and* the answer pipeline with conflict/staleness detection), the mention router and assistant dispatch, multi-tool combined requests, web image search (provider parsing over a fake transport, URL-safety rejection, probe bounding, caching and dedup), the stage-2 intent classifier, prompt-injection sanitizing, the shared TTL cache and single-flight collapsing, the calculator sandbox, the Gemini client and AI provider chain (key-masking, rejection/quota/fallback handling), weather, conversions, timezones, voice tracking, midnight session splitting, daily reports, image rendering, and the full entertainment pipeline (source parsers tested against real captured API payloads, resolver ranking, autocomplete, natural-language parsing, cache expiry, and end-to-end lookup flows over a fake transport).
+All 480+ test cases run completely offline and validate every subsystem: search (raw engine *and* the answer pipeline with conflict/staleness detection), the mention router and assistant dispatch, multi-tool combined requests, web image search (provider parsing over a fake transport, URL-safety rejection, probe bounding, caching and dedup), the stage-2 intent classifier, prompt-injection sanitizing, the shared TTL cache and single-flight collapsing, the calculator sandbox, the Gemini client and AI provider chain (key-masking, rejection/quota/fallback handling), weather, conversions, timezones, voice tracking, midnight session splitting, daily reports and image rendering.

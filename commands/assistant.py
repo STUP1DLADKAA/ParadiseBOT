@@ -5,8 +5,8 @@ the request with the deterministic router (functions/router.py) and sends
 it to the most specialised tool:
 
     calculator · define · convert · image search · weather · time/date
-    · translate → entertainment engine → explicit web search (answer +
-    sources) → Gemini/OpenAI-compatible AI — strictly the last resort
+    · translate → explicit web search (answer + sources)
+    → Gemini/OpenAI-compatible AI — strictly the last resort
 
 Pipeline:
 
@@ -48,7 +48,7 @@ from functions.images import (
 from functions.intent import classify_request, should_classify
 from functions.router import (
     AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
-    ENTERTAINMENT, HELP, IMAGE, PING, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
+    HELP, IMAGE, PING, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
     Route, route_many,
 )
 from functions.search import SearchAnswerView, SearchResponse, build_answer_embed
@@ -209,8 +209,6 @@ class Assistant(commands.Cog):
             return await self._date(message)
         if kind == TRANSLATE:
             return await self._translate(message, route)
-        if kind == ENTERTAINMENT:
-            return await self._entertainment(message, text)
         if kind == SEARCH:
             return await self._search(message, route)
         if kind in (AI, UNKNOWN):
@@ -621,16 +619,6 @@ class Assistant(commands.Cog):
             f"> {shorten(result.text, 900)}\n\n-# {result.source} → {target} · Google Translate",
         )
         return True
-
-    # -- entertainment --------------------------------------------------------------
-
-    async def _entertainment(self, message: discord.Message, text: str) -> bool:
-        cog = self.bot.get_cog("Entertainment")
-        handler = getattr(cog, "handle_mention", None) if cog is not None else None
-        if handler is not None and await handler(message, text):
-            return True
-        # The entertainment NLU changed its mind — the web still has answers.
-        return await self._search(message, Route(kind=SEARCH, payload=text, confidence=0.3))
 
     # -- web search ---------------------------------------------------------------------
 
