@@ -32,14 +32,11 @@ class ConversionEngine:
         if from_curr and to_curr:
             return await self.currency_service.convert(val, from_curr, to_curr)
 
-        # 2. Check if temperature
-        from_clean = from_unit_raw.strip().lower()
-        to_clean = to_unit_raw.strip().lower()
-        if (from_clean in TEMP_UNITS or from_clean.rstrip("°") in TEMP_UNITS) and \
-           (to_clean in TEMP_UNITS or to_clean.rstrip("°") in TEMP_UNITS):
-            from_t = from_clean.rstrip("°")
-            to_t = to_clean.rstrip("°")
-            return convert_temperature(val, from_t, to_t)
+        # 2. Check if temperature ("°C", "25C°" and bare "c" all normalize)
+        from_clean = from_unit_raw.strip().lower().strip("°º∘")
+        to_clean = to_unit_raw.strip().lower().strip("°º∘")
+        if from_clean in TEMP_UNITS and to_clean in TEMP_UNITS:
+            return convert_temperature(val, from_clean, to_clean)
 
         # 3. Check standard units
         from_u = resolve_unit(from_unit_raw)
