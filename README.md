@@ -20,13 +20,13 @@ can a native tool answer?      calculator · define · convert · weather · tim
         ├── YES → verified cards, zero AI
         └── NO
              can web search answer?            → answer + key points + sources (never bare links)
-             ├── YES → sourced summary, optionally rephrased by AI *from retrieved facts*
+             ├── YES → native sourced answer, zero AI
              └── NO
                   needs real reasoning?        → Gemini (or the OpenAI-compatible fallback)
                   └── everything else         → asks what you meant
 ```
 
-AI is strictly the last resort: `"25% of 800"`, `"100 USD to INR"`, `"weather in Delhi"` or `"upcoming anime"` never touch an AI model. With **no API key at all** the bot is fully functional — only free-form conversation and AI-polished summaries are off.
+AI is strictly the last resort: `"25% of 800"`, `"100 USD to INR"`, `"weather in Delhi"` or `"upcoming anime"` never touch an AI model. Search cards are generated locally from retrieved evidence; they never make a second search or AI-polish call. With **no API key at all** the bot is fully functional — only free-form conversation and `/summarize` are off.
 
 ## Run it
 
@@ -54,7 +54,7 @@ Everything lives in `.env` (never committed). See `.env.example` for all options
 | --- | --- | --- |
 | Discord | `DISCORD_TOKEN` | required |
 | Voice | `VOICE_DB_PATH`, `VOICE_DM_REPORTS_ENABLED` | SQLite voice database path (default: `data/paradise.db`) and daily DM summaries |
-| Gemini (AI) | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_ENABLED`, `GEMINI_VALIDATE_ON_START`, `GEMINI_TIMEOUT`, `GEMINI_SYNTHESIZE_SEARCH` | the optional AI reasoning layer. Key validated at startup, never logged/displayed, never required — every tool works without it. Get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
+| Gemini (AI) | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_ENABLED`, `GEMINI_VALIDATE_ON_START`, `GEMINI_TIMEOUT` | the optional AI interpretation/reasoning layer. Key validated at startup, never logged/displayed, never required — every native tool works without it. Get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | AI fallback | `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | optional OpenAI-compatible endpoint (OpenAI, Groq, local Ollama), used when Gemini is not configured or unavailable |
 | Personality | `PERSONALITY_ENABLED`, `PERSONALITY_REACTION_CHANCE`, `PERSONALITY_REPLY_CHANCE`, `PERSONALITY_GLOBAL_COOLDOWN`, `PERSONALITY_CHANNEL_COOLDOWN`, `PERSONALITY_REPLY_CHANNEL_COOLDOWN` | tuning for the rare reactions/replies; defaults are deliberately conservative |
 | Dictionary | `DICTIONARY_TEXT_TRIGGERS`, `DICTIONARY_TIMEOUT`, `DICTIONARY_CACHE_TTL`, `DICTIONARY_CACHE_SIZE`, `DICTIONARY_CARD_THEME` | all optional — the dictionary needs no keys and works out of the box |
@@ -62,7 +62,7 @@ Everything lives in `.env` (never committed). See `.env.example` for all options
 
 ## Mention me — no commands to learn
 
-The easiest interface is a plain mention. The deterministic router picks the right tool; a temporary *"🔎 searching the web…"* placeholder is edited into the final answer when something takes a moment:
+The easiest interface is a plain mention. The deterministic router picks the right native tool; only explicit search requests use the temporary *"🔎 searching the web…"* placeholder:
 
 ```text
 @Paradise define photosynthesis        → dictionary card (web answer if not a word)
@@ -90,7 +90,7 @@ The easiest interface is a plain mention. The deterministic router picks the rig
 3. **⚠️ Heads-up** — shown when sources disagree on dates/figures or everything looks dated.
 4. **Sources** — numbered clickable links, authoritative sources starred.
 
-A "📑 Browse results" button flips the card into the classic paginated result browser. Summaries are extracted deterministically from what was actually retrieved — never from thin air; if the owner configured Gemini *and* the query genuinely benefits from synthesis, the retrieved facts are handed to the model for rephrasing (footer marks the card `summary rephrased by Gemini`).
+A "📑 Browse results" button flips the card into the classic paginated result browser. Summaries are extracted deterministically from what was actually retrieved — never from thin air. Search never calls the AI, and the answer card reuses its first retrieval instead of issuing a duplicate search for the browse view.
 
 ## Built-in calculator
 
@@ -192,12 +192,12 @@ functions/
                           time/translate/entertainment/search/AI priority chain
   calculator.py           safe AST-whitelisted calculator (percent idioms, word operators)
   gemini.py               Gemini REST client (key in header only, masked logs, graceful
-                          invalid/quota handling, grounded reason() synthesis)
+                          invalid/quota handling, complete-output retry handling)
   ai.py                   provider chain: Gemini → OpenAI-compatible → none; activation
-                          rules, bounded context, reason() over retrieved facts
-  search/                 web search engine (DuckDuckGo, Wikipedia, caching) + answer
-                          pipeline (direct answer, key points, conflict/staleness warnings,
-                          source evidence, optional grounded AI rephrasing)
+                          rules, bounded context, concise direct responses
+  search/                 native web search engine (DuckDuckGo, Wikipedia, caching) +
+                          deterministic answer pipeline (direct answer, key points,
+                          conflict/staleness warnings, source evidence)
   translate.py            shared key-less translation helper
   weather/                Open-Meteo weather provider, fuzzy geocoding, forecast embed
   conversion/             units conversion (9 categories), currency exchange rates, natural parser

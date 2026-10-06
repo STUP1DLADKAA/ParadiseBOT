@@ -141,7 +141,38 @@ class GeminiService:
         max_tokens: int = 500,
         temperature: float = 0.7,
     ) -> str:
-        """Generate a completion, or raise a friendly ``ParadiseError``."""
+        """Generate a complete answer, retrying once after ``MAX_TOKENS``."""
+        text, truncated = await self._generate_once(
+            prompt, system=system, max_tokens=max_tokens, temperature=temperature
+        )
+        if not truncated:
+            return text
+
+        # Do not expose a partial thought. One bounded retry is enough; an
+        # outage during the retry becomes a friendly error instead of a second
+        # retry loop that burns tokens.
+        retry_budget = min(max(512, int(max_tokens) * 2), 1200)
+        try:
+            retry_text, retry_truncated = await self._generate_once(
+                prompt,
+                system=system,
+                max_tokens=retry_budget,
+                temperature=temperature,
+            )
+        except ParadiseError:
+            raise ParadiseError("I couldn't finish that answer cleanly. try again.") from None
+        if retry_truncated or not retry_text:
+            raise ParadiseError("I couldn't finish that answer cleanly. try again.")
+        return retry_text
+
+    async def _generate_once(
+        self,
+        prompt: str,
+        *,
+        system: str,
+        max_tokens: int,
+        temperature: float,
+    ) -> tuple[str, bool]:
         if not self.configured:
             raise ParadiseError("Gemini isn't configured on this bot.")
         if self.disabled_reason:
@@ -155,7 +186,7 @@ class GeminiService:
         payload: dict = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
-                "maxOutputTokens": max(64, int(max_tokens)),
+                "maxOutputTokens": max(128, int(max_tokens)),
                 "temperature": temperature,
             },
         }
@@ -172,7 +203,14 @@ class GeminiService:
                 data = await response.json(content_type=None)
         except ParadiseError:
             raise
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            OSError,
+            ValueError,
+            IndexError,
+            TypeError,
+        ):
             self._failure_until = time.monotonic() + _FAILURE_COOLDOWN
             log.warning("Gemini request failed (network/parsing)", exc_info=True)
             raise ParadiseError(
@@ -183,7 +221,7 @@ class GeminiService:
         if not text:
             log.warning("Gemini returned an empty/unexpected payload: %s", str(data)[:200])
             raise ParadiseError("Gemini answered with nothing useful. try again.")
-        return text
+        return text, self._finish_reason(data) in {"max_tokens", "length"}
 
     async def reason(self, question: str, facts: list[str] | str, *, max_tokens: int = 500) -> str:
         """Grounded reasoning: answer *question* strictly from *facts*.
@@ -276,3 +314,10 @@ class GeminiService:
         except (AttributeError, TypeError):
             pass
         return ""
+
+    @staticmethod
+    def _finish_reason(data) -> str:
+        try:
+            return str((data.get("candidates") or [])[0].get("finishReason") or "").casefold()
+        except (AttributeError, IndexError, TypeError):
+            return ""

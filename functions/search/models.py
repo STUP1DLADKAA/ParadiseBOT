@@ -51,9 +51,8 @@ class SearchAnswer:
     """A search engine answer: summary first, sources as evidence.
 
     The whole point of the upgraded search UX: a user gets the answer
-    *before* needing to open a link. ``summary``/``key_points`` are built
-    deterministically from retrieved snippets, optionally polished by
-    Gemini — never invented.
+    *before* needing to open a link. ``summary`` and ``key_points`` are built
+    deterministically from retrieved snippets and never invented.
     """
 
     query: str
@@ -63,7 +62,9 @@ class SearchAnswer:
     sources: list[SearchResult] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)  # conflicts / staleness
     answer_source: str = ""        # where the direct answer came from
-    generated_by: str = "local"    # "local" (deterministic) or "gemini"
+    # Kept for compatibility with serialized cards from older releases.
+    # New answers are always generated locally from retrieved evidence.
+    generated_by: str = "local"
     engine: str = "Web"
     fresh: bool = False
     cached: bool = False

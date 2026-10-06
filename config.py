@@ -192,9 +192,6 @@ class GeminiConfig:
     validate_on_start: bool = True
     # Per-request deadline for Gemini calls.
     timeout: float = 30.0
-    # Let Gemini polish complex web-search summaries (grounded in
-    # retrieved facts; deterministic summaries remain the default).
-    synthesize_search: bool = True
 
     @property
     def configured(self) -> bool:
@@ -217,7 +214,6 @@ class GeminiConfig:
             model=(env.get("GEMINI_MODEL", "") or "").strip() or "gemini-2.5-flash",
             validate_on_start=_bool(env.get("GEMINI_VALIDATE_ON_START"), True),
             timeout=max(5.0, _float(env.get("GEMINI_TIMEOUT"), 30.0)),
-            synthesize_search=_bool(env.get("GEMINI_SYNTHESIZE_SEARCH"), True),
         )
 
 

@@ -45,7 +45,13 @@ def build_ping_message(latency: float | None, quip: str | None = None) -> str:
 
 
 def flip_coin() -> str:
+    """Return a genuinely random coin side for slash and natural-language use."""
     return random.choice(("Heads", "Tails"))
+
+
+def choose_option(options: list[str]) -> str:
+    """Choose one validated option; the assistant reuses this native operation."""
+    return random.choice(options)
 
 
 def cooldown():
@@ -96,7 +102,7 @@ class Fun(commands.Cog):
                 ephemeral=True,
             )
             return
-        pick = random.choice(choices)
+        pick = choose_option(choices)
         await interaction.response.send_message(
             f"**{discord.utils.escape_markdown(pick)}**.\n\nthe council has spoken.",
             allowed_mentions=discord.AllowedMentions.none(),

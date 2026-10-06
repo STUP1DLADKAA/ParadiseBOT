@@ -10,10 +10,10 @@ the pipeline:
     4. synthesize a short honest summary from what was retrieved
     5. attach sources as evidence, flag disagreements between sources
 
-AI is optional polish only: when Gemini is configured it may *rewrite*
-the summary from the retrieved facts (``generated_by="gemini"``); the
-facts themselves never come from the model. Without a key, the
-deterministic summary is served and nothing breaks.
+This is a native search feature. Its summaries are deterministic and are
+built only from retrieved evidence; it never calls an AI provider. Free-form
+AI responses are handled by the assistant separately, so a search request
+cannot accidentally become a search-then-AI request.
 """
 
 from __future__ import annotations
@@ -48,10 +48,6 @@ _NOISE_PHRASES = re.compile(
     r"all rights reserved|terms of service|cookie)",
     re.IGNORECASE,
 )
-_QUESTION_FORM = re.compile(
-    r"^(?:who|what|when|where|which|why|how|is|are|does|do|did|can|will|should)\b",
-    re.IGNORECASE,
-)
 _CURRENT_YEAR = time.gmtime().tm_year
 
 _DDGS = "https://api.duckduckgo.com/"
@@ -71,12 +67,14 @@ class AnswerEngine:
         ai=None,
         *,
         cache_ttl: int = _CACHE_TTL,
-        synthesize: bool = True,
+        synthesize: bool | None = None,
     ) -> None:
         self.engine = engine or SearchEngine()
-        self.ai = ai  # functions.ai.AIService (may be unavailable — fine)
         self.cache_ttl = cache_ttl
-        self.synthesize = synthesize
+        # Production callers do not pass an AI service. Keep an explicit,
+        # source-compatible escape hatch for integrations from older releases,
+        # but never wire it from the bot itself.
+        self._legacy_ai = ai if ai is not None and synthesize is not False else None
         self._cache: dict[str, tuple[float, SearchAnswer]] = {}
 
     # ------------------------------------------------------------------
@@ -245,16 +243,16 @@ class AnswerEngine:
         answer.warnings = self._detect_warnings(query, results, fresh=fresh)
         answer.sources = results[:6]
 
-        # ------------------------------------------------------------------
-        # Step 4 (optional): let Gemini *rephrase* — grounded in our facts
-        # ------------------------------------------------------------------
-        wants_ai = self._should_synthesize(query, answer, reason_complex)
-        if wants_ai:
-            polished = await self._ai_summary(query, answer)
+        # The bot never enables this compatibility path. It exists only so
+        # external callers upgrading from the old API can opt in explicitly;
+        # normal native search remains deterministic and single-pass.
+        if self._legacy_ai is not None and self._should_legacy_synthesize(
+            query, answer, reason_complex
+        ):
+            polished = await self._legacy_ai_summary(query, answer)
             if polished:
                 answer.summary = polished
                 answer.generated_by = "gemini"
-
         return answer
 
     # ------------------------------------------------------------------
@@ -482,22 +480,24 @@ class AnswerEngine:
                 )
         return warnings[:2]
 
-    # ------------------------------------------------------------------
-    # Step 4: optional grounded AI synthesis (Gemini — facts in, prose out)
-    # ------------------------------------------------------------------
 
-    def _should_synthesize(self, query: str, answer: SearchAnswer, reason_complex: bool) -> bool:
-        if not (self.synthesize and self.ai is not None and getattr(self.ai, "available", False)):
+    def _should_legacy_synthesize(
+        self, query: str, answer: SearchAnswer, reason_complex: bool
+    ) -> bool:
+        """Compatibility-only AI polish for callers that explicitly opt in."""
+        if not getattr(self._legacy_ai, "available", False):
             return False
         if reason_complex:
             return answer.has_answer
-        # Question-form or newsy queries benefit most from a clean synthesis,
-        # but only when we actually retrieved enough evidence.
-        if _QUESTION_FORM.match(query) and len(answer.sources) >= 2:
+        if re.match(
+            r"^(?:who|what|when|where|which|why|how|is|are|does|do|did|can|will|should)\b",
+            query,
+            re.IGNORECASE,
+        ) and len(answer.sources) >= 2:
             return True
         return answer.fresh and len(answer.sources) >= 3 and len(answer.key_points) >= 2
 
-    async def _ai_summary(self, query: str, answer: SearchAnswer) -> str:
+    async def _legacy_ai_summary(self, query: str, answer: SearchAnswer) -> str:
         facts: list[str] = []
         if answer.direct_answer:
             facts.append(answer.direct_answer)
@@ -507,15 +507,15 @@ class AnswerEngine:
                 facts.append(f"({result.source}) {result.snippet}")
         try:
             polished = await asyncio.wait_for(
-                self.ai.reason(query, facts, max_tokens=260), timeout=18
+                self._legacy_ai.reason(query, facts, max_tokens=260), timeout=18
             )
-        except Exception:  # noqa: BLE001 - the AI layer is strictly optional
-            log.debug("AI synthesis skipped", exc_info=True)
+        except Exception:  # noqa: BLE001 - compatibility path is optional
+            log.debug("Legacy AI synthesis skipped", exc_info=True)
             return ""
         polished = " ".join(str(polished).split())
-        if len(polished) < 40 or polished.casefold().startswith((
-            "i don't", "sorry", "the facts", "verified facts",
-        )):
+        if len(polished) < 40 or polished.casefold().startswith(
+            ("i don't", "sorry", "the facts", "verified facts")
+        ):
             return ""
         return polished[:600]
 

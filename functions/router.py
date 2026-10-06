@@ -8,20 +8,20 @@ most specialised tool that can answer it:
 
 Routing priority (first confident match wins):
 
-    1. calculator     "25% of 800", "234 × 56", "what's 2+2"
-    2. define         "define photosynthesis", "what does X mean"
-    3. convert        "convert 100 USD to INR", "10 km to miles"
-    4. weather        "weather in Delhi", "how hot is it in Tokyo"
-    5. time / date    "what time is it in Tokyo", "what day is it"
-    6. translate      "translate hello into Japanese"
-    7. entertainment  "upcoming anime", "recommend a thriller movie",
+    1. command/help   "what does /search do", "help"
+    2. calculator     "25% of 800", "234 × 56", "what's 2+2"
+    3. define         "define photosynthesis", "what does X mean"
+    4. convert        "convert 100 USD to INR", "10 km to miles"
+    5. weather        "weather in Delhi", "how hot is it in Tokyo"
+    6. time / date    "what time is it in Tokyo", "what day is it"
+    7. translate      "translate hello into Japanese"
+    8. entertainment  "upcoming anime", "recommend a thriller movie",
                       "what's trending in anime" (via the entertainment NLU)
-    8. web search     "search latest Minecraft update", "who won the match",
-                      "what happened today" — factual questions the tools
-                      above can't answer directly
-    9. AI (Gemini)    reasoning/comparison questions and anything genuinely
-                      ambiguous — always the last resort, and when facts are
-                      needed they are retrieved first and handed to the AI
+    9. web search     explicit search requests and freshness-sensitive facts
+                      the native search feature can answer directly
+    10. AI (Gemini)   reasoning/comparison questions and anything genuinely
+                      ambiguous — always the last resort; it is never preceded
+                      by an automatic search-and-rewrite loop
 
 The router never makes network calls: classification is pure pattern
 matching, so it answers in microseconds.
@@ -43,6 +43,10 @@ from functions.helpers import ParadiseError
 # ---------------------------------------------------------------------------
 
 HELP = "help"
+COMMAND_HELP = "command_help"
+PING = "ping"
+COINFLIP = "coinflip"
+CHOOSE = "choose"
 CALCULATE = "calculate"
 DEFINE = "define"
 CONVERT = "convert"
@@ -80,7 +84,23 @@ _HELP = re.compile(
     r"^(?:help|commands|what can you do|what do you do|how do (?:i|you) use (?:you|this)|usage)\s*[?!.]*$",
     re.IGNORECASE,
 )
+_COMMAND_HELP = re.compile(
+    r"^(?:what does|how does)\s+/(?P<command>[a-z][a-z0-9_-]*)\s+(?:do|work)\s*[?!.]*$",
+    re.IGNORECASE,
+)
 
+_PING = re.compile(
+    r"^(?:ping|are you (?:alive|online)|check your latency)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_COINFLIP = re.compile(
+    r"^(?:(?:flip|toss)\s+(?:a\s+)?coin|coin ?flip|heads or tails)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_CHOOSE = re.compile(
+    r"^(?:choose|pick|decide between|choose between)\s+(?P<options>.+?)\s*[?!.]*$",
+    re.IGNORECASE,
+)
 _CALC_VERB = re.compile(
     r"^(?:calculate|compute|evaluate|solve|do the math on|math)\s+",
     re.IGNORECASE,
@@ -237,6 +257,22 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
         cleaned = cleaned[:400]
     if _HELP.match(cleaned):
         return Route(kind=HELP, confidence=0.95)
+    command_help = _COMMAND_HELP.match(cleaned)
+    if command_help:
+        return Route(
+            kind=COMMAND_HELP,
+            payload=command_help.group("command").casefold(),
+            confidence=0.98,
+        )
+    # These are already native deterministic commands. Natural phrasing gets
+    # routed to the same implementation instead of spending an AI call.
+    if _PING.match(cleaned):
+        return Route(kind=PING, confidence=0.98)
+    if _COINFLIP.match(cleaned):
+        return Route(kind=COINFLIP, confidence=0.98)
+    choose_match = _CHOOSE.match(cleaned)
+    if choose_match:
+        return Route(kind=CHOOSE, payload=choose_match.group("options").strip(), confidence=0.95)
 
     # -- 1/2/3. calculator, define, convert — the explicit-verb fast lane --
     calc_probe = _CALC_VERB.sub("", cleaned, count=1) if _CALC_VERB.match(cleaned) else ""
@@ -354,6 +390,7 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
 
 
 __all__ = [
-    "AI", "CALCULATE", "CONVERT", "DATE", "DEFINE", "ENTERTAINMENT", "HELP",
-    "Route", "SEARCH", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER", "route_query",
+    "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE", "DEFINE",
+    "ENTERTAINMENT", "HELP", "PING", "Route", "SEARCH", "TIME", "TRANSLATE",
+    "UNKNOWN", "WEATHER", "route_query",
 ]
