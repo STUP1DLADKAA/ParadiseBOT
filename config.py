@@ -173,6 +173,45 @@ class EntertainmentConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ImageSearchConfig:
+    """Web image search for "@Paradise show me a picture of…" requests.
+
+    Works with zero configuration: Wikipedia, Wikimedia Commons and
+    Openverse are all key-less. Setting the optional Google Programmable
+    Search pair upgrades general web coverage (100 free queries/day); with
+    no key the key-less chain is used and nothing breaks.
+
+    This searches the web for real photos. It never generates images.
+    """
+
+    enabled: bool = True
+    # Per-request deadline for every outbound image-search call.
+    timeout: float = 10.0
+    # Found image URLs are cached; these bound that cache. Only short
+    # strings are stored — never image bytes.
+    cache_ttl: int = 30 * 60
+    cache_size: int = 128
+    # Optional upgrade: Google Programmable Search (both values required).
+    api_key: str = ""
+    engine_id: str = ""
+
+    @property
+    def api_configured(self) -> bool:
+        return bool(self.api_key.strip() and self.engine_id.strip())
+
+    @classmethod
+    def from_env(cls, env) -> "ImageSearchConfig":
+        return cls(
+            enabled=_bool(env.get("IMAGE_SEARCH_ENABLED"), True),
+            timeout=max(3.0, _float(env.get("IMAGE_SEARCH_TIMEOUT"), 10.0)),
+            cache_ttl=max(60, _int(env.get("IMAGE_SEARCH_CACHE_TTL"), 30 * 60)),
+            cache_size=max(8, _int(env.get("IMAGE_SEARCH_CACHE_SIZE"), 128)),
+            api_key=env.get("IMAGE_SEARCH_API_KEY", "").strip(),
+            engine_id=env.get("IMAGE_SEARCH_ENGINE_ID", "").strip(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class GeminiConfig:
     """Google Gemini — the optional AI reasoning layer (see functions/gemini.py).
 
@@ -243,6 +282,9 @@ class Config:
     # Movies / anime / series discovery (/example, /trending, /upcoming…).
     entertainment: EntertainmentConfig = EntertainmentConfig()
 
+    # Web image search for mention requests ("show me a picture of …").
+    image_search: ImageSearchConfig = ImageSearchConfig()
+
     @property
     def ai_configured(self) -> bool:
         # Gemini is the primary provider; an OpenAI-compatible endpoint is a
@@ -262,6 +304,7 @@ class Config:
             dictionary=DictionaryConfig.from_env(env),
             voice=VoiceConfig.from_env(env),
             entertainment=EntertainmentConfig.from_env(env),
+            image_search=ImageSearchConfig.from_env(env),
         )
 
 

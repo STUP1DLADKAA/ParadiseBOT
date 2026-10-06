@@ -12,19 +12,26 @@ Routing priority (first confident match wins):
     2. calculator     "25% of 800", "234 × 56", "what's 2+2"
     3. define         "define photosynthesis", "what does X mean"
     4. convert        "convert 100 USD to INR", "10 km to miles"
-    5. weather        "weather in Delhi", "how hot is it in Tokyo"
-    6. time / date    "what time is it in Tokyo", "what day is it"
-    7. translate      "translate hello into Japanese"
-    8. entertainment  "upcoming anime", "recommend a thriller movie",
+    5. image          "show me a picture of a red panda", "what does X look like"
+    6. weather        "weather in Delhi", "how hot is it in Tokyo"
+    7. time / date    "what time is it in Tokyo", "what day is it"
+    8. translate      "translate hello into Japanese"
+    9. entertainment  "upcoming anime", "recommend a thriller movie",
                       "what's trending in anime" (via the entertainment NLU)
-    9. web search     explicit search requests and freshness-sensitive facts
+    10. web search    explicit search requests and freshness-sensitive facts
                       the native search feature can answer directly
-    10. AI (Gemini)   reasoning/comparison questions and anything genuinely
+    11. AI (Gemini)   reasoning/comparison questions and anything genuinely
                       ambiguous — always the last resort; it is never preceded
                       by an automatic search-and-rewrite loop
 
+:func:`route_many` additionally handles requests that ask for two things
+at once ("search the latest Minecraft update and convert 20 USD to INR")
+by splitting conservatively and routing each half on its own.
+
 The router never makes network calls: classification is pure pattern
-matching, so it answers in microseconds.
+matching, so it answers in microseconds. When it genuinely cannot tell
+(low confidence), the assistant may ask Gemini for a tiny JSON
+classification — see :mod:`functions.intent`.
 """
 
 from __future__ import annotations
@@ -50,6 +57,7 @@ CHOOSE = "choose"
 CALCULATE = "calculate"
 DEFINE = "define"
 CONVERT = "convert"
+IMAGE = "image"
 WEATHER = "weather"
 TIME = "time"
 DATE = "date"
@@ -70,6 +78,7 @@ class Route:
     confidence: float = 0.0
     fresh: bool = False      # the answer likely depends on recent information
     reason_complex: bool = False  # retrieved facts probably need AI reasoning
+    count: int = 1           # how many results were asked for (images)
 
     @property
     def routed(self) -> bool:
@@ -130,6 +139,42 @@ _CONVERT_VERB = re.compile(
 )
 _CONVERT_QUESTION = re.compile(
     r"^(?:what(?:'s| is|s)?|how much is|how many)\s+", re.IGNORECASE
+)
+
+# -- image requests ---------------------------------------------------------
+# "show me a picture of X", "find 3 images of X", "what does X look like".
+# Deliberately requires an explicit picture word (or "look like") so nothing
+# else in the router can be stolen by these patterns.
+_IMAGE_NOUN = r"(?:pictures?|pics?|images?|photos?|photographs?|screenshots?|wallpapers?)"
+_IMAGE_COUNT = r"(?:an?|one|a\s+few|some|couple\s+of|a\s+couple\s+of|\d{1,2})"
+_IMAGE_VERB = re.compile(
+    rf"^(?:(?:can\s+you\s+|could\s+you\s+|please\s+|pls\s+)?"
+    rf"(?:show|send|give|find|get|fetch|post|share|grab|display|search\s+for|look\s+up)"
+    rf"\s+(?:me\s+|us\s+)?)?"
+    rf"(?:{_IMAGE_COUNT}\s+)?"
+    rf"{_IMAGE_NOUN}"
+    rf"\s+(?:of|for|showing|with)\s+(?P<subject>.{{2,120}}?)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_IMAGE_LOOK_LIKE = re.compile(
+    r"^(?:what(?:'s| is|s)?|how)\s+(?:does|do|did)\s+(?:an?\s+|the\s+)?"
+    r"(?P<subject>.{2,120}?)\s+look\s+like\s*[?!.]*$",
+    re.IGNORECASE,
+)
+# "picture of the Eiffel Tower" with no verb at all.
+_IMAGE_BARE = re.compile(
+    rf"^(?:{_IMAGE_COUNT}\s+)?{_IMAGE_NOUN}\s+(?:of|for)\s+(?P<subject>.{{2,120}}?)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_IMAGE_COUNT_WORDS = {
+    "a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+    "a few": 3, "some": 3, "couple of": 2, "a couple of": 2,
+}
+_IMAGE_COUNT_PREFIX = re.compile(
+    rf"\b(?P<count>{_IMAGE_COUNT})\s+{_IMAGE_NOUN}\b", re.IGNORECASE
+)
+_IMAGE_SUBJECT_TRIM = re.compile(
+    r"^(?:a|an|the|some|any)\s+|\s+(?:please|pls|thanks|thx)$", re.IGNORECASE
 )
 
 _WEATHER = re.compile(
@@ -220,7 +265,8 @@ def _conversion_resolvable(value: float, from_raw: str, to_raw: str) -> bool:
         return True
     if resolve_currency(from_raw) and resolve_currency(to_raw):
         return True
-    from_c, to_c = from_raw.strip().lower().rstrip("°"), to_raw.strip().lower().rstrip("°")
+    from_c = from_raw.strip().lower().strip("°º∘")
+    to_c = to_raw.strip().lower().strip("°º∘")
     return from_c in TEMP_UNITS and to_c in TEMP_UNITS
 
 
@@ -233,6 +279,43 @@ def _try_conversion(text: str) -> Route | None:
     if not _conversion_resolvable(value, from_raw, to_raw):
         return None
     return Route(kind=CONVERT, payload=text, confidence=0.95)
+
+
+def _image_count(text: str) -> int:
+    """How many pictures were asked for (1–4), from "3 pictures of…" etc."""
+    match = _IMAGE_COUNT_PREFIX.search(text)
+    if match is None:
+        return 1
+    raw = " ".join(match.group("count").split()).casefold()
+    if raw.isdigit():
+        return max(1, min(int(raw), 4))
+    return _IMAGE_COUNT_WORDS.get(raw, 1)
+
+
+def _clean_image_subject(subject: str) -> str:
+    cleaned = _squash(subject).strip(" \"'“”")
+    # Run twice so "the some X" style doubles collapse too.
+    cleaned = _IMAGE_SUBJECT_TRIM.sub("", cleaned).strip()
+    cleaned = _IMAGE_SUBJECT_TRIM.sub("", cleaned).strip()
+    return cleaned
+
+
+def _try_image(text: str) -> Route | None:
+    """IMAGE when the text explicitly asks to see a picture of something."""
+    for pattern in (_IMAGE_VERB, _IMAGE_BARE, _IMAGE_LOOK_LIKE):
+        match = pattern.match(text)
+        if match is None:
+            continue
+        subject = _clean_image_subject(match.group("subject"))
+        if not subject or len(subject) > 120:
+            continue
+        return Route(
+            kind=IMAGE,
+            payload=subject,
+            confidence=0.95,
+            count=_image_count(text),
+        )
+    return None
 
 
 def _entertainment_request(text: str):
@@ -273,6 +356,12 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
     choose_match = _CHOOSE.match(cleaned)
     if choose_match:
         return Route(kind=CHOOSE, payload=choose_match.group("options").strip(), confidence=0.95)
+
+    # -- image requests go first: "find me a picture of X" must never be
+    # grabbed by the generic "find …" web-search verb below.
+    route = _try_image(cleaned)
+    if route is not None:
+        return route
 
     # -- 1/2/3. calculator, define, convert — the explicit-verb fast lane --
     calc_probe = _CALC_VERB.sub("", cleaned, count=1) if _CALC_VERB.match(cleaned) else ""
@@ -389,8 +478,66 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
     return Route(kind=SEARCH, payload=cleaned, confidence=0.3, fresh=_looks_fresh(cleaned))
 
 
+# ---------------------------------------------------------------------------
+# Multi-tool requests ("search X and convert 20 USD to INR")
+# ---------------------------------------------------------------------------
+
+# Conservative split points only. Plain "and" is included but every split is
+# re-validated below, so "rock and roll" or "difference between X and Y"
+# stay single requests.
+_COMPOUND_SPLIT = re.compile(
+    r"(?:\s*;\s*|\s*,\s*(?:and|also|then)\s+|\s+and\s+(?:also\s+|then\s+)?|\s+&\s+)",
+    re.IGNORECASE,
+)
+_MAX_COMPOUND_PARTS = 3
+
+# Kinds that can take part in a combined answer at all.
+_COMPOUND_KINDS = frozenset(
+    {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, SEARCH, DEFINE}
+)
+# At least one part must be an unambiguous deterministic tool, otherwise the
+# "and" was almost certainly part of a single sentence.
+_STRONG_KINDS = frozenset({CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE})
+
+
+def route_many(text: str) -> list[Route]:
+    """Route *text*, splitting it only when it clearly asks for two things.
+
+    Returns a single-element list for ordinary requests — the common case —
+    and two or three routes for genuine multi-tool requests. Callers can
+    execute the parts concurrently and combine the answers.
+    """
+    cleaned = _squash(text)
+    primary = route_query(cleaned)
+    if not cleaned or len(cleaned) > 400:
+        return [primary]
+    # Fast path: no join word at all, so there is nothing to split. Greedy
+    # single-tool patterns ("weather in Delhi and time in Tokyo" matches the
+    # weather regex whole) must still be re-checked, so confidence alone is
+    # not enough to skip the split.
+    if not _COMPOUND_SPLIT.search(cleaned):
+        return [primary]
+
+    segments = [part.strip(" ,;") for part in _COMPOUND_SPLIT.split(cleaned)]
+    segments = [part for part in segments if len(part) >= 2]
+    if not 2 <= len(segments) <= _MAX_COMPOUND_PARTS:
+        return [primary]
+
+    routes = [route_query(segment) for segment in segments]
+    usable = [
+        route
+        for route in routes
+        if route.kind in _COMPOUND_KINDS and route.confidence >= 0.6
+    ]
+    if len(usable) < 2:
+        return [primary]
+    if not any(route.kind in _STRONG_KINDS for route in usable):
+        return [primary]
+    return usable[:_MAX_COMPOUND_PARTS]
+
+
 __all__ = [
     "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE", "DEFINE",
-    "ENTERTAINMENT", "HELP", "PING", "Route", "SEARCH", "TIME", "TRANSLATE",
-    "UNKNOWN", "WEATHER", "route_query",
+    "ENTERTAINMENT", "HELP", "IMAGE", "PING", "Route", "SEARCH", "TIME", "TRANSLATE",
+    "UNKNOWN", "WEATHER", "route_many", "route_query",
 ]

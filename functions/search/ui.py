@@ -45,7 +45,11 @@ def build_answer_embed(answer: SearchAnswer) -> discord.Embed:
         description.append("Here's what the web says — open the sources below for the details.")
     embed.description = "\n\n".join(description)[:_MAX_EMBED]
 
-    if answer.direct_answer and answer.summary and answer.generated_by == "local":
+    if answer.direct_answer and answer.summary and answer.generated_by != "local":
+        # A grounded AI synthesis of the retrieved sources: it says more than
+        # the extracted one-liner, so show it rather than dropping it.
+        embed.add_field(name="In short", value=shorten(answer.summary, 600), inline=False)
+    elif answer.direct_answer and answer.summary and answer.generated_by == "local":
         # Only add the summary when it says something the quick answer didn't.
         extra = answer.summary
         anchor = answer.direct_answer.rstrip(".!?").casefold()
@@ -77,6 +81,8 @@ def build_answer_embed(answer: SearchAnswer) -> discord.Embed:
         embed.add_field(name="Sources", value="\n".join(source_lines)[:1000], inline=False)
 
     footer_bits = ["answer from retrieved sources"]
+    if answer.generated_by and answer.generated_by != "local":
+        footer_bits[0] = "answer written from retrieved sources"
     if answer.answer_source and answer.answer_source not in footer_bits:
         footer_bits.append(f"via {answer.answer_source}")
     if answer.cached:

@@ -279,11 +279,19 @@ def calculate(raw: str) -> CalcResult:
         ) from None
 
     value = _eval_node(tree)
-    return CalcResult(expression=_flatten_percent_of_display(flattened), result=value)
+    return CalcResult(expression=_display_expression(text, normalised), result=value)
 
 
-def _flatten_percent_of_display(expr: str) -> str:
-    return expr.strip()
+def _display_expression(original: str, normalised: str) -> str:
+    """What to echo back next to the result.
+
+    The user's own notation reads best ("15% of 847 = 127.05", "7283 × 492
+    = 3,583,236"); the internal flattened form ("((15/100) * (847))") is an
+    implementation detail nobody asked to see. Falls back to the normalised
+    expression if the input was only punctuation.
+    """
+    shown = " ".join(str(original).split()).strip()
+    return shown or " ".join(str(normalised).split()).strip()
 
 
 # ---------------------------------------------------------------------------

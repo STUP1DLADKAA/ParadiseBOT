@@ -191,6 +191,9 @@ TEMP_UNITS = {"c", "celsius", "centigrade", "f", "fahrenheit", "k", "kelvin"}
 def resolve_unit(name: str) -> str | None:
     """Normalize unit string to canonical key."""
     clean = name.strip().lower().replace(" ", "").replace("_", "").replace("-", "")
+    # Degree signs can arrive on either side ("°C", "25C°") and no unit key
+    # contains one, so drop them before matching.
+    clean = clean.replace("°", "").replace("º", "").replace("∘", "")
     if clean in UNITS_DB:
         return clean
     if clean in UNIT_ALIASES:
