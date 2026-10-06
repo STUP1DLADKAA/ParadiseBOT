@@ -62,7 +62,9 @@ class SearchEngine:
     def __init__(self, cache_ttl: int = 900) -> None:
         self.cache_ttl = cache_ttl
         self._cache: dict[str, tuple[float, SearchResponse]] = {}
-        self._lock = asyncio.Lock()
+        # Identical requests arriving together share one fallback chain rather
+        # than opening several sessions and hitting the providers repeatedly.
+        self._inflight: dict[str, asyncio.Task[SearchResponse]] = {}
 
     async def search(self, query: str, limit: int = 8) -> SearchResponse:
         """Search the web for query, returning ranked results."""
@@ -72,8 +74,9 @@ class SearchEngine:
 
         cache_key = query.lower()
         now = time.monotonic()
-        if cache_key in self._cache:
-            cached_time, cached_resp = self._cache[cache_key]
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            cached_time, cached_resp = cached
             if now - cached_time < self.cache_ttl:
                 return SearchResponse(
                     query=cached_resp.query,
@@ -82,6 +85,38 @@ class SearchEngine:
                     cached=True,
                 )
 
+        task = self._inflight.get(cache_key)
+        if task is None:
+            task = asyncio.create_task(
+                self._search_uncached(query, cache_key, now, limit),
+                name=f"search:{cache_key[:40]}",
+            )
+            self._inflight[cache_key] = task
+
+            def clear_inflight(done: asyncio.Task[SearchResponse]) -> None:
+                if self._inflight.get(cache_key) is done:
+                    self._inflight.pop(cache_key, None)
+                # A cancelled caller can be the only waiter. Observe a task
+                # failure here so asyncio does not emit an unhelpful warning.
+                if not done.cancelled():
+                    done.exception()
+
+            task.add_done_callback(clear_inflight)
+
+        # Shielding keeps one cancelled Discord interaction from cancelling
+        # the provider request for other identical waiters.
+        response = await asyncio.shield(task)
+        return SearchResponse(
+            query=response.query,
+            results=response.results[:limit],
+            engine=response.engine,
+            cached=response.cached,
+        )
+
+    async def _search_uncached(
+        self, query: str, cache_key: str, started_at: float, limit: int
+    ) -> SearchResponse:
+        """Run one provider fallback chain for a cache key."""
         # Try multiple strategies in sequence
         results: list[SearchResult] = []
         engine_name = "Web"
@@ -119,7 +154,7 @@ class SearchEngine:
         response = SearchResponse(query=query, results=cleaned, engine=engine_name)
 
         if cleaned:
-            self._cache[cache_key] = (now, response)
+            self._cache[cache_key] = (started_at, response)
             # Bound cache size
             if len(self._cache) > 256:
                 oldest = min(self._cache.keys(), key=lambda k: self._cache[k][0])

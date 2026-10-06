@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
 from typing import Any
 
@@ -14,6 +15,9 @@ from functions.helpers import ParadiseError
 from .models import ConversionCategory, ConversionResult
 
 log = logging.getLogger(__name__)
+
+_RATES_CACHE_MAX_SOURCES = 64
+_RATES_CACHE_MAX_DESTINATIONS = 64
 
 CURRENCY_SYMBOLS: dict[str, str] = {
     "usd": "$",
@@ -113,7 +117,7 @@ class CurrencyService:
 
     def __init__(self, cache_ttl: int = 3600) -> None:
         self.cache_ttl = cache_ttl
-        self._rates_cache: dict[str, tuple[float, dict[str, float]]] = {}
+        self._rates_cache: OrderedDict[str, tuple[float, dict[str, float]]] = OrderedDict()
         self._last_timestamp: dict[str, str] = {}
 
     async def convert(self, val: float, from_curr: str, to_curr: str) -> ConversionResult:
@@ -163,10 +167,15 @@ class CurrencyService:
         """Fetch exchange rate from_c -> to_c with caching and fallback."""
         cache_key = from_c
         now = time.monotonic()
-        if cache_key in self._rates_cache:
-            c_time, rates = self._rates_cache[cache_key]
+        cached = self._rates_cache.get(cache_key)
+        if cached is not None:
+            c_time, rates = cached
             if now - c_time < self.cache_ttl and to_c in rates:
+                self._rates_cache.move_to_end(cache_key)
                 return rates[to_c], self._last_timestamp.get(cache_key, "Cached rate")
+            if now - c_time >= self.cache_ttl:
+                self._rates_cache.pop(cache_key, None)
+                self._last_timestamp.pop(cache_key, None)
 
         # Try live Frankfurter API
         try:
@@ -182,9 +191,17 @@ class CurrencyService:
                         rate_date = data.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
                         if to_c.upper() in rates:
                             rate = float(rates[to_c.upper()])
-                            if cache_key not in self._rates_cache:
+                            cached_rates = self._rates_cache.get(cache_key)
+                            if cached_rates is None:
                                 self._rates_cache[cache_key] = (now, {})
-                            self._rates_cache[cache_key][1][to_c] = rate
+                                cached_rates = self._rates_cache[cache_key]
+                            cached_rates[1][to_c] = rate
+                            while len(cached_rates[1]) > _RATES_CACHE_MAX_DESTINATIONS:
+                                cached_rates[1].pop(next(iter(cached_rates[1])))
+                            self._rates_cache.move_to_end(cache_key)
+                            while len(self._rates_cache) > _RATES_CACHE_MAX_SOURCES:
+                                old_key, _ = self._rates_cache.popitem(last=False)
+                                self._last_timestamp.pop(old_key, None)
                             self._last_timestamp[cache_key] = f"Live rate as of {rate_date}"
                             return rate, f"Live rate as of {rate_date}"
         except Exception as err:
