@@ -16,11 +16,9 @@ Routing priority (first confident match wins):
     6. weather        "weather in Delhi", "how hot is it in Tokyo"
     7. time / date    "what time is it in Tokyo", "what day is it"
     8. translate      "translate hello into Japanese"
-    9. entertainment  "upcoming anime", "recommend a thriller movie",
-                      "what's trending in anime" (via the entertainment NLU)
-    10. web search    explicit search requests and freshness-sensitive facts
+    9. web search    explicit search requests and freshness-sensitive facts
                       the native search feature can answer directly
-    11. AI (Gemini)   reasoning/comparison questions and anything genuinely
+    10. AI (Gemini)   reasoning/comparison questions and anything genuinely
                       ambiguous — always the last resort; it is never preceded
                       by an automatic search-and-rewrite loop
 
@@ -62,7 +60,6 @@ WEATHER = "weather"
 TIME = "time"
 DATE = "date"
 TRANSLATE = "translate"
-ENTERTAINMENT = "entertainment"
 SEARCH = "search"
 AI = "ai"
 UNKNOWN = "unknown"
@@ -318,19 +315,6 @@ def _try_image(text: str) -> Route | None:
     return None
 
 
-def _entertainment_request(text: str):
-    """Ask the entertainment NLU (imported lazily to keep import cycles away)."""
-    try:
-        from functions.entertainment import nlu  # local import by design
-
-        intent = nlu.match_entertainment_request(text)
-    except Exception:  # noqa: BLE001 - NLU must never break routing
-        return None
-    if intent is not None and intent.is_actionable:
-        return intent
-    return None
-
-
 def route_query(text: str, *, allow_ai: bool = True) -> Route:
     """Classify a user query into the best tool. Pure and deterministic."""
     cleaned = _squash(text)
@@ -429,11 +413,6 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
         term = match.group("term").strip(" \"'“”")
         if term and len(term) <= 40:
             return Route(kind=DEFINE, payload=term, confidence=0.75)
-
-    # -- 7. entertainment (its own mature NLU) -------------------------------
-    if _entertainment_request(cleaned) is not None:
-        return Route(kind=ENTERTAINMENT, payload=cleaned, confidence=0.85,
-                     fresh=_looks_fresh(cleaned))
 
     # -- 8. web search ---------------------------------------------------------
     reason_complex = bool(_REASONING_MARKERS.search(cleaned))
@@ -538,6 +517,6 @@ def route_many(text: str) -> list[Route]:
 
 __all__ = [
     "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE", "DEFINE",
-    "ENTERTAINMENT", "HELP", "IMAGE", "PING", "Route", "SEARCH", "TIME", "TRANSLATE",
+    "HELP", "IMAGE", "PING", "Route", "SEARCH", "TIME", "TRANSLATE",
     "UNKNOWN", "WEATHER", "route_many", "route_query",
 ]

@@ -52,7 +52,6 @@ HELP_GROUPS = {
         "define",
         "recipe",
     ),
-    "🍿 entertainment": ("example", "trending", "upcoming", "recommend"),
     "🎙️ voice": ("vc",),
     "🤖 ai": ("summarize",),
 }

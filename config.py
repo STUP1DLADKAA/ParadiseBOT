@@ -141,38 +141,6 @@ class VoiceConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class EntertainmentConfig:
-    """The movies/anime/series discovery system (see functions/entertainment/).
-
-    Works with zero configuration: every source (IMDb suggestions, TVMaze,
-    Kitsu, AniList, MyAnimeList via Jikan, Wikipedia/Wikidata, Apple's
-    iTunes search, DuckDuckGo) is key-less. Everything below is optional
-    tuning.
-    """
-
-    # Answer plain-chat requests ("recommend anime like X", "what's trending?").
-    text_triggers: bool = True
-    # Per-request deadline for every outbound entertainment call.
-    timeout: float = 8.0
-    # How long a full title card stays cached before a fresh lookup.
-    stable_cache_ttl: int = 24 * 3600
-    # How long volatile facts (ratings, streaming, status) stay fresh.
-    volatile_cache_ttl: int = 45 * 60
-    # Bounded number of cached cards.
-    cache_size: int = 256
-
-    @classmethod
-    def from_env(cls, env) -> "EntertainmentConfig":
-        return cls(
-            text_triggers=_bool(env.get("ENTERTAINMENT_TEXT_TRIGGERS"), True),
-            timeout=max(3.0, _float(env.get("ENTERTAINMENT_TIMEOUT"), 8.0)),
-            stable_cache_ttl=max(600, _int(env.get("ENTERTAINMENT_STABLE_TTL"), 24 * 3600)),
-            volatile_cache_ttl=max(60, _int(env.get("ENTERTAINMENT_VOLATILE_TTL"), 45 * 60)),
-            cache_size=max(16, _int(env.get("ENTERTAINMENT_CACHE_SIZE"), 256)),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class ImageSearchConfig:
     """Web image search for "@Paradise show me a picture of…" requests.
 
@@ -216,7 +184,7 @@ class GeminiConfig:
     """Google Gemini — the optional AI reasoning layer (see functions/gemini.py).
 
     Entirely optional: with no key the bot still answers definitions,
-    conversions, calculations, weather, time, search, entertainment and
+    conversions, calculations, weather, time, search and
     more — AI is strictly the last-resort reasoning layer.
 
     The key is only ever sent to Gemini's API in a header. It is never
@@ -279,9 +247,6 @@ class Config:
     # Voice activity tracking and statistics.
     voice: VoiceConfig = VoiceConfig()
 
-    # Movies / anime / series discovery (/example, /trending, /upcoming…).
-    entertainment: EntertainmentConfig = EntertainmentConfig()
-
     # Web image search for mention requests ("show me a picture of …").
     image_search: ImageSearchConfig = ImageSearchConfig()
 
@@ -303,7 +268,6 @@ class Config:
             personality=PersonalityConfig.from_env(env),
             dictionary=DictionaryConfig.from_env(env),
             voice=VoiceConfig.from_env(env),
-            entertainment=EntertainmentConfig.from_env(env),
             image_search=ImageSearchConfig.from_env(env),
         )
 

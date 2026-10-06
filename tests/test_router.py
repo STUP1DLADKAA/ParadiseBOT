@@ -14,7 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from functions.router import (
-    AI, CALCULATE, CONVERT, DATE, DEFINE, ENTERTAINMENT, HELP, IMAGE,
+    AI, CALCULATE, CONVERT, DATE, DEFINE, HELP, IMAGE,
     SEARCH, TIME, TRANSLATE, WEATHER, route_many, route_query,
 )
 
@@ -106,26 +106,6 @@ class TestRouter(unittest.TestCase):
         self.assertEqual(route.kind, TRANSLATE)
         self.assertEqual(route.payload2.lower(), "hindi")
 
-    def test_entertainment(self):
-        for text in (
-            "upcoming anime",
-            "recommend me a thriller movie",
-            "recommend anime like JJK",
-            "what's trending in anime",
-            "find anime like Naruto",
-            "what should I watch tonight",
-            "what movies are trending",
-            "best sci-fi movies",
-            "latest Netflix shows",
-            "give me something underrated",
-            "where can I watch Oppenheimer in India",
-            "short anime under 24 episodes",
-            "movies with mind-blowing endings",
-            "best psychological anime",
-        ):
-            route = self.route(text)
-            self.assertEqual(route.kind, ENTERTAINMENT, text)
-
     def test_reasoning_goes_to_ai_or_grounded_search(self):
         route = self.route("explain why One Piece is so popular")
         self.assertEqual(route.kind, AI, "pure reasoning question should reach AI")
@@ -157,7 +137,6 @@ class TestRouter(unittest.TestCase):
             ("weather in Delhi", WEATHER),
             ("time in Tokyo", TIME),
             ("translate hello into Japanese", TRANSLATE),
-            ("upcoming anime", ENTERTAINMENT),
             ("search latest Minecraft update", SEARCH),
             ("latest Minecraft news", SEARCH),
         ):
