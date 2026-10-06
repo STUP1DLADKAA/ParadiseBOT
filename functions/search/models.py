@@ -28,6 +28,15 @@ class SearchResult:
                 self.source = "web"
 
 
+#: Outcome of a retrieval attempt. The caller must be able to tell these
+#: apart: "nothing matched" is a useful answer, "the provider is down" is
+#: an apology, and both are different from a parsing bug on our side.
+OK = "ok"
+EMPTY = "empty"
+PROVIDER_ERROR = "provider_error"
+PARSE_ERROR = "parse_error"
+
+
 @dataclass(slots=True)
 class SearchResponse:
     """Collection of search results for a query."""
@@ -36,10 +45,16 @@ class SearchResponse:
     results: list[SearchResult] = field(default_factory=list)
     engine: str = "Web"
     cached: bool = False
+    status: str = OK
 
     @property
     def has_results(self) -> bool:
         return bool(self.results)
+
+    @property
+    def failed(self) -> bool:
+        """True when no provider could be reached (not merely empty)."""
+        return self.status in (PROVIDER_ERROR, PARSE_ERROR)
 
     @property
     def total_count(self) -> int:
@@ -68,6 +83,12 @@ class SearchAnswer:
     engine: str = "Web"
     fresh: bool = False
     cached: bool = False
+    status: str = OK
+
+    @property
+    def failed(self) -> bool:
+        """True when retrieval itself failed, so there is nothing to show."""
+        return self.status in (PROVIDER_ERROR, PARSE_ERROR) and not self.has_sources
 
     @property
     def has_answer(self) -> bool:

@@ -256,3 +256,174 @@ class TestCompoundRouting(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TestTolerantRouting(unittest.TestCase):
+    """Real chat: typos, slang, Hinglish, missing punctuation, profanity.
+
+    Every line here is a request a human actually types. None of them may
+    fall through to the AI when a deterministic tool can answer.
+    """
+
+    def assertRoute(self, text, kind, *, payload_contains=None, count=None):
+        route = route_query(text)
+        self.assertEqual(route.kind, kind, f"{text!r} → {route.kind}")
+        self.assertGreaterEqual(route.confidence, 0.6, text)
+        if payload_contains is not None:
+            self.assertIn(payload_contains, route.payload.casefold(), text)
+        if count is not None:
+            self.assertEqual(route.count, count, text)
+        return route
+
+    # -- calculator --------------------------------------------------------
+
+    def test_calculator(self):
+        for text in (
+            "calculate 20% of 500",
+            "25 * 32",
+            "what's 99 divided by 3",
+            "calc 8238/29",
+            "8238 divided by 29",
+            "calc 23% 829",
+            "23% 482",
+            "bro calculate 29% of 734",
+            "how much is 15 percent of 4900",
+            "sqrt 144",
+            "what's 18 squared",
+            "divide 829 by 17",
+        ):
+            self.assertRoute(text, CALCULATE)
+
+    def test_calculator_payload_is_evaluable(self):
+        from functions.calculator import calculate
+
+        for text in ("bro calculate 29% of 734", "calc 23% 829", "what is 25 * 32"):
+            route = route_query(text)
+            self.assertEqual(route.kind, CALCULATE, text)
+            calculate(route.payload)  # must not raise
+
+    # -- conversion --------------------------------------------------------
+
+    def test_conversion(self):
+        for text, needle in (
+            ("100 USD to INR", "usd"),
+            ("5 km to miles", "km"),
+            ("72F in C", "72"),
+            ("100 usd inr", "usd"),
+            ("5 kg pound", "kg"),
+            ("100 doller in rupees", "100"),
+            ("how many bloody rupees is 50 dollars", "50"),
+            ("convert 50 dollars into rupees", "50"),
+            ("how many inches is 6 feet", "6"),
+        ):
+            self.assertRoute(text, CONVERT, payload_contains=needle)
+
+    # -- weather -----------------------------------------------------------
+
+    def test_weather(self):
+        for text in (
+            "weather Delhi",
+            "Delhi weather",
+            "will it rain in Delhi tomorrow",
+            "wthr delhi",
+            "wats weather delhi",
+            "delhi weather rn??",
+            "yo bro how hot is delhi rn",
+            "wthr delhi pls",
+            "temperature in Tokyo",
+            "forecast for Mumbai",
+            "delhi ka weather batao",
+        ):
+            route = self.assertRoute(text, WEATHER)
+            self.assertTrue(route.payload, text)
+
+    # -- time / date -------------------------------------------------------
+
+    def test_time(self):
+        for text in ("time Tokyo", "what time is it in Tokyo", "tokyo time rn",
+                     "wha time tokyo", "tokyo time"):
+            self.assertRoute(text, TIME, payload_contains="tokyo")
+
+    def test_date(self):
+        for text in ("what date is it", "what day is today", "today's date"):
+            self.assertEqual(route_query(text).kind, DATE, text)
+
+    # -- dictionary --------------------------------------------------------
+
+    def test_dictionary(self):
+        for text in (
+            "define ephemeral",
+            "what does ephemeral mean",
+            "dictonary ephemeral",
+            "dictonry meaning of ephemeral",
+            "meaning ambivalent",
+            "meaning of ephemeral",
+        ):
+            route = self.assertRoute(text, DEFINE)
+            self.assertLessEqual(len(route.payload.split()), 3, text)
+
+    # -- images ------------------------------------------------------------
+
+    def test_images(self):
+        self.assertRoute("show me pictures of cats", IMAGE, payload_contains="cat")
+        self.assertRoute("pic red panda", IMAGE, payload_contains="red panda")
+        self.assertRoute("what does a capybara look like", IMAGE,
+                         payload_contains="capybara")
+        self.assertRoute("show pic of minecraft", IMAGE, payload_contains="minecraft")
+        self.assertRoute("send me 3 pictures of a red panda", IMAGE, count=3)
+
+    # -- search ------------------------------------------------------------
+
+    def test_search(self):
+        for text in (
+            "search latest Minecraft update",
+            "latest Minecraft news",
+            "latest mcpe",
+            "who invented Minecraft",
+            "google rtx 4060 price",
+        ):
+            route = route_query(text)
+            self.assertEqual(route.kind, SEARCH, text)
+            self.assertTrue(route.payload, text)
+
+    def test_comparison_requests_retrieve_before_reasoning(self):
+        route = route_query("which is better RTX 4060 or 3060")
+        self.assertEqual(route.kind, SEARCH)
+        self.assertTrue(route.reason_complex)
+
+    # -- AI stays the last resort -----------------------------------------
+
+    def test_ai_fallback_only_for_open_questions(self):
+        for text in (
+            "explain why the sky is blue like I'm stupid",
+            "why do cats purr",
+            "explain recursion simply",
+            "give me an idea for a Minecraft event",
+        ):
+            self.assertEqual(route_query(text).kind, AI, text)
+
+    def test_translation(self):
+        route = route_query('translate "hello bro" into Hindi')
+        self.assertEqual(route.kind, TRANSLATE)
+        self.assertEqual(route.payload2.casefold(), "hindi")
+        self.assertEqual(route_query("hello in spanish").kind, TRANSLATE)
+        self.assertEqual(route_query("how do you say hello in japanese").kind, TRANSLATE)
+
+    # -- mixed requests ----------------------------------------------------
+
+    def test_mixed_request_splits(self):
+        routes = route_many("what's the weather in Delhi and convert 100 USD to INR")
+        kinds = [route.kind for route in routes]
+        self.assertIn(WEATHER, kinds)
+        self.assertIn(CONVERT, kinds)
+
+    def test_single_requests_are_not_split(self):
+        for text in ("difference between rock and roll", "weather in Delhi"):
+            self.assertEqual(len(route_many(text)), 1, text)
+
+    # -- everything returns something -------------------------------------
+
+    def test_router_never_returns_unknown_for_real_text(self):
+        for text in ("asdkjh", "???", "idk man", "hmm", "ok"):
+            route = route_query(text)
+            self.assertTrue(route.routed, text)

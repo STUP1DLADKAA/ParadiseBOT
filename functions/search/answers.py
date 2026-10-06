@@ -28,7 +28,7 @@ import aiohttp
 
 from functions.helpers import shorten
 from .engine import SearchEngine, USER_AGENT
-from .models import SearchAnswer, SearchResult
+from .models import EMPTY, OK, PROVIDER_ERROR, SearchAnswer, SearchResult
 
 log = logging.getLogger(__name__)
 
@@ -168,6 +168,7 @@ class AnswerEngine:
             query=query,
             engine=(response.engine if response is not None else "Web"),
             fresh=fresh,
+            status=(response.status if response is not None else PROVIDER_ERROR),
         )
 
         # Merge wiki into sources when it isn't already there. For fresh /
@@ -242,6 +243,11 @@ class AnswerEngine:
             ][:4]
         answer.warnings = self._detect_warnings(query, results, fresh=fresh)
         answer.sources = results[:6]
+        # Final status: something usable, nothing matched, or retrieval down.
+        if answer.has_answer or answer.has_sources:
+            answer.status = OK
+        elif answer.status == OK:
+            answer.status = EMPTY
 
         # The bot never enables this compatibility path. It exists only so
         # external callers upgrading from the old API can opt in explicitly;
@@ -262,15 +268,15 @@ class AnswerEngine:
     async def _instant_answer(self, query: str) -> dict | None:
         params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as session:
-                async with session.get(
-                    _DDGS, params=params, headers={"User-Agent": USER_AGENT}
-                ) as response:
-                    if response.status != 200:
-                        return None
-                    data = await response.json(content_type=None)
+            # Reuse the search engine's keep-alive session: one connector
+            # for every outbound retrieval leg.
+            session = await self.engine.session()
+            async with session.get(
+                _DDGS, params=params, headers={"User-Agent": USER_AGENT}
+            ) as response:
+                if response.status != 200:
+                    return None
+                data = await response.json(content_type=None)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             log.debug("DDG instant answer failed", exc_info=True)
             return None
@@ -289,30 +295,28 @@ class AnswerEngine:
     async def _wikipedia_summary(self, query: str) -> dict | None:
         headers = {"User-Agent": USER_AGENT}
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as session:
-                async with session.get(
-                    _WIKI_SEARCH,
-                    params={
-                        "action": "opensearch", "search": query, "limit": "1",
-                        "namespace": "0", "format": "json",
-                    },
-                    headers=headers,
-                ) as response:
-                    if response.status != 200:
-                        return None
-                    data = await response.json(content_type=None)
-                if not (isinstance(data, list) and len(data) >= 4 and data[1]):
+            session = await self.engine.session()
+            async with session.get(
+                _WIKI_SEARCH,
+                params={
+                    "action": "opensearch", "search": query, "limit": "1",
+                    "namespace": "0", "format": "json",
+                },
+                headers=headers,
+            ) as response:
+                if response.status != 200:
                     return None
-                title = data[1][0]
-                async with session.get(
-                    _WIKI_SUMMARY + quote(title.replace(" ", "_")),
-                    headers=headers,
-                ) as response:
-                    if response.status != 200:
-                        return None
-                    payload = await response.json(content_type=None)
+                data = await response.json(content_type=None)
+            if not (isinstance(data, list) and len(data) >= 4 and data[1]):
+                return None
+            title = data[1][0]
+            async with session.get(
+                _WIKI_SUMMARY + quote(title.replace(" ", "_")),
+                headers=headers,
+            ) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json(content_type=None)
         except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
             log.debug("Wikipedia summary failed", exc_info=True)
             return None

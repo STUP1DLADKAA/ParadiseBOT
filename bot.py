@@ -6,6 +6,7 @@ import asyncio
 import logging
 import sys
 import time
+from collections import deque
 
 import discord
 from discord import app_commands
@@ -15,6 +16,7 @@ from config import Config, load_config
 from functions.ai import AIService
 from functions.personality import Personality
 from functions.presence import PresenceManager
+from functions.startup import PRIMARY_GUILD_ID, CommandSynchronizer
 
 log = logging.getLogger("paradise")
 
@@ -79,22 +81,34 @@ class ParadiseBot(commands.Bot):
         self.afk_states: dict = {}
         self._afk_notice_last: dict[tuple[int, int], float] = {}
         self._ready_logged = False
+        # The single owner of every command-tree write (see functions/startup).
+        self.synchronizer = CommandSynchronizer(self, guild_id=PRIMARY_GUILD_ID)
+        self.commands_ready = False
+        # Exactly-once guard for message dispatch (bounded, in-memory).
+        self._handled: deque[int] = deque()
+        self._handled_ids: set[int] = set()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def setup_hook(self) -> None:
-        for extension in EXTENSIONS:
-            await self.load_extension(extension)
+        """The explicit startup flow: extensions → prune → sync → ready."""
+        await self._load_extensions()
 
-        try:
-            synced = await self.tree.sync()
-            names = sorted(command.name for command in synced)
-            log.info("Synced %d slash commands: %s", len(synced), ", ".join(names))
-        except discord.DiscordException:
-            # Existing registered commands still work; a sync failure is not fatal.
-            log.warning("Could not sync slash commands", exc_info=True)
+        # Command synchronisation is awaited here, before the bot is
+        # considered ready, so a restart always publishes the current tree
+        # (including removals) to the home guild immediately.
+        report = await self.synchronizer.run()
+        self.commands_ready = report.ok
+        if report.guild_commands:
+            log.info(
+                "Guild %s commands: %s",
+                report.guild_id,
+                ", ".join(report.guild_commands),
+            )
+        for problem in report.errors:
+            log.warning("Command sync issue — %s", problem)
 
         log.info("AI provider: %s", self.ai.describe())
         # Validate the Gemini key (if any) in the background — validation is
@@ -102,6 +116,16 @@ class ParadiseBot(commands.Bot):
         self.loop.create_task(self._validate_ai())
 
         self.presence_manager.start()
+
+    async def _load_extensions(self) -> None:
+        """Load every extension; one broken cog never blocks the others."""
+        for extension in EXTENSIONS:
+            try:
+                await self.load_extension(extension)
+            except commands.ExtensionAlreadyLoaded:
+                continue
+            except Exception:  # noqa: BLE001 - startup must stay resilient
+                log.exception("Could not load extension %s", extension)
 
     async def _validate_ai(self) -> None:
         try:
@@ -148,8 +172,17 @@ class ParadiseBot(commands.Bot):
     # ------------------------------------------------------------------
 
     async def on_message(self, message: discord.Message) -> None:
+        """One message, one path.
+
+        basic filtering → AFK → explicitly addressed? → assistant → STOP.
+        Only messages that were *not* addressed to Paradise fall through to
+        the dictionary text triggers and the passive personality, so a ping
+        can never produce two replies.
+        """
         if message.author.bot or not message.guild:
             return
+        if not self._claim(message):
+            return  # a duplicate dispatch of the same message
 
         self.ai.record(message)
 
@@ -158,23 +191,55 @@ class ParadiseBot(commands.Bot):
         except Exception:
             log.exception("AFK handling failed")
 
+        # Explicit address (mention or reply): the assistant owns it.
+        addressed = False
+        try:
+            addressed = self.ai.should_reply_to(message)
+        except Exception:
+            log.exception("Mention detection failed")
+        if addressed:
+            try:
+                if await self._maybe_assistant(message):
+                    return
+            except Exception:
+                log.exception("Assistant handling failed")
+                await self._assistant_failure(message)
+            return
+
         try:
             if await self._maybe_dictionary(message):
                 return
         except Exception:
             log.exception("Dictionary handling failed")
 
-        # Mentions/replies route through the assistant: tools first, AI last.
-        try:
-            if await self._maybe_assistant(message):
-                return
-        except Exception:
-            log.exception("Assistant handling failed")
-
         try:
             await self.personality.handle(message)
         except Exception:
             log.exception("Personality handler failed")
+
+    def _claim(self, message: discord.Message) -> bool:
+        """True the first time a message id is seen (bounded memory)."""
+        message_id = getattr(message, "id", None)
+        if message_id is None:
+            return True
+        if message_id in self._handled_ids:
+            return False
+        self._handled.append(message_id)
+        self._handled_ids.add(message_id)
+        while len(self._handled) > 512:
+            self._handled_ids.discard(self._handled.popleft())
+        return True
+
+    async def _assistant_failure(self, message: discord.Message) -> None:
+        """A ping always gets an answer, even when the pipeline broke."""
+        try:
+            await message.reply(
+                "that broke on my end — it's been logged. try again in a moment.",
+                mention_author=False,
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.DiscordException:
+            log.debug("Could not send assistant failure notice", exc_info=True)
 
     # -- AFK ----------------------------------------------------------------
 

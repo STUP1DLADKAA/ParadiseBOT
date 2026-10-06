@@ -11,8 +11,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 
-from functions.helpers import ParadiseError
-from .models import SearchResponse, SearchResult
+from .models import EMPTY, OK, PROVIDER_ERROR, SearchResponse, SearchResult
 
 log = logging.getLogger(__name__)
 
@@ -56,15 +55,54 @@ def _unwrap_ddg_url(raw_url: str) -> str:
     return raw_url
 
 
+class _ProviderStatus(Exception):
+    """A provider answered with a non-200 status (rate limit, block, outage)."""
+
+    def __init__(self, status: int) -> None:
+        super().__init__(f"HTTP {status}")
+        self.status = status
+
+
 class SearchEngine:
     """Searches the web via multiple reliable fallbacks."""
 
-    def __init__(self, cache_ttl: int = 900) -> None:
+    def __init__(self, cache_ttl: int = 900, *, timeout: float = 8.0) -> None:
         self.cache_ttl = cache_ttl
+        self.timeout = max(2.0, float(timeout))
         self._cache: dict[str, tuple[float, SearchResponse]] = {}
         # Identical requests arriving together share one fallback chain rather
         # than opening several sessions and hitting the providers repeatedly.
         self._inflight: dict[str, asyncio.Task[SearchResponse]] = {}
+        # One shared keep-alive session for every provider call. Opening a
+        # session per request wastes a TLS handshake on each lookup and
+        # leaks connectors under load.
+        self._session: aiohttp.ClientSession | None = None
+        self._session_lock = asyncio.Lock()
+
+    # ------------------------------------------------------------------
+    # Shared HTTP session
+    # ------------------------------------------------------------------
+
+    async def session(self) -> aiohttp.ClientSession:
+        """The shared session, created on first use."""
+        if self._session is not None and not self._session.closed:
+            return self._session
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=self.timeout),
+                    headers={"User-Agent": USER_AGENT},
+                )
+        return self._session
+
+    async def close(self) -> None:
+        """Release the shared session (called on shutdown)."""
+        session, self._session = self._session, None
+        if session is not None and not session.closed:
+            try:
+                await session.close()
+            except Exception:  # noqa: BLE001 - shutdown is best effort
+                log.debug("Could not close the search session", exc_info=True)
 
     async def search(self, query: str, limit: int = 8) -> SearchResponse:
         """Search the web for query, returning ranked results."""
@@ -83,6 +121,7 @@ class SearchEngine:
                     results=cached_resp.results[:limit],
                     engine=cached_resp.engine,
                     cached=True,
+                    status=cached_resp.status,
                 )
 
         task = self._inflight.get(cache_key)
@@ -111,47 +150,51 @@ class SearchEngine:
             results=response.results[:limit],
             engine=response.engine,
             cached=response.cached,
+            status=response.status,
         )
 
     async def _search_uncached(
         self, query: str, cache_key: str, started_at: float, limit: int
     ) -> SearchResponse:
         """Run one provider fallback chain for a cache key."""
-        # Try multiple strategies in sequence
+        # Provider fallback chain. Each failure is recorded so the caller
+        # can tell "nothing matched" apart from "every provider is down".
         results: list[SearchResult] = []
         engine_name = "Web"
-
-        try:
-            results = await self._search_duckduckgo_lite(query)
-            engine_name = "DuckDuckGo"
-        except Exception as err:
-            log.debug("DDG Lite search failed: %s", err)
-
-        if not results:
+        providers = (
+            ("DuckDuckGo", self._search_duckduckgo_lite),
+            ("DuckDuckGo", self._search_duckduckgo_html),
+            ("DuckDuckGo Instant", self._search_duckduckgo_api),
+            ("Wikipedia", self._search_wikipedia),
+        )
+        reachable = False
+        for name, provider in providers:
+            if results:
+                break
             try:
-                results = await self._search_duckduckgo_html(query)
-                engine_name = "DuckDuckGo"
-            except Exception as err:
-                log.debug("DDG HTML search failed: %s", err)
-
-        if not results:
-            try:
-                results = await self._search_duckduckgo_api(query)
-                engine_name = "DuckDuckGo Instant"
-            except Exception as err:
-                log.debug("DDG API search failed: %s", err)
-
-        if not results:
-            try:
-                results = await self._search_wikipedia(query)
-                if results:
-                    engine_name = "Wikipedia"
-            except Exception as err:
-                log.debug("Wikipedia fallback failed: %s", err)
+                found = await provider(query)
+                reachable = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as err:  # noqa: BLE001 - try the next provider
+                # Technical detail stays in the log; users never see it.
+                log.debug("%s search failed: %s", name, err)
+                continue
+            if found:
+                results = found
+                engine_name = name
 
         # Post-process, rank and deduplicate
         cleaned = self._clean_and_rank(results, query, limit)
-        response = SearchResponse(query=query, results=cleaned, engine=engine_name)
+        if cleaned:
+            status = OK
+        elif reachable:
+            status = EMPTY
+        else:
+            status = PROVIDER_ERROR
+        response = SearchResponse(
+            query=query, results=cleaned, engine=engine_name, status=status
+        )
 
         if cleaned:
             self._cache[cache_key] = (started_at, response)
@@ -171,13 +214,11 @@ class SearchEngine:
             "Content-Type": "application/x-www-form-urlencoded",
         }
         data = {"q": query}
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=6)
-        ) as session:
-            async with session.post(url, data=data, headers=headers) as resp:
-                if resp.status != 200:
-                    return []
-                html_text = await resp.text(errors="replace")
+        session = await self.session()
+        async with session.post(url, data=data, headers=headers) as resp:
+            if resp.status != 200:
+                raise _ProviderStatus(resp.status)
+            html_text = await resp.text(errors="replace")
 
         return self._parse_ddg_lite_html(html_text)
 
@@ -221,13 +262,11 @@ class SearchEngine:
             "Content-Type": "application/x-www-form-urlencoded",
         }
         data = {"q": query, "b": ""}
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=6)
-        ) as session:
-            async with session.post(url, data=data, headers=headers) as resp:
-                if resp.status != 200:
-                    return []
-                html_text = await resp.text(errors="replace")
+        session = await self.session()
+        async with session.post(url, data=data, headers=headers) as resp:
+            if resp.status != 200:
+                raise _ProviderStatus(resp.status)
+            html_text = await resp.text(errors="replace")
 
         return self._parse_ddg_html(html_text)
 
@@ -274,13 +313,11 @@ class SearchEngine:
         url = "https://api.duckduckgo.com/"
         params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "0"}
         headers = {"User-Agent": USER_AGENT}
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as session:
-            async with session.get(url, params=params, headers=headers) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json(content_type=None)
+        session = await self.session()
+        async with session.get(url, params=params, headers=headers) as resp:
+            if resp.status != 200:
+                raise _ProviderStatus(resp.status)
+            data = await resp.json(content_type=None)
 
         results: list[SearchResult] = []
         # Check abstract
@@ -326,13 +363,11 @@ class SearchEngine:
             "format": "json",
         }
         headers = {"User-Agent": USER_AGENT}
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=5)
-        ) as session:
-            async with session.get(url, params=params, headers=headers) as resp:
-                if resp.status != 200:
-                    return []
-                data = await resp.json(content_type=None)
+        session = await self.session()
+        async with session.get(url, params=params, headers=headers) as resp:
+            if resp.status != 200:
+                raise _ProviderStatus(resp.status)
+            data = await resp.json(content_type=None)
 
         results: list[SearchResult] = []
         # Format: [query, [titles], [descriptions], [urls]]

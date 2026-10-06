@@ -336,3 +336,31 @@ def looks_like_math(text: str) -> bool:
     if re.search(r"[a-zA-Z]", scrubbed) and not _PERCENT_OF.search(probe):
         return False
     return any(op in probe for op in "+-*/×÷^%(")
+
+
+def extract_expression(text: str) -> str | None:
+    """Return the fragment of *text* that actually evaluates, or ``None``.
+
+    People wrap arithmetic in conversation ("bro calculate 29% of 734",
+    "ok so whats 25 * 32 please"). The router needs the part the
+    calculator can parse, and the only trustworthy test for that is the
+    calculator itself — so this trims leading words until :func:`calculate`
+    accepts the remainder. Pure, bounded (at most a handful of attempts)
+    and side-effect free.
+    """
+    cleaned = strip_question_words(" ".join(str(text or "").split())).strip(" ?!.")
+    if not cleaned or len(cleaned) > 200:
+        return None
+    words = cleaned.split()
+    for start in range(min(len(words), 6)):
+        candidate = " ".join(words[start:]).strip(" ?!.")
+        if not candidate or not any(char.isdigit() for char in candidate):
+            break
+        try:
+            calculate(candidate)
+        except ParadiseError:
+            continue
+        except Exception:  # noqa: BLE001 - never let probing raise
+            continue
+        return candidate
+    return None

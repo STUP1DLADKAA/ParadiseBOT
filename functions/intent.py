@@ -26,9 +26,9 @@ from dataclasses import dataclass
 
 from functions.cache import TTLCache
 from functions.helpers import ParadiseError
-from functions.router import (
-    AI, CALCULATE, CONVERT, DATE, DEFINE, IMAGE, SEARCH, TIME, TRANSLATE,
-    WEATHER, Route,
+from functions.routes import (
+    AI, CALCULATE, CONVERT, DATE, DEFINE, IMAGE, MEDIUM_CONFIDENCE, SEARCH,
+    TIME, TRANSLATE, WEATHER, Route, clamp_confidence,
 )
 
 log = logging.getLogger(__name__)
@@ -44,11 +44,24 @@ _INTENT_TO_KIND: dict[str, str] = {
     "search": SEARCH,
     "define": DEFINE,
     "translate": TRANSLATE,
+    "dictionary": DEFINE,
+    "recipe": SEARCH,
     "chat": AI,
+    "unknown": AI,
 }
 
+# Model output is data. Anything that looks like code, a command, a URL
+# with credentials or an attempt to address the bot's internals is dropped
+# rather than passed to a tool.
+_UNSAFE_PAYLOAD = re.compile(
+    r"(?:```|\$\(|`|<\?|</|\bimport\s|\bexec\s*\(|\beval\s*\(|\bos\.|"
+    r"\bsubprocess\b|\bapi[_-]?key\b|\btoken\b|\benv(?:iron)?\b|"
+    r"\bsystem\s*\(|\brm\s+-rf\b|\bsudo\b|\\x[0-9a-f]{2})",
+    re.IGNORECASE,
+)
+
 # Below this, the deterministic router is admitting it guessed.
-AMBIGUOUS_CONFIDENCE = 0.45
+AMBIGUOUS_CONFIDENCE = MEDIUM_CONFIDENCE
 _CLASSIFY_TIMEOUT = 10.0
 _MAX_QUERY = 200
 
@@ -66,6 +79,7 @@ class IntentGuess:
     query: str
     needs_web: bool = False
     needs_image: bool = False
+    confidence: float = 0.55
 
     @property
     def kind(self) -> str:
@@ -82,7 +96,7 @@ class IntentGuess:
         return Route(
             kind=kind,
             payload=payload,
-            confidence=0.55,
+            confidence=self.confidence,
             fresh=self.needs_web or fallback.fresh,
             reason_complex=fallback.reason_complex,
             count=fallback.count,
@@ -90,7 +104,13 @@ class IntentGuess:
 
 
 def should_classify(route: Route) -> bool:
-    """True when the router was unsure enough to be worth one AI label."""
+    """True when the router was unsure enough to be worth one AI label.
+
+    Deterministic tool routes are never sent to the model — that is the
+    whole point of the hierarchy. Only an unplaced request (``ai`` /
+    ``unknown``) at or below the medium-confidence band qualifies, so an
+    obvious calculation or weather lookup can never cost an API call.
+    """
     return route.kind in (AI, "unknown") and route.confidence <= AMBIGUOUS_CONFIDENCE
 
 
@@ -113,11 +133,24 @@ def parse_intent(raw: str) -> IntentGuess | None:
     if intent not in _INTENT_TO_KIND:
         return None
     query = " ".join(str(data.get("query", "") or "").split())[:_MAX_QUERY]
+    if query and _UNSAFE_PAYLOAD.search(query):
+        # Never hand an executable-looking string to a tool, whatever the
+        # model claims it is.
+        log.debug("Rejected a classifier payload that looked executable")
+        return None
+    # Confidence is advisory: clamp it, and never let the model claim more
+    # certainty than a deterministic match would get.
+    confidence = data.get("confidence")
+    if confidence is None:
+        score = 0.55
+    else:
+        score = min(0.7, max(0.3, clamp_confidence(confidence)))
     return IntentGuess(
         intent=intent,
         query=query,
         needs_web=_as_bool(data.get("needs_web")),
         needs_image=_as_bool(data.get("needs_image")),
+        confidence=score,
     )
 
 

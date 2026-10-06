@@ -1272,6 +1272,7 @@ from types import SimpleNamespace  # noqa: E402
 
 from commands.dictionary import (  # noqa: E402
     SCREEN_CARD,
+    Editor,
     SCREEN_EXAMPLES,
     SCREEN_MORE,
     Dictionary,
@@ -1387,6 +1388,26 @@ def make_cog(
     return cog
 
 
+async def run_lookup(cog: Dictionary, interaction, raw: str) -> None:
+    """Drive the dictionary pipeline the way the mention assistant does.
+
+    There is no /dictionary or /define slash command any more — the only
+    entry points are chat triggers and ``@Paradise define <word>``. This
+    helper reproduces that flow against a fake interaction so the card,
+    button and failure behaviour stays covered.
+    """
+    try:
+        term = cog.feature.service.validate(raw)
+    except ParadiseError as error:
+        await interaction.response.send_message(str(error), ephemeral=True)
+        return
+    try:
+        await interaction.response.send_message(view=LoadingView(term))
+    except discord.HTTPException:
+        return  # the interaction expired before the lookup started
+    await cog.deliver(term, Editor(interaction=interaction), invoker_id=interaction.user.id)
+
+
 def buttons_of(view: discord.ui.LayoutView) -> dict[str, discord.ui.Button]:
     found = {}
     for item in view.walk_children():
@@ -1403,11 +1424,11 @@ def text_of(view: discord.ui.LayoutView) -> str:
     )
 
 
-class TestSlashCommandFlow(unittest.TestCase):
+class TestLookupFlow(unittest.TestCase):
     def test_loading_state_then_card(self):
         cog = make_cog()
         interaction = FakeInteraction()
-        run(cog._run_command(interaction, "promise"))
+        run(run_lookup(cog, interaction, "promise"))
 
         self.assertEqual(len(interaction.response.messages), 1, "a loading state is shown first")
         loading = interaction.response.messages[0]["view"]
@@ -1425,7 +1446,7 @@ class TestSlashCommandFlow(unittest.TestCase):
     def test_card_attachment_is_a_real_png(self):
         cog = make_cog()
         interaction = FakeInteraction()
-        run(cog._run_command(interaction, "promise"))
+        run(run_lookup(cog, interaction, "promise"))
         payload = interaction.original_edits[0]["attachments"][0].fp.read()
         self.assertTrue(payload.startswith(b"\x89PNG\r\n\x1a\n"))
         run(cog.cog_unload())
@@ -1433,7 +1454,7 @@ class TestSlashCommandFlow(unittest.TestCase):
     def test_buttons_offered_on_the_card(self):
         cog = make_cog()
         interaction = FakeInteraction()
-        run(cog._run_command(interaction, "promise"))
+        run(run_lookup(cog, interaction, "promise"))
         labels = set(buttons_of(interaction.original_edits[0]["view"]))
         self.assertIn("Pronounce", labels)
         self.assertIn("More", labels)
@@ -1450,14 +1471,14 @@ class TestSlashCommandFlow(unittest.TestCase):
         )
         cog = make_cog(entries={"hello": entry})
         interaction = FakeInteraction()
-        run(cog._run_command(interaction, "hello"))
+        run(run_lookup(cog, interaction, "hello"))
         self.assertIn("Examples", buttons_of(interaction.original_edits[0]["view"]))
         run(cog.cog_unload())
 
     def test_bad_input_never_posts_a_card(self):
         cog = make_cog()
         interaction = FakeInteraction()
-        run(cog._run_command(interaction, "12345"))
+        run(run_lookup(cog, interaction, "12345"))
         self.assertEqual(interaction.original_edits, [])
         self.assertTrue(interaction.response.messages[0]["ephemeral"])
         run(cog.cog_unload())
@@ -1465,7 +1486,7 @@ class TestSlashCommandFlow(unittest.TestCase):
     def test_unknown_word_offers_a_confirmed_correction(self):
         cog = make_cog(entries={}, suggestions=[("receive", 100.0), ("relieve", 10.0)])
         interaction = FakeInteraction()
-        run(cog._run_command(interaction, "recieve"))
+        run(run_lookup(cog, interaction, "recieve"))
         view = interaction.original_edits[0]["view"]
         self.assertIsInstance(view, NotFoundView)
         self.assertIn("Did you mean", text_of(view))
@@ -1480,7 +1501,7 @@ class TestSlashCommandFlow(unittest.TestCase):
             suggestions=[("receive", 100.0)],
         )
         interaction = FakeInteraction()
-        run(cog._run_command(interaction, "recieve"))
+        run(run_lookup(cog, interaction, "recieve"))
         view = interaction.original_edits[0]["view"]
         self.assertIsInstance(view, ResultView)
         self.assertIn("corrected from", text_of(view))
@@ -1489,7 +1510,7 @@ class TestSlashCommandFlow(unittest.TestCase):
     def test_correction_button_belongs_to_the_asker(self):
         cog = make_cog(entries={}, suggestions=[("receive", 100.0)])
         interaction = FakeInteraction(user_id=1)
-        run(cog._run_command(interaction, "recieve"))
+        run(run_lookup(cog, interaction, "recieve"))
         button = buttons_of(interaction.original_edits[0]["view"])["Yes, search receive"]
         stranger = FakeInteraction(user_id=2)
         run(button.callback(stranger))
@@ -1509,7 +1530,7 @@ class TestSlashCommandFlow(unittest.TestCase):
         cog.feature.service.primary = Exploding()
         cog.feature.service.secondary = FakeSecondary(suggestions=[])
         interaction = FakeInteraction()
-        run(cog._run_command(interaction, "promise"))
+        run(run_lookup(cog, interaction, "promise"))
         view = interaction.original_edits[0]["view"]
         self.assertNotIsInstance(view, ResultView)
         self.assertIn("Couldn't find", text_of(view))
@@ -1519,7 +1540,7 @@ class TestSlashCommandFlow(unittest.TestCase):
         cog = make_cog()
         interaction = FakeInteraction()
         interaction.response.raises = discord.NotFound(http_error(404), "unknown interaction")
-        run(cog._run_command(interaction, "promise"))  # must not raise
+        run(run_lookup(cog, interaction, "promise"))  # must not raise
         self.assertEqual(interaction.original_edits, [])
         run(cog.cog_unload())
 
@@ -1528,7 +1549,7 @@ class TestSlashCommandFlow(unittest.TestCase):
 
         async def scenario():
             interactions = [FakeInteraction(user_id=i) for i in range(5)]
-            await asyncio.gather(*[cog._run_command(i, "promise") for i in interactions])
+            await asyncio.gather(*[run_lookup(cog, i, "promise") for i in interactions])
             return interactions
 
         interactions = run(scenario())
@@ -1537,14 +1558,10 @@ class TestSlashCommandFlow(unittest.TestCase):
             self.assertIsInstance(interaction.original_edits[0]["view"], ResultView)
         run(cog.cog_unload())
 
-    def test_define_and_dictionary_are_the_same_pipeline(self):
+    def test_dictionary_registers_no_slash_commands(self):
+        """The capability is mention-only now; nothing may be registered."""
         cog = make_cog()
-        self.assertEqual(
-            cog.dictionary.callback.__wrapped__ if hasattr(cog.dictionary.callback, "__wrapped__") else True,
-            cog.dictionary.callback.__wrapped__ if hasattr(cog.dictionary.callback, "__wrapped__") else True,
-        )
-        names = {command.name for command in cog.get_app_commands()}
-        self.assertEqual(names, {"dictionary", "define"})
+        self.assertEqual({command.name for command in cog.get_app_commands()}, set())
         run(cog.cog_unload())
 
 
@@ -1600,7 +1617,7 @@ class TestChatTriggerFlow(unittest.TestCase):
 class TestButtonFlow(unittest.TestCase):
     def _posted(self, cog, user_id=1):
         interaction = FakeInteraction(user_id=user_id)
-        run(cog._run_command(interaction, "promise"))
+        run(run_lookup(cog, interaction, "promise"))
         return interaction.original_edits[0]["view"]
 
     def test_more_screen_shows_extra_material(self):
@@ -1681,7 +1698,7 @@ class TestButtonFlow(unittest.TestCase):
     def test_timeout_greys_the_buttons_out(self):
         cog = make_cog()
         interaction = FakeInteraction()
-        run(cog._run_command(interaction, "promise"))
+        run(run_lookup(cog, interaction, "promise"))
         view = interaction.original_edits[0]["view"]
         run(view.on_timeout())
         self.assertTrue(all(button.disabled for button in buttons_of(view).values()))
@@ -1813,7 +1830,7 @@ class TestFeatureFacade(unittest.TestCase):
         cog.feature.service.primary = FakePrimary({"promise": entry_for()})
         feature_module.render_card = boom
         try:
-            run(cog._run_command(interaction, "promise"))
+            run(run_lookup(cog, interaction, "promise"))
         finally:
             feature_module.render_card = original
         view = interaction.original_edits[0]["view"]

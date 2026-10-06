@@ -35,52 +35,19 @@ classification — see :mod:`functions.intent`.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
 
-from functions.calculator import looks_like_math, strip_question_words
+from functions.calculator import extract_expression, looks_like_math
 from functions.conversion import parse_conversion_query
 from functions.conversion.currency import resolve_currency
 from functions.conversion.units import TEMP_UNITS, resolve_unit
 from functions.helpers import ParadiseError
-
-# ---------------------------------------------------------------------------
-# Route kinds
-# ---------------------------------------------------------------------------
-
-HELP = "help"
-COMMAND_HELP = "command_help"
-PING = "ping"
-COINFLIP = "coinflip"
-CHOOSE = "choose"
-CALCULATE = "calculate"
-DEFINE = "define"
-CONVERT = "convert"
-IMAGE = "image"
-WEATHER = "weather"
-TIME = "time"
-DATE = "date"
-TRANSLATE = "translate"
-SEARCH = "search"
-AI = "ai"
-UNKNOWN = "unknown"
-
-
-@dataclass(slots=True)
-class Route:
-    """Where a query should be answered, plus the cleaned argument."""
-
-    kind: str
-    payload: str = ""        # primary argument (word, query, city, text…)
-    payload2: str = ""       # secondary argument (target language)
-    confidence: float = 0.0
-    fresh: bool = False      # the answer likely depends on recent information
-    reason_complex: bool = False  # retrieved facts probably need AI reasoning
-    count: int = 1           # how many results were asked for (images)
-
-    @property
-    def routed(self) -> bool:
-        return self.kind not in (UNKNOWN,)
-
+from functions.keywords import keyword_route
+from functions.normalize import normalize_request
+from functions.routes import (
+    AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
+    DETERMINISTIC_KINDS, HELP, HIGH_CONFIDENCE, IMAGE, MEDIUM_CONFIDENCE,
+    PING, Route, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
+)
 
 # ---------------------------------------------------------------------------
 # Patterns
@@ -315,8 +282,8 @@ def _try_image(text: str) -> Route | None:
     return None
 
 
-def route_query(text: str, *, allow_ai: bool = True) -> Route:
-    """Classify a user query into the best tool. Pure and deterministic."""
+def route_strict(text: str, *, allow_ai: bool = True) -> Route:
+    """Pattern-match a *well formed* request. Pure and deterministic."""
     cleaned = _squash(text)
     if not cleaned:
         return Route(kind=HELP, confidence=1.0)
@@ -350,9 +317,17 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
     # -- 1/2/3. calculator, define, convert — the explicit-verb fast lane --
     calc_probe = _CALC_VERB.sub("", cleaned, count=1) if _CALC_VERB.match(cleaned) else ""
     if calc_probe:
-        return Route(kind=CALCULATE, payload=calc_probe, confidence=0.95)
+        # Validate with the calculator itself so the payload is always
+        # something it can actually evaluate.
+        return Route(
+            kind=CALCULATE,
+            payload=extract_expression(calc_probe) or calc_probe,
+            confidence=0.95,
+        )
     if looks_like_math(cleaned):
-        return Route(kind=CALCULATE, payload=strip_question_words(cleaned).rstrip("?!.").strip(), confidence=0.95)
+        expression = extract_expression(cleaned)
+        if expression:
+            return Route(kind=CALCULATE, payload=expression, confidence=0.95)
 
     match = _WHAT_DOES_MEAN.match(cleaned) or _DEFINE.match(cleaned)
     if match:
@@ -458,6 +433,47 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
 
 
 # ---------------------------------------------------------------------------
+# The hybrid router: strict patterns, then tolerant keywords
+# ---------------------------------------------------------------------------
+
+#: Above this, the strict patterns are trusted without a second opinion.
+_TRUST_STRICT = 0.9
+
+
+def route_query(text: str, *, allow_ai: bool = True) -> Route:
+    """Classify a user query into the best tool.
+
+    Three cheap, local stages — no network, no AI:
+
+    1. strict patterns on the text as typed;
+    2. strict patterns on the *normalised* text (slang, typos, Hinglish);
+    3. tolerant keyword/entity scoring for everything still unclear.
+
+    The most confident candidate wins, so a well-formed sentence costs one
+    pass and a mangled one costs three cheap ones.
+    """
+    cleaned = _squash(text)
+    best = route_strict(cleaned, allow_ai=allow_ai)
+    if best.confidence >= _TRUST_STRICT:
+        return best
+    if not cleaned:
+        return best
+
+    normalized = normalize_request(cleaned)
+    if normalized.text and normalized.text != cleaned.casefold():
+        alternative = route_strict(normalized.text, allow_ai=allow_ai)
+        if alternative.confidence > best.confidence:
+            best = alternative
+    if best.confidence >= _TRUST_STRICT:
+        return best
+
+    guess = keyword_route(normalized)
+    if guess is not None and guess.confidence > best.confidence:
+        best = guess
+    return best
+
+
+# ---------------------------------------------------------------------------
 # Multi-tool requests ("search X and convert 20 USD to INR")
 # ---------------------------------------------------------------------------
 
@@ -517,6 +533,7 @@ def route_many(text: str) -> list[Route]:
 
 __all__ = [
     "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE", "DEFINE",
-    "HELP", "IMAGE", "PING", "Route", "SEARCH", "TIME", "TRANSLATE",
-    "UNKNOWN", "WEATHER", "route_many", "route_query",
+    "DETERMINISTIC_KINDS", "HELP", "HIGH_CONFIDENCE", "IMAGE", "MEDIUM_CONFIDENCE",
+    "PING", "Route", "SEARCH", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER",
+    "route_many", "route_query", "route_strict",
 ]

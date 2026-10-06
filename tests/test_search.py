@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from functions.search import (
+    EMPTY,
+    PROVIDER_ERROR,
     SearchEngine,
     SearchPaginationView,
     SearchResponse,
@@ -129,6 +131,50 @@ class TestSearchEngine(unittest.IsolatedAsyncioTestCase):
             resp2 = await self.engine.search("test query")
             self.assertTrue(resp2.cached)
             self.assertEqual(resp2.results[0].title, "Cached Title")
+
+    async def test_all_providers_down_reports_provider_error(self):
+        boom = AsyncMock(side_effect=RuntimeError("blocked"))
+        with patch.object(self.engine, "_search_duckduckgo_lite", new=boom), \
+             patch.object(self.engine, "_search_duckduckgo_html", new=boom), \
+             patch.object(self.engine, "_search_duckduckgo_api", new=boom), \
+             patch.object(self.engine, "_search_wikipedia", new=boom):
+            response = await self.engine.search("anything")
+        self.assertTrue(response.failed)
+        self.assertEqual(response.status, PROVIDER_ERROR)
+        self.assertFalse(response.has_results)
+
+    async def test_reachable_but_empty_is_not_a_failure(self):
+        empty = AsyncMock(return_value=[])
+        with patch.object(self.engine, "_search_duckduckgo_lite", new=empty), \
+             patch.object(self.engine, "_search_duckduckgo_html", new=empty), \
+             patch.object(self.engine, "_search_duckduckgo_api", new=empty), \
+             patch.object(self.engine, "_search_wikipedia", new=empty):
+            response = await self.engine.search("flurbleglorp")
+        self.assertEqual(response.status, EMPTY)
+        self.assertFalse(response.failed)
+
+    async def test_session_is_shared_and_closable(self):
+        first = await self.engine.session()
+        second = await self.engine.session()
+        self.assertIs(first, second, "a new HTTP session per request")
+        await self.engine.close()
+        self.assertTrue(first.closed)
+        third = await self.engine.session()
+        self.assertIsNot(third, first)
+        await self.engine.close()
+
+    async def test_results_are_deduplicated_and_limited(self):
+        duplicates = [
+            SearchResult(title="One", url="https://example.com/a", snippet="x"),
+            SearchResult(title="One again", url="https://example.com/a/", snippet="x"),
+            SearchResult(title="Two", url="https://example.com/b", snippet="y"),
+        ]
+        with patch.object(
+            self.engine, "_search_duckduckgo_lite", new=AsyncMock(return_value=duplicates)
+        ):
+            response = await self.engine.search("dupes", limit=5)
+        self.assertEqual([item.url for item in response.results],
+                         ["https://example.com/a", "https://example.com/b"])
 
 
 class TestSearchUI(unittest.TestCase):

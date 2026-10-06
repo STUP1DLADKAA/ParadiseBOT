@@ -62,9 +62,10 @@ class TestShouldClassify(unittest.TestCase):
             self.assertFalse(should_classify(route_query(text)), text)
 
     def test_vague_requests_are_classified(self):
-        route = route_query("anything on the new pixel")
-        self.assertEqual(route.kind, AI)
-        self.assertTrue(should_classify(route))
+        for text in ("anything on that thing we discussed", "hmm maybe the other one"):
+            route = route_query(text)
+            self.assertEqual(route.kind, AI, text)
+            self.assertTrue(should_classify(route), text)
 
 
 class TestParseIntent(unittest.TestCase):
