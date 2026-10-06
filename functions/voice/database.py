@@ -86,12 +86,15 @@ class VoiceDatabase:
             isolation_level=None,  # Autocommit mode
         )
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA journal_mode = WAL;")
+        # journal_mode is selected once during initialisation below. Repeating
+        # that potentially locking PRAGMA for every short-lived operation is
+        # unnecessary I/O; synchronous remains a per-connection setting.
         conn.execute("PRAGMA synchronous = NORMAL;")
         return conn
 
     def _init_db(self) -> None:
         with self._get_connection() as conn:
+            conn.execute("PRAGMA journal_mode = WAL;")
             conn.executescript("""
                 CREATE TABLE IF NOT EXISTS user_settings (
                     user_id INTEGER PRIMARY KEY,
@@ -237,6 +240,12 @@ class VoiceDatabase:
                         excluded.avatar_url, voice_member_profiles.avatar_url
                     ),
                     updated_at = excluded.updated_at
+                WHERE voice_member_profiles.display_name IS NOT excluded.display_name
+                   OR voice_member_profiles.username IS NOT excluded.username
+                   OR (
+                       excluded.avatar_url IS NOT NULL
+                       AND voice_member_profiles.avatar_url IS NOT excluded.avatar_url
+                   )
                 """,
                 (guild_id, user_id, display_name, username, avatar_url, now_iso),
             )

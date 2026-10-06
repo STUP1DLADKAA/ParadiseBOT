@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import time
 from collections import OrderedDict
-from typing import Any, Generic, Hashable, TypeVar
+from typing import Generic, Hashable, TypeVar
 
 from .models import Identity, MediaTitle
 
@@ -149,65 +149,3 @@ class TitleMemory:
                         seen.add(sig)
                         hits.append(identity)
         return hits[:limit]
-
-
-class RateLimiter:
-    """Token bucket: at most ``rate`` calls per ``per`` seconds."""
-
-    __slots__ = ("_per", "_rate", "_tokens", "_updated")
-
-    def __init__(self, rate: int = 10, per: float = 1.0) -> None:
-        self._rate = max(1, int(rate))
-        self._per = max(0.001, float(per))
-        self._tokens = float(self._rate)
-        self._updated = time.monotonic()
-
-    def try_acquire(self) -> bool:
-        now = time.monotonic()
-        elapsed = now - self._updated
-        if elapsed > 0:
-            self._updated = now
-            self._tokens = min(float(self._rate), self._tokens + elapsed * self._rate / self._per)
-        if self._tokens >= 1.0:
-            self._tokens -= 1.0
-            return True
-        return False
-
-
-class SingleFlight(Generic[K, V]):
-    """Collapse concurrent identical async calls into one."""
-
-    __slots__ = ("_calls",)
-
-    def __init__(self) -> None:
-        self._calls: dict[Hashable, Any] = {}
-
-    async def run(self, key: Hashable, factory) -> V:
-        existing = self._calls.get(key)
-        if existing is not None:
-            return await _shield(existing)
-
-        import asyncio
-
-        loop = asyncio.get_running_loop()
-        future: asyncio.Future = loop.create_future()
-        self._calls[key] = future
-        try:
-            result = await factory()
-        except BaseException as error:  # noqa: BLE001 - re-raised below
-            if not future.done():
-                future.set_exception(error)
-            future.exception()
-            raise
-        else:
-            if not future.done():
-                future.set_result(result)
-            return result
-        finally:
-            self._calls.pop(key, None)
-
-
-async def _shield(future):
-    import asyncio
-
-    return await asyncio.shield(future)

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import math
 import time
+from collections import OrderedDict
 from datetime import datetime
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
@@ -19,6 +20,7 @@ from .models import LocationInfo, WeatherData
 log = logging.getLogger(__name__)
 
 USER_AGENT = "ParadiseBot/1.0 (+https://github.com/STUP1DLADKAA/ParadiseBOT) weather"
+_WEATHER_CACHE_MAX_ITEMS = 256
 
 # WMO Weather interpretation codes (WW)
 # https://open-meteo.com/en/docs
@@ -125,7 +127,7 @@ class OpenMeteoWeatherService:
 
     def __init__(self, cache_ttl: int = 600) -> None:
         self.cache_ttl = cache_ttl
-        self._cache: dict[str, tuple[float, WeatherData]] = {}
+        self._cache: OrderedDict[str, tuple[float, WeatherData]] = OrderedDict()
 
     async def get_weather(self, query: str) -> WeatherData:
         query = query.strip()
@@ -134,10 +136,13 @@ class OpenMeteoWeatherService:
 
         cache_key = query.lower()
         now = time.monotonic()
-        if cache_key in self._cache:
-            cached_time, cached_data = self._cache[cache_key]
+        cached = self._cache.get(cache_key)
+        if cached is not None:
+            cached_time, cached_data = cached
             if now - cached_time < self.cache_ttl:
+                self._cache.move_to_end(cache_key)
                 return cached_data
+            self._cache.pop(cache_key, None)
 
         # 1. Resolve location
         location = await self._resolve_location(query)
@@ -149,6 +154,9 @@ class OpenMeteoWeatherService:
         # 2. Fetch forecast
         data = await self._fetch_weather_data(location)
         self._cache[cache_key] = (now, data)
+        self._cache.move_to_end(cache_key)
+        while len(self._cache) > _WEATHER_CACHE_MAX_ITEMS:
+            self._cache.popitem(last=False)
         return data
 
     async def _resolve_location(self, query: str) -> LocationInfo | None:

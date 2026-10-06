@@ -5,7 +5,7 @@ the request with the deterministic router (functions/router.py) and sends
 it to the most specialised tool:
 
     calculator · define · convert · weather · time/date · translate
-    → entertainment engine → web search (answer + sources)
+    → entertainment engine → explicit web search (answer + sources)
     → Gemini/OpenAI-compatible AI — strictly the last resort
 
 Everything here reuses the existing services owned by the other cogs, so
@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import re
 import time
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -26,13 +27,16 @@ from zoneinfo import ZoneInfo
 import discord
 from discord.ext import commands
 
+from commands.fun import build_ping_message, choose_option, flip_coin
+from commands.system import HELP_BLURBS
 from functions.calculator import calculate
-from functions.helpers import ParadiseError, shorten
+from functions.helpers import ParadiseError, parse_options, shorten, split_discord_text
 from functions.router import (
-    AI, CALCULATE, CONVERT, DATE, DEFINE, ENTERTAINMENT, HELP,
-    SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER, Route, route_query,
+    AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
+    ENTERTAINMENT, HELP, PING, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER, Route,
+    route_query,
 )
-from functions.search import SearchAnswerView, build_answer_embed
+from functions.search import SearchAnswerView, SearchResponse, build_answer_embed
 from functions.time import build_time_embed, get_current_time_for_zone, resolve_timezone
 from functions.translate import resolve_language, translate_text
 from functions.weather import build_weather_embed, render_weather_card
@@ -48,6 +52,7 @@ ASK_HINT = (
     "hey! just ask me things like:\n"
     "• `@Paradise define photosynthesis`\n"
     "• `@Paradise 25% of 800`  ·  `@Paradise convert 100 USD to INR`\n"
+    "• `@Paradise flip a coin`  ·  `@Paradise choose pizza or burgers`\n"
     "• `@Paradise weather in Delhi`  ·  `@Paradise time in Tokyo`\n"
     "• `@Paradise latest Minecraft news`\n"
     "• `@Paradise recommend a movie like Interstellar`\n"
@@ -113,6 +118,19 @@ class Assistant(commands.Cog):
         if kind == HELP:
             await self._quiet_reply(message, ASK_HINT)
             return True
+        if kind == COMMAND_HELP:
+            return await self._command_help(message, route)
+        if kind == PING:
+            await self._quiet_reply(
+                message,
+                build_ping_message(getattr(self.bot, "latency", None)),
+            )
+            return True
+        if kind == COINFLIP:
+            await self._quiet_reply(message, f"🪙 **{flip_coin()}**")
+            return True
+        if kind == CHOOSE:
+            return await self._choose(message, route)
         if kind == CALCULATE:
             return await self._calculate(message, route)
         if kind == DEFINE:
@@ -132,12 +150,51 @@ class Assistant(commands.Cog):
         if kind == SEARCH:
             return await self._search(message, route)
         if kind in (AI, UNKNOWN):
-            # No deterministic tool fits: web-search complex factual asks
-            # first (facts before AI); converse when it's small talk.
-            if route.reason_complex and not route.fresh:
-                return await self._reason_or_search(message, route, text)
+            # AI is a language/reasoning fallback, not an agent loop. In
+            # particular, never search first and then ask AI to rewrite the
+            # result; explicit search requests are handled by _search above.
             return await self._ai(message, text)
         return await self._ai(message, text)
+
+    # -- command metadata --------------------------------------------------
+
+    async def _command_help(self, message: discord.Message, route: Route) -> bool:
+        name = route.payload.casefold().lstrip("/")
+        blurb = HELP_BLURBS.get(name)
+        if blurb is None:
+            await self._quiet_reply(
+                message,
+                f"I don't know `/{name}`. try `/help` for the commands that are actually registered.",
+            )
+            return True
+        await self._quiet_reply(message, f"`/{name}` — {blurb}.")
+        return True
+
+    # -- native fun commands ----------------------------------------------
+
+    async def _choose(self, message: discord.Message, route: Route) -> bool:
+        raw = route.payload.strip()
+        choices = parse_options(raw, limit=20)
+        if len(choices) < 2:
+            # The slash command documents `|` and `,`; natural speech often
+            # uses "or", so accept that shape without involving AI.
+            choices = [
+                part.strip()
+                for part in re.split(r"\s+or\s+", raw, flags=re.IGNORECASE)
+                if part.strip()
+            ]
+        if not 2 <= len(choices) <= 20 or any(len(item) > 100 for item in choices):
+            await self._quiet_reply(
+                message,
+                "give me 2–20 choices, separated by `|`, `,`, or `or`.",
+            )
+            return True
+        pick = choose_option(choices)
+        await self._quiet_reply(
+            message,
+            f"**{discord.utils.escape_markdown(pick)}**.\n\nthe council has spoken.",
+        )
+        return True
 
     # -- calculator --------------------------------------------------------
 
@@ -297,7 +354,11 @@ class Assistant(commands.Cog):
                 "try `japanese`, `hindi`, `spanish`… or a code like `ja` / `hi`.",
             )
             return True
-        result = await translate_text(route.payload, target)
+        try:
+            result = await translate_text(route.payload, target)
+        except Exception:  # noqa: BLE001 - translation is a native best-effort tool
+            log.warning("Mention translation failed", exc_info=True)
+            result = None
         if result is None:
             await self._quiet_reply(message, "the translation service isn't responding right now.")
             return True
@@ -334,7 +395,7 @@ class Assistant(commands.Cog):
             placeholder = await message.reply(
                 "🔎 searching the web…", mention_author=False
             )
-        except discord.HTTPException:
+        except discord.DiscordException:
             return False
 
         try:
@@ -349,33 +410,25 @@ class Assistant(commands.Cog):
             await self._quiet_edit(placeholder, SEARCH_FAIL_LINE)
             return True
 
-        try:
-            response = await utility.search_engine.search(subject, limit=8)
-        except Exception:  # noqa: BLE001 - sources are best-effort
-            response = None
-
+        # AnswerEngine already performed the native retrieval and exposes the
+        # evidence needed by both the card and its browse view. Never repeat
+        # the same network search here.
+        response = SearchResponse(
+            query=answer.query,
+            results=list(answer.sources),
+            engine=answer.engine,
+            cached=answer.cached,
+        )
         embed = build_answer_embed(answer)
         view = SearchAnswerView(answer, response, author_id=message.author.id)
         try:
             await placeholder.edit(content=None, embed=embed, view=view)
             view.message = placeholder
-        except discord.HTTPException:
+        except (discord.DiscordException, AttributeError):
             log.debug("Could not deliver search answer", exc_info=True)
         return True
 
     # -- AI (the last resort) ---------------------------------------------------------------
-
-    async def _reason_or_search(
-        self, message: discord.Message, route: Route, text: str
-    ) -> bool:
-        """Complex reasoning: facts first, AI explanation over them."""
-        if self.bot.ai.available and self.bot.ai.cooldown_remaining(message) <= 0:
-            return await self._ai(message, text)
-        # No AI configured (or cooling down): the web answers what it can.
-        return await self._search(
-            message,
-            Route(kind=SEARCH, payload=text, fresh=route.fresh, reason_complex=True),
-        )
 
     async def _ai(self, message: discord.Message, text: str) -> bool:
         ai = self.bot.ai
@@ -398,14 +451,17 @@ class Assistant(commands.Cog):
             answer = await asyncio.wait_for(ai.respond(message), timeout=60)
         except asyncio.TimeoutError:
             log.warning("Assistant AI answer timed out")
+            await self._quiet_reply(message, "AI's having a moment. try again.")
             return True
         except ParadiseError as error:
             await self._quiet_reply(message, str(error))
             return True
         except Exception:  # noqa: BLE001
             log.exception("Assistant AI answer failed")
+            await self._quiet_reply(message, "I couldn't finish that answer. try again.")
             return True
         if not answer:
+            await self._quiet_reply(message, "I couldn't get a useful answer. try again.")
             return True
         await self._quiet_reply(message, answer)
         return True
@@ -440,26 +496,44 @@ class Assistant(commands.Cog):
         return True
 
     async def _quiet_reply(self, message: discord.Message, content: str = "", **kwargs) -> None:
+        """Reply safely without truncating a complete answer.
+
+        Discord allows 2,000 characters per message. Normal responses use
+        one message; only unexpectedly long output is split at natural
+        boundaries. Attachments/embeds stay on the first message.
+        """
         try:
+            reply_kwargs = dict(kwargs)
             if content:
-                kwargs.setdefault("content", content[:1900])
-            await asyncio.wait_for(
-                message.reply(
-                    allowed_mentions=discord.AllowedMentions.none(),
-                    mention_author=False,
-                    **kwargs,
-                ),
-                timeout=15,
-            )
-        except (discord.DiscordException, asyncio.TimeoutError):
+                reply_kwargs.setdefault("content", content)
+            raw_content = reply_kwargs.pop("content", None)
+            chunks = split_discord_text(raw_content) if raw_content else [None]
+            for index, chunk in enumerate(chunks):
+                current = dict(reply_kwargs)
+                if chunk is not None:
+                    current["content"] = chunk
+                if index:
+                    # Views and files are single-use; the first message owns
+                    # them and continuation messages are plain text.
+                    for key in ("embed", "embeds", "file", "files", "view"):
+                        current.pop(key, None)
+                await asyncio.wait_for(
+                    message.reply(
+                        allowed_mentions=discord.AllowedMentions.none(),
+                        mention_author=False,
+                        **current,
+                    ),
+                    timeout=15,
+                )
+        except (discord.DiscordException, asyncio.TimeoutError, AttributeError):
             log.debug("Assistant reply failed", exc_info=True)
 
     async def _quiet_edit(self, message: discord.Message, content: str = "", **kwargs) -> None:
         try:
             if content:
-                kwargs.setdefault("content", content[:1900])
+                kwargs.setdefault("content", split_discord_text(content)[0])
             await asyncio.wait_for(message.edit(**kwargs), timeout=15)
-        except (discord.DiscordException, asyncio.TimeoutError):
+        except (discord.DiscordException, asyncio.TimeoutError, AttributeError):
             log.debug("Assistant edit failed", exc_info=True)
 
 

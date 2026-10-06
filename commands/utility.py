@@ -19,7 +19,13 @@ from functions.conversion import (
     parse_conversion_query,
 )
 from functions.helpers import Colour, ParadiseError, parse_options, shorten
-from functions.search import AnswerEngine, SearchEngine, SearchAnswerView, build_answer_embed
+from functions.search import (
+    AnswerEngine,
+    SearchAnswerView,
+    SearchEngine,
+    SearchResponse,
+    build_answer_embed,
+)
 from functions.time import (
     CITY_TIMEZONES,
     TZ_ABBREVIATIONS,
@@ -97,11 +103,9 @@ class Utility(commands.Cog):
         self.reminder_owners: Counter[int] = Counter()
         self._next_reminder = 0
         self.search_engine = SearchEngine()
-        self.answer_engine = AnswerEngine(
-            self.search_engine,
-            ai=getattr(bot, "ai", None),
-            synthesize=getattr(getattr(bot.config, "gemini", None), "synthesize_search", True),
-        )
+        # Search is a native feature. It builds a concise answer from its
+        # retrieved evidence and never makes an AI call or a second search.
+        self.answer_engine = AnswerEngine(self.search_engine)
         self.weather_service = OpenMeteoWeatherService()
         self.conversion_engine = ConversionEngine()
         self.db = VoiceDatabase()
@@ -123,7 +127,6 @@ class Utility(commands.Cog):
         await interaction.response.defer()
         try:
             answer = await asyncio.wait_for(self.answer_engine.answer(query), timeout=25)
-            response = await self.search_engine.search(query, limit=8)
         except Exception as err:
             log.warning("Search failed: %s", err, exc_info=True)
             await interaction.followup.send(
@@ -131,6 +134,15 @@ class Utility(commands.Cog):
             )
             return
 
+        # AnswerEngine already owns the retrieval result. Reusing its sources
+        # avoids issuing the same web search a second time just to render the
+        # browse buttons.
+        response = SearchResponse(
+            query=answer.query,
+            results=list(answer.sources),
+            engine=answer.engine,
+            cached=answer.cached,
+        )
         embed = build_answer_embed(answer)
         view = SearchAnswerView(answer, response, author_id=interaction.user.id)
         msg = await interaction.followup.send(embed=embed, view=view)

@@ -12,7 +12,9 @@ import logging
 import math
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
+from hashlib import sha256
 from pathlib import Path
 from typing import Sequence
 from urllib.parse import urlparse
@@ -26,10 +28,13 @@ from .models import LeaderboardMember, VoicePeriod
 log = logging.getLogger(__name__)
 
 CACHE_DIR = Path(__file__).resolve().parents[2] / "data" / "avatar_cache"
-CACHE_DIR.mkdir(parents=True, exist_ok=True)
+_AVATAR_CACHE_TTL = 3600.0
+_AVATAR_CACHE_MAX_ITEMS = 128
+_DISK_CACHE_MAX_FILES = 512
 
-# In-memory avatar cache: (url, timestamp, Image)
-_AVATAR_CACHE: dict[str, tuple[float, Image.Image]] = {}
+# In-memory avatar cache: URL -> (timestamp, Image). Keep this LRU-bounded;
+# a busy server can otherwise retain one Pillow image per avatar it has seen.
+_AVATAR_CACHE: OrderedDict[str, tuple[float, Image.Image]] = OrderedDict()
 
 # Theme Palette (Dark Paradise & Material Expressive)
 BG_COLOR = (14, 12, 22)              # #0E0C16
@@ -88,53 +93,105 @@ def _render_fallback_avatar(name: str, size: int, color_seed: int = 0) -> Image.
     return output
 
 
-async def fetch_avatar(url: str | None, name: str, size: int = 128) -> Image.Image:
-    """Fetch avatar image asynchronously with in-memory & disk caching."""
+def _remember_avatar(url: str, timestamp: float, image: Image.Image) -> None:
+    """Insert an avatar into the bounded in-memory LRU cache."""
+    _AVATAR_CACHE.pop(url, None)
+    _AVATAR_CACHE[url] = (timestamp, image)
+    while len(_AVATAR_CACHE) > _AVATAR_CACHE_MAX_ITEMS:
+        _AVATAR_CACHE.popitem(last=False)
+
+
+def _prune_disk_cache() -> None:
+    """Keep generated avatar files bounded without touching persistent records."""
+    try:
+        files = list(CACHE_DIR.glob("*.png"))
+        if len(files) <= _DISK_CACHE_MAX_FILES:
+            return
+        files.sort(key=lambda path: path.stat().st_mtime)
+        for path in files[:-_DISK_CACHE_MAX_FILES]:
+            try:
+                path.unlink()
+            except OSError:
+                continue
+    except OSError:
+        log.debug("Could not prune avatar cache", exc_info=True)
+
+
+async def fetch_avatar(
+    url: str | None,
+    name: str,
+    size: int = 128,
+    *,
+    session: aiohttp.ClientSession | None = None,
+) -> Image.Image:
+    """Fetch avatar image asynchronously with bounded memory and disk caches.
+
+    ``session`` is optional for compatibility with direct callers. The
+    leaderboard renderer supplies one shared session for a page so ten
+    avatars do not create ten connector pools.
+    """
     if not url:
         return _render_fallback_avatar(name, size, hash(name))
 
     now = time.monotonic()
-    if url in _AVATAR_CACHE:
-        cache_time, img = _AVATAR_CACHE[url]
-        if now - cache_time < 3600:
+    cached = _AVATAR_CACHE.get(url)
+    if cached is not None:
+        cache_time, img = cached
+        if now - cache_time < _AVATAR_CACHE_TTL:
+            _AVATAR_CACHE.move_to_end(url)
             return img.resize((size, size), Image.Resampling.LANCZOS)
+        _AVATAR_CACHE.pop(url, None)
 
-    # Check disk cache
-    url_hash = f"{abs(hash(url))}_{size}.png"
-    disk_path = CACHE_DIR / url_hash
-    if disk_path.exists():
+    # Use a stable filename across restarts. The old process-salted filenames
+    # remain harmless cache files and are intentionally not treated as data.
+    url_hash = sha256(url.encode("utf-8")).hexdigest()[:32]
+    disk_path = CACHE_DIR / f"{url_hash}_{size}.png"
+    # Also accept the old process-salted filename for the lifetime of a
+    # process, so a hot reload does not discard a cache that was just written.
+    legacy_disk_path = CACHE_DIR / f"{abs(hash(url))}_{size}.png"
+    for cached_path in (disk_path, legacy_disk_path):
+        if not cached_path.exists():
+            continue
         try:
-            with Image.open(disk_path) as cached_img:
+            with Image.open(cached_path) as cached_img:
                 avatar = cached_img.convert("RGBA").resize((size, size), Image.Resampling.LANCZOS)
-                _AVATAR_CACHE[url] = (now, avatar)
+                _remember_avatar(url, now, avatar)
                 return avatar
         except Exception:
-            pass
+            continue
 
-    # Fetch over network
+    # Fetch over the network. A supplied page session is reused; direct calls
+    # still own and close their temporary session.
+    owned_session = session is None
+    request_session = session
     try:
-        async with aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=4)
-        ) as session:
-            async with session.get(url) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    raw_img = Image.open(io.BytesIO(data)).convert("RGBA")
-                    avatar = raw_img.resize((size, size), Image.Resampling.LANCZOS)
+        if request_session is None:
+            request_session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4))
+        assert request_session is not None
+        async with request_session.get(url) as resp:
+            if resp.status == 200:
+                data = await resp.read()
+                raw_img = Image.open(io.BytesIO(data)).convert("RGBA")
+                avatar = raw_img.resize((size, size), Image.Resampling.LANCZOS)
 
-                    # Apply circular crop
-                    mask = _create_circle_mask(size)
-                    circular = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-                    circular.paste(avatar, (0, 0), mask=mask)
+                # Apply circular crop
+                mask = _create_circle_mask(size)
+                circular = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+                circular.paste(avatar, (0, 0), mask=mask)
 
-                    _AVATAR_CACHE[url] = (now, circular)
-                    try:
-                        circular.save(disk_path, "PNG")
-                    except Exception:
-                        pass
-                    return circular
+                _remember_avatar(url, now, circular)
+                try:
+                    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+                    circular.save(disk_path, "PNG")
+                    _prune_disk_cache()
+                except OSError:
+                    pass
+                return circular
     except Exception as err:
         log.debug("Avatar fetch failed for %s: %s", url, err)
+    finally:
+        if owned_session and request_session is not None:
+            await request_session.close()
 
     return _render_fallback_avatar(name, size, hash(name))
 
@@ -158,11 +215,20 @@ class LeaderboardImageRenderer:
         start_idx = (page - 1) * page_size
         page_members = list(members[start_idx : start_idx + page_size])
 
-        avatar_tasks = [
-            fetch_avatar(m.avatar_url, m.display_name, size=160)
-            for m in page_members
-        ]
-        avatars = await asyncio.gather(*avatar_tasks)
+        if any(member.avatar_url for member in page_members):
+            # One connector pool per rendered page instead of one ClientSession
+            # per avatar. URL-less members still use local fallback avatars.
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=4)) as session:
+                avatars = await asyncio.gather(
+                    *(
+                        fetch_avatar(m.avatar_url, m.display_name, size=160, session=session)
+                        for m in page_members
+                    )
+                )
+        else:
+            avatars = await asyncio.gather(
+                *(fetch_avatar(m.avatar_url, m.display_name, size=160) for m in page_members)
+            )
 
         # Offload Pillow drawing to worker thread
         return await asyncio.to_thread(

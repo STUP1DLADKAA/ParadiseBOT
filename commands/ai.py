@@ -8,7 +8,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from functions.helpers import ParadiseError, shorten
+from functions.helpers import ParadiseError, split_discord_text
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ class AI(commands.Cog):
         if not ai.available:
             await interaction.response.send_message(
                 "the AI isn't configured right now, so no summaries either. "
-                "someone needs to set AI_API_KEY.",
+                "someone needs to configure an AI provider.",
                 ephemeral=True,
             )
             return
@@ -95,9 +95,10 @@ class AI(commands.Cog):
             return
 
         header = f"📋 **recap of the last {len(messages)} messages in #{getattr(channel, 'name', 'here')}:**"
-        await interaction.followup.send(
-            f"{header}\n\n{shorten(summary, 1600)}"
-        )
+        parts = split_discord_text(summary, limit=1800)
+        await interaction.followup.send(f"{header}\n\n{parts[0]}")
+        for part in parts[1:]:
+            await interaction.followup.send(part)
 
 
 async def setup(bot: commands.Bot) -> None:

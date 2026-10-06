@@ -12,8 +12,8 @@ Provider priority:
 - Activated only when invoked: mentions, replies, or explicit commands.
 - Keeps a tiny per-channel context window locally; nothing is sent to
   any provider unless Paradise was actually addressed.
-- ``reason()`` is the grounded synthesis path: retrieved, verified facts
-  in → explanation out. The AI layer never gets to invent facts.
+- ``respond()`` is the direct language path. Native actions are executed by
+  the bot before this service is reached; there is no agent/tool loop here.
 """
 
 from __future__ import annotations
@@ -30,20 +30,31 @@ from functions.helpers import ParadiseError
 
 log = logging.getLogger(__name__)
 
-SYSTEM_PROMPT = """You are Paradise, a bot that lives in a small private Discord server for a close group of friends.
+SYSTEM_PROMPT = """You are ParadiseBOT, a fast, intelligent, natural member of a small Discord server.
 
-How you talk:
-- casual, warm, concise. lowercase is fine.
-- helpful first, funny when appropriate. occasionally a little weird.
-- never sound like customer support. never over-explain.
+Understand what the user actually means before responding. Be casual, warm, and
+useful without sounding like customer support. The bot has deterministic native
+functions for calculations, conversions, definitions, weather, time, translation,
+entertainment, and other commands; those functions are executed outside you.
+Never replace a reliable native result with a guess, and never claim an action
+was completed unless the bot actually completed it.
 
-Hard rules:
-- never say "as an AI" or mention being a language model unless directly asked what you are.
-- never invent memories or past events. you have none.
-- never fabricate facts about the people in this server. if you don't know, say so.
-- at most one emoji per reply, and only when it genuinely adds something. no slang spam ("fr", "ngl", "bro").
-- keep replies short (1-4 sentences) unless the question genuinely needs more detail.
-- if you don't know something or can't help, say that plainly."""
+Prefer the shortest response that completely answers the request. Do not repeat
+the user's message, add filler, or say "sure" / "of course" without a reason.
+Simple questions get simple answers. Complex questions get enough explanation
+to be correct and complete, but stay efficient with tokens. Every response must
+end naturally with a complete thought; never knowingly truncate a sentence.
+
+Use only the conversation context supplied in the request. Do not invent server
+memories, user facts, current events, sources, calculations, or unavailable
+actions. If the context is insufficient or the request is unsafe to interpret,
+say what is missing or ask one concise clarification instead of guessing. You
+are not a web-search or command-execution agent and should not invent tool use.
+
+Keep a natural Discord personality. Lowercase is fine, but avoid filler, slang
+spam, excessive formatting, and more than one emoji unless it genuinely helps.
+Prioritize: correctness, completeness, relevance, native functionality, token
+efficiency, then personality."""
 
 FALLBACK_UNAVAILABLE = (
     "my brain isn't plugged in right now — no AI is configured. try /help meanwhile."
@@ -102,21 +113,35 @@ class AIService:
         """Remember a human message locally for later context."""
         if message.author.bot or not message.guild:
             return
-        content = message.content.strip()
+        content = self.extract_question(message).strip()
         if not content:
             return
         self._history[message.channel.id].append(
             (message.author.display_name, content[:300])
         )
 
-    def _context_block(self, channel_id: int) -> str:
-        entries = list(self._history[channel_id])[-_CONTEXT_MESSAGES:]
+    def _context_block(
+        self,
+        channel_id: int,
+        *,
+        exclude: tuple[str, str] | None = None,
+    ) -> str:
+        """Return only a small recent context block, excluding the live ask."""
+        entries = list(self._history[channel_id])
+        if exclude is not None:
+            # on_message records the current message before dispatch; sending
+            # it again in the prompt wastes input tokens and blurs recency.
+            for index in range(len(entries) - 1, -1, -1):
+                if entries[index] == exclude:
+                    entries.pop(index)
+                    break
+        entries = entries[-_CONTEXT_MESSAGES:]
         lines = [f"{name}: {text}" for name, text in entries]
-        block = "\n".join(lines)[-_CONTEXT_CHARS:]
-        return block
+        return "\n".join(lines)[-_CONTEXT_CHARS:]
 
-    def _remember_exchange(self, channel_id: int, question: str, answer: str) -> None:
-        self._history[channel_id].append(("you (Paradise was asked)", question[:300]))
+    def _remember_exchange(self, channel_id: int, answer: str) -> None:
+        # The user's message was already recorded by the message handler. Keep
+        # only Paradise's reply so future prompts do not contain duplicates.
         self._history[channel_id].append(("Paradise", answer[:300]))
 
     # ------------------------------------------------------------------
@@ -211,6 +236,27 @@ class AIService:
         return await self.gemini.generate(prompt, system=system, max_tokens=max_tokens)
 
     async def _chat_openai(self, messages: list[dict], *, max_tokens: int = 400) -> str:
+        """Call an OpenAI-compatible provider, retrying once on real truncation."""
+        answer, truncated = await self._chat_openai_once(messages, max_tokens=max_tokens)
+        if not truncated:
+            return answer
+
+        # A length finish is the one case where a retry is worth the tokens:
+        # returning the partial sentence would be worse than one bounded retry.
+        retry_budget = min(max(512, int(max_tokens) * 2), 1200)
+        try:
+            retry_answer, retry_truncated = await self._chat_openai_once(
+                messages, max_tokens=retry_budget
+            )
+        except ParadiseError:
+            raise ParadiseError("I couldn't finish that answer cleanly. try again.") from None
+        if retry_truncated or not retry_answer:
+            raise ParadiseError("I couldn't finish that answer cleanly. try again.")
+        return retry_answer
+
+    async def _chat_openai_once(
+        self, messages: list[dict], *, max_tokens: int
+    ) -> tuple[str, bool]:
         if not (self.config.ai_base_url and self.config.ai_model):
             raise ParadiseError(FALLBACK_UNAVAILABLE)
         if time.monotonic() < self._failure_until:
@@ -222,7 +268,7 @@ class AIService:
         payload = {
             "model": self.config.ai_model,
             "messages": messages,
-            "max_tokens": max_tokens,
+            "max_tokens": max(128, int(max_tokens)),
             "temperature": 0.8,
         }
         try:
@@ -234,22 +280,48 @@ class AIService:
             ) as response:
                 if response.status != 200:
                     body = await response.text()
-                    log.warning("AI endpoint returned %s: %s", response.status, body[:300])
+                    safe_body = body[:300]
+                    if self.config.ai_api_key:
+                        safe_body = safe_body.replace(self.config.ai_api_key, "[redacted]")
+                    log.warning("AI endpoint returned %s: %s", response.status, safe_body)
                     raise ParadiseError("the AI isn't responding properly right now.")
                 data = await response.json(content_type=None)
         except ParadiseError:
             raise
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
+        except (
+            aiohttp.ClientError,
+            asyncio.TimeoutError,
+            OSError,
+            ValueError,
+            IndexError,
+            TypeError,
+        ):
             log.warning("AI request failed", exc_info=True)
             self._failure_until = time.monotonic() + _FAILURE_COOLDOWN
             raise ParadiseError("the AI isn't responding right now.") from None
 
         try:
-            answer = data["choices"][0]["message"]["content"]
-        except (KeyError, IndexError, TypeError):
+            choice = data["choices"][0]
+            answer = str(choice["message"].get("content") or "").strip()
+            finish_reason = str(choice.get("finish_reason") or "").casefold()
+        except (KeyError, IndexError, TypeError, AttributeError):
             log.warning("Unexpected AI response shape: %s", str(data)[:300])
             raise ParadiseError("the AI answered in gibberish. try again.") from None
-        return (answer or "").strip()
+        return answer, finish_reason in {"length", "max_tokens"}
+
+    @staticmethod
+    def _response_budget(question: str) -> int:
+        """Give genuinely complex asks room without over-budgeting small talk."""
+        words = len(question.split())
+        complex_markers = (
+            "explain", "compare", "difference", "why", "how does", "pros", "cons",
+            "steps", "example", "debug", "design", "recommend",
+        )
+        if words > 35 or any(marker in question.casefold() for marker in complex_markers):
+            return 700
+        if words > 12:
+            return 420
+        return 260
 
     async def respond(self, message) -> str:
         """Answer a mention / reply. Caller sends the message."""
@@ -257,7 +329,10 @@ class AIService:
         if not question:
             return "hm?"
 
-        context = self._context_block(message.channel.id)
+        context = self._context_block(
+            message.channel.id,
+            exclude=(message.author.display_name, question[:300]),
+        )
         user_content = (
             f"Recent conversation in this channel (for context, may be empty):\n"
             f"{context}\n\n{message.author.display_name} asks you: {question}"
@@ -268,20 +343,22 @@ class AIService:
             [
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": user_content},
-            ]
+            ],
+            max_tokens=self._response_budget(question),
         )
         self._touch(message)
-        self._remember_exchange(message.channel.id, question, answer)
-        return answer[:1900] or "…I have nothing."
+        self._remember_exchange(message.channel.id, answer)
+        return answer.strip() or "I don't have a useful answer for that yet."
 
     async def reason(
         self, question: str, facts: list[str] | str, *, max_tokens: int = 500
     ) -> str:
         """Grounded synthesis: answer *question* strictly from retrieved *facts*.
 
-        Used by the search pipeline (and any other deterministic tool that
-        needs natural-language reasoning over verified data). The AI never
-        gets to invent facts — it only explains the ones we retrieved.
+        Kept as an explicit, opt-in grounded helper for future integrations.
+        The active search pipeline does not call it: native search answers are
+        complete on their own. The AI never gets to invent facts — it only
+        explains facts supplied by its caller.
         Falls back across providers the same way ``chat`` does.
         """
         if not self.available:

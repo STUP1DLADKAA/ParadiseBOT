@@ -56,9 +56,6 @@ def build_answer_embed(answer: SearchAnswer) -> discord.Embed:
             remainder = _drop_repeated_sentences(extra, answer.direct_answer)
             if len(remainder) >= 40:
                 embed.add_field(name="In short", value=shorten(remainder, 500), inline=False)
-    elif answer.summary and answer.generated_by == "gemini":
-        embed.add_field(name="In short", value=shorten(answer.summary, 600), inline=False)
-
     if answer.key_points:
         points = "\n".join(f"• {point}" for point in answer.key_points[:4])
         embed.add_field(name="Key points", value=points[:1000], inline=False)
@@ -80,8 +77,6 @@ def build_answer_embed(answer: SearchAnswer) -> discord.Embed:
         embed.add_field(name="Sources", value="\n".join(source_lines)[:1000], inline=False)
 
     footer_bits = ["answer from retrieved sources"]
-    if answer.generated_by == "gemini":
-        footer_bits.append("summary rephrased by Gemini")
     if answer.answer_source and answer.answer_source not in footer_bits:
         footer_bits.append(f"via {answer.answer_source}")
     if answer.cached:

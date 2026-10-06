@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Iterable
 
@@ -24,6 +25,10 @@ log = logging.getLogger(__name__)
 # Upper bound on HTTP member fetches performed per leaderboard render for
 # identities that are neither cached nor previously persisted.
 MAX_HYDRATE_FETCHES = 50
+# Reconciliation sees every connected member once per minute. Keep only a
+# bounded process-local signature cache so unchanged profiles do not reopen
+# SQLite connections on every scan.
+MAX_PROFILE_SIGNATURES = 4096
 
 
 class VoiceTracker:
@@ -33,6 +38,9 @@ class VoiceTracker:
         self.bot = bot
         self.db = db or VoiceDatabase()
         self.active_sessions: dict[tuple[int, int], ActiveVoiceSession] = {}
+        self._profile_signatures: OrderedDict[
+            tuple[int, int], tuple[str, str, str | None]
+        ] = OrderedDict()
         self._lock = asyncio.Lock()
         self._reconciliation_task: asyncio.Task[None] | None = None
         self._dm_report_task: asyncio.Task[None] | None = None
@@ -193,6 +201,36 @@ class VoiceTracker:
     # Persistence helpers (identities + in-flight sessions survive restarts)
     # ------------------------------------------------------------------
 
+    def _remember_profile(
+        self,
+        guild_id: int,
+        user_id: int,
+        display_name: str,
+        username: str,
+        avatar_url: str | None,
+    ) -> None:
+        """Persist an identity only when its process-local values changed."""
+        key = (int(guild_id), int(user_id))
+        signature = (display_name, username, avatar_url)
+        if self._profile_signatures.get(key) == signature:
+            self._profile_signatures.move_to_end(key)
+            return
+        try:
+            self.db.upsert_member_profile(
+                guild_id=key[0],
+                user_id=key[1],
+                display_name=display_name,
+                username=username,
+                avatar_url=avatar_url,
+            )
+        except Exception:
+            log.debug("Could not persist member profile", exc_info=True)
+            return
+        self._profile_signatures[key] = signature
+        self._profile_signatures.move_to_end(key)
+        while len(self._profile_signatures) > MAX_PROFILE_SIGNATURES:
+            self._profile_signatures.popitem(last=False)
+
     def _remember_member(self, member: discord.Member) -> None:
         """Persist a member's last-known identity; best effort, never fatal."""
         try:
@@ -201,9 +239,9 @@ class VoiceTracker:
                 avatar_url = str(member.display_avatar.url)
             except Exception:
                 avatar_url = None
-            self.db.upsert_member_profile(
-                guild_id=int(member.guild.id),
-                user_id=int(member.id),
+            self._remember_profile(
+                guild_id=member.guild.id,
+                user_id=member.id,
                 display_name=str(member.display_name),
                 username=str(member.name),
                 avatar_url=avatar_url,
@@ -214,9 +252,9 @@ class VoiceTracker:
     def _remember_user(self, guild_id: int, user: discord.User) -> None:
         """Persist identity for a user no longer in the guild (global fallback)."""
         try:
-            self.db.upsert_member_profile(
-                guild_id=int(guild_id),
-                user_id=int(user.id),
+            self._remember_profile(
+                guild_id=guild_id,
+                user_id=user.id,
                 display_name=str(user.display_name),
                 username=str(user.name),
                 avatar_url=str(user.display_avatar.url),
