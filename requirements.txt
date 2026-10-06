@@ -1,5 +1,9 @@
 discord.py>=2.6,<3.0
 python-dotenv>=1.0,<2.0
+# HTTP client used by weather, conversion, search and image lookups.
+# Installed alongside discord.py, but pinned here because the tool
+# modules import it directly.
+aiohttp>=3.9,<4.0
 # Dictionary cards. Without it the dictionary still works and falls back
 # to a text result instead of a rendered image.
 Pillow>=10.0,<13.0
