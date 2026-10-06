@@ -734,3 +734,245 @@ class TestSearchAnswerView(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class TestPingAlwaysAnswers(unittest.IsolatedAsyncioTestCase):
+    """Every explicit ping produces exactly one useful response."""
+
+    async def test_messy_requests_reach_the_right_tool(self):
+        cases = {
+            "wthr delhi pls": "weather",
+            "wha time tokyo rn": "time",
+            "calc 23% 829": "calculate",
+            "100 doller in rupees": "convert",
+            "dictonry meaning of ephemeral": "define",
+        }
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                from functions.router import route_query
+
+                self.assertEqual(route_query(text).kind, expected)
+
+    async def test_terrible_input_still_gets_a_reply(self):
+        ai = FakeAI(available=True, answer="here you go")
+        for text in ("wthr delhi pls", "calc 23% 829", "100 doller in rupees",
+                     "asdkjh", "hmmm idk"):
+            assistant, _ = make_assistant(ai=ai)
+            message = mention(text)
+            handled = await assistant.handle_message(message)
+            self.assertTrue(handled, text)
+            self.assertTrue(message.replies, f"silent on {text!r}")
+
+    async def test_deterministic_requests_never_reach_gemini(self):
+        ai = FakeAI(available=True)
+        gemini_calls = []
+
+        class LoudGemini:
+            available = True
+
+            async def classify(self, request, max_tokens=120):
+                gemini_calls.append(request)
+                return ""
+
+        ai.gemini = LoudGemini()
+        for text in ("what is 15% of 920", "wthr delhi", "100 usd inr",
+                     "tokyo time rn", "define ephemeral"):
+            assistant, _ = make_assistant(ai=ai)
+            assistant.images = FakeImageService()
+            await assistant.handle_message(mention(text))
+        self.assertEqual(gemini_calls, [])
+        self.assertEqual(ai.responded_to, [])
+
+    async def test_bare_value_conversion_asks_only_for_units(self):
+        assistant, _ = make_assistant()
+        message = mention("x")
+        await assistant._convert(message, Route(kind="convert", payload="50"))
+        content = message.replies[0]["content"]
+        self.assertIn("50", content)
+        self.assertIn("USD", content)
+
+
+class TestSearchReliability(unittest.IsolatedAsyncioTestCase):
+    """Search answers, or says it couldn't — never nothing."""
+
+    async def test_provider_failure_gets_a_clear_short_message(self):
+        assistant, bot = make_assistant()
+
+        async def broken(query, *, fresh=None, reason_complex=False):
+            raise RuntimeError("provider exploded")
+
+        bot.get_cog("Utility").answer_engine.answer = broken
+        message = mention("search latest Minecraft update")
+        self.assertTrue(await assistant.handle_message(message))
+        placeholder = message.replies[0]
+        self.assertIn("searching the web", placeholder["content"].casefold())
+
+    async def test_empty_result_set_is_explained(self):
+        from functions.search import EMPTY
+
+        assistant, bot = make_assistant()
+        edits = []
+
+        async def nothing(query, *, fresh=None, reason_complex=False):
+            return SearchAnswer(query=query, status=EMPTY)
+
+        bot.get_cog("Utility").answer_engine.answer = nothing
+
+        original_edit = assistant._quiet_edit
+
+        async def record(target, content="", **kwargs):
+            edits.append(content)
+            await original_edit(target, content, **kwargs)
+
+        assistant._quiet_edit = record
+        message = mention("search flurbleglorp news")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertTrue(edits)
+        self.assertIn("couldn't find anything solid", edits[0])
+
+    async def test_failed_status_reports_the_outage_not_an_empty_card(self):
+        from functions.search import PROVIDER_ERROR
+
+        assistant, bot = make_assistant()
+        edits = []
+
+        async def down(query, *, fresh=None, reason_complex=False):
+            return SearchAnswer(query=query, status=PROVIDER_ERROR)
+
+        bot.get_cog("Utility").answer_engine.answer = down
+        assistant._quiet_edit = lambda target, content="", **kwargs: edits.append(content)
+        message = mention("search latest Minecraft update")
+        await assistant.handle_message(message)
+        self.assertIn("couldn't reach the search service", edits[0])
+
+
+class TestImageFallback(unittest.IsolatedAsyncioTestCase):
+    async def test_no_images_falls_back_to_web_search(self):
+        assistant, bot = make_assistant()
+        assistant.images = FakeImageService(results=0)
+        message = mention("show me pictures of a flurbleglorp")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertIn("couldn't find a usable image", message.replies[0]["content"])
+        # …and the web search ran for the same subject instead of nothing.
+        self.assertTrue(bot.get_cog("Utility").answer_engine.calls)
+        self.assertIn(
+            "flurbleglorp", bot.get_cog("Utility").answer_engine.calls[0][0]
+        )
+
+
+class TestSingleResponsePerPing(unittest.IsolatedAsyncioTestCase):
+    """bot.on_message: AFK → assistant → stop. Never two handlers."""
+
+    async def test_mention_skips_dictionary_and_personality(self):
+        from config import Config
+
+        import bot as bot_module
+
+        paradise = bot_module.ParadiseBot.__new__(bot_module.ParadiseBot)
+        paradise.config = Config()
+        paradise._handled = __import__("collections").deque()
+        paradise._handled_ids = set()
+        paradise.afk_states = {}
+        paradise._afk_notice_last = {}
+        calls = []
+
+        class Recorder:
+            def __init__(self, name, result):
+                self.name = name
+                self.result = result
+
+            async def __call__(self, message):
+                calls.append(self.name)
+                return self.result
+
+        paradise.ai = SimpleNamespace(
+            record=lambda message: None,
+            should_reply_to=lambda message: True,
+        )
+        paradise.personality = SimpleNamespace(handle=Recorder("personality", None))
+        paradise._handle_afk = Recorder("afk", None)
+        paradise._maybe_dictionary = Recorder("dictionary", True)
+        paradise._maybe_assistant = Recorder("assistant", True)
+
+        message = mention("define ephemeral")
+        await bot_module.ParadiseBot.on_message(paradise, message)
+
+        self.assertEqual(calls, ["afk", "assistant"])
+
+    async def test_same_message_is_only_handled_once(self):
+        from config import Config
+
+        import bot as bot_module
+
+        paradise = bot_module.ParadiseBot.__new__(bot_module.ParadiseBot)
+        paradise.config = Config()
+        paradise._handled = __import__("collections").deque()
+        paradise._handled_ids = set()
+        paradise.afk_states = {}
+        paradise._afk_notice_last = {}
+        handled = []
+        paradise.ai = SimpleNamespace(
+            record=lambda message: None, should_reply_to=lambda message: True
+        )
+        paradise.personality = SimpleNamespace(handle=AsyncMock())
+
+        async def noop(message):
+            return None
+
+        async def assistant(message):
+            handled.append(message.id)
+            return True
+
+        paradise._handle_afk = noop
+        paradise._maybe_dictionary = noop
+        paradise._maybe_assistant = assistant
+
+        message = mention("weather in Delhi")
+        await bot_module.ParadiseBot.on_message(paradise, message)
+        await bot_module.ParadiseBot.on_message(paradise, message)
+
+        self.assertEqual(handled, [message.id])
+
+    async def test_non_mentions_still_use_dictionary_and_personality(self):
+        from config import Config
+
+        import bot as bot_module
+
+        paradise = bot_module.ParadiseBot.__new__(bot_module.ParadiseBot)
+        paradise.config = Config()
+        paradise._handled = __import__("collections").deque()
+        paradise._handled_ids = set()
+        paradise.afk_states = {}
+        paradise._afk_notice_last = {}
+        calls = []
+        paradise.ai = SimpleNamespace(
+            record=lambda message: None, should_reply_to=lambda message: False
+        )
+
+        async def noop(message):
+            return None
+
+        async def dictionary(message):
+            calls.append("dictionary")
+            return False
+
+        async def personality(message):
+            calls.append("personality")
+
+        paradise._handle_afk = noop
+        paradise._maybe_dictionary = dictionary
+        paradise._maybe_assistant = noop
+        paradise.personality = SimpleNamespace(handle=personality)
+
+        await bot_module.ParadiseBot.on_message(paradise, FakeMessage("define x", addressed=False))
+        self.assertEqual(calls, ["dictionary", "personality"])
+
+
+class TestRetiredCommandQuestions(unittest.IsolatedAsyncioTestCase):
+    async def test_asking_about_a_retired_command_points_at_the_sentence(self):
+        assistant, _ = make_assistant()
+        message = mention("what does /weather do")
+        self.assertTrue(await assistant.handle_message(message))
+        content = message.replies[0]["content"]
+        self.assertIn("isn't a command any more", content)
+        self.assertIn("weather in Delhi", content)

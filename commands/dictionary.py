@@ -27,13 +27,11 @@ import logging
 import time
 
 import discord
-from discord import app_commands
 from discord.ext import commands
 
 from functions.dictionary import (
     DictionaryFeature,
     LookupResult,
-    PronunciationError,
     WordDetails,
     WordEntry,
     match_text_request,
@@ -706,12 +704,8 @@ async def _followup(interaction: discord.Interaction, content: str, **kwargs) ->
 # ---------------------------------------------------------------------------
 
 
-def cooldown(seconds: float = 4):
-    return app_commands.checks.cooldown(1, seconds, key=lambda i: (i.guild_id, i.user.id))
-
-
 class Dictionary(commands.Cog):
-    """Slash commands, chat triggers and the card lifecycle."""
+    """Chat triggers, the mention path and the card lifecycle."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -727,43 +721,16 @@ class Dictionary(commands.Cog):
         except Exception:  # noqa: BLE001 - shutdown is best effort
             log.debug("Dictionary shutdown failed", exc_info=True)
 
-    # -- commands ----------------------------------------------------------
-
-    @app_commands.command(
-        name="dictionary", description="Look up a word: meaning, pronunciation and more"
-    )
-    @app_commands.describe(word="The word to look up")
-    @cooldown()
-    async def dictionary(
-        self, interaction: discord.Interaction, word: app_commands.Range[str, 1, 96]
-    ) -> None:
-        await self._run_command(interaction, word)
-
-    @app_commands.command(description="Look up what a word means")
-    @app_commands.describe(word="The word to define")
-    @cooldown()
-    async def define(
-        self, interaction: discord.Interaction, word: app_commands.Range[str, 1, 96]
-    ) -> None:
-        await self._run_command(interaction, word)
-
-    async def _run_command(self, interaction: discord.Interaction, raw: str) -> None:
-        try:
-            term = self.feature.service.validate(raw)
-        except ParadiseError as error:
-            await _safe_respond(interaction, str(error))
-            return
-
-        try:
-            await interaction.response.send_message(view=LoadingView(term))
-        except discord.NotFound:
-            log.debug("Interaction expired before the lookup started")
-            return
-        except discord.HTTPException:
-            log.warning("Could not post the dictionary loading state", exc_info=True)
-            return
-
-        await self.deliver(term, Editor(interaction=interaction), invoker_id=interaction.user.id)
+    # -- no public slash commands -----------------------------------------
+    #
+    # The dictionary has no registered slash command any more. Every path
+    # into it is conversational:
+    #
+    #   @Paradise define ephemeral      @Paradise what does ephemeral mean
+    #   "define ephemeral" in chat      (text trigger, see handle_message)
+    #
+    # The card, pronunciation and lookup pipeline below are unchanged and
+    # are shared by both the text triggers and the mention assistant.
 
     # -- plain-chat triggers ----------------------------------------------
 

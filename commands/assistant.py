@@ -38,6 +38,7 @@ from discord.ext import commands
 
 from commands.fun import build_ping_message, choose_option, flip_coin
 from commands.system import HELP_BLURBS
+from functions.startup import RETIRED_COMMANDS
 from functions.calculator import calculate
 from functions.helpers import (
     ParadiseError, parse_options, sanitize_untrusted, shorten, split_discord_text,
@@ -72,16 +73,32 @@ _WEAK_SUMMARY_CHARS = 140
 ASK_HINT = (
     "hey! just ask me things like:\n"
     "• `@Paradise define photosynthesis`\n"
-    "• `@Paradise 25% of 800`  ·  `@Paradise convert 100 USD to INR`\n"
-    "• `@Paradise flip a coin`  ·  `@Paradise choose pizza or burgers`\n"
+    "• `@Paradise 25% of 800`  ·  `@Paradise 100 USD to INR`\n"
     "• `@Paradise weather in Delhi`  ·  `@Paradise time in Tokyo`\n"
     "• `@Paradise show me a picture of a red panda`\n"
     "• `@Paradise latest Minecraft news`\n"
-    "• `@Paradise recommend a movie like Interstellar`\n"
-    "or use `/help` for the full list."
+    "• `@Paradise translate hello into Japanese`\n"
+    "• `@Paradise flip a coin`  ·  `@Paradise choose pizza or burgers`\n"
+    "no commands to remember — just say it normally."
 )
 
-SEARCH_FAIL_LINE = "⚠️ I couldn't retrieve reliable information right now. Try again in a moment."
+# What to say instead, now that these commands are gone.
+_RETIRED_EXAMPLES = {
+    "search": "@Paradise search the latest Minecraft update",
+    "weather": "@Paradise weather in Delhi",
+    "convert": "@Paradise 100 USD to INR",
+    "time": "@Paradise what time is it in Tokyo",
+    "define": "@Paradise define ephemeral",
+    "dictionary": "@Paradise define ephemeral",
+    "recommend": "@Paradise recommend a movie like Interstellar",
+}
+
+SEARCH_FAIL_LINE = (
+    "⚠️ I couldn't reach the search service right now. Try again in a moment."
+)
+
+# "convert 50" — a value with no units at all.
+_BARE_NUMBER = re.compile(r"^[-+]?\d+(?:[.,]\d+)?$")
 
 
 class Assistant(commands.Cog):
@@ -382,6 +399,15 @@ class Assistant(commands.Cog):
 
     async def _command_help(self, message: discord.Message, route: Route) -> bool:
         name = route.payload.casefold().lstrip("/")
+        if name in RETIRED_COMMANDS:
+            # The capability still exists — only the command is gone.
+            example = _RETIRED_EXAMPLES.get(name, f"@Paradise {name} …")
+            await self._quiet_reply(
+                message,
+                f"`/{name}` isn't a command any more — just ask me directly: "
+                f"*{example}*",
+            )
+            return True
         blurb = HELP_BLURBS.get(name)
         if blurb is None:
             await self._quiet_reply(
@@ -467,6 +493,15 @@ class Assistant(commands.Cog):
         utility = self.bot.get_cog("Utility")
         if utility is None:
             return False
+        if _BARE_NUMBER.match(route.payload):
+            # "convert 50" — the number is clear, the units are not. Ask for
+            # exactly the missing piece, nothing else.
+            await self._quiet_reply(
+                message,
+                f"{route.payload} what — USD, km, kg, °C? tell me the units "
+                f"(e.g. *{route.payload} USD to INR*).",
+            )
+            return True
         try:
             outcome = await utility.conversion_engine.convert_query(route.payload)
         except ParadiseError as error:
@@ -492,8 +527,15 @@ class Assistant(commands.Cog):
 
         response = await self._find_images(subject, route.count)
         if response is None or not response.has_results:
-            await self._quiet_reply(message, NO_IMAGE_LINE)
-            return True
+            # No usable picture: say so once, then answer the question the
+            # only other way we can — a normal web search for the subject.
+            await self._quiet_reply(
+                message,
+                f"{NO_IMAGE_LINE} searching the web for **{shorten(subject, 60)}** instead…",
+            )
+            return await self._search(
+                message, Route(kind=SEARCH, payload=subject, confidence=route.confidence)
+            )
 
         embeds = build_image_embeds(response, route.count)
         await self._quiet_reply(message, embeds=embeds)
@@ -648,8 +690,20 @@ class Assistant(commands.Cog):
                 timeout=30,
             )
         except Exception:  # noqa: BLE001
-            log.debug("Mention search failed", exc_info=True)
+            # The technical reason stays in the log; chat gets one short line.
+            log.warning("Mention search failed", exc_info=True)
             await self._quiet_edit(placeholder, SEARCH_FAIL_LINE)
+            return True
+
+        if getattr(answer, "failed", False):
+            await self._quiet_edit(placeholder, SEARCH_FAIL_LINE)
+            return True
+        if not (answer.has_answer or answer.has_sources):
+            await self._quiet_edit(
+                placeholder,
+                f"🔎 I couldn't find anything solid for **{shorten(subject, 60)}**. "
+                "try rewording it?",
+            )
             return True
 
         # Optional grounded synthesis: the AI may *explain* what was
@@ -737,8 +791,8 @@ class Assistant(commands.Cog):
             await self._quiet_reply(
                 message,
                 "my AI brain isn't configured here, but the tools work! try:\n"
-                "*search <topic>* · *define <word>* · *convert 100 USD to INR* ·\n"
-                "*weather in <city>* · *recommend anime like <title>* — or `/help`.",
+                "*search <topic>* · *define <word>* · *100 USD to INR* ·\n"
+                "*weather in <city>* · *time in <city>* · *picture of <thing>*.",
             )
             return True
         if ai.cooldown_remaining(message) > 0:

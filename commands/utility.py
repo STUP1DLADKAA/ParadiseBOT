@@ -1,9 +1,14 @@
-"""Useful commands: remind, poll, afk, translate, search, weather, convert, time, settimezone."""
+"""Useful commands: remind, poll, afk, translate, settimezone.
+
+This cog also owns the shared engines for search, weather and conversion.
+Those no longer have public slash commands — they are reached by mentioning
+Paradise — but the engines stay here so there is exactly one implementation
+of each and the assistant can reuse them.
+"""
 
 from __future__ import annotations
 
 import asyncio
-import io
 import logging
 from collections import Counter
 from dataclasses import dataclass
@@ -13,30 +18,18 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from functions.conversion import (
-    ConversionEngine,
-    build_conversion_embed,
-    parse_conversion_query,
-)
-from functions.helpers import Colour, ParadiseError, parse_options, shorten
-from functions.search import (
-    AnswerEngine,
-    SearchAnswerView,
-    SearchEngine,
-    SearchResponse,
-    build_answer_embed,
-)
+from functions.conversion import ConversionEngine
+from functions.helpers import parse_options, shorten
+from functions.search import AnswerEngine, SearchEngine
 from functions.time import (
     CITY_TIMEZONES,
-    TZ_ABBREVIATIONS,
-    build_time_embed,
     get_current_time_for_zone,
     resolve_timezone,
 )
 from functions.translate import resolve_language, translate_text
 from functions.translate import LANGUAGE_CODES  # noqa: F401 - re-exported for compatibility
 from functions.voice.database import VoiceDatabase
-from functions.weather import OpenMeteoWeatherService, build_weather_embed, render_weather_card
+from functions.weather import OpenMeteoWeatherService
 
 log = logging.getLogger(__name__)
 
@@ -110,202 +103,30 @@ class Utility(commands.Cog):
         self.conversion_engine = ConversionEngine()
         self.db = VoiceDatabase()
 
-    def cog_unload(self) -> None:
+    async def cog_unload(self) -> None:
         for task in self.reminders.values():
             task.cancel()
-
-    # -- search -----------------------------------------------------------
-
-    @app_commands.command(description="Search the web — answer first, sources as evidence")
-    @app_commands.describe(query="What to search for")
-    @cooldown(5)
-    async def search(
-        self,
-        interaction: discord.Interaction,
-        query: app_commands.Range[str, 1, 300],
-    ) -> None:
-        await interaction.response.defer()
+        # Release the shared search session so shutdown leaves no connector.
         try:
-            answer = await asyncio.wait_for(self.answer_engine.answer(query), timeout=25)
-        except Exception as err:
-            log.warning("Search failed: %s", err, exc_info=True)
-            await interaction.followup.send(
-                "⚠️ I couldn't retrieve reliable information right now. Try again in a moment."
-            )
-            return
+            await self.search_engine.close()
+        except Exception:  # noqa: BLE001 - shutdown is best effort
+            log.debug("Could not close the search session", exc_info=True)
 
-        # AnswerEngine already owns the retrieval result. Reusing its sources
-        # avoids issuing the same web search a second time just to render the
-        # browse buttons.
-        response = SearchResponse(
-            query=answer.query,
-            results=list(answer.sources),
-            engine=answer.engine,
-            cached=answer.cached,
-        )
-        embed = build_answer_embed(answer)
-        view = SearchAnswerView(answer, response, author_id=interaction.user.id)
-        msg = await interaction.followup.send(embed=embed, view=view)
-        view.message = msg
-
-    # -- weather ----------------------------------------------------------
-
-    @app_commands.command(description="Check current weather and forecast for any location")
-    @app_commands.describe(location="City, region, or country (e.g. Delhi, London, Tokyo)")
-    @cooldown(5)
-    async def weather(
-        self,
-        interaction: discord.Interaction,
-        location: app_commands.Range[str, 1, 100],
-    ) -> None:
-        await interaction.response.defer()
-        try:
-            data = await self.weather_service.get_weather(location)
-        except ParadiseError as err:
-            await interaction.followup.send(str(err))
-            return
-        except Exception as err:
-            log.warning("Weather fetch failed: %s", err, exc_info=True)
-            await interaction.followup.send(
-                "the weather service is unavailable right now. try again in a bit."
-            )
-            return
-
-        # Rendering is isolated from the Discord event loop and has a defensive
-        # text fallback so optional font/image failures never break the command.
-        try:
-            image = await asyncio.to_thread(render_weather_card, data)
-            await interaction.followup.send(
-                content=f"Weather for {data.location.name}",
-                file=discord.File(io.BytesIO(image), filename="weather.png"),
-            )
-        except Exception as err:
-            log.warning("Weather card rendering failed: %s", err, exc_info=True)
-            await interaction.followup.send(embed=build_weather_embed(data))
-
-    # -- convert ----------------------------------------------------------
-
-    @app_commands.command(description="Convert units or live currency exchange rates")
-    @app_commands.describe(
-        query="Natural query, e.g. '10 km to miles', '100 USD to INR', '25 celsius to fahrenheit'",
-        value="Optional direct number value",
-        from_unit="Optional source unit/currency",
-        to_unit="Optional target unit/currency",
-    )
-    @cooldown(3)
-    async def convert(
-        self,
-        interaction: discord.Interaction,
-        query: str | None = None,
-        value: float | None = None,
-        from_unit: str | None = None,
-        to_unit: str | None = None,
-    ) -> None:
-        if query is None and (value is None or from_unit is None or to_unit is None):
-            await interaction.response.send_message(
-                "give me something to convert, e.g.:\n"
-                "• `/convert query: 10 km to miles`\n"
-                "• `/convert query: 100 USD to INR`\n"
-                "• `/convert query: 25 celsius to fahrenheit`\n"
-                "• `/convert query: 5 kg to lb`",
-                ephemeral=True,
-            )
-            return
-
-        await interaction.response.defer()
-        try:
-            if value is not None and from_unit is not None and to_unit is not None:
-                result = await self.conversion_engine.convert(value, from_unit, to_unit)
-            elif query:
-                result = await self.conversion_engine.convert_query(query)
-            else:
-                raise ParadiseError("Please provide all conversion units.")
-        except ParadiseError as err:
-            await interaction.followup.send(str(err))
-            return
-        except Exception as err:
-            log.warning("Conversion failed: %s", err, exc_info=True)
-            await interaction.followup.send("couldn't perform that conversion.")
-            return
-
-        embed = build_conversion_embed(result)
-        await interaction.followup.send(embed=embed)
-
-    # -- time -------------------------------------------------------------
-
-    @app_commands.command(description="Check current local time for a location or member")
-    @app_commands.describe(
-        location="City, timezone, or region (e.g. Delhi, London, New York)",
-        member="Optional server member to check configured time for",
-    )
-    @app_commands.autocomplete(location=timezone_autocomplete)
-    @cooldown(3)
-    async def time(
-        self,
-        interaction: discord.Interaction,
-        location: str | None = None,
-        member: discord.Member | None = None,
-    ) -> None:
-        if member is not None:
-            # Check configured timezone for member
-            tz_str = self.db.get_user_timezone(member.id)
-            if not tz_str:
-                if member.id == interaction.user.id:
-                    await interaction.response.send_message(
-                        "You haven't set your timezone yet. Set it with `/settimezone <timezone>`.",
-                        ephemeral=True,
-                    )
-                else:
-                    await interaction.response.send_message(
-                        f"**{member.display_name}** hasn't configured their timezone yet.\n"
-                        "They can set it using `/settimezone`.",
-                        ephemeral=True,
-                    )
-                return
-            try:
-                info = get_current_time_for_zone(tz_str, label=member.display_name)
-            except ParadiseError as err:
-                await interaction.response.send_message(str(err), ephemeral=True)
-                return
-            embed = build_time_embed(info, user_target=member)
-            await interaction.response.send_message(embed=embed)
-            return
-
-        if not location:
-            # If no location or member provided, check if the caller has set their own timezone
-            user_tz = self.db.get_user_timezone(interaction.user.id)
-            if user_tz:
-                info = get_current_time_for_zone(user_tz, label=interaction.user.display_name)
-                embed = build_time_embed(info, user_target=interaction.user)
-                await interaction.response.send_message(embed=embed)
-                return
-            await interaction.response.send_message(
-                "provide a location, timezone, or @member (e.g. `/time Delhi`, `/time London`, `/time @User`).",
-                ephemeral=True,
-            )
-            return
-
-        resolved_tz = resolve_timezone(location)
-        if not resolved_tz:
-            await interaction.response.send_message(
-                f"I don't recognize the timezone or location **{location}**.\n"
-                "Try a major city name like `Delhi`, `London`, `Tokyo`, `New York`, or an IANA timezone like `Asia/Kolkata`.",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            info = get_current_time_for_zone(resolved_tz, label=location.title())
-        except ParadiseError as err:
-            await interaction.response.send_message(str(err), ephemeral=True)
-            return
-
-        embed = build_time_embed(info)
-        await interaction.response.send_message(embed=embed)
+    # -- retired public commands ------------------------------------------
+    #
+    # /search, /weather, /convert and /time are no longer registered. Their
+    # capabilities live on and are reached by simply talking to the bot:
+    #
+    #   @Paradise search Minecraft 1.21      @Paradise weather in Delhi
+    #   @Paradise 100 USD to INR             @Paradise time in Tokyo
+    #
+    # The engines below are the single implementation of each capability and
+    # are used by the mention assistant (commands/assistant.py). Nothing was
+    # duplicated or deleted — only the slash-command surface was removed.
 
     # -- settimezone ------------------------------------------------------
 
-    @app_commands.command(description="Set your personal timezone for /time and reports")
+    @app_commands.command(description="Set your personal timezone for time lookups and reports")
     @app_commands.describe(timezone="Your timezone or city (e.g. Asia/Kolkata, London, EST)")
     @app_commands.autocomplete(timezone=timezone_autocomplete)
     @cooldown(3)
@@ -327,9 +148,8 @@ class Utility(commands.Cog):
         await interaction.response.send_message(
             f"✅ Timezone set to **{resolved}** (`{info.utc_offset}`).\n"
             f"Your current local time is **{info.formatted_12h}** ({info.formatted_date}).\n"
-            "-# Other members can now check your local time with `/time member:@{}`".format(
-                interaction.user.display_name
-            ),
+            "-# Others can check your local time by asking me: "
+            "`@Paradise what time is it for {}`".format(interaction.user.display_name),
             ephemeral=True,
         )
 

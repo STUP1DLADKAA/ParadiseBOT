@@ -36,8 +36,7 @@ from functions.presence import NOTES, ROTATE_SECONDS, WATCHING, PresenceManager 
 
 EXPECTED_COMMANDS = {
     "ping", "coinflip", "choose",
-    "remind", "poll", "afk", "translate", "search", "weather", "convert",
-    "time", "settimezone", "vc", "dictionary", "define", "recipe",
+    "remind", "poll", "afk", "translate", "settimezone", "vc", "recipe",
     "summarize", "help",
 }
 
@@ -53,6 +52,9 @@ REMOVED_COMMANDS = {
     "say",
     # misc removals
     "8ball", "settings", "truth", "dare", "serverinfo", "userinfo", "vibe", "roll",
+    # retired in favour of natural mentions (the capabilities remain)
+    "search", "weather", "convert", "time", "define", "dictionary", "recommend",
+    "example", "trending", "upcoming",
 }
 
 
@@ -85,20 +87,21 @@ class TestCommandSet(unittest.TestCase):
         leaked = registered & REMOVED_COMMANDS
         self.assertFalse(leaked, f"removed commands still registered: {leaked}")
 
-    def test_no_removed_commands_in_source(self):
-        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for folder in ("commands", "functions"):
-            for filename in os.listdir(os.path.join(root, folder)):
-                if not filename.endswith(".py"):
-                    continue
-                with open(os.path.join(root, folder, filename), encoding="utf-8") as handle:
-                    source = handle.read()
-                for name in REMOVED_COMMANDS:
-                    self.assertNotIn(
-                        f'"{name}"',
-                        source,
-                        f"{folder}/{filename} still references removed command {name}",
-                    )
+    def test_no_app_command_declares_a_retired_name(self):
+        """No decorator anywhere may register a retired command name."""
+
+        async def run():
+            bot = ParadiseBot(Config())
+            for extension in EXTENSIONS:
+                await bot.load_extension(extension)
+            names = set()
+            for cog in bot.cogs.values():
+                names.update(command.name for command in cog.get_app_commands())
+            return names
+
+        declared = asyncio.run(run())
+        self.assertFalse(declared & REMOVED_COMMANDS)
+        self.assertTrue(declared <= EXPECTED_COMMANDS, f"unexpected: {declared - EXPECTED_COMMANDS}")
 
     def test_no_music_or_tts_modules_left(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))

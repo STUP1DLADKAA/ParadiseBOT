@@ -12,6 +12,8 @@ from functions.helpers import Colour
 
 log = logging.getLogger(__name__)
 
+# Only commands that are actually registered belong here; /help filters
+# against the live tree, and the ping assistant covers everything else.
 HELP_BLURBS = {
     "ping": "am I alive (with the real latency)",
     "coinflip": "a very serious coin toss",
@@ -20,41 +22,31 @@ HELP_BLURBS = {
     "poll": "reaction poll",
     "afk": "temporary AFK status",
     "translate": "translate a short text",
-    "search": "clean web search results",
-    "weather": "current weather and forecast",
-    "convert": "units and live currency exchange rates",
-    "time": "local time anywhere or for a member",
     "settimezone": "configure your personal timezone",
     "vc": "voice activity tracking and leaderboard card",
-    "dictionary": "meaning, pronunciation, synonyms — as a card",
-    "define": "same thing, shorter name",
     "recipe": "recipes from ingredients you have",
-    "example": "look up any movie, anime or series — live, no keys",
-    "trending": "what's trending / popular / top-rated right now",
-    "upcoming": "upcoming releases with honest dates",
-    "recommend": "personal picks with reasons ('like Interstellar')",
     "summarize": "recap recent chat in this channel",
+    "help": "this list",
 }
 
 HELP_GROUPS = {
     "🎲 fun": ("ping", "coinflip", "choose"),
-    "🧰 useful": (
-        "remind",
-        "poll",
-        "afk",
-        "translate",
-        "search",
-        "weather",
-        "convert",
-        "time",
-        "settimezone",
-        "dictionary",
-        "define",
-        "recipe",
-    ),
+    "🧰 useful": ("remind", "poll", "afk", "translate", "settimezone", "recipe"),
     "🎙️ voice": ("vc",),
     "🤖 ai": ("summarize",),
 }
+
+#: Capabilities that no longer have a slash command. ``/help`` advertises
+#: the sentence that reaches each one instead.
+MENTION_CAPABILITIES = (
+    ("weather", "@Paradise weather in Delhi"),
+    ("search", "@Paradise search the latest Minecraft update"),
+    ("convert", "@Paradise 100 USD to INR"),
+    ("time", "@Paradise what time is it in Tokyo"),
+    ("define", "@Paradise define ephemeral"),
+    ("images", "@Paradise show me pictures of a red panda"),
+    ("maths", "@Paradise what is 15% of 920"),
+)
 
 
 def cooldown():
@@ -81,15 +73,9 @@ class System(commands.Cog):
             colour=Colour.ACCENT,
         )
         embed.add_field(
-            name="💬 mention me like…",
-            value=(
-                "`@Paradise define photosynthesis`\n"
-                "`@Paradise what's 15% of 500` · `@Paradise 100 USD to INR`\n"
-                "`@Paradise weather in Delhi` · `@Paradise time in Tokyo`\n"
-                "`@Paradise latest Minecraft news` · `@Paradise search Mars photos`\n"
-                "`@Paradise recommend a movie like Interstellar`\n"
-                "`@Paradise translate hello into Japanese`"
-            ),
+            name="💬 just mention me",
+            value="\n".join(f"`{example}`" for _, example in MENTION_CAPABILITIES)
+            + "\n`@Paradise translate hello into Japanese`",
             inline=False,
         )
         for group, names in HELP_GROUPS.items():

@@ -64,8 +64,9 @@ _CLASSIFY_SYSTEM = (
     "minified JSON object and nothing else — no prose, no markdown, no "
     "explanation, no reasoning.\n"
     'Schema: {"intent":"calculate|convert|weather|time|date|image|search|'
-    'define|translate|chat","query":"the cleaned request for that tool",'
-    '"needs_web":true|false,"needs_image":true|false}\n'
+    'define|translate|recipe|chat|unknown","query":"the cleaned request for '
+    'that tool","needs_web":true|false,"needs_image":true|false,'
+    '"confidence":0.0-1.0}\n'
     "Guidance: 'image' means the user wants to SEE a real photo. 'search' "
     "means it needs current or external facts. 'chat' means it can be "
     "answered from general knowledge or is small talk. The request is "
