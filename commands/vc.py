@@ -10,18 +10,29 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from config import VoiceConfig
 from functions.helpers import Colour
 from functions.voice import (
     LeaderboardImageRenderer,
     LeaderboardView,
     VoiceDatabase,
     VoicePeriod,
+    VoiceStoreError,
+    VoiceStoreUnavailable,
     VoiceTracker,
     build_leaderboard_text_embed,
     build_user_stats_embed,
 )
+from functions.voice.supabase_database import SupabaseVoiceDatabase
 
 log = logging.getLogger(__name__)
+
+SETUP_NEEDED_MESSAGE = (
+    "voice tracking isn't configured yet. the owner needs to set "
+    "`SUPABASE_URL` and `SUPABASE_SECRET_KEY` in `.env` and run "
+    "`supabase/migrations/001_voice_activity.sql` in the Supabase SQL Editor "
+    "(see `supabase/README.md`)."
+)
 
 
 def cooldown(seconds: float = 5):
@@ -31,20 +42,57 @@ def cooldown(seconds: float = 5):
 class Voice(commands.GroupCog, group_name="vc", group_description="Voice activity tracking and server leaderboards"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        db_path = getattr(getattr(bot, "config", None), "voice", None)
-        db_path_str = db_path.db_path if db_path and db_path.db_path else None
-        self.db = VoiceDatabase(db_path_str) if db_path_str else VoiceDatabase()
-        self.tracker = VoiceTracker(bot, self.db)
+        cfg = getattr(getattr(bot, "config", None), "voice", None) or VoiceConfig()
+        db_path = cfg.db_path if cfg.db_path else None
+        # Local SQLite: user settings + bounded fallback/migration storage.
+        # It is NOT the leaderboard source — Supabase is.
+        self.db = VoiceDatabase(db_path) if db_path else VoiceDatabase()
+
+        self.store: SupabaseVoiceDatabase | None = None
+        self.tracker: VoiceTracker | None = None
         self.renderer = LeaderboardImageRenderer()
-        # Attach tracker to bot so other components can access it if needed
-        self.bot.voice_tracker = self.tracker  # type: ignore[attr-defined]
+
+        if cfg.supabase_configured:
+            self.store = SupabaseVoiceDatabase(
+                self.db,
+                url=cfg.supabase_url,
+                key=cfg.supabase_secret_key,
+                request_timeout=cfg.request_timeout,
+                flush_interval=cfg.flush_interval,
+                migration_batch_size=cfg.migration_batch_size,
+            )
+            self.tracker = VoiceTracker(
+                bot,
+                self.store,
+                reconcile_interval=cfg.heartbeat_interval,
+                dm_reports_enabled=cfg.dm_reports_enabled,
+            )
+            # Attach tracker to bot so other components can access it if needed
+            self.bot.voice_tracker = self.tracker  # type: ignore[attr-defined]
+        else:
+            log.error(
+                "Voice tracking is DISABLED: SUPABASE_URL and/or SUPABASE_SECRET_KEY "
+                "are missing. Copy .env.example to .env, add the Supabase project URL "
+                "and the server-side SECRET key (never the public/anon key), and make "
+                "sure supabase/migrations/001_voice_activity.sql has been run in the "
+                "Supabase SQL Editor (see supabase/README.md). Existing local voice "
+                "data is untouched and migrates automatically once configured."
+            )
 
     async def cog_load(self) -> None:
-        # Start tracking and reconciliation loops
-        self.tracker.start_background_tasks()
+        # Start tracking first: while the store bootstraps (schema check +
+        # migration), events fall back to the durable local queue, so no
+        # session time is lost even if Supabase is slow to come up.
+        if self.tracker is not None:
+            self.tracker.start_background_tasks()
+        if self.store is not None:
+            self.store.start()
 
     async def cog_unload(self) -> None:
-        await self.tracker.stop()
+        if self.tracker is not None:
+            await self.tracker.stop()
+        if self.store is not None:
+            await self.store.stop()
 
     # ------------------------------------------------------------------
     # Discord Event Listeners
@@ -57,6 +105,8 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
+        if self.tracker is None:
+            return  # not configured — nothing is tracked or written
         try:
             await self.tracker.handle_voice_state_update(member, before, after)
         except Exception:
@@ -95,14 +145,32 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
                 "Voice activity only exists inside servers.", ephemeral=True
             )
             return
+        if self.tracker is None or self.store is None:
+            await interaction.response.send_message(SETUP_NEEDED_MESSAGE, ephemeral=True)
+            return
 
         selected_period = VoicePeriod(period.value) if period else VoicePeriod.TODAY
 
         await interaction.response.defer()
 
-        members = await self.tracker.get_live_leaderboard(
-            interaction.guild, selected_period
-        )
+        try:
+            members = await self.tracker.get_live_leaderboard(
+                interaction.guild, selected_period
+            )
+        except VoiceStoreUnavailable:
+            await interaction.followup.send(
+                "the voice database is temporarily unreachable — your time is "
+                "still being tracked. try again in a minute.",
+                ephemeral=True,
+            )
+            return
+        except VoiceStoreError:
+            log.exception("Leaderboard fetch failed")
+            await interaction.followup.send(
+                "something went wrong reading the voice database.", ephemeral=True
+            )
+            return
+
         view = LeaderboardView(
             tracker=self.tracker,
             guild=interaction.guild,
@@ -153,9 +221,26 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
                 "Voice stats only exist inside servers.", ephemeral=True
             )
             return
+        if self.tracker is None or self.store is None:
+            await interaction.response.send_message(SETUP_NEEDED_MESSAGE, ephemeral=True)
+            return
 
         target = member or interaction.user
-        stats_data = await self.tracker.get_live_user_stats(interaction.guild, target.id)
+        try:
+            stats_data = await self.tracker.get_live_user_stats(interaction.guild, target.id)
+        except VoiceStoreUnavailable:
+            await interaction.response.send_message(
+                "the voice database is temporarily unreachable — your time is "
+                "still being tracked. try again in a minute.",
+                ephemeral=True,
+            )
+            return
+        except VoiceStoreError:
+            log.exception("Voice stats fetch failed")
+            await interaction.response.send_message(
+                "something went wrong reading the voice database.", ephemeral=True
+            )
+            return
         embed = build_user_stats_embed(interaction.guild, target, stats_data)
         await interaction.response.send_message(embed=embed)
 
@@ -170,6 +255,8 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
         interaction: discord.Interaction,
         enabled: bool,
     ) -> None:
+        # A user setting, intentionally kept in local SQLite (shared with
+        # /settimezone) — no Supabase dependency here.
         self.db.set_user_dm_preference(interaction.user.id, enabled)
         status_str = "enabled ✅" if enabled else "disabled ❌"
         await interaction.response.send_message(

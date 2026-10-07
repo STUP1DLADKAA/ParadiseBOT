@@ -1,17 +1,51 @@
-"""Database storage for voice tracking, daily aggregates, and user settings."""
+"""Local SQLite storage for voice tracking.
+
+Since the Supabase migration this file has three jobs:
+
+1. **User settings** (timezones, DM-report preference) — shared with the
+   /settimezone command and intentionally still SQLite.
+2. **Bounded fallback/outbox** — when Supabase is temporarily unreachable,
+   completed sessions, profiles and DM-report marks are queued here and
+   flushed to Supabase as soon as it returns; in-progress sessions are
+   mirrored one-row-per-user so restarts never lose live time.
+3. **Migration source** — the historical voice tables are read out in
+   bounded batches and deleted only after the corresponding Supabase write
+   has been verified (see functions/voice/migration.py).
+
+The voice tables here are NOT a second leaderboard implementation: they hold
+no query API beyond what the migration and fallback need.
+"""
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
-from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
+from .models import (
+    DailyUserStat,
+    LeaderboardEntry,
+    MemberProfile,
+    PersistedActiveSession,
+    VoiceSessionRecord,
+)
+
 log = logging.getLogger(__name__)
 
 DEFAULT_DB_PATH = Path(__file__).resolve().parents[2] / "data" / "paradise.db"
+
+__all__ = [
+    "DailyUserStat",
+    "LeaderboardEntry",
+    "MemberProfile",
+    "PersistedActiveSession",
+    "VoiceDatabase",
+    "VoiceSessionRecord",
+    "split_session_by_midnight",
+]
 
 
 def _ensure_aware(dt: datetime) -> datetime:
@@ -19,55 +53,6 @@ def _ensure_aware(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
-
-
-@dataclass(slots=True)
-class VoiceSessionRecord:
-    id: int
-    guild_id: int
-    user_id: int
-    channel_id: int
-    started_at: datetime
-    ended_at: datetime
-    duration_seconds: int
-
-
-@dataclass(slots=True)
-class DailyUserStat:
-    guild_id: int
-    user_id: int
-    date_str: str
-    duration_seconds: int
-
-
-@dataclass(slots=True)
-class LeaderboardEntry:
-    user_id: int
-    total_seconds: int
-    rank: int = 0
-
-
-@dataclass(slots=True)
-class MemberProfile:
-    """Last-known Discord identity for a member, kept across restarts."""
-
-    guild_id: int
-    user_id: int
-    display_name: str
-    username: str
-    avatar_url: str | None
-
-
-@dataclass(slots=True)
-class PersistedActiveSession:
-    """A voice session that was still in progress when it was persisted."""
-
-    guild_id: int
-    user_id: int
-    channel_id: int
-    started_at: datetime
-    last_seen_at: datetime
-    is_afk: bool
 
 
 class VoiceDatabase:
@@ -147,6 +132,13 @@ class VoiceDatabase:
                     last_seen_at TEXT NOT NULL,
                     is_afk INTEGER NOT NULL DEFAULT 0,
                     PRIMARY KEY (guild_id, user_id)
+                );
+
+                CREATE TABLE IF NOT EXISTS voice_outbox (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    kind TEXT NOT NULL,
+                    payload TEXT NOT NULL,
+                    created_at TEXT NOT NULL
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_voice_sessions_guild_user
@@ -303,7 +295,11 @@ class VoiceDatabase:
         last_seen_at: datetime,
         is_afk: bool = False,
     ) -> None:
-        """Persist (or heartbeat) an in-progress voice session."""
+        """Persist (or heartbeat) an in-progress voice session.
+
+        Mirrors the Supabase upsert: last-write-wins on ``last_seen_at`` so a
+        delayed heartbeat can never clobber fresher local fallback state.
+        """
         started_at = _ensure_aware(started_at)
         last_seen_at = _ensure_aware(last_seen_at)
         with self._get_connection() as conn:
@@ -317,6 +313,7 @@ class VoiceDatabase:
                     started_at = excluded.started_at,
                     last_seen_at = excluded.last_seen_at,
                     is_afk = excluded.is_afk
+                WHERE excluded.last_seen_at >= voice_active_sessions.last_seen_at
                 """,
                 (
                     guild_id,
@@ -326,6 +323,34 @@ class VoiceDatabase:
                     last_seen_at.isoformat(),
                     int(is_afk),
                 ),
+            )
+
+    def get_active_session(self, guild_id: int, user_id: int) -> PersistedActiveSession | None:
+        """Fetch the persisted in-progress session for one user, if any."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT guild_id, user_id, channel_id, started_at, last_seen_at, is_afk
+                FROM voice_active_sessions
+                WHERE guild_id = ? AND user_id = ?
+                """,
+                (guild_id, user_id),
+            )
+            r = cur.fetchone()
+            if r is None:
+                return None
+            try:
+                started_at = _ensure_aware(datetime.fromisoformat(r["started_at"]))
+                last_seen_at = _ensure_aware(datetime.fromisoformat(r["last_seen_at"]))
+            except (TypeError, ValueError):
+                return None
+            return PersistedActiveSession(
+                guild_id=r["guild_id"],
+                user_id=r["user_id"],
+                channel_id=r["channel_id"],
+                started_at=started_at,
+                last_seen_at=last_seen_at,
+                is_afk=bool(r["is_afk"]),
             )
 
     def delete_active_session(self, guild_id: int, user_id: int) -> None:
@@ -615,6 +640,287 @@ class VoiceDatabase:
                 """,
                 (date_str, guild_id, user_id, now_iso),
             )
+
+    # ------------------------------------------------------------------
+    # Local outbox (bounded fallback queue for Supabase outages)
+    # ------------------------------------------------------------------
+
+    def queue_outbox(self, kind: str, payload: dict) -> None:
+        """Queue an operation that could not reach Supabase (never drops it)."""
+        now_iso = datetime.now(timezone.utc).isoformat()
+        with self._get_connection() as conn:
+            conn.execute(
+                "INSERT INTO voice_outbox (kind, payload, created_at) VALUES (?, ?, ?)",
+                (kind, json.dumps(payload, separators=(",", ":")), now_iso),
+            )
+
+    def count_outbox(self) -> int:
+        with self._get_connection() as conn:
+            cur = conn.execute("SELECT COUNT(*) AS c FROM voice_outbox")
+            return int(cur.fetchone()["c"])
+
+    def fetch_outbox_batch(self, limit: int) -> list[tuple[int, str, dict]]:
+        """Oldest-first pending operations (id, kind, payload)."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT id, kind, payload FROM voice_outbox ORDER BY id ASC LIMIT ?",
+                (limit,),
+            )
+            rows = []
+            for r in cur.fetchall():
+                try:
+                    payload = json.loads(r["payload"])
+                except (TypeError, ValueError):
+                    log.error("Dropping corrupt outbox row %s (kind=%s)", r["id"], r["kind"])
+                    self.delete_outbox_rows([int(r["id"])])
+                    continue
+                rows.append((int(r["id"]), str(r["kind"]), payload))
+            return rows
+
+    def delete_outbox_rows(self, ids: Sequence[int]) -> int:
+        ids = [int(i) for i in ids]
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                f"DELETE FROM voice_outbox WHERE id IN ({placeholders})",
+                ids,
+            )
+            return cur.rowcount
+
+    # ------------------------------------------------------------------
+    # Migration source: bounded batch reads + verified deletions.
+    # Every fetch is ordered by primary key so batches are deterministic
+    # and re-runs after partial failures never skip or duplicate rows.
+    # ------------------------------------------------------------------
+
+    def count_migration_rows(self, table: str) -> int:
+        """Row count of a legacy voice table (0 when the table is gone)."""
+        if table not in (
+            "voice_sessions",
+            "voice_daily_stats",
+            "voice_member_profiles",
+            "voice_active_sessions",
+            "voice_dm_reports",
+        ):
+            raise ValueError(f"unknown voice table: {table}")
+        with self._get_connection() as conn:
+            try:
+                cur = conn.execute(f"SELECT COUNT(*) AS c FROM {table}")
+            except sqlite3.OperationalError:
+                return 0
+            return int(cur.fetchone()["c"])
+
+    def has_pending_voice_data(self) -> bool:
+        return any(
+            self.count_migration_rows(t) > 0
+            for t in (
+                "voice_sessions",
+                "voice_daily_stats",
+                "voice_member_profiles",
+                "voice_active_sessions",
+                "voice_dm_reports",
+            )
+        )
+
+    def fetch_migration_sessions(self, limit: int) -> list[VoiceSessionRecord]:
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT id, guild_id, user_id, channel_id, started_at, ended_at, duration_seconds
+                FROM voice_sessions ORDER BY id ASC LIMIT ?
+                """,
+                (limit,),
+            )
+            rows = []
+            for r in cur.fetchall():
+                try:
+                    started = _ensure_aware(datetime.fromisoformat(r["started_at"]))
+                    ended = _ensure_aware(datetime.fromisoformat(r["ended_at"]))
+                except (TypeError, ValueError):
+                    log.error("Skipping corrupt voice_sessions row %s", r["id"])
+                    continue
+                rows.append(
+                    VoiceSessionRecord(
+                        id=int(r["id"]),
+                        guild_id=r["guild_id"],
+                        user_id=r["user_id"],
+                        channel_id=r["channel_id"],
+                        started_at=started,
+                        ended_at=ended,
+                        duration_seconds=int(r["duration_seconds"]),
+                    )
+                )
+            return rows
+
+    def delete_migration_sessions(self, ids: Sequence[int]) -> int:
+        return self._delete_by_ids("voice_sessions", "id", ids)
+
+    def fetch_migration_daily(self, limit: int) -> list[DailyUserStat]:
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT guild_id, user_id, date, duration_seconds
+                FROM voice_daily_stats
+                ORDER BY guild_id ASC, user_id ASC, date ASC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [
+                DailyUserStat(
+                    guild_id=r["guild_id"],
+                    user_id=r["user_id"],
+                    date_str=str(r["date"]),
+                    duration_seconds=int(r["duration_seconds"]),
+                )
+                for r in cur.fetchall()
+            ]
+
+    def delete_migration_daily(self, keys: Sequence[tuple[int, int, str]]) -> int:
+        """Delete daily rows by (guild_id, user_id, date) keys."""
+        return self._delete_daily_keys(keys)
+
+    def fetch_migration_profiles(self, limit: int) -> list[MemberProfile]:
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT guild_id, user_id, display_name, username, avatar_url, updated_at
+                FROM voice_member_profiles
+                ORDER BY guild_id ASC, user_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [
+                MemberProfile(
+                    guild_id=r["guild_id"],
+                    user_id=r["user_id"],
+                    display_name=r["display_name"],
+                    username=r["username"],
+                    avatar_url=r["avatar_url"],
+                )
+                for r in cur.fetchall()
+            ]
+
+    def fetch_migration_profiles_meta(
+        self, limit: int
+    ) -> list[tuple[MemberProfile, str]]:
+        """Profiles plus their SQLite updated_at (for last-write-wins merges)."""
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT guild_id, user_id, display_name, username, avatar_url, updated_at
+                FROM voice_member_profiles
+                ORDER BY guild_id ASC, user_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [
+                (
+                    MemberProfile(
+                        guild_id=r["guild_id"],
+                        user_id=r["user_id"],
+                        display_name=r["display_name"],
+                        username=r["username"],
+                        avatar_url=r["avatar_url"],
+                    ),
+                    str(r["updated_at"]),
+                )
+                for r in cur.fetchall()
+            ]
+
+    def delete_migration_profiles(self, keys: Sequence[tuple[int, int]]) -> int:
+        keys = list(keys)
+        if not keys:
+            return 0
+        deleted = 0
+        with self._get_connection() as conn:
+            for guild_id, user_id in keys:
+                cur = conn.execute(
+                    "DELETE FROM voice_member_profiles WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                )
+                deleted += cur.rowcount
+        return deleted
+
+    def fetch_migration_active(self, limit: int) -> list[PersistedActiveSession]:
+        sessions = self.get_active_sessions()
+        return sessions[:limit]
+
+    def delete_migration_active(self, keys: Sequence[tuple[int, int]]) -> int:
+        keys = list(keys)
+        if not keys:
+            return 0
+        deleted = 0
+        with self._get_connection() as conn:
+            for guild_id, user_id in keys:
+                cur = conn.execute(
+                    "DELETE FROM voice_active_sessions WHERE guild_id = ? AND user_id = ?",
+                    (guild_id, user_id),
+                )
+                deleted += cur.rowcount
+        return deleted
+
+    def fetch_migration_dm_reports(self, limit: int) -> list[tuple[str, int, int, str]]:
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT date, guild_id, user_id, sent_at
+                FROM voice_dm_reports
+                ORDER BY date ASC, guild_id ASC, user_id ASC
+                LIMIT ?
+                """,
+                (limit,),
+            )
+            return [
+                (str(r["date"]), int(r["guild_id"]), int(r["user_id"]), str(r["sent_at"]))
+                for r in cur.fetchall()
+            ]
+
+    def delete_migration_dm_reports(self, keys: Sequence[tuple[str, int, int]]) -> int:
+        keys = list(keys)
+        if not keys:
+            return 0
+        deleted = 0
+        with self._get_connection() as conn:
+            for date_str, guild_id, user_id in keys:
+                cur = conn.execute(
+                    "DELETE FROM voice_dm_reports WHERE date = ? AND guild_id = ? AND user_id = ?",
+                    (date_str, guild_id, user_id),
+                )
+                deleted += cur.rowcount
+        return deleted
+
+    # -- internal helpers ------------------------------------------------
+
+    def _delete_by_ids(self, table: str, column: str, ids: Sequence[int]) -> int:
+        ids = [int(i) for i in ids]
+        if not ids:
+            return 0
+        placeholders = ", ".join("?" for _ in ids)
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                f"DELETE FROM {table} WHERE {column} IN ({placeholders})",
+                ids,
+            )
+            return cur.rowcount
+
+    def _delete_daily_keys(self, keys: Sequence[tuple[int, int, str]]) -> int:
+        keys = list(keys)
+        if not keys:
+            return 0
+        deleted = 0
+        with self._get_connection() as conn:
+            for guild_id, user_id, date_str in keys:
+                cur = conn.execute(
+                    "DELETE FROM voice_daily_stats WHERE guild_id = ? AND user_id = ? AND date = ?",
+                    (guild_id, user_id, date_str),
+                )
+                deleted += cur.rowcount
+        return deleted
 
 
 def split_session_by_midnight(

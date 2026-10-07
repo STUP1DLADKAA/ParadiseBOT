@@ -11,6 +11,7 @@ import discord
 from functions.helpers import Colour, shorten
 from .models import LeaderboardMember, VoicePeriod, format_duration
 from .render import LeaderboardImageRenderer
+from .store import VoiceStoreError, VoiceStoreUnavailable
 
 log = logging.getLogger(__name__)
 
@@ -162,7 +163,21 @@ class LeaderboardView(discord.ui.View):
 
     async def update_view(self, interaction: discord.Interaction) -> None:
         """Re-render response according to current state."""
-        members = await self.tracker.get_live_leaderboard(self.guild, self.period)
+        try:
+            members = await self.tracker.get_live_leaderboard(self.guild, self.period)
+        except VoiceStoreUnavailable:
+            await interaction.response.send_message(
+                "the voice database is temporarily unreachable — try again in a "
+                "minute. your time is still being tracked.",
+                ephemeral=True,
+            )
+            return
+        except VoiceStoreError:
+            log.exception("Leaderboard refresh failed")
+            await interaction.response.send_message(
+                "something went wrong reading the voice database.", ephemeral=True
+            )
+            return
         total_pages = max(1, (len(members) + self.page_size - 1) // self.page_size)
         self.page = max(1, min(self.page, total_pages))
         self.prev_btn.disabled = self.page <= 1

@@ -127,16 +127,64 @@ class DictionaryConfig:
 
 @dataclass(frozen=True, slots=True)
 class VoiceConfig:
-    """Voice activity tracking and daily DM reports configuration."""
+    """Voice activity tracking and daily DM reports configuration.
 
+    Voice data lives in Supabase (the authoritative database). The two
+    credentials are required for /vc to work; they are server-side only and
+    must never be committed, logged or exposed to clients.
+    """
+
+    # Local SQLite file: user settings (timezones, DM preferences), the
+    # bounded fallback outbox during Supabase outages, and the historical
+    # voice data until it has been migrated and verified.
     db_path: str = ""
     dm_reports_enabled: bool = True
+
+    # Supabase project ("Paradise", ref gxcjtbiyamyyxokgehpe, ap-south-1).
+    # SUPABASE_SECRET_KEY must be the server-side SECRET key (service_role),
+    # NOT the public/anon key. Create the schema first by running
+    # supabase/migrations/001_voice_activity.sql in the Supabase SQL Editor.
+    supabase_url: str = ""
+    supabase_secret_key: str = ""
+
+    # How often active VC sessions heartbeat last_seen_at to Supabase
+    # (seconds). 15-30s keeps the leaderboard near-real-time without
+    # spamming the database.
+    heartbeat_interval: int = 20
+    # Rows per batch when migrating SQLite history to Supabase.
+    migration_batch_size: int = 500
+    # Seconds between outbox flush / migration retry cycles.
+    flush_interval: int = 30
+    # Per-request timeout for Supabase calls (seconds).
+    request_timeout: float = 15.0
+
+    @property
+    def supabase_configured(self) -> bool:
+        return bool(self.supabase_url.strip() and self.supabase_secret_key.strip())
+
+    @property
+    def masked_supabase_key(self) -> str:
+        """A log-safe rendering of the secret — never the full key."""
+        key = self.supabase_secret_key.strip()
+        if len(key) <= 8:
+            return "…" if key else ""
+        return f"{key[:2]}…{key[-2:]}"
 
     @classmethod
     def from_env(cls, env) -> "VoiceConfig":
         return cls(
             db_path=env.get("VOICE_DB_PATH", "").strip(),
             dm_reports_enabled=_bool(env.get("VOICE_DM_REPORTS_ENABLED"), True),
+            supabase_url=env.get("SUPABASE_URL", "").strip().rstrip("/"),
+            supabase_secret_key=env.get("SUPABASE_SECRET_KEY", "").strip(),
+            heartbeat_interval=max(
+                10, _int(env.get("VOICE_HEARTBEAT_INTERVAL"), 20)
+            ),
+            migration_batch_size=max(
+                10, _int(env.get("VOICE_MIGRATION_BATCH_SIZE"), 500)
+            ),
+            flush_interval=max(5, _int(env.get("VOICE_FLUSH_INTERVAL"), 30)),
+            request_timeout=max(5.0, _float(env.get("VOICE_SUPABASE_TIMEOUT"), 15.0)),
         )
 
 

@@ -161,7 +161,7 @@ class ParadiseBot(commands.Bot):
 
         # Reconcile voice sessions after connect / reconnect
         voice_cog = self.get_cog("Voice") or self.get_cog("vc")
-        if voice_cog and hasattr(voice_cog, "tracker"):
+        if voice_cog and getattr(voice_cog, "tracker", None):
             try:
                 await voice_cog.tracker.reconcile_guilds()
             except Exception:
