@@ -1,15 +1,15 @@
-"""Data models for weather observations and forecasts."""
+"""Data models for provider observations and hourly/daily forecasts."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 
 @dataclass(slots=True)
 class LocationInfo:
-    """Geographic information for a resolved location."""
+    """Geographic information returned by the existing geocoder."""
 
     name: str
     country: str = ""
@@ -30,26 +30,26 @@ class LocationInfo:
 
 @dataclass(slots=True)
 class WeatherData:
-    """A provider-shaped weather report. Optional values stay ``None`` when absent."""
+    """Provider-shaped report; unavailable measurements remain ``None``."""
 
     location: LocationInfo
-    temp_c: float
-    feels_like_c: float
+    temp_c: float | None
+    feels_like_c: float | None
     condition: str
-    condition_emoji: str
-    humidity: int
-    wind_speed_kmh: float
-    wind_direction: str
-    wind_deg: int = 0
-    temp_min_c: float = 0.0
-    temp_max_c: float = 0.0
+    condition_emoji: str = ""
+    humidity: int | None = None
+    wind_speed_kmh: float | None = None
+    wind_direction: str | None = None
+    wind_deg: int | None = None
+    temp_min_c: float | None = None
+    temp_max_c: float | None = None
     visibility_km: float | None = None
     sunrise: str | None = None
     sunset: str | None = None
     uv_index: float | None = None
     forecast_text: str = ""
-    updated_at: datetime = field(default_factory=datetime.utcnow)
-    weather_code: int = 0
+    updated_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    weather_code: int | None = None
     local_time: str | None = None
     local_date: str | None = None
     precipitation_mm: float | None = None
@@ -62,25 +62,29 @@ class WeatherData:
     daily_forecast: list[dict[str, Any]] = field(default_factory=list)
     air_quality: dict[str, Any] | None = None
 
-    @property
-    def temp_f(self) -> float:
-        return (self.temp_c * 9 / 5) + 32
+    @staticmethod
+    def _to_fahrenheit(value: float | None) -> float | None:
+        return None if value is None else (value * 9 / 5) + 32
 
     @property
-    def feels_like_f(self) -> float:
-        return (self.feels_like_c * 9 / 5) + 32
+    def temp_f(self) -> float | None:
+        return self._to_fahrenheit(self.temp_c)
 
     @property
-    def temp_min_f(self) -> float:
-        return (self.temp_min_c * 9 / 5) + 32
+    def feels_like_f(self) -> float | None:
+        return self._to_fahrenheit(self.feels_like_c)
 
     @property
-    def temp_max_f(self) -> float:
-        return (self.temp_max_c * 9 / 5) + 32
+    def temp_min_f(self) -> float | None:
+        return self._to_fahrenheit(self.temp_min_c)
 
     @property
-    def wind_speed_mph(self) -> float:
-        return self.wind_speed_kmh * 0.621371
+    def temp_max_f(self) -> float | None:
+        return self._to_fahrenheit(self.temp_max_c)
+
+    @property
+    def wind_speed_mph(self) -> float | None:
+        return None if self.wind_speed_kmh is None else self.wind_speed_kmh * 0.621371
 
     @property
     def visibility_miles(self) -> float | None:

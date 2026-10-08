@@ -7,7 +7,7 @@ Design summary
   leaderboard cache, so manual edits in the Supabase Dashboard show up on
   the very next render.
 * Aggregation and sorting happen in PostgreSQL via the helper functions in
-  ``supabase/migrations/001_voice_activity.sql``; Python only formats rows.
+  ``supabase/migrations/002_voice_ist_calendar.sql``; Python only formats rows.
 * Writes are idempotent (natural-key conflict handling) and atomic
   (``voice_close_active_session`` records + deletes in one transaction).
 * Outage safety: when Supabase is unreachable, completed sessions, profiles
@@ -40,6 +40,7 @@ from .models import (
     VoiceSessionRecord,
 )
 from .store import VoiceSchemaError, VoiceStore, VoiceStoreUnavailable
+from .time_windows import ist_date
 
 log = logging.getLogger(__name__)
 
@@ -50,9 +51,10 @@ DEFAULT_PROFILE_CHUNK = 50
 
 SCHEMA_MISSING_MESSAGE = (
     "The Paradise Supabase project is missing the voice-activity schema. "
-    "Open the Supabase Dashboard -> SQL Editor and run "
-    "supabase/migrations/001_voice_activity.sql (see supabase/README.md), "
-    "then restart or wait — the bot retries automatically."
+    "In the Dashboard SQL Editor, run migrations/001_voice_activity.sql "
+    "followed by migrations/002_voice_ist_calendar.sql (or apply only 002 "
+    "when upgrading schema version 1); see supabase/README.md. "
+    "The bot retries automatically."
 )
 
 # Supabase / PostgREST error types are optional at import time so this module
@@ -105,7 +107,7 @@ def _chunks(items: Sequence, size: int):
 class SupabaseVoiceDatabase(VoiceStore):
     """VoiceStore implementation on Supabase PostgreSQL + SQLite fallback."""
 
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -263,10 +265,14 @@ class SupabaseVoiceDatabase(VoiceStore):
             raise
         version = _coerce_int(res.data, default=-1)
         if version != self.SCHEMA_VERSION:
+            hint = (
+                "Apply supabase/migrations/002_voice_ist_calendar.sql in the SQL Editor."
+                if version < self.SCHEMA_VERSION
+                else "Update the bot to a version compatible with the database schema."
+            )
             raise VoiceSchemaError(
                 f"Supabase voice schema version {version} does not match the bot's "
-                f"expected version {self.SCHEMA_VERSION}. Apply the newest "
-                "supabase/migrations/*.sql file in the Supabase SQL Editor."
+                f"expected version {self.SCHEMA_VERSION}. {hint}"
             )
         self._schema_ok = True
         return version
@@ -641,7 +647,7 @@ class SupabaseVoiceDatabase(VoiceStore):
         period: str = "today",
         target_date: date | None = None,
     ) -> list[LeaderboardEntry]:
-        today = target_date or datetime.now(timezone.utc).date()
+        today = target_date or ist_date()
         params = {
             "p_guild_id": int(guild_id),
             "p_period": str(period),
@@ -670,7 +676,7 @@ class SupabaseVoiceDatabase(VoiceStore):
         user_id: int,
         target_date: date | None = None,
     ) -> dict[str, int]:
-        today = target_date or datetime.now(timezone.utc).date()
+        today = target_date or ist_date()
         params = {
             "p_guild_id": int(guild_id),
             "p_user_id": int(user_id),

@@ -11,16 +11,29 @@ queue while Supabase is unreachable.
 > (via `voice_schema_version()`) and refuses to track voice data until it
 > exists.
 
-## 1. Apply the schema (one-time, ~2 minutes)
+## 1. Apply the schema (one-time, ~3 minutes)
 
 1. Open the Supabase Dashboard → your **Paradise** project.
 2. Go to **SQL Editor** → **New query**.
-3. Paste the entire contents of
-   [`migrations/001_voice_activity.sql`](migrations/001_voice_activity.sql).
-4. Click **Run**.
+3. For a new database, run [`migrations/001_voice_activity.sql`](migrations/001_voice_activity.sql) first.
+4. Run [`migrations/002_voice_ist_calendar.sql`](migrations/002_voice_ist_calendar.sql) second.
 
-The script is a single transaction and is **safe to re-run** (idempotent):
-running it twice changes nothing and reports success. It creates:
+Each migration is transactional and safe to re-run. If the project already has
+schema version 1, apply **only migration 002**. The bot requires schema version
+2 after the cutover. Migration 002 changes no tables: it replaces the reporting
+functions and safely rebuckets eligible daily aggregates, while preserving:
+
+- every historical `voice_sessions` row;
+- per-user totals whose old daily aggregate does not reconcile exactly with
+  its session history (including manual Dashboard edits);
+- all member profiles, DM marks, active-session/outbox data, and lifetime time.
+
+The migration recalculates dates only for users whose aggregate sum exactly
+matches their complete session history. The changed week/month definitions are
+Asia/Kolkata calendar periods (ISO Monday-to-Monday and first-of-month to
+first-of-next-month); future dates are excluded from the in-progress period.
+
+Migration 001 creates:
 
 | table | purpose |
 | --- | --- |
@@ -115,14 +128,18 @@ The first run (and later cycles) moves the pre-Supabase voice history from
 ## 6. Sanity checks (optional, SQL Editor)
 
 ```sql
--- Schema present and at the expected version (must return 1):
+-- Schema present and at the expected version (must return 2):
 select voice_schema_version();
 
 -- Today's leaderboard for a guild:
-select * from voice_leaderboard(<guild_id>, 'today', current_date);
+select * from voice_leaderboard(
+  <guild_id>, 'today', (now() at time zone 'Asia/Kolkata')::date
+);
 
 -- Bounded per-period totals for one user:
-select * from voice_user_breakdown(<guild_id>, <user_id>, current_date);
+select * from voice_user_breakdown(
+  <guild_id>, <user_id>, (now() at time zone 'Asia/Kolkata')::date
+);
 
 -- Rows left to migrate (should trend to 0 after the bot runs):
 -- (run in the SQL Editor against your local SQLite file instead — the bot
@@ -142,14 +159,15 @@ the SQL Editor. Never edit the `voice_*` objects by hand.
 
 ## 8. Verifying this repo's SQL (developers)
 
-`validate_locally.mjs` runs the migration file plus 60 behavioural checks
-against a real PostgreSQL (PGlite/WASM), covering midnight splitting,
-idempotent replays, rolling week/month windows, last-write-wins heartbeats,
-guarded deletes, atomic closes, AFK exclusion, the migration ledger, RLS
-lockdown, and service_role access:
+`validate_locally.mjs` runs both migrations plus behavioral checks against a
+real PostgreSQL engine (PGlite/WASM), covering IST session splitting,
+reconciled-history rebucketing, manual-total preservation, idempotent replays,
+ISO-week/calendar-month windows, last-write-wins heartbeats, guarded deletes,
+atomic closes, AFK exclusion, the migration ledger, RLS lockdown, and
+service_role access:
 
 ```bash
-cd supabase && npm install && node validate_locally.mjs
+cd supabase && npm install --no-save --package-lock=false @electric-sql/pglite && node validate_locally.mjs
 ```
 
 `tests/test_voice_supabase.py` and `tests/test_voice_migration.py` exercise
@@ -158,4 +176,5 @@ Supabase client that mirrors these exact semantics.
 
 > **Note:** this repository has **not** been verified against the live
 > Supabase project — that requires the owner's credentials and the manual
-> SQL step above. The SQL itself is fully validated locally (60/60 checks).
+> SQL step above. The local harness validates the migration files without
+> connecting to the production Supabase project.

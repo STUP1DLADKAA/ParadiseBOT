@@ -143,7 +143,8 @@ class VoiceConfig:
     # Supabase project ("Paradise", ref gxcjtbiyamyyxokgehpe, ap-south-1).
     # SUPABASE_SECRET_KEY must be the server-side SECRET key (service_role),
     # NOT the public/anon key. Create the schema first by running
-    # supabase/migrations/001_voice_activity.sql in the Supabase SQL Editor.
+    # supabase/migrations/001_voice_activity.sql then 002_voice_ist_calendar.sql
+    # in the Supabase SQL Editor.
     supabase_url: str = ""
     supabase_secret_key: str = ""
 
@@ -186,6 +187,17 @@ class VoiceConfig:
             flush_interval=max(5, _int(env.get("VOICE_FLUSH_INTERVAL"), 30)),
             request_timeout=max(5.0, _float(env.get("VOICE_SUPABASE_TIMEOUT"), 15.0)),
         )
+
+
+@dataclass(frozen=True, slots=True)
+class MiniGamesConfig:
+    """Optional destination override for automated server mini-games."""
+
+    channel_id: int = 0
+
+    @classmethod
+    def from_env(cls, env) -> "MiniGamesConfig":
+        return cls(channel_id=max(0, _int(env.get("MINIGAMES_CHANNEL_ID"), 0)))
 
 
 @dataclass(frozen=True, slots=True)
@@ -295,6 +307,9 @@ class Config:
     # Voice activity tracking and statistics.
     voice: VoiceConfig = VoiceConfig()
 
+    # Automated mini-game destination; scheduler settings are persisted in SQLite.
+    minigames: MiniGamesConfig = MiniGamesConfig()
+
     # Web image search for mention requests ("show me a picture of …").
     image_search: ImageSearchConfig = ImageSearchConfig()
 
@@ -316,6 +331,7 @@ class Config:
             personality=PersonalityConfig.from_env(env),
             dictionary=DictionaryConfig.from_env(env),
             voice=VoiceConfig.from_env(env),
+            minigames=MiniGamesConfig.from_env(env),
             image_search=ImageSearchConfig.from_env(env),
         )
 

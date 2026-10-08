@@ -1,10 +1,10 @@
 // ============================================================================
 // ParadiseBot — local validation harness for the Supabase voice schema
 // ============================================================================
-// Runs supabase/migrations/001_voice_activity.sql against a REAL PostgreSQL
-// (PGlite — Postgres compiled to WASM) inside this Node process and asserts
-// the behaviours the bot depends on: midnight splitting, retry idempotency,
-// rolling week/month windows, the migration ledger, RLS lockdown, etc.
+// Runs migrations 001 and 002 against a REAL PostgreSQL (PGlite — Postgres
+// compiled to WASM) inside this Node process and asserts the behaviours the
+// bot depends on: IST splitting, calendar windows, retry idempotency, legacy
+// aggregate rebucketing, the migration ledger, RLS lockdown, etc.
 //
 // It touches nothing outside this process — safe to run any time:
 //
@@ -23,7 +23,8 @@ import { dirname, join } from "node:path";
 import { PGlite } from "@electric-sql/pglite";
 
 const here = dirname(fileURLToPath(import.meta.url));
-const migrationSql = readFileSync(join(here, "migrations", "001_voice_activity.sql"), "utf8");
+const baseMigrationSql = readFileSync(join(here, "migrations", "001_voice_activity.sql"), "utf8");
+const istMigrationSql = readFileSync(join(here, "migrations", "002_voice_ist_calendar.sql"), "utf8");
 
 const db = new PGlite();
 let passed = 0;
@@ -62,7 +63,7 @@ async function scalar(sql, params) {
 }
 
 // ---------------------------------------------------------------------------
-console.log("\n== 0. apply migration (twice: it must be re-runnable) ==");
+console.log("\n== 0. apply base schema and the additive IST migration ==");
 // Supabase already has anon/authenticated/service_role; create equivalents
 // with the same RLS-relevant properties (service_role has BYPASSRLS there).
 await db.exec(`
@@ -78,26 +79,55 @@ await db.exec(`
     end if;
   end $$;
 `);
-await db.exec(migrationSql);
-console.log("  ok   migration applied (1st run)");
+await db.exec(baseMigrationSql);
+await db.exec(baseMigrationSql);
+console.log("  ok   base migration applied and re-applied (idempotent)");
+passed++;
+
+// Simulate legacy daily aggregates whose source sessions are still stored
+// untouched in UTC. One account reconciles exactly and can be safely rebucketed;
+// one does not, so migration 002 must preserve its hand-edited aggregate.
+await db.query(
+  "insert into public.voice_sessions (guild_id,user_id,channel_id,started_at,ended_at,duration_seconds) values ($1,$2,$3,$4,$5,$6)",
+  [778, 701, 1, "2026-09-30T18:20:00+00:00", "2026-09-30T18:50:00+00:00", 1800]);
+await db.query(
+  "insert into public.voice_daily_stats (guild_id,user_id,date,duration_seconds) values ($1,$2,$3,$4)",
+  [778, 701, "2026-09-30", 1800]);
+await db.query(
+  "insert into public.voice_sessions (guild_id,user_id,channel_id,started_at,ended_at,duration_seconds) values ($1,$2,$3,$4,$5,$6)",
+  [778, 702, 1, "2026-09-30T18:20:00+00:00", "2026-09-30T18:50:00+00:00", 1800]);
+await db.query(
+  "insert into public.voice_daily_stats (guild_id,user_id,date,duration_seconds) values ($1,$2,$3,$4)",
+  [778, 702, "2026-09-30", 1234]);
+
+await db.exec(istMigrationSql);
+const rebucketed = await q(
+  "select date,duration_seconds from public.voice_daily_stats where guild_id=778 and user_id=701 order by date");
+check("IST migration rebuckets a reconciled session", rebucketed.length === 2
+  && normDate(rebucketed[0].date) === "2026-09-30" && rebucketed[0].duration_seconds === 600
+  && normDate(rebucketed[1].date) === "2026-10-01" && rebucketed[1].duration_seconds === 1200,
+  JSON.stringify(rebucketed));
+const preserved = await scalar(
+  "select duration_seconds from public.voice_daily_stats where guild_id=778 and user_id=702 and date='2026-09-30'");
+check("IST migration preserves unreconciled/manual aggregates", preserved === 1234, `got ${preserved}`);
 try {
-  await db.exec(migrationSql);
-  console.log("  ok   migration re-applied (idempotent)");
+  await db.exec(istMigrationSql);
+  console.log("  ok   IST migration re-applied without reinterpreting data");
   passed++;
 } catch (e) {
   failed++;
-  failures.push("migration not re-runnable: " + e.message);
-  console.log("  FAIL migration not re-runnable — " + e.message);
+  failures.push("IST migration not re-runnable: " + e.message);
+  console.log("  FAIL IST migration not re-runnable — " + e.message);
 }
 
-check("schema version is 1", (await scalar("select public.voice_schema_version()")) === 1);
+check("schema version is 2", (await scalar("select public.voice_schema_version()")) === 2);
 
 // ---------------------------------------------------------------------------
 console.log("\n== 1. voice_record_session: midnight splitting & retry safety ==");
 const G = 999, U = 101, C = 555;
 
 let r = await scalar("select public.voice_record_session($1,$2,$3,$4,$5)",
-  [G, U, C, "2026-09-30T23:50:00+00:00", "2026-10-01T00:20:00+00:00"]);
+  [G, U, C, "2026-09-30T18:20:00+00:00", "2026-09-30T18:50:00+00:00"]);
 check("returns session duration (1800s)", r === 1800, `got ${r}`);
 
 let daily = await q(
@@ -111,7 +141,7 @@ check("day 2 gets 1200s (00:00→00:20)",
 
 // Retrying the exact same event must not double-count.
 r = await scalar("select public.voice_record_session($1,$2,$3,$4,$5)",
-  [G, U, C, "2026-09-30T23:50:00+00:00", "2026-10-01T00:20:00+00:00"]);
+  [G, U, C, "2026-09-30T18:20:00+00:00", "2026-09-30T18:50:00+00:00"]);
 check("duplicate retry returns 0", r === 0, `got ${r}`);
 daily = await q(
   "select coalesce(sum(duration_seconds),0) as s from public.voice_daily_stats where guild_id=$1 and user_id=$2",
@@ -120,15 +150,15 @@ check("duplicate retry did not change daily totals", Number(daily[0].s) === 1800
 check("only one session row exists",
   (await scalar("select count(*) from public.voice_sessions where guild_id=$1 and user_id=$2", [G, U])) === 1);
 
-// Multi-day session 23:00 (Sep 29) → 02:00 (Oct 1) = 27h.
+// Multi-day session 22:30 IST (Sep 29) → 01:30 IST (Oct 1) = 27h.
 await scalar("select public.voice_record_session($1,$2,$3,$4,$5)",
-  [G, U, C, "2026-09-29T23:00:00+00:00", "2026-10-01T02:00:00+00:00"]);
+  [G, U, C, "2026-09-29T17:00:00+00:00", "2026-09-30T20:00:00+00:00"]);
 const u1 = await q("select date, duration_seconds from public.voice_daily_stats where guild_id=$1 and user_id=$2 order by date", [G, U]);
-check("multi-day split 3600/86400+600/7200+1200",
+check("multi-day IST split preserves all whole seconds",
   u1.length === 3 &&
-  u1[0].duration_seconds === 3600 &&
-  u1[1].duration_seconds === 86400 + 600 &&
-  u1[2].duration_seconds === 7200 + 1200,
+  normDate(u1[0].date) === "2026-09-29" && u1[0].duration_seconds === 5400 &&
+  normDate(u1[1].date) === "2026-09-30" && u1[1].duration_seconds === 86400 + 600 &&
+  normDate(u1[2].date) === "2026-10-01" && u1[2].duration_seconds === 5400 + 1200,
   JSON.stringify(u1));
 
 // Sub-second and invalid ranges are ignored.
@@ -141,7 +171,7 @@ check("reversed range ignored",
 
 // A session ending exactly at midnight must not create a 0s row for the new day.
 await scalar("select public.voice_record_session($1,$2,$3,$4,$5)",
-  [G, 202, C, "2026-10-02T22:00:00+00:00", "2026-10-03T00:00:00+00:00"]);
+  [G, 202, C, "2026-10-02T16:30:00+00:00", "2026-10-02T18:30:00+00:00"]);
 const edge = await q("select date, duration_seconds from public.voice_daily_stats where guild_id=$1 and user_id=202 order by date", [G]);
 check("session ending at midnight: single 7200s row",
   edge.length === 1 && normDate(edge[0].date) === "2026-10-02" && edge[0].duration_seconds === 7200,
@@ -204,11 +234,20 @@ check("AFK time never reached daily stats",
   (await scalar("select count(*) from public.voice_daily_stats where guild_id=$1 and user_id=304", [G])) === 0);
 
 // ---------------------------------------------------------------------------
-console.log("\n== 3. leaderboards: exact rolling-window semantics ==");
-// Target date 2026-10-08. Boundaries: week = Oct 1..Oct 8,
-// month = Sep 8..Oct 8 (target-30 = Sep 8 inclusive; Sep 7 excluded).
-const T = "2026-10-08";
-const seedDates = { "2026-09-07": 11, "2026-09-08": 22, "2026-10-01": 33, "2026-10-07": 44, "2026-10-08": 55, "2026-10-09": 66 };
+console.log("\n== 3. leaderboards: IST calendar-window semantics ==");
+// Target date Friday 2026-10-09. The ISO week starts Monday Oct 5, and the
+// calendar month starts Oct 1. Future daily rows are not counted.
+const T = "2026-10-09";
+const seedDates = {
+  "2026-09-07": 11,
+  "2026-09-30": 22,
+  "2026-10-01": 33,
+  "2026-10-02": 44,
+  "2026-10-05": 55,
+  "2026-10-08": 66,
+  "2026-10-09": 77,
+  "2026-10-10": 88,
+};
 for (const [day, secs] of Object.entries(seedDates)) {
   await db.query(
     "insert into public.voice_daily_stats (guild_id, user_id, date, duration_seconds) values ($1,$2,$3,$4)",
@@ -218,15 +257,15 @@ const board = async (period) =>
   (await scalar("select (public.voice_leaderboard($1,$2,$3)).total_seconds", [555, period, T]));
 
 let b = await board("today");
-check("today = target only (55s)", b === 55, `got ${b}`);
+check("today = target only (77s)", b === 77, `got ${b}`);
 b = await board("yesterday");
-check("yesterday = target-1 only (44s)", b === 44, `got ${b}`);
+check("yesterday = target-1 only (66s)", b === 66, `got ${b}`);
 b = await board("week");
-check("week = target-7..target inclusive (33+44+55=132; Oct 1 boundary in, Sep 30 out)", b === 132, `got ${b}`);
+check("week = Monday Oct 5 through target (55+66+77=198)", b === 198, `got ${b}`);
 b = await board("month");
-check("month = target-30..target inclusive (22+33+44+55=154; Sep 8 boundary in, Sep 7 out)", b === 154, `got ${b}`);
+check("month = Oct 1 through target (33+44+55+66+77=275)", b === 275, `got ${b}`);
 b = await board("all_time");
-check("all_time = 11+22+33+44+55+66=231", b === 231, `got ${b}`);
+check("all_time includes every row (396s)", b === 396, `got ${b}`);
 check("unknown period returns no rows",
   (await scalar("select count(*) from public.voice_leaderboard($1,$2,$3)", [555, "bogus", T])) === 0);
 
@@ -240,17 +279,17 @@ check("ranking ordered by seconds desc, user_id asc",
 
 // User breakdown mirrors the same windows.
 const bd = (await q("select * from public.voice_user_breakdown($1,$2,$3)", [555, 501, T]))[0];
-check("breakdown today", Number(bd.today_seconds) === 55, JSON.stringify(bd));
-check("breakdown yesterday", Number(bd.yesterday_seconds) === 44);
-check("breakdown week", Number(bd.week_seconds) === 132);
-check("breakdown month", Number(bd.month_seconds) === 154);
-check("breakdown all_time", Number(bd.all_time_seconds) === 231);
+check("breakdown today", Number(bd.today_seconds) === 77, JSON.stringify(bd));
+check("breakdown yesterday", Number(bd.yesterday_seconds) === 66);
+check("breakdown week", Number(bd.week_seconds) === 198);
+check("breakdown month", Number(bd.month_seconds) === 275);
+check("breakdown all_time", Number(bd.all_time_seconds) === 396);
 const bdNone = (await q("select * from public.voice_user_breakdown($1,$2,$3)", [555, 999999, T]))[0];
 check("breakdown of unknown user is all zeros",
   Number(bdNone.today_seconds) === 0 && Number(bdNone.all_time_seconds) === 0);
 
 check("daily server total",
-  (await scalar("select public.voice_daily_server_total($1,$2)", [555, T])) === 110);
+  (await scalar("select public.voice_daily_server_total($1,$2)", [555, T])) === 132);
 const recs = await q("select * from public.voice_daily_records($1)", [T]);
 check("daily records exclude zero rows", recs.length === 2, JSON.stringify(recs));
 

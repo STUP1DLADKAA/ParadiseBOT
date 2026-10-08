@@ -331,10 +331,20 @@ class Assistant(commands.Cog):
         except (ParadiseError, asyncio.TimeoutError):
             # Live data could not be retrieved — say so; never guess it.
             return "🌦️ I couldn't retrieve live weather right now.", []
+        details = []
+        if data.humidity is not None:
+            details.append(f"humidity {data.humidity}%")
+        if data.wind_speed_kmh is not None:
+            wind = f"wind {data.wind_speed_kmh:.0f} km/h"
+            if data.wind_direction:
+                wind += f" {data.wind_direction}"
+            details.append(wind)
+        temperature = f"{data.temp_c:.0f}°C" if data.temp_c is not None else "temperature unavailable"
+        suffix = " · " + " · ".join(details) if details else ""
+        icon = f"{data.condition_emoji} " if data.condition_emoji else ""
         return (
-            f"{data.condition_emoji} **{data.location.name}** — "
-            f"{data.temp_c:.0f}°C, {data.condition.lower()} · "
-            f"humidity {data.humidity}% · wind {data.wind_speed_kmh:.0f} km/h",
+            f"{icon}**{data.location.name}** — "
+            f"{temperature}, {data.condition.lower()}{suffix}",
             [],
         )
 
@@ -582,8 +592,8 @@ class Assistant(commands.Cog):
                 file=discord.File(io.BytesIO(image), filename="weather.png"),
                 mention_author=False,
             )
-        except Exception:  # noqa: BLE001 - card art is optional
-            log.debug("Weather card render failed, using embed", exc_info=True)
+        except Exception:  # noqa: BLE001 - the data still has a text fallback
+            log.warning("Weather card rendering or delivery failed; using textual weather fallback", exc_info=True)
             await self._quiet_reply(message, embed=build_weather_embed(data))
         return True
 

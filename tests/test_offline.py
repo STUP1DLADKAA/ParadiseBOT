@@ -15,6 +15,7 @@ import os
 import sys
 import unittest
 from collections import Counter
+from datetime import datetime
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -32,11 +33,11 @@ from functions import presence as presence_module  # noqa: E402
 from functions.ai import AIService  # noqa: E402
 from functions.helpers import parse_options, sanitize_untrusted, shorten  # noqa: E402
 from functions.personality import PATTERNS, Personality  # noqa: E402
-from functions.presence import NOTES, ROTATE_SECONDS, WATCHING, PresenceManager  # noqa: E402
+from functions.presence import IST, NOTES, ROTATE_SECONDS, PresenceManager  # noqa: E402
 
 EXPECTED_COMMANDS = {
     "ping", "coinflip", "choose",
-    "remind", "poll", "afk", "translate", "settimezone", "vc", "recipe",
+    "remind", "poll", "afk", "translate", "settimezone", "vc", "minigames", "recipe",
     "summarize", "help",
 }
 
@@ -376,12 +377,26 @@ class TestPresence(unittest.TestCase):
     def test_rotation_interval_is_twenty_minutes(self):
         self.assertEqual(ROTATE_SECONDS, 20 * 60)
 
-    def test_activity_is_always_watching_paradise(self):
-        self.assertEqual(WATCHING, "Paradise")
-        activity = PresenceManager.build_activity("Still here.")
-        self.assertEqual(activity.type, discord.ActivityType.watching)
-        self.assertEqual(activity.name, "Paradise")
-        self.assertEqual(activity.state, "Still here.")
+    def test_game_priority_and_ist_overnight_status(self):
+        manager = PresenceManager(SimpleNamespace())
+        day = datetime(2026, 10, 8, 12, 0, tzinfo=IST)
+        night = datetime(2026, 10, 8, 22, 0, tzinfo=IST)
+        self.assertEqual(manager.desired_status(day), discord.Status.online)
+        self.assertEqual(manager.desired_status(night), discord.Status.idle)
+        manager._game_active = True
+        self.assertEqual(manager.desired_status(day), discord.Status.dnd)
+        self.assertEqual(manager.desired_status(night), discord.Status.dnd)
+
+    def test_overnight_boundaries_are_08_and_20_ist(self):
+        manager = PresenceManager(SimpleNamespace())
+        for hour, minute, expected in (
+            (7, 59, discord.Status.idle),
+            (8, 0, discord.Status.online),
+            (19, 59, discord.Status.online),
+            (20, 0, discord.Status.idle),
+        ):
+            moment = datetime(2026, 10, 8, hour, minute, tzinfo=IST)
+            self.assertEqual(manager.desired_status(moment), expected)
 
     def test_no_back_to_back_repeats(self):
         manager = PresenceManager(SimpleNamespace())
@@ -409,18 +424,25 @@ class TestPresence(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_apply_current_reasserts_without_advancing(self):
+    def test_presence_has_no_activity_and_reconnect_restores_priority(self):
         async def run():
-            bot = SimpleNamespace(change_presence=AsyncMock())
-            manager = PresenceManager(bot)
-            await manager.apply_current()  # nothing yet — must be a no-op
-            bot.change_presence.assert_not_called()
-            manager._current_note = "Still here."
-            await manager.apply_current()
-            bot.change_presence.assert_called_once()
-            activity = bot.change_presence.call_args.kwargs["activity"]
-            self.assertEqual(activity.name, "Paradise")
-            self.assertEqual(activity.state, "Still here.")
+            moment = datetime(2026, 10, 8, 22, 0, tzinfo=IST)
+            bot = SimpleNamespace(
+                change_presence=AsyncMock(),
+                is_ready=lambda: True,
+            )
+            manager = PresenceManager(bot, clock=lambda: moment)
+            await manager.set_game_active(True)
+            self.assertEqual(bot.change_presence.call_args.kwargs["status"], discord.Status.dnd)
+            self.assertIsNone(bot.change_presence.call_args.kwargs["activity"])
+
+            await manager.apply_current(force=True)  # on_ready/reconnect reapplies DND
+            self.assertEqual(bot.change_presence.call_args.kwargs["status"], discord.Status.dnd)
+            self.assertIsNone(bot.change_presence.call_args.kwargs["activity"])
+
+            await manager.set_game_active(False)  # game end restores the overnight status
+            self.assertEqual(bot.change_presence.call_args.kwargs["status"], discord.Status.idle)
+            self.assertIsNone(bot.change_presence.call_args.kwargs["activity"])
 
         asyncio.run(run())
 

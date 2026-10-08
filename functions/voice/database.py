@@ -25,6 +25,8 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
 
+from .time_windows import IST, split_session_by_ist_midnight
+
 from .models import (
     DailyUserStat,
     LeaderboardEntry,
@@ -458,8 +460,16 @@ class VoiceDatabase:
         """
         Get ranked members for a given period: 'today', 'yesterday', 'week', 'month', 'all_time'.
         """
-        now = datetime.now(timezone.utc)
-        today_date = target_date or now.date()
+        today_date = target_date or datetime.now(IST).date()
+        week_start = today_date - timedelta(days=today_date.weekday())
+        week_end = min(week_start + timedelta(days=7), today_date + timedelta(days=1))
+        month_start = today_date.replace(day=1)
+        month_end = min(
+            date(month_start.year + 1, 1, 1)
+            if month_start.month == 12
+            else date(month_start.year, month_start.month + 1, 1),
+            today_date + timedelta(days=1),
+        )
 
         with self._get_connection() as conn:
             if period == "today":
@@ -485,30 +495,28 @@ class VoiceDatabase:
                     (guild_id, yest_str),
                 )
             elif period == "week":
-                start_str = (today_date - timedelta(days=7)).isoformat()
                 cur = conn.execute(
                     """
                     SELECT user_id, SUM(duration_seconds) as total_seconds
                     FROM voice_daily_stats
-                    WHERE guild_id = ? AND date >= ? AND date <= ?
+                    WHERE guild_id = ? AND date >= ? AND date < ?
                     GROUP BY user_id
                     HAVING total_seconds > 0
                     ORDER BY total_seconds DESC, user_id ASC
                     """,
-                    (guild_id, start_str, today_date.isoformat()),
+                    (guild_id, week_start.isoformat(), week_end.isoformat()),
                 )
             elif period == "month":
-                start_str = (today_date - timedelta(days=30)).isoformat()
                 cur = conn.execute(
                     """
                     SELECT user_id, SUM(duration_seconds) as total_seconds
                     FROM voice_daily_stats
-                    WHERE guild_id = ? AND date >= ? AND date <= ?
+                    WHERE guild_id = ? AND date >= ? AND date < ?
                     GROUP BY user_id
                     HAVING total_seconds > 0
                     ORDER BY total_seconds DESC, user_id ASC
                     """,
-                    (guild_id, start_str, today_date.isoformat()),
+                    (guild_id, month_start.isoformat(), month_end.isoformat()),
                 )
             elif period == "all_time":
                 cur = conn.execute(
@@ -544,12 +552,22 @@ class VoiceDatabase:
         target_date: date | None = None,
     ) -> dict[str, int]:
         """Return user's voice time across today, yesterday, week, month, and all-time."""
-        now = datetime.now(timezone.utc)
-        today_date = target_date or now.date()
+        today_date = target_date or datetime.now(IST).date()
         today_str = today_date.isoformat()
         yest_str = (today_date - timedelta(days=1)).isoformat()
-        week_start_str = (today_date - timedelta(days=7)).isoformat()
-        month_start_str = (today_date - timedelta(days=30)).isoformat()
+        week_start_str = (today_date - timedelta(days=today_date.weekday())).isoformat()
+        week_end_str = min(
+            today_date - timedelta(days=today_date.weekday()) + timedelta(days=7),
+            today_date + timedelta(days=1),
+        ).isoformat()
+        month_start = today_date.replace(day=1)
+        month_start_str = month_start.isoformat()
+        month_end_str = min(
+            date(month_start.year + 1, 1, 1)
+            if month_start.month == 12
+            else date(month_start.year, month_start.month + 1, 1),
+            today_date + timedelta(days=1),
+        ).isoformat()
 
         with self._get_connection() as conn:
             # Single aggregated query
@@ -558,8 +576,8 @@ class VoiceDatabase:
                 SELECT
                     COALESCE(SUM(CASE WHEN date = ? THEN duration_seconds ELSE 0 END), 0) as today_sec,
                     COALESCE(SUM(CASE WHEN date = ? THEN duration_seconds ELSE 0 END), 0) as yest_sec,
-                    COALESCE(SUM(CASE WHEN date >= ? AND date <= ? THEN duration_seconds ELSE 0 END), 0) as week_sec,
-                    COALESCE(SUM(CASE WHEN date >= ? AND date <= ? THEN duration_seconds ELSE 0 END), 0) as month_sec,
+                    COALESCE(SUM(CASE WHEN date >= ? AND date < ? THEN duration_seconds ELSE 0 END), 0) as week_sec,
+                    COALESCE(SUM(CASE WHEN date >= ? AND date < ? THEN duration_seconds ELSE 0 END), 0) as month_sec,
                     COALESCE(SUM(duration_seconds), 0) as all_time_sec
                 FROM voice_daily_stats
                 WHERE guild_id = ? AND user_id = ?
@@ -568,9 +586,9 @@ class VoiceDatabase:
                     today_str,
                     yest_str,
                     week_start_str,
-                    today_str,
+                    week_end_str,
                     month_start_str,
-                    today_str,
+                    month_end_str,
                     guild_id,
                     user_id,
                 ),
@@ -926,38 +944,5 @@ class VoiceDatabase:
 def split_session_by_midnight(
     started_at: datetime, ended_at: datetime
 ) -> dict[str, int]:
-    """
-    Split a session between started_at and ended_at across midnight boundaries (UTC).
-    
-    Example:
-        23:50 -> 00:20 gives:
-        - Day 1: 10m (600s)
-        - Day 2: 20m (1200s)
-    """
-    if started_at.tzinfo is None:
-        started_at = started_at.replace(tzinfo=timezone.utc)
-    if ended_at.tzinfo is None:
-        ended_at = ended_at.replace(tzinfo=timezone.utc)
-
-    if ended_at <= started_at:
-        return {}
-
-    splits: dict[str, int] = {}
-    current_start = started_at
-
-    while current_start < ended_at:
-        # Date string for current_start
-        date_str = current_start.date().isoformat()
-        # Next midnight UTC
-        next_day = current_start.date() + timedelta(days=1)
-        next_midnight = datetime(
-            next_day.year, next_day.month, next_day.day, 0, 0, 0, tzinfo=timezone.utc
-        )
-
-        current_end = min(ended_at, next_midnight)
-        seconds = int((current_end - current_start).total_seconds())
-
-        splits[date_str] = splits.get(date_str, 0) + seconds
-        current_start = current_end
-
-    return splits
+    """Split a voice session across calendar midnights in Asia/Kolkata."""
+    return split_session_by_ist_midnight(started_at, ended_at)

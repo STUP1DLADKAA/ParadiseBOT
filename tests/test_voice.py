@@ -46,23 +46,24 @@ class TestVoiceDatabaseAndMidnightSplitting(unittest.TestCase):
         self.assertEqual(splits["2026-09-30"], 5400)
 
     def test_midnight_splitting_spanning_midnight(self):
-        t_start = datetime(2026, 9, 30, 23, 50, 0, tzinfo=timezone.utc)
-        t_end = datetime(2026, 10, 1, 0, 20, 0, tzinfo=timezone.utc)
+        # These instants straddle midnight in IST (not in UTC).
+        t_start = datetime(2026, 10, 1, 18, 20, 0, tzinfo=timezone.utc)
+        t_end = datetime(2026, 10, 1, 18, 50, 0, tzinfo=timezone.utc)
 
         splits = split_session_by_midnight(t_start, t_end)
         self.assertEqual(len(splits), 2)
-        self.assertEqual(splits["2026-09-30"], 600)   # 10 minutes
-        self.assertEqual(splits["2026-10-01"], 1200)  # 20 minutes
+        self.assertEqual(splits["2026-10-01"], 600)   # 10 minutes before IST midnight
+        self.assertEqual(splits["2026-10-02"], 1200)  # 20 minutes after IST midnight
 
     def test_midnight_splitting_multiday(self):
-        t_start = datetime(2026, 9, 29, 23, 0, 0, tzinfo=timezone.utc)
-        t_end = datetime(2026, 10, 1, 2, 0, 0, tzinfo=timezone.utc)
+        t_start = datetime(2026, 9, 29, 17, 0, 0, tzinfo=timezone.utc)  # 22:30 IST
+        t_end = datetime(2026, 9, 30, 20, 0, 0, tzinfo=timezone.utc)   # Oct 1, 01:30 IST
 
         splits = split_session_by_midnight(t_start, t_end)
         self.assertEqual(len(splits), 3)
-        self.assertEqual(splits["2026-09-29"], 3600)   # 1 hour
+        self.assertEqual(splits["2026-09-29"], 5400)   # 1.5 hours
         self.assertEqual(splits["2026-09-30"], 86400)  # 24 hours
-        self.assertEqual(splits["2026-10-01"], 7200)   # 2 hours
+        self.assertEqual(splits["2026-10-01"], 5400)   # 1.5 hours
 
     def test_user_settings_timezone_and_dm(self):
         user_id = 111222333
@@ -80,13 +81,13 @@ class TestVoiceDatabaseAndMidnightSplitting(unittest.TestCase):
         user_1 = 101
         user_2 = 102
 
-        # User 1: 23:50 on 2026-09-30 to 00:20 on 2026-10-01
+        # User 1: 23:50–00:20 IST across Oct 1/Oct 2.
         self.db.record_completed_session(
             guild_id=guild_id,
             user_id=user_1,
             channel_id=555,
-            started_at=datetime(2026, 9, 30, 23, 50, 0, tzinfo=timezone.utc),
-            ended_at=datetime(2026, 10, 1, 0, 20, 0, tzinfo=timezone.utc),
+            started_at=datetime(2026, 10, 1, 18, 20, 0, tzinfo=timezone.utc),
+            ended_at=datetime(2026, 10, 1, 18, 50, 0, tzinfo=timezone.utc),
         )
 
         # User 2: 14:00 to 16:00 on 2026-09-30 (7200s)
@@ -98,24 +99,20 @@ class TestVoiceDatabaseAndMidnightSplitting(unittest.TestCase):
             ended_at=datetime(2026, 9, 30, 16, 0, 0, tzinfo=timezone.utc),
         )
 
-        # Check leaderboard for 2026-09-30
+        # Check the untouched Sep 30 record and both sides of the IST split.
         sep_30 = date(2026, 9, 30)
         board_30 = self.db.get_leaderboard_data(guild_id, "today", target_date=sep_30)
-        self.assertEqual(len(board_30), 2)
-        self.assertEqual(board_30[0].user_id, user_2)
-        self.assertEqual(board_30[0].total_seconds, 7200)
-        self.assertEqual(board_30[1].user_id, user_1)
-        self.assertEqual(board_30[1].total_seconds, 600)
+        self.assertEqual([(entry.user_id, entry.total_seconds) for entry in board_30], [(user_2, 7200)])
 
-        # Check leaderboard for 2026-10-01
         oct_01 = date(2026, 10, 1)
         board_01 = self.db.get_leaderboard_data(guild_id, "today", target_date=oct_01)
-        self.assertEqual(len(board_01), 1)
-        self.assertEqual(board_01[0].user_id, user_1)
-        self.assertEqual(board_01[0].total_seconds, 1200)
+        self.assertEqual([(entry.user_id, entry.total_seconds) for entry in board_01], [(user_1, 600)])
+        oct_02 = date(2026, 10, 2)
+        board_02 = self.db.get_leaderboard_data(guild_id, "today", target_date=oct_02)
+        self.assertEqual([(entry.user_id, entry.total_seconds) for entry in board_02], [(user_1, 1200)])
 
         # User breakdown
-        breakdown_u1 = self.db.get_user_breakdown(guild_id, user_1, target_date=oct_01)
+        breakdown_u1 = self.db.get_user_breakdown(guild_id, user_1, target_date=oct_02)
         self.assertEqual(breakdown_u1["today"], 1200)
         self.assertEqual(breakdown_u1["yesterday"], 600)
         self.assertEqual(breakdown_u1["all_time"], 1800)
@@ -420,6 +417,32 @@ class TestVoiceTracker(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(board2[0].display_name, "Alex")
         mock_guild.fetch_member.assert_awaited_once_with(user_id)  # still once
+
+    async def test_dispatch_daily_dm_reports_includes_live_time_on_ist_day_boundary(self):
+        guild_id, user_id = 555, 999
+        now = datetime(2026, 10, 1, 18, 40, tzinfo=timezone.utc)  # Oct 2, 00:10 IST
+        self.tracker._clock = lambda: now
+        self.tracker.active_sessions[(guild_id, user_id)] = ActiveVoiceSession(
+            guild_id=guild_id,
+            user_id=user_id,
+            channel_id=111,
+            started_at=datetime(2026, 10, 1, 18, 20, tzinfo=timezone.utc),  # Oct 1, 23:50 IST
+        )
+        mock_guild = MagicMock()
+        mock_guild.id = guild_id
+        mock_guild.name = "Paradise Server"
+        self.mock_bot.get_guild.return_value = mock_guild
+        mock_user = MagicMock()
+        mock_user.id = user_id
+        mock_user.name = "Alex"
+        mock_user.send = AsyncMock()
+        self.mock_bot.get_user.return_value = mock_user
+
+        await self.tracker.dispatch_daily_dm_reports("2026-10-01")
+
+        mock_user.send.assert_awaited_once()
+        self.assertIn("Voice time: 10m", mock_user.send.call_args.args[0])
+        self.assertTrue(self.db.has_dm_report_sent("2026-10-01", guild_id, user_id))
 
     async def test_dispatch_daily_dm_reports(self):
         guild_id = 555

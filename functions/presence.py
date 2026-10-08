@@ -1,8 +1,9 @@
-"""Paradise's presence: always «👀 Watching Paradise», with a rotating note.
+"""Central Discord presence state and local profile-note rotation.
 
-The activity itself never changes — only the small status note attached to
-it (the activity's ``state`` line, visible on the profile) rotates every
-20 minutes, never repeating back-to-back.
+Discord's public bot API does not expose ordinary account profile-note edits.
+The note pool is retained and rotated in memory, but it is never published as
+an activity or misrepresented as an account note. Presence itself is managed
+only here; no activity payload is ever sent.
 """
 
 from __future__ import annotations
@@ -10,17 +11,30 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+from collections import deque
+from datetime import datetime, time, timedelta, timezone
+from typing import Callable
+from zoneinfo import ZoneInfo
 
 import discord
 
 log = logging.getLogger(__name__)
-
-# The one and only activity. Do not rotate this.
-WATCHING = "Paradise"
-# How often the note rotates.
+IST = ZoneInfo("Asia/Kolkata")
 ROTATE_SECONDS = 20 * 60
+OVERNIGHT_START = time(20, 0)
+DAY_START = time(8, 0)
 
 NOTES = (
+    "probably doing something questionable",
+    "paradise has excellent wifi in my imagination",
+    "currently observing the chaos",
+    "no thoughts, just paradise",
+    "professional overthinker",
+    "this server is a social experiment",
+    "emotionally attached to the loading screen",
+    "someone here owes me an explanation",
+    "paradise lore continues",
+    "the council is probably asleep",
     "Probably doing something.",
     "Paradise is watching 👀",
     "Someone definitely broke something.",
@@ -118,72 +132,123 @@ NOTES = (
 )
 
 
+
 class PresenceManager:
-    """Owns the single presence loop.
+    """Owns status priority, IST boundary changes, and note generation."""
 
-    ``start`` is idempotent — calling it twice never creates a second timer —
-    and ``apply_current`` re-asserts the current presence after reconnects so
-    the activity survives restarts without advancing the rotation.
-    """
-
-    def __init__(self, bot: discord.Client) -> None:
+    def __init__(
+        self,
+        bot: discord.Client,
+        *,
+        clock: Callable[[], datetime] | None = None,
+    ) -> None:
         self.bot = bot
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._task: asyncio.Task[None] | None = None
-        self._last_note: str | None = None
-        self._current_note: str | None = None
         self._lock = asyncio.Lock()
-
-    # -- lifecycle ---------------------------------------------------------
-
-    def start(self) -> None:
-        if self._task is not None and not self._task.done():
-            return  # never run two rotation timers
-        self._task = asyncio.create_task(self._loop(), name="paradise-presence")
-
-    async def stop(self) -> None:
-        if self._task is None:
-            return
-        self._task.cancel()
-        await asyncio.gather(self._task, return_exceptions=True)
-        self._task = None
-
-    # -- rotation ------------------------------------------------------------
-
-    def pick_note(self) -> str:
-        """A random note, never the same one twice in a row."""
-        choices = [note for note in NOTES if note != self._last_note]
-        note = random.choice(choices)
-        self._last_note = note
-        return note
+        self._wake = asyncio.Event()
+        self._game_active = False
+        self._last_status: discord.Status | None = None
+        self._recent_notes: deque[str] = deque(maxlen=8)
+        self._current_note: str | None = None
+        self._last_note_at: datetime | None = None
 
     @staticmethod
-    def build_activity(note: str) -> discord.Activity:
-        # The activity is always "Watching Paradise"; the note rides along as
-        # the activity's state line and is the only thing that rotates.
-        return discord.Activity(
-            type=discord.ActivityType.watching, name=WATCHING, state=note
-        )
+    def _aware(value: datetime) -> datetime:
+        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
 
-    async def apply_current(self) -> None:
-        """Re-assert the current presence (used after reconnects)."""
-        if self._current_note is not None:
-            await self._set(self.build_activity(self._current_note))
+    @classmethod
+    def _next_status_boundary(cls, now: datetime) -> datetime:
+        local = cls._aware(now).astimezone(IST)
+        if local.timetz().replace(tzinfo=None) < DAY_START:
+            boundary_day, boundary_time = local.date(), DAY_START
+        elif local.timetz().replace(tzinfo=None) < OVERNIGHT_START:
+            boundary_day, boundary_time = local.date(), OVERNIGHT_START
+        else:
+            boundary_day, boundary_time = local.date() + timedelta(days=1), DAY_START
+        return datetime.combine(boundary_day, boundary_time, tzinfo=IST)
 
-    async def _set(self, activity: discord.BaseActivity) -> None:
+    @classmethod
+    def is_overnight(cls, now: datetime | None = None) -> bool:
+        local = cls._aware(now or datetime.now(timezone.utc)).astimezone(IST)
+        return local.hour >= 20 or local.hour < 8
+
+    def desired_status(self, now: datetime | None = None) -> discord.Status:
+        if self._game_active:
+            return discord.Status.dnd
+        return discord.Status.idle if self.is_overnight(now or self._clock()) else discord.Status.online
+
+    def pick_note(self) -> str:
+        """Select a playful note, avoiding the most recent eight selections."""
+        choices = [note for note in NOTES if note not in self._recent_notes]
+        if not choices:
+            self._recent_notes.clear()
+            choices = list(NOTES)
+        note = random.choice(choices)
+        self._recent_notes.append(note)
+        return note
+
+    def start(self) -> None:
+        """Start one boundary/note task. Repeated calls are harmless."""
+        if self._task is None or self._task.done():
+            self._task = asyncio.create_task(self._loop(), name="paradise-presence")
+
+    async def stop(self) -> None:
+        task, self._task = self._task, None
+        if task is not None:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    async def set_game_active(self, active: bool) -> None:
+        """Set or clear mini-game priority and recalculate immediately."""
+        changed = self._game_active != bool(active)
+        self._game_active = bool(active)
+        self._wake.set()
+        is_ready = getattr(self.bot, "is_ready", None)
+        if changed and (is_ready is None or is_ready()):
+            await self.apply_current()
+
+    async def apply_current(self, *, force: bool = False) -> None:
+        """Apply the current status, including after a Discord reconnect."""
+        desired = self.desired_status()
+        if not force and desired == self._last_status:
+            return
         async with self._lock:
+            # Re-check under the lock so two callers cannot publish stale state.
+            desired = self.desired_status()
+            if not force and desired == self._last_status:
+                return
             try:
                 await asyncio.wait_for(
-                    self.bot.change_presence(
-                        status=discord.Status.online, activity=activity
-                    ),
-                    timeout=15,
+                    self.bot.change_presence(status=desired, activity=None), timeout=15
                 )
             except (discord.DiscordException, asyncio.TimeoutError):
-                log.warning("Could not update presence", exc_info=True)
+                log.warning("Could not update Discord presence", exc_info=True)
+                return
+            self._last_status = desired
+            log.info("Presence changed to %s", desired.name.lower())
 
     async def _loop(self) -> None:
         await self.bot.wait_until_ready()
+        await self.apply_current(force=True)
+        self._current_note = self.pick_note()
+        self._last_note_at = self._aware(self._clock()).astimezone(timezone.utc)
+        log.debug("Generated profile note locally; Discord bot profile-note editing is unsupported")
+
         while not self.bot.is_closed():
-            self._current_note = self.pick_note()
-            await self._set(self.build_activity(self._current_note))
-            await asyncio.sleep(ROTATE_SECONDS)
+            now = self._aware(self._clock()).astimezone(timezone.utc)
+            next_boundary = self._next_status_boundary(now).astimezone(timezone.utc)
+            next_note = self._last_note_at + timedelta(seconds=ROTATE_SECONDS)
+            timeout = max(0.25, min((next_boundary - now).total_seconds(), (next_note - now).total_seconds()))
+            self._wake.clear()
+            try:
+                await asyncio.wait_for(self._wake.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+
+            now = self._aware(self._clock()).astimezone(timezone.utc)
+            if now >= next_note:
+                self._current_note = self.pick_note()
+                self._last_note_at = now
+                log.debug("Generated profile note locally; not published (Discord bot API limitation)")
+            await self.apply_current()

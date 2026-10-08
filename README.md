@@ -2,7 +2,7 @@
 
 A small private Discord bot for a friends-only server — part search engine, part utility toolbox, with an *optional* AI reasoning layer on top.
 
-Paradise answers when addressed, quietly watches the server, and every once in a while reacts to or comments on a message — rarely enough that it feels like an Easter egg. It is intentionally not a moderation suite, dashboard, music player, or AI wrapper.
+Paradise answers when addressed, quietly watches the server, and every once in a while reacts to or comments on a message — rarely enough that it feels like an Easter egg. Its presence is status-only (no activity payload); it is Online from 08:00–20:00 IST, Idle overnight, and Do Not Disturb while a mini-game is running. Discord's public bot API does not support editing an ordinary account profile note, so Paradise never claims to publish the locally rotated note pool. It is intentionally not a moderation suite, dashboard, music player, or AI wrapper.
 
 ## Tool-first, AI-last
 
@@ -53,8 +53,9 @@ Everything lives in `.env` (never committed). See `.env.example` for all options
 | Group | Variables | Notes |
 | --- | --- | --- |
 | Discord | `DISCORD_TOKEN` | required |
-| Voice | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | required for `/vc` — the Supabase project storing all voice data. Use the **secret (service_role) key**, apply `supabase/migrations/001_voice_activity.sql` once in the SQL Editor first (see `supabase/README.md`). Without these the bot runs fine but voice tracking is disabled |
-| Voice (optional) | `VOICE_HEARTBEAT_INTERVAL`, `VOICE_MIGRATION_BATCH_SIZE`, `VOICE_FLUSH_INTERVAL`, `VOICE_SUPABASE_TIMEOUT`, `VOICE_DB_PATH`, `VOICE_DM_REPORTS_ENABLED` | heartbeat cadence (15–30s, default 20), migration batch size, outage retry cadence, request timeout, local fallback/settings file (default: `data/paradise.db`), daily DM summaries |
+| Voice | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | required for `/vc` — use the **secret (service_role) key**. Apply migrations `001_voice_activity.sql` then `002_voice_ist_calendar.sql` in the SQL Editor (see `supabase/README.md`). Without these the bot runs fine but voice tracking is disabled |
+| Voice (optional) | `VOICE_HEARTBEAT_INTERVAL`, `VOICE_MIGRATION_BATCH_SIZE`, `VOICE_FLUSH_INTERVAL`, `VOICE_SUPABASE_TIMEOUT`, `VOICE_DB_PATH`, `VOICE_DM_REPORTS_ENABLED` | heartbeat cadence (15–30s, default 20), migration batch size, outage retry cadence, request timeout, shared local SQLite settings/outbox file (default: `data/paradise.db`), daily DM summaries |
+| Mini-games (optional) | `MINIGAMES_CHANNEL_ID` | override the announcement channel; blank uses the home server system channel or a sendable text channel. Requires no extra service or dependency |
 | Gemini (AI) | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_ENABLED`, `GEMINI_VALIDATE_ON_START`, `GEMINI_TIMEOUT` | the optional AI interpretation/reasoning layer. Key validated at startup, never logged/displayed, never required — every native tool works without it. Get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | AI fallback | `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | optional OpenAI-compatible endpoint (OpenAI, Groq, local Ollama), used when Gemini is not configured or unavailable |
 | Personality | `PERSONALITY_ENABLED`, `PERSONALITY_REACTION_CHANCE`, `PERSONALITY_REPLY_CHANCE`, `PERSONALITY_GLOBAL_COOLDOWN`, `PERSONALITY_CHANNEL_COOLDOWN`, `PERSONALITY_REPLY_CHANNEL_COOLDOWN` | tuning for the rare reactions/replies; defaults are deliberately conservative |
@@ -119,6 +120,10 @@ Ask for two things at once and both run concurrently, answered in one message:
 
 Mentioning Paradise with nothing else just gets a friendly cheat-sheet — no external API is called for an empty ping, and it never replies to itself or to other bots.
 
+## Weather cards
+
+`@Paradise weather in Delhi` keeps the existing Open-Meteo lookup, fuzzy city resolution, cache, location timezone, units, and provider-outage fallback, but now renders a native **1200×675 (16:9) landscape card** with current conditions, available measurements, and upcoming hours. Missing provider observations are omitted rather than rendered as zeroes; if image rendering fails, Paradise falls back to a readable text embed.
+
 ## Pictures: real web images, never AI-generated
 
 `@Paradise show me a picture of a red panda` **searches the web** and embeds the image it finds. Paradise does not generate pictures.
@@ -158,6 +163,7 @@ Mentions like `@Paradise 25% of 800` understand everyday math: percent (`25% of 
 - **Mention-only capabilities** (no slash command) — search, weather, unit and
   currency conversion, time/date, dictionary, image search, calculator
 - **Voice** — `/vc leaderboard` (rendered stats card or text list for Today, Yesterday, Week, Month, All-Time), `/vc stats`, `/vc dmreports`
+- **Community** — `/minigames` (automatic schedule, admin controls, and aggregate leaderboard)
 - **AI** — `/summarize`, or just mention Paradise (needs `GEMINI_API_KEY` or an OpenAI-compatible endpoint; everything else works regardless)
 - `/help` lists exactly what is registered — nothing more
 
@@ -167,9 +173,25 @@ Choices for `/choose` and `/poll` are separated with `|` or `,`:
 /choose options:pizza | burgers | something responsible
 ```
 
+## Automated mini-games
+
+Paradise runs a single per-server scheduler for **Quick Trivia**, **Word Scramble**, **Rapid Quiz**, and **Number Guess**. Players join from the registration message; games announce results in the same channel and add wins/points to an aggregate leaderboard. Create a `minigames` role in the configured guild and allow the bot to mention it; the bot resolves it by name and pings it once on the initial start message, never on edits or rounds. If the role is absent, a game still starts without a role ping.
+
+```text
+/minigames status
+/minigames auto enabled:false
+/minigames start game:Word Scramble
+/minigames configure registration_seconds:90 minimum_players:2 maximum_players:20 answer_seconds:30
+/minigames cancel
+/minigames reschedule delay_minutes:45
+/minigames leaderboard
+```
+
+The admin controls require **Manage Server**. The first automatic game is scheduled 30 minutes after initialization. A successful game schedules the next one 30 minutes after result cleanup; any unsuccessful ending (including cancellation, timeout, restart, or internal failure) uses 20 minutes unless an administrator explicitly reschedules it. Scheduler state and active-round snapshots are stored in additive tables in the existing `data/paradise.db` (or `VOICE_DB_PATH`); the SQLite file must be on persistent storage for restart recovery. Completed games retain only per-player aggregate statistics—not a per-game winner/result record or completed winner identity. No new database service, migration, currency, or dependency is introduced.
+
 ## Voice Activity & Statistics
 
-Paradise automatically tracks voice channel sessions with zero database spam and high resilience. Voice data lives in **Supabase PostgreSQL** (see [`supabase/README.md`](supabase/README.md) for the one-time setup); SQLite is only a fallback queue during outages:
+Paradise automatically tracks voice channel sessions with zero database spam and high resilience. Voice data lives in **Supabase PostgreSQL** (see [`supabase/README.md`](supabase/README.md) for setup and the additive IST cutover); SQLite is only a fallback queue during outages. Daily totals and all reporting windows use `Asia/Kolkata`:
 
 - **Supabase-Backed**: `/vc leaderboard`, `/vc stats` and the daily reports read straight from PostgreSQL — aggregations, sorting and midnight splitting happen in the database. Manual edits in the Supabase Dashboard show up on the next render (no cache).
 - **Session Tracking**: Tracks join, leave, channel move, and disconnects safely.
@@ -177,7 +199,7 @@ Paradise automatically tracks voice channel sessions with zero database spam and
 - **Outage-Safe**: If Supabase is unreachable, completed sessions queue in a bounded local outbox and flush in order when the connection returns — nothing is lost and nothing blocks.
 - **Automatic History Migration**: Existing SQLite voice history migrates itself to Supabase in verified, idempotent batches (verify-then-delete, never double-counting); user settings stay in SQLite.
 - **Real Names, Always**: Member names/avatars are remembered in the database and refreshed opportunistically, so the leaderboard renders real identities even after restarts, cold member caches, or members leaving voice (requires the **Server Members Intent**).
-- **Midnight Splitting**: Long sessions spanning across midnight are accurately split across days (e.g. 23:50 → 00:20 becomes 10m on Day 1, 20m on Day 2).
+- **IST Calendar Windows**: Long sessions split exactly at Asia/Kolkata midnight; Today/Yesterday use local calendar days, Week is ISO Monday-to-Monday, and Month is the calendar month. Active sessions are clipped to each selected window, and views recompute from the current date after restarts/boundaries. Existing historical session rows, aggregates, member identities, and lifetime totals are retained; migration 002 rebuckets only daily totals that reconcile exactly with session history and leaves ambiguous/manual aggregates untouched.
 - **Daily DM Reports**: Automatically sends each active member their own personal daily VC summary at day's end.
 - **Rendered Leaderboard Card**: Programmatic Pillow renderer producing Material Expressive statistics cards with podium highlights (#1 gold, #2 silver, #3 bronze), Discord avatars, time duration pills, and percentage shares.
 
@@ -212,6 +234,7 @@ commands/
   utility.py              remind, poll, afk, translate, settimezone — and the shared
                           search / weather / conversion engines used by the assistant
   vc.py                   /vc leaderboard, /vc stats, /vc dmreports, voice state listeners
+  minigames.py            /minigames scheduler, admin controls and aggregate leaderboard
   dictionary.py           chat triggers + mention lookups, card UI, buttons
   recipe.py               /recipe command + Components V2 recipe UI
   ai.py                   /summarize command
@@ -243,7 +266,7 @@ functions/
                           deterministic answer pipeline (direct answer, key points,
                           conflict/staleness warnings, source evidence)
   translate.py            shared key-less translation helper
-  weather/                Open-Meteo weather provider, fuzzy geocoding, forecast embed
+  weather/                Open-Meteo provider, fuzzy geocoding, 16:9 Pillow card + fallback
   conversion/             units conversion (9 categories), currency exchange rates, natural parser
   time/                   IANA timezone resolver, city maps, time formatting
   voice/                  voice activity tracker, Supabase persistence (with SQLite
@@ -251,7 +274,10 @@ functions/
                           splitting, daily DM reporter, Pillow leaderboard renderer
   helpers.py              shared errors, colours, parsing, formatting
   personality.py          rare contextual reactions and short replies
-  presence.py             fixed «Watching Paradise» activity + rotating note
+  presence.py             centralized status priority (game DND / IST overnight Idle / Online),
+                          no activities; rotating notes stay local due Discord API limits
+  minigames/              recoverable SQLite scheduler, lifecycle, four modular games,
+                          UI controls and aggregate-only leaderboard
   dictionary/             dictionary engine & card renderer
   recipes/                recipe engine & bundled recipe book
 assets/fonts/             bundled Inter subset for card renderers
@@ -287,4 +313,10 @@ pytest
 # or: python -m unittest discover -s tests -v
 ```
 
-All 590+ test cases run completely offline and validate every subsystem: startup command synchronisation for the home guild (removals, edits, idempotency, failure handling), request normalisation and tolerant routing for messy real-world phrasing, search (raw engine *and* the answer pipeline with conflict/staleness detection), the mention router and assistant dispatch, multi-tool combined requests, web image search (provider parsing over a fake transport, URL-safety rejection, probe bounding, caching and dedup), the stage-2 intent classifier, prompt-injection sanitizing, the shared TTL cache and single-flight collapsing, the calculator sandbox, the Gemini client and AI provider chain (key-masking, rejection/quota/fallback handling), weather, conversions, timezones, voice tracking (all five leaderboard periods, midnight session splitting, live elapsed time, restart/crash recovery, AFK exclusion, the outage outbox, the SQLite→Supabase migration's idempotency and failure safety), daily reports and image rendering.
+The suite runs offline without Discord credentials or real waits. It covers command sync and routing, weather/provider failure handling and 16:9 card rendering (including missing fields and long locations), centralized presence with no activity payloads and IST boundaries, mini-game scheduling/recovery/idempotent rewards without persisted winner identities, IST voice midnight/week/month boundaries and session clipping, plus the existing search, conversion, AI, dictionary, image, and database-outage behavior.
+
+The SQL migration harness uses PGlite (PostgreSQL-in-WASM) to validate both schema migrations, exact IST rebucketing/preservation, and calendar periods:
+
+```bash
+cd supabase && npm install --no-save --package-lock=false @electric-sql/pglite && node validate_locally.mjs
+```

@@ -13,12 +13,14 @@ import logging
 import time
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import discord
 
 from .models import (
     ActiveVoiceSession,
+    DailyUserStat,
+    LeaderboardEntry,
     LeaderboardMember,
     PersistedActiveSession,
     VoicePeriod,
@@ -26,6 +28,7 @@ from .models import (
     format_duration_diff,
 )
 from .store import VoiceStore, VoiceStoreError, VoiceStoreUnavailable
+from .time_windows import IST, ensure_aware, ist_date, next_ist_midnight, period_overlap_seconds
 
 log = logging.getLogger(__name__)
 
@@ -50,10 +53,12 @@ class VoiceTracker:
         *,
         reconcile_interval: float = 20.0,
         dm_reports_enabled: bool = True,
+        clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.bot = bot
         self.db = db
         self.dm_reports_enabled = dm_reports_enabled
+        self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.reconcile_interval = max(5.0, float(reconcile_interval))
         self.active_sessions: dict[tuple[int, int], ActiveVoiceSession] = {}
         self._profile_signatures: OrderedDict[
@@ -91,7 +96,7 @@ class VoiceTracker:
 
         # Flush and close all active sessions
         async with self._lock:
-            now = datetime.now(timezone.utc)
+            now = ensure_aware(self._clock()).astimezone(timezone.utc)
             for (guild_id, user_id), session in list(self.active_sessions.items()):
                 try:
                     if not session.is_afk:
@@ -121,7 +126,7 @@ class VoiceTracker:
         guild = member.guild
         guild_id = guild.id
         user_id = member.id
-        now = datetime.now(timezone.utc)
+        now = ensure_aware(self._clock()).astimezone(timezone.utc)
         key = (guild_id, user_id)
 
         await self._remember_member(member)
@@ -345,7 +350,7 @@ class VoiceTracker:
 
     async def reconcile_guilds(self) -> None:
         """Scan all guilds and voice channels to recover/synchronize active sessions."""
-        now = datetime.now(timezone.utc)
+        now = ensure_aware(self._clock()).astimezone(timezone.utc)
         current_connected_keys: set[tuple[int, int]] = set()
 
         async with self._lock:
@@ -533,20 +538,22 @@ class VoiceTracker:
         Fetch leaderboard for guild, merging live active session time seamlessly.
         """
         guild_id = guild.id
-        now = datetime.now(timezone.utc)
-        today_date = target_date or now.date()
+        now = ensure_aware(self._clock()).astimezone(timezone.utc)
+        today_date = target_date or now.astimezone(IST).date()
 
         # 1. Fetch base records from the authoritative database (Supabase).
         #    A manual Dashboard edit is reflected here immediately — no cache.
         db_entries = await self.db.get_leaderboard_data(guild_id, period.value, today_date)
         time_map: dict[int, int] = {e.user_id: e.total_seconds for e in db_entries}
 
-        # 2. Add ongoing active session elapsed time if applicable (for today, week, month, all_time)
-        if period in (VoicePeriod.TODAY, VoicePeriod.WEEK, VoicePeriod.MONTH, VoicePeriod.ALL_TIME):
-            for (g_id, u_id), session in self.active_sessions.items():
-                if g_id == guild_id and not session.is_afk:
-                    # Calculate active elapsed seconds for today
-                    elapsed = max(0, int((now - session.started_at).total_seconds()))
+        # 2. Clip active sessions to this exact IST window. This also handles
+        #    an active session that crossed a boundary before it was closed.
+        for (g_id, u_id), session in self.active_sessions.items():
+            if g_id == guild_id and not session.is_afk:
+                elapsed = period_overlap_seconds(
+                    session.started_at, now, period.value, today_date, now=now
+                )
+                if elapsed:
                     time_map[u_id] = time_map.get(u_id, 0) + elapsed
 
         # 3. Resolve identities for everyone on the board (cache -> HTTP -> DB)
@@ -662,18 +669,34 @@ class VoiceTracker:
     ) -> dict[str, Any]:
         """Fetch full user voice breakdown including current live session."""
         breakdown = await self.db.get_user_breakdown(guild.id, user_id, target_date)
-        now = datetime.now(timezone.utc)
+        now = ensure_aware(self._clock()).astimezone(timezone.utc)
+        today_date = target_date or now.astimezone(IST).date()
         key = (guild.id, user_id)
 
         active_session = self.active_sessions.get(key)
-        active_elapsed = 0
+        active_today = active_yesterday = active_week = active_month = active_all = 0
         if active_session and not active_session.is_afk:
-            active_elapsed = max(0, int((now - active_session.started_at).total_seconds()))
+            active_today = period_overlap_seconds(
+                active_session.started_at, now, "today", today_date, now=now
+            )
+            active_yesterday = period_overlap_seconds(
+                active_session.started_at, now, "yesterday", today_date, now=now
+            )
+            active_week = period_overlap_seconds(
+                active_session.started_at, now, "week", today_date, now=now
+            )
+            active_month = period_overlap_seconds(
+                active_session.started_at, now, "month", today_date, now=now
+            )
+            active_all = period_overlap_seconds(
+                active_session.started_at, now, "all_time", today_date, now=now
+            )
 
-        today_total = breakdown["today"] + active_elapsed
-        week_total = breakdown["week"] + active_elapsed
-        month_total = breakdown["month"] + active_elapsed
-        all_time_total = breakdown["all_time"] + active_elapsed
+        today_total = breakdown["today"] + active_today
+        yesterday_total = breakdown["yesterday"] + active_yesterday
+        week_total = breakdown["week"] + active_week
+        month_total = breakdown["month"] + active_month
+        all_time_total = breakdown["all_time"] + active_all
 
         # Rank for today (ids and seconds only — skip identity hydration)
         leaderboard_today = await self.get_live_leaderboard(
@@ -687,14 +710,14 @@ class VoiceTracker:
 
         return {
             "today_seconds": today_total,
-            "yesterday_seconds": breakdown["yesterday"],
+            "yesterday_seconds": yesterday_total,
             "week_seconds": week_total,
             "month_seconds": month_total,
             "all_time_seconds": all_time_total,
             "rank_today": user_rank,
             "is_active_now": active_session is not None,
             "active_channel_id": active_session.channel_id if active_session else None,
-            "active_session_elapsed": active_elapsed,
+            "active_session_elapsed": active_all,
         }
 
     # ------------------------------------------------------------------
@@ -702,51 +725,63 @@ class VoiceTracker:
     # ------------------------------------------------------------------
 
     async def _dm_report_loop(self) -> None:
-        """Checks every 60s if UTC date has changed and sends daily DM reports."""
+        """Dispatch completed-day reports on the IST calendar boundary.
+
+        The reports themselves are idempotent in storage, so after an offline
+        boundary the loop catches up from the previous IST day on restart.
+        """
+        wait_until_ready = getattr(self.bot, "wait_until_ready", None)
+        if callable(wait_until_ready):
+            await wait_until_ready()
+        # Give the Ready handler time to reconcile restored active sessions
+        # before a catch-up report reads daily aggregates.
         await asyncio.sleep(10)
         last_completed_date: date | None = None
 
         while not self._stopped:
+            now_utc = ensure_aware(self._clock()).astimezone(timezone.utc)
+            today_ist = now_utc.astimezone(IST).date()
             try:
-                now_utc = datetime.now(timezone.utc)
-                today_utc = now_utc.date()
-
                 if not self.dm_reports_enabled:
-                    last_completed_date = today_utc
-                    await asyncio.sleep(60)
-                    continue
+                    last_completed_date = today_ist
+                else:
+                    # On startup, retry the last fully closed IST day. Durable
+                    # per-user sent marks prevent a duplicate report after a
+                    # restart immediately before or after midnight.
+                    if last_completed_date is None:
+                        last_completed_date = today_ist - timedelta(days=1)
 
-                if last_completed_date is None:
-                    # First boot: never send reports for days we never observed.
-                    last_completed_date = today_utc
-
-                # If the UTC date rolled over, dispatch reports for the day
-                # that just ended. A partly failed dispatch (Supabase hiccup)
-                # is retried every minute until complete or too old.
-                if today_utc > last_completed_date:
-                    target = last_completed_date
-                    log.info(
-                        "Triggering Daily DM Voice Reports for date %s",
-                        target.isoformat(),
-                    )
-                    blocked = await self.dispatch_daily_dm_reports(target.isoformat())
-                    if blocked <= 0:
-                        last_completed_date = today_utc
-                    elif (today_utc - target).days >= DM_REPORT_RETRY_DAYS:
-                        log.error(
-                            "Giving up on daily DM reports for %s after %s days "
-                            "of retries; the data remains in Supabase.",
+                    while last_completed_date < today_ist:
+                        target = last_completed_date
+                        log.info(
+                            "Triggering daily IST voice reports for %s",
                             target.isoformat(),
-                            DM_REPORT_RETRY_DAYS,
                         )
-                        last_completed_date = today_utc
-
+                        blocked = await self.dispatch_daily_dm_reports(target.isoformat())
+                        if blocked <= 0:
+                            last_completed_date = target + timedelta(days=1)
+                            continue
+                        if (today_ist - target).days >= DM_REPORT_RETRY_DAYS:
+                            log.error(
+                                "Giving up on daily voice reports for %s after %s days "
+                                "of retries; the data remains in Supabase.",
+                                target.isoformat(),
+                                DM_REPORT_RETRY_DAYS,
+                            )
+                            last_completed_date = target + timedelta(days=1)
+                            continue
+                        break
             except asyncio.CancelledError:
                 break
-            except Exception as err:
-                log.error("Error in daily DM report loop: %s", err)
+            except Exception:
+                log.exception("Error in daily IST voice report loop")
 
-            await asyncio.sleep(60)
+            # No reporting reset depends on this wake-up: database queries
+            # derive the current period from the actual IST date on every read.
+            until_midnight = max(
+                1.0, (next_ist_midnight(now_utc) - now_utc).total_seconds()
+            )
+            await asyncio.sleep(min(60.0, until_midnight))
 
     async def dispatch_daily_dm_reports(self, target_date_str: str) -> int:
         """Deliver personalized daily VC reports for target_date_str.
@@ -770,22 +805,87 @@ class VoiceTracker:
             log.warning("Daily DM reports postponed (database unreachable): %s", err)
             return 1
 
+        # A voice session that is still open has not yet been committed to a
+        # daily aggregate. Clip it to each requested IST day so the midnight
+        # report includes live time without prematurely closing the session.
+        now = ensure_aware(self._clock()).astimezone(timezone.utc)
+        live_today: dict[tuple[int, int], int] = {}
+        live_day_before: dict[tuple[int, int], int] = {}
+        for (guild_id, user_id), session in self.active_sessions.items():
+            if session.is_afk:
+                continue
+            today_seconds = period_overlap_seconds(
+                session.started_at, now, "today", target_date, now=now
+            )
+            if today_seconds:
+                live_today[(guild_id, user_id)] = today_seconds
+            previous_seconds = period_overlap_seconds(
+                session.started_at, now, "today", day_before, now=now
+            )
+            if previous_seconds:
+                live_day_before[(guild_id, user_id)] = previous_seconds
+
+        # Merge only in memory: historical rows and lifetime totals remain
+        # untouched until the existing normal session-close path persists them.
+        stats_by_key = {
+            (stat.guild_id, stat.user_id): DailyUserStat(
+                guild_id=stat.guild_id,
+                user_id=stat.user_id,
+                date_str=stat.date_str,
+                duration_seconds=stat.duration_seconds,
+            )
+            for stat in stats_list
+        }
+        for (guild_id, user_id), seconds in live_today.items():
+            key = (guild_id, user_id)
+            if key in stats_by_key:
+                stats_by_key[key].duration_seconds += seconds
+            else:
+                stats_by_key[key] = DailyUserStat(
+                    guild_id=guild_id,
+                    user_id=user_id,
+                    date_str=target_date_str,
+                    duration_seconds=seconds,
+                )
+        stats_list = list(stats_by_key.values())
+
         # One leaderboard/total fetch per guild instead of per user.
         guild_ids = {s.guild_id for s in stats_list}
         blocked_guilds: set[int] = set()
         board_cache: dict[int, list] = {}
         prev_board_cache: dict[int, list] = {}
         total_cache: dict[int, int] = {}
+
+        def with_live_time(guild_id: int, rows: list, live: dict[tuple[int, int], int]) -> list[LeaderboardEntry]:
+            totals = {int(row.user_id): int(row.total_seconds) for row in rows}
+            for (live_guild_id, user_id), seconds in live.items():
+                if live_guild_id == guild_id:
+                    totals[user_id] = totals.get(user_id, 0) + seconds
+            ranked = sorted(totals.items(), key=lambda item: (-item[1], item[0]))
+            return [
+                LeaderboardEntry(user_id=user_id, total_seconds=seconds, rank=rank)
+                for rank, (user_id, seconds) in enumerate(ranked, start=1)
+            ]
+
         for guild_id in guild_ids:
             try:
-                board_cache[guild_id] = await self.db.get_leaderboard_data(
+                daily_board = await self.db.get_leaderboard_data(
                     guild_id, "today", target_date
                 )
-                prev_board_cache[guild_id] = await self.db.get_leaderboard_data(
+                previous_board = await self.db.get_leaderboard_data(
                     guild_id, "today", day_before
                 )
-                total_cache[guild_id] = await self.db.get_daily_server_total(
-                    guild_id, target_date_str
+                board_cache[guild_id] = with_live_time(guild_id, daily_board, live_today)
+                prev_board_cache[guild_id] = with_live_time(
+                    guild_id, previous_board, live_day_before
+                )
+                total_cache[guild_id] = (
+                    await self.db.get_daily_server_total(guild_id, target_date_str)
+                    + sum(
+                        seconds
+                        for (live_guild_id, _user_id), seconds in live_today.items()
+                        if live_guild_id == guild_id
+                    )
                 )
             except VoiceStoreUnavailable as err:
                 log.warning(

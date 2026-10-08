@@ -12,6 +12,6 @@ Pillow>=10.0,<13.0
 rapidfuzz>=3.0,<4.0
 # Supabase — the authoritative voice-activity database (/vc leaderboard,
 # /vc stats). Official Python client, used server-side only with the
-# project's secret key. Voice tracking needs the schema from
-# supabase/migrations/001_voice_activity.sql applied first.
+# project's secret key. Voice tracking needs migrations 001_voice_activity.sql
+# and 002_voice_ist_calendar.sql applied (or 002 alone when upgrading v1).
 supabase>=2.32,<3.0
