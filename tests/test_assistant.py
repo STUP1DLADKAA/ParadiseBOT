@@ -673,6 +673,16 @@ class TestLiveDataHonesty(unittest.IsolatedAsyncioTestCase):
         await assistant.handle_message(message)
         self.assertEqual(bot.get_cog("Utility").weather_service.calls, ["Delhi"])
         self.assertTrue(message.replies)
+        self.assertIn("file", message.replies[0])
+
+    async def test_weather_card_failure_uses_textual_embed_fallback(self):
+        assistant, _bot = make_assistant()
+        message = mention("weather in Delhi")
+        with patch("commands.assistant.render_weather_card", side_effect=RuntimeError("font error")):
+            await assistant.handle_message(message)
+        self.assertTrue(message.replies)
+        self.assertIn("embed", message.replies[0])
+        self.assertIn("Delhi", message.replies[0]["embed"].title)
 
 
 class TestIntentRefinement(unittest.IsolatedAsyncioTestCase):

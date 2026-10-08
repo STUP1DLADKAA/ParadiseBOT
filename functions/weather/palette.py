@@ -90,7 +90,7 @@ def category_for_code(code: int) -> Category:
 
 
 def classify(weather: WeatherData) -> Category:
-    base = category_for_code(weather.weather_code)
+    base = category_for_code(weather.weather_code if weather.weather_code is not None else -1)
     # Nudge intensity/gloom toward what the API actually observed, so two
     # cities reporting the same WMO code but different cloud cover/rain
     # rate don't render identically.

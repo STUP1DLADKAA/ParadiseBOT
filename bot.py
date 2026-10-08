@@ -24,6 +24,7 @@ EXTENSIONS = (
     "commands.fun",
     "commands.utility",
     "commands.vc",
+    "commands.minigames",
     "commands.dictionary",
     "commands.recipe",
     "commands.ai",
@@ -154,10 +155,20 @@ class ParadiseBot(commands.Bot):
             self._ready_logged = True
         else:
             log.info("Paradise reconnected")
+
+        # Recover scheduled community systems before restoring their shared
+        # presence. On a fresh start this also reconciles an interrupted game.
+        mini_games = self.get_cog("MiniGames")
+        if mini_games is not None:
             try:
-                await self.presence_manager.apply_current()
+                await mini_games.manager.recover_after_restart()
             except Exception:
-                log.debug("Presence re-apply failed", exc_info=True)
+                log.exception("Mini-game restart recovery failed")
+            mini_games.manager.start()
+        try:
+            await self.presence_manager.apply_current(force=True)
+        except Exception:
+            log.debug("Presence re-apply failed", exc_info=True)
 
         # Reconcile voice sessions after connect / reconnect
         voice_cog = self.get_cog("Voice") or self.get_cog("vc")

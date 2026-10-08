@@ -1,7 +1,7 @@
 """Tests for the Supabase voice data layer (offline, against the fake client).
 
-Covers: session recording + midnight splitting, retry idempotency, live
-leaderboard reads for every period (exact rolling-window semantics), manual
+Covers: IST session recording + midnight splitting, retry idempotency,
+calendar leaderboard reads for every period, manual
 Dashboard edits being reflected immediately, heartbeats (frequency shape,
 LWW, no history rows), atomic closes, the outbox fallback during outages,
 outbox flush order, schema verification, DM report marks and restart
@@ -52,19 +52,19 @@ class TestSessionRecording(SupabaseStoreTestBase):
     async def test_record_session_splits_across_midnight(self):
         recorded = await self.store.record_completed_session(
             999, 101, 555,
-            _dt(2026, 9, 30, 23, 50), _dt(2026, 10, 1, 0, 20),
+            _dt(2026, 10, 1, 18, 20), _dt(2026, 10, 1, 18, 50),
         )
         self.assertEqual(recorded, 1800)
         daily = {
             row["date"]: row["duration_seconds"] for row in self.fake.daily.values()
         }
-        self.assertEqual(daily.get("2026-09-30"), 600)
-        self.assertEqual(daily.get("2026-10-01"), 1200)
+        self.assertEqual(daily.get("2026-10-01"), 600)
+        self.assertEqual(daily.get("2026-10-02"), 1200)
         self.assertEqual(len(self.fake.sessions), 1)
         self.assertEqual(self.fake.sessions[list(self.fake.sessions)[0]]["duration_seconds"], 1800)
 
     async def test_duplicate_retry_never_double_counts(self):
-        args = (999, 101, 555, _dt(2026, 9, 30, 23, 50), _dt(2026, 10, 1, 0, 20))
+        args = (999, 101, 555, _dt(2026, 10, 1, 18, 20), _dt(2026, 10, 1, 18, 50))
         first = await self.store.record_completed_session(*args)
         second = await self.store.record_completed_session(*args)
         self.assertEqual(first, 1800)
@@ -93,18 +93,18 @@ class TestSessionRecording(SupabaseStoreTestBase):
 
 
 class TestLeaderboardPeriods(SupabaseStoreTestBase):
-    """Week = target-7..target inclusive (8 days); month = target-30..target."""
+    """Calendar week/month windows are anchored to Monday and month day one."""
 
     async def seed(self):
         seeds = {
             "2026-09-07": 11,  # outside every window
-            "2026-09-09": 22,  # month boundary (target-30) — in
-            "2026-09-30": 33,  # inside month, outside week
-            "2026-10-01": 44,  # inside month, outside week (target-7 is Oct 2)
-            "2026-10-02": 55,  # week boundary (target-7) — in
+            "2026-09-30": 22,  # prior month
+            "2026-10-01": 33,  # first of month, outside this week's Monday start
+            "2026-10-02": 44,  # still in month, outside week
+            "2026-10-05": 55,  # ISO Monday start — in
             "2026-10-08": 66,  # yesterday
             "2026-10-09": 77,  # today
-            "2026-10-10": 88,  # future — never counted
+            "2026-10-10": 88,  # future date — capped at target day
         }
         for day, seconds in seeds.items():
             self.fake.daily[("555", "501", day)] = {
@@ -132,19 +132,19 @@ class TestLeaderboardPeriods(SupabaseStoreTestBase):
         board = await self.store.get_leaderboard_data(555, "yesterday", date(2026, 10, 9))
         self.assertEqual([(e.user_id, e.total_seconds) for e in board], [(501, 66)])
 
-    async def test_week_is_rolling_eight_day_window(self):
+    async def test_week_starts_monday_and_excludes_future_days(self):
         await self.seed()
         board = await self.store.get_leaderboard_data(555, "week", date(2026, 10, 9))
-        # Oct 2..Oct 9 inclusive (target-7 boundary in, Oct 1 out)
+        # Monday Oct 5 through Friday Oct 9; Oct 10 is neither current nor counted.
         self.assertEqual([(e.user_id, e.total_seconds) for e in board], [(501, 55 + 66 + 77), (502, 10)])
 
-    async def test_month_is_rolling_thirtyone_day_window(self):
+    async def test_month_starts_on_day_one_and_excludes_prior_month(self):
         await self.seed()
         board = await self.store.get_leaderboard_data(555, "month", date(2026, 10, 9))
-        # Sep 9..Oct 9 inclusive (target-30 boundary in, Sep 7 out)
+        # Oct 1..Oct 9; Sep 30 is outside and Oct 10 is future.
         self.assertEqual(
             [(e.user_id, e.total_seconds) for e in board],
-            [(501, 22 + 33 + 44 + 55 + 66 + 77), (502, 10)],
+            [(501, 33 + 44 + 55 + 66 + 77), (502, 10)],
         )
 
     async def test_all_time(self):
@@ -162,7 +162,7 @@ class TestLeaderboardPeriods(SupabaseStoreTestBase):
         self.assertEqual(breakdown["today"], 77)
         self.assertEqual(breakdown["yesterday"], 66)
         self.assertEqual(breakdown["week"], 55 + 66 + 77)
-        self.assertEqual(breakdown["month"], 22 + 33 + 44 + 55 + 66 + 77)
+        self.assertEqual(breakdown["month"], 33 + 44 + 55 + 66 + 77)
         self.assertEqual(breakdown["all_time"], 11 + 22 + 33 + 44 + 55 + 66 + 77 + 88)
 
     async def test_breakdown_unknown_user_zeroes(self):
@@ -364,7 +364,7 @@ class TestOutageFallback(SupabaseStoreTestBase):
         self.fake.schema_installed = False
         with self.assertRaises(VoiceSchemaError) as ctx:
             await self.store.verify_schema()
-        self.assertIn("001_voice_activity.sql", str(ctx.exception))
+        self.assertIn("002_voice_ist_calendar.sql", str(ctx.exception))
 
     async def test_verify_schema_detects_stale_version(self):
         self.fake.schema_version = 0
@@ -372,7 +372,7 @@ class TestOutageFallback(SupabaseStoreTestBase):
             await self.store.verify_schema()
 
     async def test_verify_schema_ok(self):
-        self.assertEqual(await self.store.verify_schema(), 1)
+        self.assertEqual(await self.store.verify_schema(), 2)
 
 
 class TestProfilesAndDmReports(SupabaseStoreTestBase):
@@ -456,11 +456,15 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
             )
             mock_dt.now.return_value = t1
             board = await self.tracker.get_live_leaderboard(guild, VoicePeriod.TODAY)
+            # Keep the same injected clock for yesterday's view; without an
+            # explicit historical clock an active test session would extend
+            # through the real current day.
+            board_yesterday = await self.tracker.get_live_leaderboard(
+                guild, VoicePeriod.YESTERDAY, target_date=date(2026, 10, 1)
+            )
         entry = next(m for m in board if m.user_id == 777)
         self.assertEqual(entry.total_seconds, 2 * 3600 + 15 * 60 + 17 * 60)
         self.assertTrue(entry.is_active_now)
-        # Live time must not leak into "yesterday".
-        board_yesterday = await self.tracker.get_live_leaderboard(guild, VoicePeriod.YESTERDAY)
         self.assertEqual(board_yesterday, [])
 
     async def test_midnight_split_survives_full_tracker_flow(self):
@@ -468,8 +472,8 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
         member = _make_mock_member(guild, 777)
         channel = MagicMock()
         channel.id = 888
-        t_start = _dt(2026, 9, 30, 23, 50)
-        t_end = _dt(2026, 10, 1, 0, 20)
+        t_start = _dt(2026, 10, 1, 18, 20)
+        t_end = _dt(2026, 10, 1, 18, 50)
         with patch("functions.voice.tracker.datetime") as mock_dt:
             mock_dt.now.return_value = t_start
             await self.tracker.handle_voice_state_update(
@@ -480,8 +484,8 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
                 member, _voice_state(channel), _voice_state(None)
             )
         daily = {row["date"]: row["duration_seconds"] for row in self.fake.daily.values()}
-        self.assertEqual(daily.get("2026-09-30"), 600)
-        self.assertEqual(daily.get("2026-10-01"), 1200)
+        self.assertEqual(daily.get("2026-10-01"), 600)
+        self.assertEqual(daily.get("2026-10-02"), 1200)
 
     async def test_restart_recovery_resumes_original_start(self):
         guild = _make_mock_guild()

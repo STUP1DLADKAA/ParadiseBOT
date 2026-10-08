@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import math
 import time
 from collections import OrderedDict
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
@@ -210,103 +208,205 @@ class OpenMeteoWeatherService:
         return None
 
     async def _fetch_weather_data(self, location: LocationInfo) -> WeatherData:
-        """Fetch current weather and daily forecast for coordinates."""
+        """Fetch provider observations, preserving the existing offline fallback."""
+        url = "https://api.open-meteo.com/v1/forecast"
+        params = {
+            "latitude": f"{location.latitude:.4f}",
+            "longitude": f"{location.longitude:.4f}",
+            "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,precipitation,rain,showers,snowfall,pressure_msl,surface_pressure,dew_point_2m,cloud_cover",
+            "hourly": "temperature_2m,apparent_temperature,weather_code,precipitation_probability,precipitation,wind_speed_10m,wind_direction_10m",
+            "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max",
+            "timezone": location.timezone or "auto",
+        }
+        headers = {"User-Agent": USER_AGENT}
         try:
-            url = "https://api.open-meteo.com/v1/forecast"
-            params = {
-                "latitude": f"{location.latitude:.4f}",
-                "longitude": f"{location.longitude:.4f}",
-                "current": "temperature_2m,relative_humidity_2m,apparent_temperature,weather_code,wind_speed_10m,wind_direction_10m,wind_gusts_10m,visibility,precipitation,rain,showers,snowfall,pressure_msl,surface_pressure,dew_point_2m,cloud_cover",
-                "hourly": "temperature_2m,apparent_temperature,weather_code,precipitation_probability,precipitation,wind_speed_10m,wind_direction_10m",
-                "daily": "weather_code,temperature_2m_max,temperature_2m_min,sunrise,sunset,uv_index_max,precipitation_probability_max",
-                "timezone": location.timezone or "auto",
-            }
-            headers = {"User-Agent": USER_AGENT}
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=6)
             ) as session:
-                async with session.get(url, params=params, headers=headers) as resp:
-                    if resp.status == 200:
-                        data = await resp.json(content_type=None)
-                        return self._parse_open_meteo_response(location, data)
-        except Exception as err:
-            log.debug("Open-Meteo Forecast network call failed: %s", err)
-
-        # Resilient offline/fallback generation if network is unreachable
-        return self._generate_fallback_weather(location)
+                async with session.get(url, params=params, headers=headers) as response:
+                    if response.status != 200:
+                        log.warning("Open-Meteo returned HTTP %s for a weather request", response.status)
+                        return self._generate_fallback_weather(location)
+                    payload = await response.json(content_type=None)
+            return self._parse_open_meteo_response(location, payload)
+        except Exception as error:  # retain the existing offline fallback behavior
+            log.warning("Open-Meteo weather request failed (%s); using fallback", type(error).__name__)
+            return self._generate_fallback_weather(location)
 
     def _parse_open_meteo_response(self, location: LocationInfo, data: dict[str, Any]) -> WeatherData:
-        current, daily, hourly = data.get("current", {}), data.get("daily", {}), data.get("hourly", {})
-        num = lambda key, default=None: (float(current[key]) if current.get(key) is not None else default)
-        temp_c = num("temperature_2m", 20.0)
-        feels_like_c = num("apparent_temperature", temp_c)
-        humidity = int(current.get("relative_humidity_2m", 50))
-        wind_speed = num("wind_speed_10m", 10.0)
-        wind_deg = int(current.get("wind_direction_10m", 0))
-        code = int(current.get("weather_code", 0))
-        condition, emoji = WMO_CODES.get(code, ("Fair", "🌤️"))
-        visibility_km = num("visibility")
-        if visibility_km is not None: visibility_km /= 1000
-        maxes, mins = daily.get("temperature_2m_max", []), daily.get("temperature_2m_min", [])
-        temp_max_c = float(maxes[0]) if maxes and maxes[0] is not None else temp_c
-        temp_min_c = float(mins[0]) if mins and mins[0] is not None else temp_c
-        first = lambda key: daily.get(key, [None])[0]
-        sunrise = first("sunrise"); sunset = first("sunset")
-        sunrise = sunrise.split("T")[-1][:5] if sunrise else None
-        sunset = sunset.split("T")[-1][:5] if sunset else None
-        uv = first("uv_index_max")
-        hourly_rows = []
-        keys = ("time", "temperature_2m", "weather_code", "precipitation_probability", "wind_speed_10m", "wind_direction_10m")
-        for i, stamp in enumerate(hourly.get("time", [])[:24]):
-            row = {k: hourly.get(k, [None] * len(hourly.get("time", [])))[i] for k in keys}
+        current = data.get("current") or {}
+        daily = data.get("daily") or {}
+        hourly = data.get("hourly") or {}
+
+        def current_number(key: str) -> float | None:
+            value = current.get(key)
+            try:
+                return float(value) if value is not None else None
+            except (TypeError, ValueError):
+                return None
+
+        temp_c = current_number("temperature_2m")
+        feels_like_c = current_number("apparent_temperature")
+        humidity_raw = current.get("relative_humidity_2m")
+        try:
+            humidity = int(humidity_raw) if humidity_raw is not None else None
+        except (TypeError, ValueError):
+            humidity = None
+        wind_speed = current_number("wind_speed_10m")
+        wind_degree_value = current_number("wind_direction_10m")
+        wind_deg = int(wind_degree_value) % 360 if wind_degree_value is not None else None
+        wind_direction = _degrees_to_cardinal(wind_deg) if wind_deg is not None else None
+        code_raw = current.get("weather_code")
+        try:
+            code = int(code_raw) if code_raw is not None else None
+        except (TypeError, ValueError):
+            code = None
+        condition, emoji = WMO_CODES.get(code, ("Conditions unavailable", "")) if code is not None else ("Conditions unavailable", "")
+        visibility_km = current_number("visibility")
+        if visibility_km is not None:
+            visibility_km /= 1000.0
+
+        maxes = daily.get("temperature_2m_max") or []
+        mins = daily.get("temperature_2m_min") or []
+        temp_max_c = self._first_number(maxes)
+        temp_min_c = self._first_number(mins)
+
+        def first_value(key: str):
+            values = daily.get(key) or []
+            return values[0] if values else None
+
+        sunrise_raw = first_value("sunrise")
+        sunset_raw = first_value("sunset")
+        sunrise = str(sunrise_raw).split("T")[-1][:5] if sunrise_raw else None
+        sunset = str(sunset_raw).split("T")[-1][:5] if sunset_raw else None
+        uv_raw = first_value("uv_index_max")
+        try:
+            uv_index = float(uv_raw) if uv_raw is not None else None
+        except (TypeError, ValueError):
+            uv_index = None
+
+        hourly_times = list(hourly.get("time") or [])
+        hourly_keys = (
+            "temperature_2m", "weather_code", "precipitation_probability",
+            "precipitation", "wind_speed_10m", "wind_direction_10m",
+        )
+        hourly_rows: list[dict[str, Any]] = []
+        for index, stamp in enumerate(hourly_times[:24]):
+            row: dict[str, Any] = {"time": stamp}
+            for key in hourly_keys:
+                values = hourly.get(key) or []
+                row[key] = values[index] if index < len(values) else None
             hourly_rows.append(row)
-        daily_rows = []
-        for i, date in enumerate(daily.get("time", [])[:7]):
-            get_day = lambda key: daily.get(key, [None] * 7)[i] if i < len(daily.get(key, [])) else None
-            daily_rows.append({"date": date, "code": get_day("weather_code"), "high": get_day("temperature_2m_max"), "low": get_day("temperature_2m_min"), "precipitation_probability": get_day("precipitation_probability_max")})
-        local_time = current.get("time")
+
+        current_time = current.get("time")
         current_probability = None
-        if hourly_rows and hourly_rows[0].get("precipitation_probability") is not None:
-            current_probability = int(hourly_rows[0]["precipitation_probability"])
-        return WeatherData(location=location, temp_c=temp_c, feels_like_c=feels_like_c, condition=condition,
-            condition_emoji=emoji, humidity=humidity, wind_speed_kmh=wind_speed, wind_direction=_degrees_to_cardinal(wind_deg),
-            wind_deg=wind_deg, temp_min_c=temp_min_c, temp_max_c=temp_max_c, visibility_km=visibility_km, sunrise=sunrise, sunset=sunset,
-            uv_index=float(uv) if uv is not None else None, forecast_text=f"{condition} with a high of {round(temp_max_c)}°C and a low of {round(temp_min_c)}°C.",
-            weather_code=code, local_time=local_time, local_date=local_time.split("T")[0] if local_time else None,
-            precipitation_mm=num("precipitation"), precipitation_probability=current_probability, pressure_hpa=num("pressure_msl", num("surface_pressure")), dew_point_c=num("dew_point_2m"),
-            cloud_cover=int(current["cloud_cover"]) if current.get("cloud_cover") is not None else None,
-            wind_gusts_kmh=num("wind_gusts_10m"), hourly_forecast=hourly_rows, daily_forecast=daily_rows)
+        if current_time and hourly_rows:
+            try:
+                current_dt = datetime.fromisoformat(str(current_time))
+                timed_rows = []
+                for row in hourly_rows:
+                    if row.get("precipitation_probability") is None or not row.get("time"):
+                        continue
+                    row_dt = datetime.fromisoformat(str(row["time"]))
+                    timed_rows.append((abs((row_dt - current_dt).total_seconds()), row))
+                if timed_rows:
+                    current_probability = int(min(timed_rows, key=lambda entry: entry[0])[1]["precipitation_probability"])
+            except (TypeError, ValueError):
+                current_probability = None
+
+        daily_rows: list[dict[str, Any]] = []
+        for index, day_stamp in enumerate((daily.get("time") or [])[:7]):
+            def day_value(key: str):
+                values = daily.get(key) or []
+                return values[index] if index < len(values) else None
+            daily_rows.append({
+                "date": day_stamp,
+                "code": day_value("weather_code"),
+                "high": day_value("temperature_2m_max"),
+                "low": day_value("temperature_2m_min"),
+                "precipitation_probability": day_value("precipitation_probability_max"),
+            })
+
+        forecast_parts = []
+        if temp_max_c is not None:
+            forecast_parts.append(f"High {round(temp_max_c)}°C")
+        if temp_min_c is not None:
+            forecast_parts.append(f"low {round(temp_min_c)}°C")
+        forecast_text = f"{condition} · " + " / ".join(forecast_parts) if forecast_parts else condition
+
+        try:
+            cloud_cover = int(current["cloud_cover"]) if current.get("cloud_cover") is not None else None
+        except (TypeError, ValueError):
+            cloud_cover = None
+
+        return WeatherData(
+            location=location,
+            temp_c=temp_c,
+            feels_like_c=feels_like_c,
+            condition=condition,
+            condition_emoji=emoji,
+            humidity=humidity,
+            wind_speed_kmh=wind_speed,
+            wind_direction=wind_direction,
+            wind_deg=wind_deg,
+            temp_min_c=temp_min_c,
+            temp_max_c=temp_max_c,
+            visibility_km=visibility_km,
+            sunrise=sunrise,
+            sunset=sunset,
+            uv_index=uv_index,
+            forecast_text=forecast_text,
+            weather_code=code,
+            local_time=str(current_time) if current_time else None,
+            local_date=str(current_time).split("T")[0] if current_time else None,
+            precipitation_mm=current_number("precipitation"),
+            precipitation_probability=current_probability,
+            pressure_hpa=current_number("pressure_msl") or current_number("surface_pressure"),
+            dew_point_c=current_number("dew_point_2m"),
+            cloud_cover=cloud_cover,
+            wind_gusts_kmh=current_number("wind_gusts_10m"),
+            hourly_forecast=hourly_rows,
+            daily_forecast=daily_rows,
+        )
+
+    @staticmethod
+    def _first_number(values: list[Any]) -> float | None:
+        if not values or values[0] is None:
+            return None
+        try:
+            return float(values[0])
+        except (TypeError, ValueError):
+            return None
 
     def _generate_fallback_weather(self, location: LocationInfo) -> WeatherData:
-        """Deterministic seasonal fallback for offline operation."""
-        # Estimate temperature by latitude
-        abs_lat = abs(location.latitude)
-        temp_c = max(-5.0, 32.0 - (abs_lat * 0.5))
-        condition = "Partly cloudy"
-        emoji = "⛅"
-
+        """Retain the original deterministic fallback for provider outages."""
+        temperature = max(-5.0, 32.0 - (abs(location.latitude) * 0.5))
         try:
             local_now = datetime.now(ZoneInfo(location.timezone or "UTC"))
         except Exception:
-            local_now = datetime.utcnow()
+            local_now = datetime.now(timezone.utc)
+        condition = "Partly cloudy"
         return WeatherData(
             location=location,
-            temp_c=round(temp_c, 1),
-            feels_like_c=round(temp_c + 1.0, 1),
+            temp_c=round(temperature, 1),
+            feels_like_c=round(temperature + 1.0, 1),
             condition=condition,
-            condition_emoji=emoji,
-            weather_code=2,
-            local_time=local_now.isoformat(timespec="minutes"),
-            local_date=local_now.date().isoformat(),
+            condition_emoji="⛅",
             humidity=55,
             wind_speed_kmh=12.0,
             wind_direction="NE",
             wind_deg=45,
-            temp_min_c=round(temp_c - 4.0, 1),
-            temp_max_c=round(temp_c + 4.0, 1),
+            temp_min_c=round(temperature - 4.0, 1),
+            temp_max_c=round(temperature + 4.0, 1),
             visibility_km=10.0,
             sunrise="06:30",
             sunset="18:30",
             uv_index=5.0,
-            forecast_text=f"{condition} with expected temperatures between {round(temp_c - 4)}°C and {round(temp_c + 4)}°C.",
+            forecast_text=(
+                f"{condition} with expected temperatures between "
+                f"{round(temperature - 4)}°C and {round(temperature + 4)}°C."
+            ),
+            weather_code=2,
+            local_time=local_now.isoformat(timespec="minutes"),
+            local_date=local_now.date().isoformat(),
         )

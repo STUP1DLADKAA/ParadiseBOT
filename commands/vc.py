@@ -29,9 +29,10 @@ log = logging.getLogger(__name__)
 
 SETUP_NEEDED_MESSAGE = (
     "voice tracking isn't configured yet. the owner needs to set "
-    "`SUPABASE_URL` and `SUPABASE_SECRET_KEY` in `.env` and run "
-    "`supabase/migrations/001_voice_activity.sql` in the Supabase SQL Editor "
-    "(see `supabase/README.md`)."
+    "`SUPABASE_URL` and `SUPABASE_SECRET_KEY` in `.env` and apply "
+    "`001_voice_activity.sql` followed by `002_voice_ist_calendar.sql` "
+    "in the Supabase SQL Editor (for an existing schema v1, apply only 002; "
+    "see `supabase/README.md`)."
 )
 
 
@@ -74,8 +75,8 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
                 "Voice tracking is DISABLED: SUPABASE_URL and/or SUPABASE_SECRET_KEY "
                 "are missing. Copy .env.example to .env, add the Supabase project URL "
                 "and the server-side SECRET key (never the public/anon key), and make "
-                "sure supabase/migrations/001_voice_activity.sql has been run in the "
-                "Supabase SQL Editor (see supabase/README.md). Existing local voice "
+                "sure migrations/001_voice_activity.sql and 002_voice_ist_calendar.sql "
+                "have been run in the Supabase SQL Editor (see supabase/README.md). Existing local voice "
                 "data is untouched and migrates automatically once configured."
             )
 

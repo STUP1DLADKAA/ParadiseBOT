@@ -9,7 +9,7 @@ in-memory tables, reproducing the semantics of the PostgreSQL functions in
 * midnight splitting (reuses the shared ``split_session_by_midnight``)
 * last-write-wins heartbeats and profile upserts
 * the exactly-once migration ledger
-* rolling week/month leaderboard windows
+* ISO-week and calendar-month leaderboard windows in IST
 
 This lets the full production store + migrator be tested offline. The SQL
 itself is validated separately by ``supabase/validate_locally.mjs`` against a
@@ -155,7 +155,7 @@ class FakeSupabaseClient:
         }
         # (guild_id, user_id, started_at, ended_at) -> row
         self._session_identity = {}
-        self.schema_version = 1
+        self.schema_version = 2
         self.schema_installed = True
 
     # -- client surface ---------------------------------------------------
@@ -415,9 +415,17 @@ class FakeSupabaseClient:
         if period == "yesterday":
             return day == target - timedelta(days=1)
         if period == "week":
-            return target - timedelta(days=7) <= day <= target
+            week_start = target - timedelta(days=target.weekday())
+            week_end = min(week_start + timedelta(days=7), target + timedelta(days=1))
+            return week_start <= day < week_end
         if period == "month":
-            return target - timedelta(days=30) <= day <= target
+            month_start = target.replace(day=1)
+            month_end = (
+                date(month_start.year + 1, 1, 1)
+                if month_start.month == 12
+                else date(month_start.year, month_start.month + 1, 1)
+            )
+            return month_start <= day < min(month_end, target + timedelta(days=1))
         if period == "all_time":
             return True
         return False
@@ -450,9 +458,10 @@ class FakeSupabaseClient:
                 totals["today"] += seconds
             if day == target - timedelta(days=1):
                 totals["yesterday"] += seconds
-            if target - timedelta(days=7) <= day <= target:
+            week_start = target - timedelta(days=target.weekday())
+            if week_start <= day <= target:
                 totals["week"] += seconds
-            if target - timedelta(days=30) <= day <= target:
+            if day >= target.replace(day=1) and day <= target:
                 totals["month"] += seconds
         return [
             {
