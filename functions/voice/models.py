@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 
@@ -54,6 +54,71 @@ class LeaderboardMember:
     @property
     def formatted_time(self) -> str:
         return format_duration(self.total_seconds)
+
+
+# ---------------------------------------------------------------------------
+# Persistence records shared by every storage backend (SQLite + Supabase)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(slots=True)
+class VoiceSessionRecord:
+    """A completed voice session as stored historically."""
+
+    id: int
+    guild_id: int
+    user_id: int
+    channel_id: int
+    started_at: datetime
+    ended_at: datetime
+    duration_seconds: int
+
+
+@dataclass(slots=True)
+class DailyUserStat:
+    """One (guild, user, day) aggregate row."""
+
+    guild_id: int
+    user_id: int
+    date_str: str
+    duration_seconds: int
+
+
+@dataclass(slots=True)
+class LeaderboardEntry:
+    """A ranked leaderboard row (identity + seconds only)."""
+
+    user_id: int
+    total_seconds: int
+    rank: int = 0
+
+
+@dataclass(slots=True)
+class MemberProfile:
+    """Last-known Discord identity for a member, kept across restarts."""
+
+    guild_id: int
+    user_id: int
+    display_name: str
+    username: str
+    avatar_url: str | None
+
+
+@dataclass(slots=True)
+class PersistedActiveSession:
+    """A voice session that was still in progress when it was persisted."""
+
+    guild_id: int
+    user_id: int
+    channel_id: int
+    started_at: datetime
+    last_seen_at: datetime
+    is_afk: bool
+
+
+# ---------------------------------------------------------------------------
+# Formatting helpers
+# ---------------------------------------------------------------------------
 
 
 def format_duration(total_seconds: int) -> str:

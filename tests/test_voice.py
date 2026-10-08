@@ -16,6 +16,7 @@ import discord
 from functions.voice import (
     ActiveVoiceSession,
     LeaderboardMember,
+    LocalVoiceStore,
     VoiceDatabase,
     VoicePeriod,
     VoiceTracker,
@@ -176,8 +177,9 @@ class TestVoiceTracker(unittest.IsolatedAsyncioTestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.db_path = os.path.join(self.temp_dir.name, "test_paradise.db")
         self.db = VoiceDatabase(self.db_path)
+        self.store = LocalVoiceStore(self.db)
         self.mock_bot = MagicMock()
-        self.tracker = VoiceTracker(self.mock_bot, self.db)
+        self.tracker = VoiceTracker(self.mock_bot, self.store)
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -289,7 +291,7 @@ class TestVoiceTracker(unittest.IsolatedAsyncioTestCase):
             )
 
             # "Restart" — brand new tracker over the same database file
-            tracker2 = VoiceTracker(self.mock_bot, self.db)
+            tracker2 = VoiceTracker(self.mock_bot, LocalVoiceStore(self.db))
 
             # The user stays connected through the restart; 2 hours pass
             mock_dt.now.return_value = t1
@@ -339,7 +341,7 @@ class TestVoiceTracker(unittest.IsolatedAsyncioTestCase):
 
             # --- crash --- user leaves while the bot is down ---
             channel.members = []
-            tracker2 = VoiceTracker(self.mock_bot, self.db)
+            tracker2 = VoiceTracker(self.mock_bot, LocalVoiceStore(self.db))
             mock_dt.now.return_value = t_restart
             await tracker2.reconcile_guilds()
 

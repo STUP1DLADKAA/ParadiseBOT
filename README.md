@@ -53,7 +53,8 @@ Everything lives in `.env` (never committed). See `.env.example` for all options
 | Group | Variables | Notes |
 | --- | --- | --- |
 | Discord | `DISCORD_TOKEN` | required |
-| Voice | `VOICE_DB_PATH`, `VOICE_DM_REPORTS_ENABLED` | SQLite voice database path (default: `data/paradise.db`) and daily DM summaries |
+| Voice | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` | required for `/vc` — the Supabase project storing all voice data. Use the **secret (service_role) key**, apply `supabase/migrations/001_voice_activity.sql` once in the SQL Editor first (see `supabase/README.md`). Without these the bot runs fine but voice tracking is disabled |
+| Voice (optional) | `VOICE_HEARTBEAT_INTERVAL`, `VOICE_MIGRATION_BATCH_SIZE`, `VOICE_FLUSH_INTERVAL`, `VOICE_SUPABASE_TIMEOUT`, `VOICE_DB_PATH`, `VOICE_DM_REPORTS_ENABLED` | heartbeat cadence (15–30s, default 20), migration batch size, outage retry cadence, request timeout, local fallback/settings file (default: `data/paradise.db`), daily DM summaries |
 | Gemini (AI) | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_ENABLED`, `GEMINI_VALIDATE_ON_START`, `GEMINI_TIMEOUT` | the optional AI interpretation/reasoning layer. Key validated at startup, never logged/displayed, never required — every native tool works without it. Get one at [aistudio.google.com/apikey](https://aistudio.google.com/apikey) |
 | AI fallback | `AI_BASE_URL`, `AI_API_KEY`, `AI_MODEL` | optional OpenAI-compatible endpoint (OpenAI, Groq, local Ollama), used when Gemini is not configured or unavailable |
 | Personality | `PERSONALITY_ENABLED`, `PERSONALITY_REACTION_CHANCE`, `PERSONALITY_REPLY_CHANCE`, `PERSONALITY_GLOBAL_COOLDOWN`, `PERSONALITY_CHANNEL_COOLDOWN`, `PERSONALITY_REPLY_CHANNEL_COOLDOWN` | tuning for the rare reactions/replies; defaults are deliberately conservative |
@@ -168,10 +169,13 @@ Choices for `/choose` and `/poll` are separated with `|` or `,`:
 
 ## Voice Activity & Statistics
 
-Paradise automatically tracks voice channel sessions with zero database spam and high resilience:
+Paradise automatically tracks voice channel sessions with zero database spam and high resilience. Voice data lives in **Supabase PostgreSQL** (see [`supabase/README.md`](supabase/README.md) for the one-time setup); SQLite is only a fallback queue during outages:
 
+- **Supabase-Backed**: `/vc leaderboard`, `/vc stats` and the daily reports read straight from PostgreSQL — aggregations, sorting and midnight splitting happen in the database. Manual edits in the Supabase Dashboard show up on the next render (no cache).
 - **Session Tracking**: Tracks join, leave, channel move, and disconnects safely.
-- **Restart- & Crash-Safe**: In-progress sessions are persisted with periodic heartbeats. Someone still in VC through a bot restart keeps their *original* join time (nothing is re-counted from zero); if a user left while the bot was down, their session is closed at the last confirmed heartbeat.
+- **Restart- & Crash-Safe**: In-progress sessions are persisted with periodic heartbeats (a single compact row per user, not one row per beat). Someone still in VC through a bot restart keeps their *original* join time (nothing is re-counted from zero); if a user left while the bot was down, their session is closed at the last confirmed heartbeat.
+- **Outage-Safe**: If Supabase is unreachable, completed sessions queue in a bounded local outbox and flush in order when the connection returns — nothing is lost and nothing blocks.
+- **Automatic History Migration**: Existing SQLite voice history migrates itself to Supabase in verified, idempotent batches (verify-then-delete, never double-counting); user settings stay in SQLite.
 - **Real Names, Always**: Member names/avatars are remembered in the database and refreshed opportunistically, so the leaderboard renders real identities even after restarts, cold member caches, or members leaving voice (requires the **Server Members Intent**).
 - **Midnight Splitting**: Long sessions spanning across midnight are accurately split across days (e.g. 23:50 → 00:20 becomes 10m on Day 1, 20m on Day 2).
 - **Daily DM Reports**: Automatically sends each active member their own personal daily VC summary at day's end.
@@ -242,8 +246,9 @@ functions/
   weather/                Open-Meteo weather provider, fuzzy geocoding, forecast embed
   conversion/             units conversion (9 categories), currency exchange rates, natural parser
   time/                   IANA timezone resolver, city maps, time formatting
-  voice/                  voice activity tracker, SQLite persistence, midnight splitting,
-                          daily DM reporter, programmatic Pillow leaderboard card renderer
+  voice/                  voice activity tracker, Supabase persistence (with SQLite
+                          outbox fallback + automatic history migration), midnight
+                          splitting, daily DM reporter, Pillow leaderboard renderer
   helpers.py              shared errors, colours, parsing, formatting
   personality.py          rare contextual reactions and short replies
   presence.py             fixed «Watching Paradise» activity + rotating note
@@ -282,4 +287,4 @@ pytest
 # or: python -m unittest discover -s tests -v
 ```
 
-All 530+ test cases run completely offline and validate every subsystem: startup command synchronisation for the home guild (removals, edits, idempotency, failure handling), request normalisation and tolerant routing for messy real-world phrasing, search (raw engine *and* the answer pipeline with conflict/staleness detection), the mention router and assistant dispatch, multi-tool combined requests, web image search (provider parsing over a fake transport, URL-safety rejection, probe bounding, caching and dedup), the stage-2 intent classifier, prompt-injection sanitizing, the shared TTL cache and single-flight collapsing, the calculator sandbox, the Gemini client and AI provider chain (key-masking, rejection/quota/fallback handling), weather, conversions, timezones, voice tracking, midnight session splitting, daily reports and image rendering.
+All 590+ test cases run completely offline and validate every subsystem: startup command synchronisation for the home guild (removals, edits, idempotency, failure handling), request normalisation and tolerant routing for messy real-world phrasing, search (raw engine *and* the answer pipeline with conflict/staleness detection), the mention router and assistant dispatch, multi-tool combined requests, web image search (provider parsing over a fake transport, URL-safety rejection, probe bounding, caching and dedup), the stage-2 intent classifier, prompt-injection sanitizing, the shared TTL cache and single-flight collapsing, the calculator sandbox, the Gemini client and AI provider chain (key-masking, rejection/quota/fallback handling), weather, conversions, timezones, voice tracking (all five leaderboard periods, midnight session splitting, live elapsed time, restart/crash recovery, AFK exclusion, the outage outbox, the SQLite→Supabase migration's idempotency and failure safety), daily reports and image rendering.

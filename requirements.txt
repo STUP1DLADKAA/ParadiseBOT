@@ -10,3 +10,8 @@ Pillow>=10.0,<13.0
 # Fast Damerau-Levenshtein matching for typo-tolerant dictionary searches.
 # A bounded pure-Python fallback remains available for minimal installs.
 rapidfuzz>=3.0,<4.0
+# Supabase — the authoritative voice-activity database (/vc leaderboard,
+# /vc stats). Official Python client, used server-side only with the
+# project's secret key. Voice tracking needs the schema from
+# supabase/migrations/001_voice_activity.sql applied first.
+supabase>=2.32,<3.0
