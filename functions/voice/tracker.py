@@ -32,6 +32,19 @@ from .time_windows import IST, ensure_aware, ist_date, next_ist_midnight, period
 
 log = logging.getLogger(__name__)
 
+DEAF_TIME_EXEMPT_USER_ID = 922359954025885737
+
+
+def excluded_from_credit(member, channel, state) -> bool:
+    """Use the persisted AFK flag for all non-creditable voice time."""
+    return bool(
+        channel is not None and member.guild.afk_channel is not None
+        and channel.id == member.guild.afk_channel.id
+        or member.id != DEAF_TIME_EXEMPT_USER_ID
+        and state is not None and (state.self_deaf or state.deaf)
+    )
+
+
 # Upper bound on HTTP member fetches performed per leaderboard render for
 # identities that are neither cached nor previously persisted.
 MAX_HYDRATE_FETCHES = 50
@@ -131,94 +144,55 @@ class VoiceTracker:
 
         await self._remember_member(member)
 
-        afk_channel_id = guild.afk_channel.id if guild.afk_channel else None
-
+        excluded = excluded_from_credit(member, after.channel, after)
+        newly_deaf = (
+            after.channel is not None
+            and member.id != DEAF_TIME_EXEMPT_USER_ID
+            and (after.self_deaf or after.deaf)
+            and (before.channel is None or not (before.self_deaf or before.deaf))
+        )
         async with self._lock:
-            # 1. User left voice entirely
-            if before.channel is not None and after.channel is None:
-                session = self.active_sessions.pop(key, None)
+            session = self.active_sessions.get(key)
+            if after.channel is None:
+                self.active_sessions.pop(key, None)
                 if session is not None and not session.is_afk:
                     await self._persist_session(session, now)
                 elif session is not None:
-                    # AFK time is never tracked; just drop the row.
-                    await self._clear_active_row(
-                        guild_id, user_id, started_before=session.started_at
-                    )
+                    await self._clear_active_row(guild_id, user_id, started_before=session.started_at)
                 else:
-                    # No in-memory session — let the persisted row decide
-                    # (close_active_session records non-AFK rows, skips AFK).
                     try:
                         await self.db.close_active_session(guild_id, user_id, now)
-                    except VoiceStoreError as err:
-                        log.debug("Could not close orphaned active row: %s", err)
+                    except VoiceStoreError:
+                        log.debug("Could not close orphaned active row", exc_info=True)
                 return
 
-            # 2. User joined voice from disconnected state
-            if before.channel is None and after.channel is not None:
-                is_afk = (after.channel.id == afk_channel_id)
+            if session is not None and session.is_afk != excluded:
+                if not session.is_afk:
+                    await self._persist_session(session, now)
+                else:
+                    await self._clear_active_row(guild_id, user_id, started_before=session.started_at)
+                session = None
+            if session is None:
                 session = ActiveVoiceSession(
-                    guild_id=guild_id,
-                    user_id=user_id,
-                    channel_id=after.channel.id,
-                    started_at=now,
-                    is_muted=after.self_mute or after.mute,
-                    is_deaf=after.self_deaf or after.deaf,
-                    is_afk=is_afk,
+                    guild_id=guild_id, user_id=user_id,
+                    channel_id=after.channel.id, started_at=now, is_afk=excluded,
                 )
                 self.active_sessions[key] = session
-                await self._persist_active_row(session, now)
-                return
+            session.channel_id = after.channel.id
+            session.is_muted = after.self_mute or after.mute
+            session.is_deaf = after.self_deaf or after.deaf
+            await self._persist_active_row(session, now)
 
-            # 3. User moved between channels in the same guild
-            if before.channel is not None and after.channel is not None:
-                session = self.active_sessions.get(key)
-                was_afk = (before.channel.id == afk_channel_id)
-                is_afk = (after.channel.id == afk_channel_id)
-
-                if before.channel.id != after.channel.id:
-                    if was_afk and not is_afk:
-                        # Moving out of AFK to normal channel -> start tracking
-                        session = ActiveVoiceSession(
-                            guild_id=guild_id,
-                            user_id=user_id,
-                            channel_id=after.channel.id,
-                            started_at=now,
-                            is_muted=after.self_mute or after.mute,
-                            is_deaf=after.self_deaf or after.deaf,
-                            is_afk=False,
-                        )
-                        self.active_sessions[key] = session
-                        await self._persist_active_row(session, now)
-                    elif not was_afk and is_afk:
-                        # Moving into AFK channel -> close session
-                        if session:
-                            await self._persist_session(session, now)
-                            self.active_sessions.pop(key, None)
-                        else:
-                            await self._clear_active_row(guild_id, user_id)
-                    else:
-                        # Normal channel to normal channel -> update channel ID
-                        if session:
-                            session.channel_id = after.channel.id
-                            await self._persist_active_row(session, now)
-                        else:
-                            session = ActiveVoiceSession(
-                                guild_id=guild_id,
-                                user_id=user_id,
-                                channel_id=after.channel.id,
-                                started_at=now,
-                                is_muted=after.self_mute or after.mute,
-                                is_deaf=after.self_deaf or after.deaf,
-                                is_afk=False,
-                            )
-                            self.active_sessions[key] = session
-                            await self._persist_active_row(session, now)
-
-                # Update mute / deaf state if changed
-                session = self.active_sessions.get(key)
-                if session:
-                    session.is_muted = after.self_mute or after.mute
-                    session.is_deaf = after.self_deaf or after.deaf
+        if newly_deaf:
+            try:
+                await after.channel.send(
+                    f"{member.mention} no VC farming — deafened time doesn't count. "
+                    "Undeafen to resume earning VC time.",
+                    allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
+                    delete_after=120,
+                )
+            except discord.DiscordException:
+                log.warning("Could not send deafened VC warning", exc_info=True)
 
     async def _persist_session(self, session: ActiveVoiceSession, ended_at: datetime) -> None:
         """Record a completed session.
@@ -372,7 +346,7 @@ class VoiceTracker:
                             continue
                         key = (guild.id, member.id)
                         current_connected_keys.add(key)
-                        is_afk = (channel.id == afk_channel_id)
+                        is_afk = excluded_from_credit(member, channel, member.voice)
 
                         await self._remember_member(member)
 
@@ -390,6 +364,12 @@ class VoiceTracker:
                         else:
                             # Update existing session channel
                             session = self.active_sessions[key]
+                            if session.is_afk != is_afk:
+                                if not session.is_afk:
+                                    await self._persist_session(session, now)
+                                else:
+                                    await self._clear_active_row(guild.id, member.id, started_before=session.started_at)
+                                session.started_at = now
                             session.channel_id = channel.id
                             session.is_afk = is_afk
 
@@ -457,7 +437,7 @@ class VoiceTracker:
                     if found is not None:
                         connected_member = found
                         connected_channel_id = channel.id
-                        currently_afk = (channel.id == afk_channel_id)
+                        currently_afk = excluded_from_credit(found, channel, found.voice)
                         break
 
             ended_at = min(row.last_seen_at, now)

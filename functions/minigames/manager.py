@@ -709,12 +709,13 @@ class MiniGameManager:
                     view=None,
                     allowed_mentions=allowed,
                 )
+                await context.message.delete(delay=120)
                 delivered = True
             except discord.DiscordException:
                 log.warning("Could not edit mini-game result message", exc_info=True)
         if not delivered:
             try:
-                await context.channel.send(content=content or None, embed=embed, allowed_mentions=allowed)
+                await context.channel.send(content=content or None, embed=embed, allowed_mentions=allowed, delete_after=120)
             except discord.DiscordException:
                 log.warning("Could not send mini-game result announcement", exc_info=True)
 

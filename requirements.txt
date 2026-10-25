@@ -1,4 +1,4 @@
-discord.py>=2.6,<3.0
+discord.py[voice]>=2.6,<3.0
 python-dotenv>=1.0,<2.0
 # HTTP client used by weather, conversion, search and image lookups.
 # Installed alongside discord.py, but pinned here because the tool

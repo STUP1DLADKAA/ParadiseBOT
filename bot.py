@@ -24,6 +24,7 @@ EXTENSIONS = (
     "commands.fun",
     "commands.utility",
     "commands.vc",
+    "commands.voice_presence",
     "commands.minigames",
     "commands.dictionary",
     "commands.recipe",

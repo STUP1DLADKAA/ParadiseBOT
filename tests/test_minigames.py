@@ -68,7 +68,7 @@ class MiniGameTestBase(unittest.IsolatedAsyncioTestCase):
         return snapshot
 
     def context(self, snapshot: GameSnapshot):
-        message = SimpleNamespace(id=snapshot.message_id, edit=AsyncMock())
+        message = SimpleNamespace(id=snapshot.message_id, edit=AsyncMock(), delete=AsyncMock())
         channel = SimpleNamespace(send=AsyncMock())
         context = MiniGameContext(
             self.manager,
@@ -162,7 +162,7 @@ class TestMiniGameExactlyOnce(MiniGameTestBase):
 class TestMiniGameRecovery(MiniGameTestBase):
     async def test_restart_marks_interrupted_game_failed_once(self):
         snapshot = self.reserve()
-        message = SimpleNamespace(edit=AsyncMock())
+        message = SimpleNamespace(edit=AsyncMock(), delete=AsyncMock())
         channel = SimpleNamespace(
             fetch_message=AsyncMock(return_value=message),
             send=AsyncMock(),
