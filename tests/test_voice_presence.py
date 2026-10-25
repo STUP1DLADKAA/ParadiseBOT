@@ -1,4 +1,4 @@
-"""Unit tests for VoicePresence ("The GOAT has arrived 🐐" VC speech + chat)."""
+"""Unit tests for VoicePresence (synchronized random funny VC speech + chat & heavy male voice)."""
 
 from __future__ import annotations
 
@@ -15,15 +15,16 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import discord
-
 from commands.voice_presence import (
-    ARRIVAL_SPEECH_TEXT,
-    ARRIVAL_TEXT,
+    ARRIVAL_LINES,
+    HEAVY_MALE_VOICE_FILTER,
+    HEAVY_NEURAL_VOICE_FILTER,
     VoicePresence,
+    audio_filter_for_clip,
 )
 from functions.dictionary.models import Clip
 from functions.dictionary.playback import playback_support, resolve_ffmpeg_executable
+import discord
 
 
 def _make_wav_bytes(duration_sec: float = 0.15, sample_rate: int = 24000) -> bytes:
@@ -34,7 +35,7 @@ def _make_wav_bytes(duration_sec: float = 0.15, sample_rate: int = 24000) -> byt
         wf.setsampwidth(2)
         wf.setframerate(sample_rate)
         frames = b"".join(
-            struct.pack("<h", int(8000 * math.sin(2 * math.pi * 440 * i / sample_rate)))
+            struct.pack("<h", int(8000 * math.sin(2 * math.pi * 220 * i / sample_rate)))
             for i in range(n_samples)
         )
         wf.writeframes(frames)
@@ -42,7 +43,7 @@ def _make_wav_bytes(duration_sec: float = 0.15, sample_rate: int = 24000) -> byt
 
 
 class _FakeSpeechProvider:
-    name = "fake"
+    name = "web"
     available = True
 
     def __init__(self, data: bytes) -> None:
@@ -51,7 +52,7 @@ class _FakeSpeechProvider:
 
     async def speak(self, request):
         self.calls.append(request.word)
-        return Clip(data=self.data, extension="wav", provider="fake")
+        return Clip(data=self.data, extension="wav", provider="web")
 
 
 def _make_voice_channel(
@@ -113,7 +114,8 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
             settle_delay=0.0,
             speech_providers=[self.provider],
         )
-        # Stub out external ffmpeg spawn during fast unit tests
+        self._real_create_source = self.cog._create_audio_source
+        # Stub out external ffmpeg spawn during fast join/move state tests
         self.cog._create_audio_source = MagicMock(
             side_effect=lambda clip, exe: MagicMock(cleanup=MagicMock())
         )
@@ -121,7 +123,37 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         await self.cog.cog_unload()
 
-    async def test_join_and_move_both_text_and_speak_arrival_once(self):
+    def test_arrival_line_pool_is_large_unique_and_non_repeating(self):
+        self.assertGreaterEqual(len(ARRIVAL_LINES), 40)
+        self.assertEqual(len(set(ARRIVAL_LINES)), len(ARRIVAL_LINES))
+        previous = None
+        picked = []
+        for _ in range(100):
+            line = self.cog.pick_arrival_line()
+            self.assertIn(line, ARRIVAL_LINES)
+            self.assertNotEqual(line, previous)
+            previous = line
+            picked.append(line)
+        # First 20 picks must all be distinct
+        self.assertEqual(len(set(picked[:20])), 20)
+
+    async def test_default_neural_provider_uses_deep_male_onyx_voice_and_filters(self):
+        default_cog = VoicePresence(self.bot, settle_delay=0.0)
+        try:
+            neural = default_cog._speech_providers[0]
+            self.assertEqual(neural._voice, "onyx")
+            web_clip = Clip(data=b"x", extension="mp3", provider="web")
+            neural_clip = Clip(data=b"x", extension="mp3", provider="neural")
+            self.assertEqual(audio_filter_for_clip(web_clip), HEAVY_MALE_VOICE_FILTER)
+            self.assertIn("asetrate=48000*0.76", HEAVY_MALE_VOICE_FILTER)
+            self.assertIn("bass=g=5", HEAVY_MALE_VOICE_FILTER)
+            self.assertEqual(
+                audio_filter_for_clip(neural_clip), HEAVY_NEURAL_VOICE_FILTER
+            )
+        finally:
+            await default_cog._http.close()
+
+    async def test_join_and_move_say_random_lines_and_chat_matches_speech_exactly(self):
         vc1 = _make_voice_channel(101, humans=1)
         vc2 = _make_voice_channel(102, humans=3)
         guild = MagicMock()
@@ -133,7 +165,6 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
 
         async def connect_vc1(**kwargs):
             guild.voice_client = _make_fake_voice_client(vc1)
-            # Simulate Discord firing VOICE_STATE_UPDATE for the bot mid-connect
             bot_member = SimpleNamespace(id=999000, bot=True, guild=guild)
             await self.cog.on_voice_state_update(
                 bot_member,
@@ -146,33 +177,37 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
 
         with patch("commands.voice_presence.playback_support", return_value=True):
             await self.cog.join_busiest(guild)
-            # Let any spawned listener tasks settle
             await asyncio.sleep(0.02)
 
             vc1.connect.assert_awaited_once()
             vc1.send.assert_awaited_once()
-            self.assertEqual(vc1.send.call_args.args[0], ARRIVAL_TEXT)
+            first_written = vc1.send.call_args.args[0]
+            self.assertIn(first_written, ARRIVAL_LINES)
             guild.voice_client.play.assert_called_once()
-            self.assertEqual(self.provider.calls, [ARRIVAL_SPEECH_TEXT])
+            self.assertEqual(len(self.provider.calls), 1)
+            # Written VC chat text and spoken TTS line MUST be 100% identical
+            self.assertEqual(first_written, self.provider.calls[0])
 
             # Staying in the same busiest VC does NOT re-announce
             await self.cog.join_busiest(guild)
             vc1.send.assert_awaited_once()
             guild.voice_client.play.assert_called_once()
 
-            # Busier VC appears -> bot moves, texts & speaks in vc2 using cached clip
+            # Busier VC appears -> bot moves, picks a NEW random line, and speaks & writes the exact same line
             guild.voice_channels = [vc1, vc2]
             await self.cog.join_busiest(guild)
             await asyncio.sleep(0.02)
 
             guild.voice_client.move_to.assert_awaited_once_with(vc2)
             vc2.send.assert_awaited_once()
-            self.assertEqual(vc2.send.call_args.args[0], ARRIVAL_TEXT)
+            second_written = vc2.send.call_args.args[0]
+            self.assertIn(second_written, ARRIVAL_LINES)
+            self.assertNotEqual(second_written, first_written)
             self.assertEqual(guild.voice_client.play.call_count, 2)
-            # Clip cached after first synthesis -> still only 1 TTS provider call!
-            self.assertEqual(self.provider.calls, [ARRIVAL_SPEECH_TEXT])
+            self.assertEqual(len(self.provider.calls), 2)
+            self.assertEqual(second_written, self.provider.calls[1])
 
-    async def test_manual_admin_move_triggers_text_and_voice_arrival(self):
+    async def test_manual_admin_move_triggers_matching_random_text_and_voice(self):
         vc1 = _make_voice_channel(101, humans=2)
         vc2 = _make_voice_channel(102, humans=1)
         guild = MagicMock()
@@ -193,7 +228,9 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
 
         vc2.send.assert_awaited_once()
-        self.assertEqual(vc2.send.call_args.args[0], ARRIVAL_TEXT)
+        written = vc2.send.call_args.args[0]
+        self.assertIn(written, ARRIVAL_LINES)
+        self.assertEqual(self.provider.calls, [written])
         guild.voice_client.play.assert_called_once()
 
     async def test_disconnect_when_empty_resets_announcement_for_next_join(self):
@@ -215,17 +252,20 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
             await self.cog.join_busiest(guild)
             self.assertEqual(vc1.send.await_count, 1)
 
-            # Everyone leaves -> periodic sweep disconnects cleanly
             vc1.members = []
             old_client = guild.voice_client
             await self.cog.join_busiest(guild, disconnect_when_empty=True)
             old_client.disconnect.assert_awaited_once()
             guild.voice_client = None
 
-            # Someone joins again -> announces fresh arrival
             vc1.members = [SimpleNamespace(bot=False, id=101)]
             await self.cog.join_busiest(guild)
             self.assertEqual(vc1.send.await_count, 2)
+            # Both joins spoke the exact line written in chat
+            self.assertEqual(
+                [c.args[0] for c in vc1.send.call_args_list],
+                self.provider.calls,
+            )
 
     async def test_text_failure_does_not_block_voice_speech(self):
         vc1 = _make_voice_channel(101, humans=1)
@@ -247,18 +287,14 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
             await self.cog.join_busiest(guild)
             guild.voice_client.play.assert_called_once()
 
-    def test_bundled_ffmpeg_encodes_opus_packets(self):
+    def test_heavy_male_voice_ffmpeg_filter_encodes_opus_packets(self):
         support = playback_support()
         self.assertTrue(bool(support), f"Expected voice playback support, got: {support.reason}")
         exe = resolve_ffmpeg_executable()
         self.assertIsNotNone(exe)
-        wav_data = _make_wav_bytes(duration_sec=0.1)
-        source = discord.FFmpegOpusAudio(
-            io.BytesIO(wav_data),
-            pipe=True,
-            executable=exe,
-            options="-loglevel error",
-        )
+        wav_data = _make_wav_bytes(duration_sec=0.25)
+        clip = Clip(data=wav_data, extension="wav", provider="web")
+        source = self._real_create_source(clip, exe)
         try:
             packets = []
             while True:
@@ -266,7 +302,7 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
                 if not pkt:
                     break
                 packets.append(pkt)
-            self.assertGreater(len(packets), 0)
+            self.assertGreater(len(packets), 5)
             self.assertTrue(source.is_opus())
         finally:
             stdout = getattr(source, "_stdout", None)

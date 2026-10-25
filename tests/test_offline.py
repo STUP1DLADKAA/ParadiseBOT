@@ -424,7 +424,7 @@ class TestPresence(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_presence_has_no_activity_and_reconnect_restores_priority(self):
+    def test_presence_publishes_random_activity_and_reconnect_restores_priority(self):
         async def run():
             moment = datetime(2026, 10, 8, 22, 0, tzinfo=IST)
             bot = SimpleNamespace(
@@ -434,15 +434,25 @@ class TestPresence(unittest.TestCase):
             manager = PresenceManager(bot, clock=lambda: moment)
             await manager.set_game_active(True)
             self.assertEqual(bot.change_presence.call_args.kwargs["status"], discord.Status.dnd)
-            self.assertIsNone(bot.change_presence.call_args.kwargs["activity"])
+            first_activity = bot.change_presence.call_args.kwargs["activity"]
+            self.assertIsInstance(first_activity, discord.BaseActivity)
 
             await manager.apply_current(force=True)  # on_ready/reconnect reapplies DND
             self.assertEqual(bot.change_presence.call_args.kwargs["status"], discord.Status.dnd)
-            self.assertIsNone(bot.change_presence.call_args.kwargs["activity"])
+            self.assertIsInstance(
+                bot.change_presence.call_args.kwargs["activity"], discord.BaseActivity
+            )
 
             await manager.set_game_active(False)  # game end restores the overnight status
             self.assertEqual(bot.change_presence.call_args.kwargs["status"], discord.Status.idle)
-            self.assertIsNone(bot.change_presence.call_args.kwargs["activity"])
+            self.assertIsInstance(
+                bot.change_presence.call_args.kwargs["activity"], discord.BaseActivity
+            )
+
+            await manager.rotate()  # periodic rotation picks a fresh random status
+            self.assertIsInstance(
+                bot.change_presence.call_args.kwargs["activity"], discord.BaseActivity
+            )
 
         asyncio.run(run())
 
@@ -480,9 +490,15 @@ def make_personality(**overrides):
         enabled=True,
         reaction_chance=1.0,
         reply_chance=0.0,
+        sticker_chance=0.0,
+        meme_chance=0.0,
+        random_quip_chance=0.0,
+        grammar_chance=0.0,
         global_cooldown=0,
         channel_cooldown=0,
         reply_channel_cooldown=0,
+        humour_cooldown=0,
+        grammar_cooldown=0,
     )
     defaults.update(overrides)
     config = PersonalityConfig(**defaults)

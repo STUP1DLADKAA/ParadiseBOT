@@ -95,10 +95,10 @@ def looks_like_audio(data: bytes) -> str:
     return ""
 
 
-def speakable(word: str) -> str:
+def speakable(word: str, *, max_chars: int = MAX_SPOKEN_CHARS) -> str:
     """The exact text a provider is allowed to say: the headword, nothing else."""
     text = " ".join(str(word or "").split())
-    return text[:MAX_SPOKEN_CHARS]
+    return text[: max(1, int(max_chars))]
 
 
 # ---------------------------------------------------------------------------
@@ -164,6 +164,7 @@ class NeuralSpeechProvider:
         model: str = "",
         voice: str = "",
         timeout: float = 15.0,
+        max_chars: int = MAX_SPOKEN_CHARS,
     ) -> None:
         self._client = client
         self._base_url = (base_url or "").strip().rstrip("/")
@@ -171,6 +172,7 @@ class NeuralSpeechProvider:
         self._model = (model or "").strip()
         self._voice = (voice or "").strip() or "alloy"
         self._timeout = timeout
+        self._max_chars = max_chars
 
     @property
     def available(self) -> bool:
@@ -179,7 +181,7 @@ class NeuralSpeechProvider:
     async def speak(self, request: SpeechRequest) -> Clip | None:
         if not self.available:
             return None
-        text = speakable(request.word)
+        text = speakable(request.word, max_chars=self._max_chars)
         if not text:
             return None
         headers = {"Content-Type": "application/json"}
@@ -218,17 +220,25 @@ class WebVoiceProvider:
 
     name = "web"
 
-    def __init__(self, client: HttpClient, *, timeout: float = 8.0, url: str = WEB_VOICE_URL) -> None:
+    def __init__(
+        self,
+        client: HttpClient,
+        *,
+        timeout: float = 8.0,
+        url: str = WEB_VOICE_URL,
+        max_chars: int = MAX_SPOKEN_CHARS,
+    ) -> None:
         self._client = client
         self._timeout = timeout
         self._url = url
+        self._max_chars = max_chars
 
     @property
     def available(self) -> bool:
         return True
 
     async def speak(self, request: SpeechRequest) -> Clip | None:
-        text = speakable(request.word)
+        text = speakable(request.word, max_chars=self._max_chars)
         if not text:
             return None
         language = request.language or "en"
