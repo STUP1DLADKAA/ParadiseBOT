@@ -125,6 +125,10 @@ class DictionaryConfig:
         )
 
 
+DEFAULT_VOICE_ALERT_CHANNEL_ID = 1507796401122181352
+DEFAULT_DEAF_WARNING_SECONDS = 30.0
+
+
 @dataclass(frozen=True, slots=True)
 class VoiceConfig:
     """Voice activity tracking and daily DM reports configuration.
@@ -139,6 +143,10 @@ class VoiceConfig:
     # voice data until it has been migrated and verified.
     db_path: str = ""
     dm_reports_enabled: bool = True
+
+    # Channel for 30s deafen ping warnings and 12:00 AM daily VC leaderboards.
+    alert_channel_id: int = DEFAULT_VOICE_ALERT_CHANNEL_ID
+    deaf_warning_seconds: float = DEFAULT_DEAF_WARNING_SECONDS
 
     # Supabase project ("Paradise", ref gxcjtbiyamyyxokgehpe, ap-south-1).
     # SUPABASE_SECRET_KEY must be the server-side SECRET key (service_role),
@@ -176,6 +184,20 @@ class VoiceConfig:
         return cls(
             db_path=env.get("VOICE_DB_PATH", "").strip(),
             dm_reports_enabled=_bool(env.get("VOICE_DM_REPORTS_ENABLED"), True),
+            alert_channel_id=max(
+                0,
+                _int(
+                    env.get("VOICE_ALERT_CHANNEL_ID"),
+                    DEFAULT_VOICE_ALERT_CHANNEL_ID,
+                ),
+            ),
+            deaf_warning_seconds=max(
+                0.0,
+                _float(
+                    env.get("VOICE_DEAF_WARNING_SECONDS"),
+                    DEFAULT_DEAF_WARNING_SECONDS,
+                ),
+            ),
             supabase_url=env.get("SUPABASE_URL", "").strip().rstrip("/"),
             supabase_secret_key=env.get("SUPABASE_SECRET_KEY", "").strip(),
             heartbeat_interval=max(

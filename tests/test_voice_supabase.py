@@ -10,6 +10,7 @@ recovery through the real VoiceTracker.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -20,10 +21,12 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from functions.voice import (
+    VOICE_ALERT_CHANNEL_ID,
     VoiceDatabase,
     VoicePeriod,
     VoiceTracker,
 )
+from functions.voice.time_windows import IST
 from functions.voice.models import PersistedActiveSession
 from functions.voice.store import VoiceSchemaError, VoiceStoreUnavailable
 from functions.voice.supabase_database import SupabaseVoiceDatabase
@@ -548,26 +551,212 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
 
     async def test_deaf_time_excluded_except_exempt_user(self):
         guild = _make_mock_guild()
+        alert_channel = MagicMock(id=VOICE_ALERT_CHANNEL_ID, guild=guild)
+        alert_channel.send = AsyncMock()
+        guild.get_channel.side_effect = (
+            lambda cid: alert_channel if cid == VOICE_ALERT_CHANNEL_ID else None
+        )
+        guild.get_channel_or_thread.side_effect = guild.get_channel.side_effect
+        self.mock_bot.get_guild.return_value = guild
+        self.tracker.deaf_warning_seconds = 0.02
+
         channel = MagicMock(id=888)
         channel.send = AsyncMock()
         for user_id, expected in ((777, 1200), (922359954025885737, 1800)):
             member = _make_mock_member(guild, user_id)
+            guild.get_member.side_effect = (
+                lambda uid, m=member: m if uid == m.id else None
+            )
             channel.send.reset_mock()
+            alert_channel.send.reset_mock()
             with patch("functions.voice.tracker.datetime") as clock:
-                for minute, before, after in (
-                    (0, _voice_state(None), _voice_state(channel)),
-                    (10, _voice_state(channel), _voice_state(channel)),
-                    (20, _voice_state(channel), _voice_state(channel)),
-                    (30, _voice_state(channel), _voice_state(None)),
-                ):
-                    before.self_deaf = minute == 20
-                    after.self_deaf = minute == 10
-                    clock.now.return_value = _dt(2026, 10, 1, 12, minute)
-                    await self.tracker.handle_voice_state_update(member, before, after)
+                # 00:00 join, 00:10 deafen -> wait >= threshold -> 00:20 undeafen -> 00:30 leave
+                clock.now.return_value = _dt(2026, 10, 1, 12, 0)
+                await self.tracker.handle_voice_state_update(
+                    member, _voice_state(None), _voice_state(channel)
+                )
+
+                deaf_state = _voice_state(channel)
+                deaf_state.self_deaf = True
+                clock.now.return_value = _dt(2026, 10, 1, 12, 10)
+                await self.tracker.handle_voice_state_update(
+                    member, _voice_state(channel), deaf_state
+                )
+                # Never warns immediately in the VC chat itself
+                channel.send.assert_not_awaited()
+                await asyncio.sleep(0.05)
+
+                clock.now.return_value = _dt(2026, 10, 1, 12, 20)
+                await self.tracker.handle_voice_state_update(
+                    member, deaf_state, _voice_state(channel)
+                )
+
+                clock.now.return_value = _dt(2026, 10, 1, 12, 30)
+                await self.tracker.handle_voice_state_update(
+                    member, _voice_state(channel), _voice_state(None)
+                )
+
             total = sum(row["duration_seconds"] for row in self.fake.daily.values()
                         if row["user_id"] == user_id)
             self.assertEqual(total, expected)
-            self.assertEqual(channel.send.await_count, int(user_id == 777))
+            channel.send.assert_not_awaited()
+            self.assertEqual(alert_channel.send.await_count, int(user_id == 777))
+
+    async def test_short_deaf_under_30s_cancels_warning(self):
+        guild = _make_mock_guild()
+        alert_channel = MagicMock(id=VOICE_ALERT_CHANNEL_ID, guild=guild)
+        alert_channel.send = AsyncMock()
+        guild.get_channel_or_thread.side_effect = (
+            lambda cid: alert_channel if cid == VOICE_ALERT_CHANNEL_ID else None
+        )
+        self.mock_bot.get_guild.return_value = guild
+        self.tracker.deaf_warning_seconds = 0.08
+
+        channel = MagicMock(id=888)
+        member = _make_mock_member(guild, 777)
+        guild.get_member.return_value = member
+
+        deaf_state = _voice_state(channel)
+        deaf_state.self_deaf = True
+        await self.tracker.handle_voice_state_update(member, _voice_state(None), deaf_state)
+        await asyncio.sleep(0.02)
+        # Undeafen before 30s threshold -> cancels warning
+        await self.tracker.handle_voice_state_update(member, deaf_state, _voice_state(channel))
+        await asyncio.sleep(0.09)
+        alert_channel.send.assert_not_awaited()
+
+    async def test_muted_user_still_detected_and_counted_without_warning(self):
+        guild = _make_mock_guild()
+        alert_channel = MagicMock(id=VOICE_ALERT_CHANNEL_ID, guild=guild)
+        alert_channel.send = AsyncMock()
+        guild.get_channel_or_thread.side_effect = (
+            lambda cid: alert_channel if cid == VOICE_ALERT_CHANNEL_ID else None
+        )
+        self.tracker.deaf_warning_seconds = 0.02
+
+        channel = MagicMock(id=888)
+        member = _make_mock_member(guild, 777)
+        muted_state = _voice_state(channel)
+        muted_state.self_mute = True
+
+        with patch("functions.voice.tracker.datetime") as clock:
+            clock.now.return_value = _dt(2026, 10, 1, 12, 0)
+            await self.tracker.handle_voice_state_update(
+                member, _voice_state(None), muted_state
+            )
+            session = self.tracker.active_sessions[(guild.id, 777)]
+            self.assertTrue(session.is_muted)
+            self.assertFalse(session.is_deaf)
+            self.assertFalse(session.is_afk)
+            await asyncio.sleep(0.05)
+
+            clock.now.return_value = _dt(2026, 10, 1, 12, 30)
+            await self.tracker.handle_voice_state_update(
+                member, muted_state, _voice_state(None)
+            )
+
+        alert_channel.send.assert_not_awaited()
+        total = sum(
+            row["duration_seconds"]
+            for row in self.fake.daily.values()
+            if row["user_id"] == 777
+        )
+        self.assertEqual(total, 1800)
+
+    async def test_join_8pm_leave_after_midnight_rollover_and_daily_channel_leaderboard(self):
+        guild = _make_mock_guild()
+        guild.name = "Paradise"
+        alert_channel = MagicMock(id=VOICE_ALERT_CHANNEL_ID, guild=guild)
+        alert_channel.send = AsyncMock()
+        guild.get_channel_or_thread.side_effect = (
+            lambda cid: alert_channel if cid == VOICE_ALERT_CHANNEL_ID else None
+        )
+        self.mock_bot.guilds = [guild]
+        self.mock_bot.get_guild.return_value = guild
+
+        channel = MagicMock(id=888)
+        member = _make_mock_member(guild, 777, name="NightOwl")
+        guild.get_member.side_effect = lambda uid: member if uid == 777 else None
+
+        # User joins at 8:00 PM IST on Oct 25, 2026
+        t_join = datetime(2026, 10, 25, 20, 0, 0, tzinfo=IST).astimezone(timezone.utc)
+        # Clock hits 12:00:05 AM IST on Oct 26, 2026
+        t_midnight = datetime(2026, 10, 26, 0, 0, 5, tzinfo=IST).astimezone(timezone.utc)
+        # User leaves at 1:00 AM IST on Oct 26, 2026 (1 hour after 12:00 AM)
+        t_leave = datetime(2026, 10, 26, 1, 0, 0, tzinfo=IST).astimezone(timezone.utc)
+
+        current_now = t_join
+        self.tracker._clock = lambda: current_now
+
+        await self.tracker.handle_voice_state_update(
+            member, _voice_state(None), _voice_state(channel)
+        )
+
+        # At 12:00 AM IST: rollover commits 8 PM–12 AM (4h) to Oct 25, and
+        # publishes the daily leaderboard for Oct 25 in 1507796401122181352.
+        current_now = t_midnight
+        rolled = await self.tracker.rollover_midnight_sessions(t_midnight)
+        self.assertEqual(rolled, 1)
+
+        blocked = await self.tracker.dispatch_daily_channel_leaderboard("2026-10-25")
+        self.assertEqual(blocked, 0)
+        alert_channel.send.assert_awaited_once()
+        sent_kwargs = alert_channel.send.call_args.kwargs
+        self.assertIn("Daily Voice Leaderboard — October 25, 2026", sent_kwargs["embed"].title)
+        self.assertIn("4h", sent_kwargs["embed"].footer.text)
+
+        # Calling again for the same date is idempotent (no duplicate post).
+        blocked_again = await self.tracker.dispatch_daily_channel_leaderboard("2026-10-25")
+        self.assertEqual(blocked_again, 0)
+        alert_channel.send.assert_awaited_once()
+
+        # User leaves at 1:00 AM IST -> the 1 hour after 12:00 AM is counted in Oct 26!
+        current_now = t_leave
+        await self.tracker.handle_voice_state_update(
+            member, _voice_state(channel), _voice_state(None)
+        )
+
+        daily_by_date = {
+            row["date"]: row["duration_seconds"]
+            for row in self.fake.daily.values()
+            if row["user_id"] == 777
+        }
+        self.assertEqual(daily_by_date.get("2026-10-25"), 4 * 3600)  # 8 PM -> 12 AM = 4h
+        self.assertEqual(daily_by_date.get("2026-10-26"), 1 * 3600)  # 12 AM -> 1 AM = 1h
+
+        board_new_day = await self.tracker.get_live_leaderboard(
+            guild, VoicePeriod.TODAY, target_date=date(2026, 10, 26)
+        )
+        self.assertEqual(len(board_new_day), 1)
+        self.assertEqual(board_new_day[0].user_id, 777)
+        self.assertEqual(board_new_day[0].total_seconds, 3600)
+
+    async def test_join_8pm_leave_1pm_next_day_splits_post_midnight_into_new_day(self):
+        guild = _make_mock_guild()
+        channel = MagicMock(id=888)
+        member = _make_mock_member(guild, 8881, name="Marathoner")
+
+        t_join = datetime(2026, 10, 25, 20, 0, 0, tzinfo=IST).astimezone(timezone.utc)
+        t_leave = datetime(2026, 10, 26, 13, 0, 0, tzinfo=IST).astimezone(timezone.utc)
+
+        current_now = t_join
+        self.tracker._clock = lambda: current_now
+        await self.tracker.handle_voice_state_update(
+            member, _voice_state(None), _voice_state(channel)
+        )
+
+        current_now = t_leave
+        await self.tracker.handle_voice_state_update(
+            member, _voice_state(channel), _voice_state(None)
+        )
+
+        daily_by_date = {
+            row["date"]: row["duration_seconds"]
+            for row in self.fake.daily.values()
+            if row["user_id"] == 8881
+        }
+        self.assertEqual(daily_by_date.get("2026-10-25"), 4 * 3600)   # 8 PM -> 12 AM = 4h
+        self.assertEqual(daily_by_date.get("2026-10-26"), 13 * 3600)  # 12 AM -> 1 PM = 13h
 
     async def test_afk_time_never_recorded(self):
         afk_channel = MagicMock()

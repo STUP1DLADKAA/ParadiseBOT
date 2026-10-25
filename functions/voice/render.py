@@ -210,8 +210,11 @@ class LeaderboardImageRenderer:
         date_str: str | None = None,
         page: int = 1,
         page_size: int = 10,
+        *,
+        title_override: str | None = None,
     ) -> bytes:
         """Render leaderboard image in an asynchronous executor."""
+        total_seconds_all = sum(m.total_seconds for m in members)
         start_idx = (page - 1) * page_size
         page_members = list(members[start_idx : start_idx + page_size])
 
@@ -240,6 +243,8 @@ class LeaderboardImageRenderer:
             date_str,
             page,
             len(members),
+            total_seconds_all,
+            title_override,
         )
 
     def _draw_canvas(
@@ -251,6 +256,8 @@ class LeaderboardImageRenderer:
         date_str: str | None,
         page: int,
         total_count: int,
+        total_seconds_all: int | None = None,
+        title_override: str | None = None,
     ) -> bytes:
         WIDTH = 1000
         # Calculate dynamic height
@@ -298,7 +305,9 @@ class LeaderboardImageRenderer:
         draw.text((54, header_y + 5), pill_text, fill=ACCENT_CYAN, font=pill_font)
 
         # Main Title (Period & Date)
-        if date_str:
+        if title_override:
+            main_title = title_override
+        elif date_str:
             main_title = f"{period.label.upper()} • {date_str.upper()}"
         else:
             main_title = f"{period.label.upper()} LEADERBOARD"
@@ -309,7 +318,11 @@ class LeaderboardImageRenderer:
         draw.text((40, header_y + 82), sub_text, fill=TEXT_SECONDARY, font=subtitle_font)
 
         # Top total voice time badge
-        total_time_sec = sum(m.total_seconds for m in members)
+        total_time_sec = (
+            total_seconds_all
+            if total_seconds_all is not None
+            else sum(m.total_seconds for m in members)
+        )
         hours = total_time_sec // 3600
         mins = (total_time_sec % 3600) // 60
         total_time_str = f"{hours}h {mins}m tracked" if hours > 0 else f"{mins}m tracked"
@@ -401,6 +414,16 @@ class LeaderboardImageRenderer:
                 self._draw_list_row(canvas, draw, 40, row_y, WIDTH - 80, 64, m, av)
 
             current_y += len(list_items) * 76 + 15
+        elif num_podium == 0:
+            empty_msg = "No voice activity recorded for this period."
+            eb = draw.textbbox((0, 0), empty_msg, font=subtitle_font)
+            ew = eb[2] - eb[0]
+            draw.text(
+                ((WIDTH - ew) // 2, current_y + 95),
+                empty_msg,
+                fill=TEXT_SECONDARY,
+                font=subtitle_font,
+            )
 
         # --------------------------------------------------------------
         # 4. FOOTER

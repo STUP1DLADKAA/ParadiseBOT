@@ -67,6 +67,9 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
                 self.store,
                 reconcile_interval=cfg.heartbeat_interval,
                 dm_reports_enabled=cfg.dm_reports_enabled,
+                alert_channel_id=cfg.alert_channel_id,
+                deaf_warning_seconds=cfg.deaf_warning_seconds,
+                renderer=self.renderer,
             )
             # Attach tracker to bot so other components can access it if needed
             self.bot.voice_tracker = self.tracker  # type: ignore[attr-defined]
