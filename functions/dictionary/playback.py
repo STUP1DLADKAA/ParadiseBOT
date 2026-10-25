@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import shutil
 from dataclasses import dataclass
 
@@ -59,11 +60,27 @@ def _has_nacl() -> bool:
     return True
 
 
+def resolve_ffmpeg_executable() -> str | None:
+    """Locate an ffmpeg binary on PATH or from the bundled imageio-ffmpeg wheel."""
+    system_ffmpeg = shutil.which("ffmpeg")
+    if system_ffmpeg:
+        return system_ffmpeg
+    try:
+        import imageio_ffmpeg
+
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and os.path.isfile(bundled):
+            return bundled
+    except Exception:  # pragma: no cover - optional fallback probe
+        pass
+    return None
+
+
 def playback_support() -> PlaybackSupport:
     """Can this machine speak into a voice channel at all?"""
     if not _has_nacl():
         return PlaybackSupport(False, "PyNaCl is not installed")
-    if shutil.which("ffmpeg") is None:
+    if resolve_ffmpeg_executable() is None:
         return PlaybackSupport(False, "ffmpeg is not on PATH")
     if not hasattr(discord, "FFmpegOpusAudio"):  # pragma: no cover - ancient lib
         return PlaybackSupport(False, "this discord.py build has no voice support")
@@ -163,7 +180,10 @@ class VoicePlayback:
                     await self._disconnect(guild)
 
     async def _render(self, client: discord.VoiceClient, clip: Clip) -> None:
-        source = discord.FFmpegOpusAudio(io.BytesIO(clip.data), pipe=True)
+        ffmpeg_exe = resolve_ffmpeg_executable() or "ffmpeg"
+        source = discord.FFmpegOpusAudio(
+            io.BytesIO(clip.data), pipe=True, executable=ffmpeg_exe
+        )
         finished = asyncio.Event()
         loop = asyncio.get_running_loop()
 

@@ -9,6 +9,7 @@ heartbeats and the outage outbox — live in the store implementations.
 from __future__ import annotations
 
 import asyncio
+import io
 import logging
 import time
 from collections import OrderedDict
@@ -16,6 +17,8 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
 
 import discord
+
+from functions.helpers import Colour
 
 from .models import (
     ActiveVoiceSession,
@@ -27,22 +30,49 @@ from .models import (
     format_duration,
     format_duration_diff,
 )
+from .render import LeaderboardImageRenderer
 from .store import VoiceStore, VoiceStoreError, VoiceStoreUnavailable
-from .time_windows import IST, ensure_aware, ist_date, next_ist_midnight, period_overlap_seconds
+from .time_windows import (
+    IST,
+    ensure_aware,
+    ist_date,
+    ist_day_start_utc,
+    next_ist_midnight,
+    period_overlap_seconds,
+)
+from .ui import build_leaderboard_text_embed
 
 log = logging.getLogger(__name__)
 
 DEAF_TIME_EXEMPT_USER_ID = 922359954025885737
+VOICE_ALERT_CHANNEL_ID = 1507796401122181352
+DEAF_WARNING_DELAY_SECONDS = 30.0
 
 
 def excluded_from_credit(member, channel, state) -> bool:
-    """Use the persisted AFK flag for all non-creditable voice time."""
+    """Use the persisted AFK flag for all non-creditable voice time.
+
+    Muted (non-deafened) members remain creditable and tracked; only the AFK
+    channel and deafened states (except the exempt user) pause credit.
+    """
     return bool(
         channel is not None and member.guild.afk_channel is not None
         and channel.id == member.guild.afk_channel.id
         or member.id != DEAF_TIME_EXEMPT_USER_ID
         and state is not None and (state.self_deaf or state.deaf)
     )
+
+
+def _should_warn_deaf(member, channel, state) -> bool:
+    """True when a member is deafened in a non-AFK VC and eligible for warning."""
+    if channel is None or state is None:
+        return False
+    afk_channel = getattr(member.guild, "afk_channel", None)
+    if afk_channel is not None and channel.id == afk_channel.id:
+        return False
+    if member.id == DEAF_TIME_EXEMPT_USER_ID:
+        return False
+    return bool(state.self_deaf or state.deaf)
 
 
 # Upper bound on HTTP member fetches performed per leaderboard render for
@@ -66,11 +96,17 @@ class VoiceTracker:
         *,
         reconcile_interval: float = 20.0,
         dm_reports_enabled: bool = True,
+        alert_channel_id: int = VOICE_ALERT_CHANNEL_ID,
+        deaf_warning_seconds: float = DEAF_WARNING_DELAY_SECONDS,
+        renderer: LeaderboardImageRenderer | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.bot = bot
         self.db = db
         self.dm_reports_enabled = dm_reports_enabled
+        self.alert_channel_id = max(0, int(alert_channel_id))
+        self.deaf_warning_seconds = max(0.0, float(deaf_warning_seconds))
+        self._renderer = renderer
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.reconcile_interval = max(5.0, float(reconcile_interval))
         self.active_sessions: dict[tuple[int, int], ActiveVoiceSession] = {}
@@ -80,6 +116,8 @@ class VoiceTracker:
         self._lock = asyncio.Lock()
         self._reconciliation_task: asyncio.Task[None] | None = None
         self._dm_report_task: asyncio.Task[None] | None = None
+        self._deaf_warning_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
+        self._deaf_warned: set[tuple[int, int]] = set()
         self._stopped = False
         # Whether persisted active sessions have been recovered after boot.
         self._recovered = False
@@ -87,6 +125,12 @@ class VoiceTracker:
         # Supabase store is bootstrapped (outbox drained) so remote rows are
         # recovered too without racing pending outbox closes.
         self._recovered_remote = False
+
+    @property
+    def renderer(self) -> LeaderboardImageRenderer:
+        if self._renderer is None:
+            self._renderer = LeaderboardImageRenderer()
+        return self._renderer
 
     def start_background_tasks(self) -> None:
         """Start periodic reconciliation and daily DM reporting loops."""
@@ -106,6 +150,12 @@ class VoiceTracker:
             self._reconciliation_task.cancel()
         if self._dm_report_task:
             self._dm_report_task.cancel()
+        for task in list(self._deaf_warning_tasks.values()):
+            task.cancel()
+        if self._deaf_warning_tasks:
+            await asyncio.gather(*self._deaf_warning_tasks.values(), return_exceptions=True)
+        self._deaf_warning_tasks.clear()
+        self._deaf_warned.clear()
 
         # Flush and close all active sessions
         async with self._lock:
@@ -145,15 +195,10 @@ class VoiceTracker:
         await self._remember_member(member)
 
         excluded = excluded_from_credit(member, after.channel, after)
-        newly_deaf = (
-            after.channel is not None
-            and member.id != DEAF_TIME_EXEMPT_USER_ID
-            and (after.self_deaf or after.deaf)
-            and (before.channel is None or not (before.self_deaf or before.deaf))
-        )
         async with self._lock:
             session = self.active_sessions.get(key)
             if after.channel is None:
+                self._cancel_deaf_warning(key)
                 self.active_sessions.pop(key, None)
                 if session is not None and not session.is_afk:
                     await self._persist_session(session, now)
@@ -179,20 +224,179 @@ class VoiceTracker:
                 )
                 self.active_sessions[key] = session
             session.channel_id = after.channel.id
-            session.is_muted = after.self_mute or after.mute
-            session.is_deaf = after.self_deaf or after.deaf
+            session.is_muted = bool(after.self_mute or after.mute)
+            session.is_deaf = bool(after.self_deaf or after.deaf)
             await self._persist_active_row(session, now)
+            self._sync_deaf_warning(member, after.channel, after)
 
-        if newly_deaf:
+    # ------------------------------------------------------------------
+    # Deafen 30-second warning & alert channel resolution
+    # ------------------------------------------------------------------
+
+    def _cancel_deaf_warning(self, key: tuple[int, int]) -> None:
+        task = self._deaf_warning_tasks.pop(key, None)
+        if task is not None and not task.done():
+            task.cancel()
+        self._deaf_warned.discard(key)
+
+    def _sync_deaf_warning(self, member: discord.Member, channel: Any, state: Any) -> None:
+        key = (member.guild.id, member.id)
+        if not _should_warn_deaf(member, channel, state):
+            self._cancel_deaf_warning(key)
+            return
+        if self.alert_channel_id <= 0 or key in self._deaf_warned:
+            return
+        existing = self._deaf_warning_tasks.get(key)
+        if existing is not None and not existing.done():
+            return
+        self._deaf_warning_tasks[key] = asyncio.create_task(
+            self._deaf_warning_worker(key, member),
+            name=f"voice-deaf-warning-{key[0]}-{key[1]}",
+        )
+
+    async def _deaf_warning_worker(
+        self,
+        key: tuple[int, int],
+        fallback_member: discord.Member,
+    ) -> None:
+        current_task = asyncio.current_task()
+        try:
+            await asyncio.sleep(self.deaf_warning_seconds)
+        except asyncio.CancelledError:
+            return
+        finally:
+            if self._deaf_warning_tasks.get(key) is current_task:
+                self._deaf_warning_tasks.pop(key, None)
+
+        if self._stopped or key in self._deaf_warned:
+            return
+
+        guild_id, user_id = key
+        session = self.active_sessions.get(key)
+        if session is None or not session.is_deaf:
+            return
+
+        guild = getattr(self.bot, "get_guild", lambda _id: None)(guild_id)
+        if getattr(guild, "id", None) != guild_id:
+            guild = getattr(fallback_member, "guild", None)
+        if guild is None:
+            return
+
+        afk_channel = getattr(guild, "afk_channel", None)
+        if afk_channel is not None and getattr(afk_channel, "id", None) == session.channel_id:
+            return
+
+        member = None
+        if hasattr(guild, "get_member"):
+            cand = guild.get_member(user_id)
+            if getattr(cand, "id", None) == user_id:
+                member = cand
+        if member is None:
+            member = fallback_member
+
+        _resolved_guild, alert_channel, _transient = await self._resolve_alert_channel(guild)
+        if alert_channel is None:
+            log.debug(
+                "Skipping deafened VC warning for user %s: channel %s unavailable",
+                user_id,
+                self.alert_channel_id,
+            )
+            return
+
+        self._deaf_warned.add(key)
+        seconds_int = max(1, int(round(self.deaf_warning_seconds)))
+        unit = "second" if seconds_int == 1 else "seconds"
+        try:
+            await alert_channel.send(
+                f"{member.mention} no VC farming — you've been deafened in "
+                f"<#{session.channel_id}> for {seconds_int} {unit}. "
+                "Deafened time doesn't count; undeafen to resume earning VC time.",
+                allowed_mentions=discord.AllowedMentions(
+                    users=[member], roles=False, everyone=False
+                ),
+            )
+        except discord.DiscordException:
+            log.warning("Could not send deafened VC warning", exc_info=True)
+
+    def _is_matching_alert_channel(self, channel: Any) -> bool:
+        return (
+            channel is not None
+            and getattr(channel, "id", None) == self.alert_channel_id
+            and callable(getattr(channel, "send", None))
+        )
+
+    async def _resolve_alert_channel(
+        self, guild: discord.Guild | None = None
+    ) -> tuple[discord.Guild | None, Any, bool]:
+        """Resolve (guild, channel, transient_error) for self.alert_channel_id."""
+        if self.alert_channel_id <= 0:
+            return guild, None, False
+
+        if guild is not None:
+            for attr in ("get_channel_or_thread", "get_channel"):
+                getter = getattr(guild, attr, None)
+                if callable(getter):
+                    ch = getter(self.alert_channel_id)
+                    if self._is_matching_alert_channel(ch):
+                        return guild, ch, False
+
+            bot_getter = getattr(self.bot, "get_channel", None)
+            if callable(bot_getter):
+                ch = bot_getter(self.alert_channel_id)
+                if self._is_matching_alert_channel(ch):
+                    ch_guild = getattr(ch, "guild", None)
+                    ch_guild_id = getattr(ch_guild, "id", None)
+                    if not isinstance(ch_guild_id, int) or ch_guild_id == guild.id:
+                        return guild, ch, False
+
+            fetcher = getattr(guild, "fetch_channel", None)
+            if callable(fetcher):
+                try:
+                    ch = await fetcher(self.alert_channel_id)
+                except (discord.NotFound, discord.Forbidden):
+                    return guild, None, False
+                except discord.HTTPException:
+                    return guild, None, True
+                except (TypeError, AttributeError):
+                    ch = None
+                if self._is_matching_alert_channel(ch):
+                    return guild, ch, False
+            return guild, None, False
+
+        # Guild not specified: locate the channel across connected guilds first
+        guilds = getattr(self.bot, "guilds", None) or ()
+        for g in guilds:
+            for attr in ("get_channel_or_thread", "get_channel"):
+                getter = getattr(g, attr, None)
+                if callable(getter):
+                    ch = getter(self.alert_channel_id)
+                    if self._is_matching_alert_channel(ch):
+                        return g, ch, False
+
+        bot_getter = getattr(self.bot, "get_channel", None)
+        if callable(bot_getter):
+            ch = bot_getter(self.alert_channel_id)
+            if self._is_matching_alert_channel(ch):
+                ch_guild = getattr(ch, "guild", None)
+                if ch_guild is not None and isinstance(getattr(ch_guild, "id", None), int):
+                    return ch_guild, ch, False
+
+        bot_fetcher = getattr(self.bot, "fetch_channel", None)
+        if callable(bot_fetcher):
             try:
-                await after.channel.send(
-                    f"{member.mention} no VC farming — deafened time doesn't count. "
-                    "Undeafen to resume earning VC time.",
-                    allowed_mentions=discord.AllowedMentions(users=[member], roles=False, everyone=False),
-                    delete_after=120,
-                )
-            except discord.DiscordException:
-                log.warning("Could not send deafened VC warning", exc_info=True)
+                ch = await bot_fetcher(self.alert_channel_id)
+            except (discord.NotFound, discord.Forbidden):
+                return None, None, False
+            except discord.HTTPException:
+                return None, None, True
+            except (TypeError, AttributeError):
+                ch = None
+            if self._is_matching_alert_channel(ch):
+                ch_guild = getattr(ch, "guild", None)
+                if ch_guild is not None and isinstance(getattr(ch_guild, "id", None), int):
+                    return ch_guild, ch, False
+
+        return None, None, False
 
     async def _persist_session(self, session: ActiveVoiceSession, ended_at: datetime) -> None:
         """Record a completed session.
@@ -357,12 +561,12 @@ class VoiceTracker:
                                 user_id=member.id,
                                 channel_id=channel.id,
                                 started_at=now,
-                                is_muted=member.voice.self_mute or member.voice.mute if member.voice else False,
-                                is_deaf=member.voice.self_deaf or member.voice.deaf if member.voice else False,
+                                is_muted=bool(member.voice.self_mute or member.voice.mute) if member.voice else False,
+                                is_deaf=bool(member.voice.self_deaf or member.voice.deaf) if member.voice else False,
                                 is_afk=is_afk,
                             )
                         else:
-                            # Update existing session channel
+                            # Update existing session channel & mute/deaf flags
                             session = self.active_sessions[key]
                             if session.is_afk != is_afk:
                                 if not session.is_afk:
@@ -371,7 +575,16 @@ class VoiceTracker:
                                     await self._clear_active_row(guild.id, member.id, started_before=session.started_at)
                                 session.started_at = now
                             session.channel_id = channel.id
+                            session.is_muted = bool(member.voice.self_mute or member.voice.mute) if member.voice else False
+                            session.is_deaf = bool(member.voice.self_deaf or member.voice.deaf) if member.voice else False
                             session.is_afk = is_afk
+
+                        self._sync_deaf_warning(member, channel, member.voice)
+
+            # Split any ongoing sessions that crossed an IST midnight boundary
+            # so pre-midnight hours are committed to the finished day and
+            # post-midnight hours accrue cleanly into the new day.
+            await self._rollover_midnight_sessions_unlocked(now)
 
             # Heartbeat every tracked session to the database in ONE batched
             # write (one compact row per user, last_seen_at bumped), so a
@@ -395,6 +608,7 @@ class VoiceTracker:
             # Safely close sessions for users no longer connected
             for key in list(self.active_sessions.keys()):
                 if key not in current_connected_keys:
+                    self._cancel_deaf_warning(key)
                     session = self.active_sessions.pop(key)
                     if not session.is_afk:
                         await self._persist_session(session, now)
@@ -402,6 +616,28 @@ class VoiceTracker:
                         await self._clear_active_row(
                             key[0], key[1], started_before=session.started_at
                         )
+
+    async def rollover_midnight_sessions(self, now: datetime | None = None) -> int:
+        """Commit pre-midnight portions of ongoing sessions and reset start to 12:00 AM IST."""
+        instant = ensure_aware(now or self._clock()).astimezone(timezone.utc)
+        async with self._lock:
+            return await self._rollover_midnight_sessions_unlocked(instant)
+
+    async def _rollover_midnight_sessions_unlocked(self, now: datetime) -> int:
+        today_start_utc = ist_day_start_utc(now.astimezone(IST).date())
+        rolled = 0
+        for (guild_id, user_id), session in list(self.active_sessions.items()):
+            if session.started_at < today_start_utc <= now:
+                if not session.is_afk:
+                    await self._persist_session(session, today_start_utc)
+                else:
+                    await self._clear_active_row(
+                        guild_id, user_id, started_before=session.started_at
+                    )
+                session.started_at = today_start_utc
+                await self._persist_active_row(session, now)
+                rolled += 1
+        return rolled
 
     async def _recover_persisted_sessions(self, now: datetime) -> None:
         """
@@ -575,7 +811,8 @@ class VoiceTracker:
                     avatar_url = None
 
             pct = (total_sec / total_server_seconds * 100.0) if total_server_seconds > 0 else 0.0
-            is_active = (guild_id, u_id) in self.active_sessions
+            active_sess = self.active_sessions.get((guild_id, u_id))
+            is_active = bool(active_sess is not None and not active_sess.is_afk)
 
             members.append(
                 LeaderboardMember(
@@ -705,7 +942,7 @@ class VoiceTracker:
     # ------------------------------------------------------------------
 
     async def _dm_report_loop(self) -> None:
-        """Dispatch completed-day reports on the IST calendar boundary.
+        """Dispatch completed-day channel leaderboards & DM reports at 12:00 AM IST.
 
         The reports themselves are idempotent in storage, so after an offline
         boundary the loop catches up from the previous IST day on restart.
@@ -722,22 +959,36 @@ class VoiceTracker:
             now_utc = ensure_aware(self._clock()).astimezone(timezone.utc)
             today_ist = now_utc.astimezone(IST).date()
             try:
-                if not self.dm_reports_enabled:
+                # Commit any ongoing pre-midnight sessions at exact 12:00 AM IST
+                # so the completed day's totals are durable and post-midnight
+                # hours accrue cleanly into the new day's leaderboard.
+                await self.rollover_midnight_sessions(now_utc)
+
+                if not self.dm_reports_enabled and self.alert_channel_id <= 0:
                     last_completed_date = today_ist
                 else:
                     # On startup, retry the last fully closed IST day. Durable
-                    # per-user sent marks prevent a duplicate report after a
+                    # sent marks prevent duplicate channel posts or DMs after a
                     # restart immediately before or after midnight.
                     if last_completed_date is None:
                         last_completed_date = today_ist - timedelta(days=1)
 
                     while last_completed_date < today_ist:
                         target = last_completed_date
+                        target_str = target.isoformat()
                         log.info(
                             "Triggering daily IST voice reports for %s",
-                            target.isoformat(),
+                            target_str,
                         )
-                        blocked = await self.dispatch_daily_dm_reports(target.isoformat())
+                        channel_blocked = await self.dispatch_daily_channel_leaderboard(
+                            target_str
+                        )
+                        dm_blocked = (
+                            await self.dispatch_daily_dm_reports(target_str)
+                            if self.dm_reports_enabled
+                            else 0
+                        )
+                        blocked = channel_blocked + dm_blocked
                         if blocked <= 0:
                             last_completed_date = target + timedelta(days=1)
                             continue
@@ -745,7 +996,7 @@ class VoiceTracker:
                             log.error(
                                 "Giving up on daily voice reports for %s after %s days "
                                 "of retries; the data remains in Supabase.",
-                                target.isoformat(),
+                                target_str,
                                 DM_REPORT_RETRY_DAYS,
                             )
                             last_completed_date = target + timedelta(days=1)
@@ -762,6 +1013,151 @@ class VoiceTracker:
                 1.0, (next_ist_midnight(now_utc) - now_utc).total_seconds()
             )
             await asyncio.sleep(min(60.0, until_midnight))
+
+    async def dispatch_daily_channel_leaderboard(self, target_date_str: str) -> int:
+        """Publish the completed day's VC leaderboard to self.alert_channel_id.
+
+        Returns 0 when done (or when the alert channel is disabled / absent),
+        and 1 when a transient store or Discord error requires a retry.
+        """
+        if self.alert_channel_id <= 0:
+            return 0
+        try:
+            target_date = date.fromisoformat(target_date_str)
+        except ValueError:
+            log.error("Invalid target_date_str for channel leaderboard: %s", target_date_str)
+            return 0
+
+        guild, channel, transient = await self._resolve_alert_channel()
+        if channel is None or guild is None:
+            if transient:
+                log.warning(
+                    "Daily VC leaderboard for %s postponed: could not fetch channel %s",
+                    target_date_str,
+                    self.alert_channel_id,
+                )
+                return 1
+            return 0
+
+        # Negative channel ID acts as a collision-free sentinel in voice_dm_reports
+        # so channel publication is exactly-once across restarts with no schema change.
+        sentinel_user_id = -int(self.alert_channel_id)
+        try:
+            already_sent = await self.db.has_dm_report_sent(
+                target_date_str, guild.id, sentinel_user_id
+            )
+        except VoiceStoreUnavailable as err:
+            log.warning(
+                "Daily VC leaderboard for %s postponed (database unreachable): %s",
+                target_date_str,
+                err,
+            )
+            return 1
+        if already_sent:
+            return 0
+
+        try:
+            members = await self.get_live_leaderboard(
+                guild, VoicePeriod.TODAY, target_date=target_date
+            )
+        except VoiceStoreUnavailable as err:
+            log.warning(
+                "Daily VC leaderboard read for %s postponed: %s",
+                target_date_str,
+                err,
+            )
+            return 1
+        except VoiceStoreError:
+            log.exception("Daily VC leaderboard read failed for %s", target_date_str)
+            return 1
+
+        date_display = target_date.strftime("%B %d, %Y")
+        short_date = target_date.strftime("%b %d, %Y")
+        total_server_seconds = sum(m.total_seconds for m in members)
+
+        file: discord.File | None = None
+        try:
+            image_bytes = await self.renderer.render_leaderboard(
+                guild_name=guild.name,
+                period=VoicePeriod.TODAY,
+                members=members,
+                date_str=short_date,
+                page=1,
+                page_size=10,
+                title_override=f"DAILY LEADERBOARD • {short_date.upper()}",
+            )
+            file = discord.File(
+                io.BytesIO(image_bytes), filename="daily_vc_leaderboard.png"
+            )
+            embed = discord.Embed(
+                title=f"🎙️ Daily Voice Leaderboard — {date_display}",
+                colour=Colour.ACCENT,
+            )
+            if not members:
+                embed.description = (
+                    f"No voice activity was recorded on **{date_display}**."
+                )
+            embed.set_image(url="attachment://daily_vc_leaderboard.png")
+            embed.set_footer(
+                text=(
+                    f"Server: {guild.name} • "
+                    f"Server Total: {format_duration(total_server_seconds)} • "
+                    f"{len(members)} tracked member{'s' if len(members) != 1 else ''}"
+                )
+            )
+        except Exception:
+            log.warning(
+                "Could not render daily VC leaderboard image; using text embed",
+                exc_info=True,
+            )
+            embed = build_leaderboard_text_embed(
+                guild, VoicePeriod.TODAY, members, page=1, page_size=10
+            )
+            embed.title = f"🎙️ Daily Voice Leaderboard — {date_display}"
+            file = None
+
+        try:
+            if file is not None:
+                await channel.send(
+                    embed=embed,
+                    file=file,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+            else:
+                await channel.send(
+                    embed=embed,
+                    allowed_mentions=discord.AllowedMentions.none(),
+                )
+        except discord.Forbidden:
+            log.warning(
+                "Missing permission to post daily VC leaderboard in channel %s",
+                self.alert_channel_id,
+            )
+            return 0
+        except discord.HTTPException as err:
+            log.warning(
+                "Transient error posting daily VC leaderboard in %s: %s",
+                self.alert_channel_id,
+                err,
+            )
+            return 1
+
+        try:
+            await self.db.mark_dm_report_sent(
+                target_date_str, guild.id, sentinel_user_id
+            )
+        except VoiceStoreError:
+            log.warning(
+                "Sent daily VC leaderboard for %s, but failed to persist mark",
+                target_date_str,
+                exc_info=True,
+            )
+        log.info(
+            "Published daily VC leaderboard for %s to channel %s",
+            target_date_str,
+            self.alert_channel_id,
+        )
+        return 0
 
     async def dispatch_daily_dm_reports(self, target_date_str: str) -> int:
         """Deliver personalized daily VC reports for target_date_str.

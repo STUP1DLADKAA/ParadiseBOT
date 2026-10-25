@@ -1,4 +1,7 @@
 discord.py[voice]>=2.6,<3.0
+# Bundled static ffmpeg binary so Discord voice Opus playback works out of
+# the box even when ffmpeg is not pre-installed on the host PATH.
+imageio-ffmpeg>=0.5,<1.0
 python-dotenv>=1.0,<2.0
 # HTTP client used by weather, conversion, search and image lookups.
 # Installed alongside discord.py, but pinned here because the tool

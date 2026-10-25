@@ -25,6 +25,11 @@ def ist_date(now: datetime | None = None) -> date:
     return instant.astimezone(IST).date()
 
 
+def ist_day_start_utc(day: date) -> datetime:
+    """Start (12:00 AM IST) of a calendar date, as an aware UTC instant."""
+    return datetime.combine(day, time.min, tzinfo=IST).astimezone(UTC)
+
+
 def next_ist_midnight(now: datetime | None = None) -> datetime:
     """The next daily reporting boundary, as an aware UTC instant."""
     instant = ensure_aware(now or datetime.now(UTC)).astimezone(IST)
@@ -152,6 +157,7 @@ __all__ = [
     "UTC",
     "ensure_aware",
     "ist_date",
+    "ist_day_start_utc",
     "next_ist_midnight",
     "period_bounds",
     "period_overlap_seconds",
