@@ -546,6 +546,29 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(self.fake.active), 0)
         self.assertEqual(len(self.fake.sessions), 1)
 
+    async def test_deaf_time_excluded_except_exempt_user(self):
+        guild = _make_mock_guild()
+        channel = MagicMock(id=888)
+        channel.send = AsyncMock()
+        for user_id, expected in ((777, 1200), (922359954025885737, 1800)):
+            member = _make_mock_member(guild, user_id)
+            channel.send.reset_mock()
+            with patch("functions.voice.tracker.datetime") as clock:
+                for minute, before, after in (
+                    (0, _voice_state(None), _voice_state(channel)),
+                    (10, _voice_state(channel), _voice_state(channel)),
+                    (20, _voice_state(channel), _voice_state(channel)),
+                    (30, _voice_state(channel), _voice_state(None)),
+                ):
+                    before.self_deaf = minute == 20
+                    after.self_deaf = minute == 10
+                    clock.now.return_value = _dt(2026, 10, 1, 12, minute)
+                    await self.tracker.handle_voice_state_update(member, before, after)
+            total = sum(row["duration_seconds"] for row in self.fake.daily.values()
+                        if row["user_id"] == user_id)
+            self.assertEqual(total, expected)
+            self.assertEqual(channel.send.await_count, int(user_id == 777))
+
     async def test_afk_time_never_recorded(self):
         afk_channel = MagicMock()
         afk_channel.id = 999
