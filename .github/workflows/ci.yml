@@ -1,0 +1,66 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    name: Tests (Python 3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pytest
+
+      - name: Unit tests
+        run: python -m pytest -q
+
+      - name: Review agent self-test
+        run: python tools/review_agent.py --self-test
+
+      # Smoke test only: the pipeline must run end to end. Latency is 0 so
+      # this is a correctness check, not a benchmark gate.
+      - name: Voice pipeline smoke run
+        run: >-
+          python benchmarks/voice_pipeline.py
+          --label ci --latency 0 --users 4 --toggles 1
+
+  review:
+    name: Review agent (diff)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # the agent needs the merge base to build the diff
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Review the proposed change
+        # Fails only on blocking findings (destructive SQL, schema changes,
+        # committed secrets, blocking calls in coroutines, unbounded shutdown
+        # flush). Warnings are printed but reported as suggestions.
+        run: |
+          python tools/review_agent.py --base "origin/${{ github.base_ref }}" --head HEAD
