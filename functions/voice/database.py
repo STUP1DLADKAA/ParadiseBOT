@@ -21,6 +21,7 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import threading
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Sequence
@@ -63,9 +64,20 @@ class VoiceDatabase:
     def __init__(self, db_path: str | Path = DEFAULT_DB_PATH) -> None:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
+        # One reusable connection per thread instead of a fresh connect +
+        # PRAGMA for every statement. Every call site here is short and
+        # sequential, so a cached connection removes the dominant per-call
+        # cost (open + configure + close) without changing transaction
+        # semantics (isolation_level=None keeps autocommit behaviour).
+        self._local = threading.local()
+        self._connections: list[sqlite3.Connection] = []
+        self._connections_lock = threading.Lock()
         self._init_db()
 
     def _get_connection(self) -> sqlite3.Connection:
+        conn = getattr(self._local, "connection", None)
+        if conn is not None:
+            return conn
         conn = sqlite3.connect(
             str(self.db_path),
             timeout=20.0,
@@ -77,7 +89,21 @@ class VoiceDatabase:
         # that potentially locking PRAGMA for every short-lived operation is
         # unnecessary I/O; synchronous remains a per-connection setting.
         conn.execute("PRAGMA synchronous = NORMAL;")
+        self._local.connection = conn
+        with self._connections_lock:
+            self._connections.append(conn)
         return conn
+
+    def close(self) -> None:
+        """Close every cached connection (call once, on shutdown)."""
+        with self._connections_lock:
+            connections, self._connections = self._connections, []
+        for conn in connections:
+            try:
+                conn.close()
+            except sqlite3.Error:  # pragma: no cover - shutdown best effort
+                log.debug("Could not close SQLite connection", exc_info=True)
+        self._local = threading.local()
 
     def _init_db(self) -> None:
         with self._get_connection() as conn:
@@ -192,6 +218,25 @@ class VoiceDatabase:
             if row is None:
                 return True  # Default enabled
             return bool(row["dm_reports_enabled"])
+
+    def get_user_dm_preferences(self, user_ids: Sequence[int]) -> dict[int, bool]:
+        """Bulk DM preference lookup; unknown users default to enabled."""
+        ids = [int(u) for u in user_ids]
+        preferences = {uid: True for uid in ids}
+        if not ids:
+            return preferences
+        placeholders = ", ".join("?" for _ in ids)
+        conn = self._get_connection()
+        cur = conn.execute(
+            f"""
+            SELECT user_id, dm_reports_enabled FROM user_settings
+            WHERE user_id IN ({placeholders})
+            """,
+            ids,
+        )
+        for row in cur.fetchall():
+            preferences[int(row["user_id"])] = bool(row["dm_reports_enabled"])
+        return preferences
 
     def set_user_dm_preference(self, user_id: int, enabled: bool) -> None:
         now_iso = datetime.now(timezone.utc).isoformat()
@@ -731,16 +776,25 @@ class VoiceDatabase:
             return int(cur.fetchone()["c"])
 
     def has_pending_voice_data(self) -> bool:
-        return any(
-            self.count_migration_rows(t) > 0
-            for t in (
-                "voice_sessions",
-                "voice_daily_stats",
-                "voice_member_profiles",
-                "voice_active_sessions",
-                "voice_dm_reports",
-            )
+        """True when any legacy voice table still holds rows.
+
+        One statement on one reused connection instead of five separate
+        COUNT(*) round trips (this runs on every maintenance cycle).
+        """
+        tables = (
+            "voice_sessions",
+            "voice_daily_stats",
+            "voice_member_profiles",
+            "voice_active_sessions",
+            "voice_dm_reports",
         )
+        total = " + ".join(f"(SELECT COUNT(*) FROM {table})" for table in tables)
+        conn = self._get_connection()
+        try:
+            row = conn.execute(f"SELECT {total} AS c").fetchone()
+        except sqlite3.OperationalError:
+            return False
+        return int(row["c"]) > 0
 
     def fetch_migration_sessions(self, limit: int) -> list[VoiceSessionRecord]:
         with self._get_connection() as conn:

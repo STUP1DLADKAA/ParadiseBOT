@@ -1,0 +1,122 @@
+{
+  "label": "baseline",
+  "generated_at": "2026-10-25T07:23:26+00:00",
+  "python": "3.11.2",
+  "scenario": {
+    "latency_simulated_ms": 40.0,
+    "users": 12,
+    "toggles_per_user": 4,
+    "coalesce_seconds": null,
+    "events": {
+      "join": 12,
+      "toggle": 48,
+      "move": 12,
+      "leave": 12
+    },
+    "event_latency_ms": {
+      "join": {
+        "mean": 82.66,
+        "p95": 83.03,
+        "max": 83.28
+      },
+      "toggle": {
+        "mean": 41.43,
+        "p95": 42.14,
+        "max": 42.74
+      },
+      "move": {
+        "mean": 41.67,
+        "p95": 41.85,
+        "max": 42.3
+      },
+      "leave": {
+        "mean": 41.42,
+        "p95": 41.79,
+        "max": 41.94
+      }
+    },
+    "supabase_calls": {
+      "join": {
+        "rpc:voice_heartbeat_active": 12,
+        "rpc:voice_upsert_profiles": 12
+      },
+      "toggle": {
+        "rpc:voice_heartbeat_active": 48
+      },
+      "move": {
+        "rpc:voice_heartbeat_active": 12
+      },
+      "flush": {},
+      "reconcile": {
+        "rpc:voice_heartbeat_active": 1,
+        "table:voice_active_sessions:select": 1
+      },
+      "leaderboard": {
+        "rpc:voice_leaderboard": 1,
+        "table:voice_member_profiles:select": 2
+      },
+      "leave": {
+        "rpc:voice_close_active_session": 12
+      }
+    },
+    "supabase_calls_total": 101,
+    "supabase_calls_per_event": {
+      "join": {
+        "calls": 24,
+        "events": 12,
+        "ratio": 2.0
+      },
+      "toggle": {
+        "calls": 48,
+        "events": 48,
+        "ratio": 1.0
+      },
+      "move": {
+        "calls": 12,
+        "events": 12,
+        "ratio": 1.0
+      },
+      "leave": {
+        "calls": 12,
+        "events": 12,
+        "ratio": 1.0
+      }
+    },
+    "persistence_lag_ms": {
+      "mean": 0.14,
+      "max": 0.14,
+      "samples": 1,
+      "rows_in_burst": 12
+    },
+    "loop_max_gap_ms": 9.61,
+    "reconcile_ms": 91.01,
+    "flush_ms": 0.01,
+    "flushed_rows": 0,
+    "leaderboard_ms": 125.36,
+    "leaderboard_rows": 12,
+    "total_event_seconds": 3.978,
+    "daily_seconds_total": 8064,
+    "active_row_writes": 72
+  },
+  "concurrent_burst": {
+    "users": 12,
+    "latency_simulated_ms": 40.0,
+    "total_ms": 534.9,
+    "per_event_ms": 44.58,
+    "calls": {
+      "rpc:voice_heartbeat_active": 12,
+      "rpc:voice_upsert_profiles": 12
+    },
+    "calls_total": 24,
+    "active_rows": 12
+  },
+  "shutdown": {
+    "latency_simulated_ms": 40.0,
+    "stop_ms": 41.15,
+    "active_rows_after_stop": 0,
+    "sessions_recorded": 1,
+    "recorded_seconds": 150,
+    "recorded_expected": 150
+  },
+  "peak_traced_memory_kib": 185.8
+}

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from datetime import date, datetime, timezone
 from typing import Any, Sequence
 
@@ -137,6 +138,17 @@ class SupabaseVoiceDatabase(VoiceStore):
         self._schema_ok = False
         self._bootstrapped = False
         self._outbox_warned = False
+        self._outbox_since_check = 0
+        self._outbox_checked_at = 0.0
+        # Lightweight request accounting (no payloads, no secrets): lets the
+        # maintenance loop report real Supabase traffic and failures.
+        self.metrics: dict[str, Any] = {
+            "requests": 0,
+            "failures": 0,
+            "max_latency_ms": 0.0,
+            "last_latency_ms": 0.0,
+            "by_operation": {},
+        }
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -228,7 +240,15 @@ class SupabaseVoiceDatabase(VoiceStore):
             try:
                 if self._local.has_pending_voice_data():
                     await migrator.run()
-                await self.flush_outbox()
+                remaining = await self.flush_outbox()
+                log.debug(
+                    "Voice store cycle: %s request(s), %s failure(s), %sms slowest, "
+                    "%s outbox row(s) pending",
+                    self.metrics["requests"],
+                    self.metrics["failures"],
+                    self.metrics["max_latency_ms"],
+                    remaining,
+                )
             except VoiceStoreUnavailable as err:
                 log.debug("Voice maintenance cycle skipped: %s", err)
             except Exception:  # noqa: BLE001 - the loop must never die
@@ -241,14 +261,38 @@ class SupabaseVoiceDatabase(VoiceStore):
 
     async def _execute(self, description: str, build):
         client = await self._ensure_client()
+        started = time.perf_counter()
         try:
-            return await build(client).execute()
+            result = await build(client).execute()
         except VoiceStoreUnavailable:
+            self._record_request(description, started, failed=True)
             raise
         except Exception as err:
             # Network failures, 5xx, rate limits, missing schema objects —
             # all treated as "try again later". Messages never contain the key.
+            self._record_request(description, started, failed=True)
             raise VoiceStoreUnavailable(f"{description}: {err.__class__.__name__}: {err}") from err
+        self._record_request(description, started, failed=False)
+        return result
+
+    def _record_request(self, description: str, started: float, *, failed: bool) -> None:
+        """Count one request (cheap; never records payloads or secrets)."""
+        elapsed_ms = (time.perf_counter() - started) * 1000.0
+        stats = self.metrics
+        stats["requests"] += 1
+        stats["last_latency_ms"] = round(elapsed_ms, 3)
+        if elapsed_ms > stats["max_latency_ms"]:
+            stats["max_latency_ms"] = round(elapsed_ms, 3)
+        counts = stats["by_operation"]
+        entry = counts.get(description)
+        if entry is None:
+            counts[description] = {"requests": 1, "failures": 1 if failed else 0}
+        else:
+            entry["requests"] += 1
+            if failed:
+                entry["failures"] += 1
+        if failed:
+            stats["failures"] += 1
 
     # ------------------------------------------------------------------
     # Schema verification (never creates or alters anything)
@@ -292,6 +336,10 @@ class SupabaseVoiceDatabase(VoiceStore):
 
     async def set_user_dm_preference(self, user_id: int, enabled: bool) -> None:
         self._local.set_user_dm_preference(user_id, enabled)
+
+    async def get_user_dm_preferences(self, user_ids: Sequence[int]) -> dict[int, bool]:
+        # Local SQLite settings; one query instead of one per candidate.
+        return self._local.get_user_dm_preferences(list(user_ids))
 
     # ------------------------------------------------------------------
     # Completed sessions
@@ -593,6 +641,32 @@ class SupabaseVoiceDatabase(VoiceStore):
         except VoiceStoreUnavailable:
             self._queue("profile", row)
 
+    async def upsert_member_profiles(self, rows: Sequence[MemberProfile]) -> None:
+        """Persist many identities in ONE batched RPC (chunked, never lossy)."""
+        payload = [
+            {
+                "guild_id": int(row.guild_id),
+                "user_id": int(row.user_id),
+                "display_name": str(row.display_name),
+                "username": str(row.username),
+                "avatar_url": row.avatar_url or "",
+            }
+            for row in rows
+            if row is not None
+        ]
+        if not payload:
+            return
+        for chunk in _chunks(payload, DEFAULT_PROFILE_CHUNK):
+            try:
+                await self._execute(
+                    "upsert profiles",
+                    lambda c, ch=chunk: c.rpc("voice_upsert_profiles", {"p_rows": ch}),
+                )
+            except VoiceStoreUnavailable:
+                # Durable per-row outbox entries; replay is idempotent.
+                for row in chunk:
+                    self._queue("profile", row)
+
     async def get_member_profiles(
         self,
         guild_id: int,
@@ -747,6 +821,32 @@ class SupabaseVoiceDatabase(VoiceStore):
         )
         return bool(res.data)
 
+    async def get_sent_dm_reports(
+        self, date_str: str, guild_id: int, user_ids: Sequence[int]
+    ) -> set[int]:
+        """One batched lookup per guild/day instead of one query per user."""
+        ids = [int(u) for u in user_ids]
+        if not ids:
+            return set()
+        sent: set[int] = set()
+        for chunk in _chunks(ids, DEFAULT_PROFILE_CHUNK * 4):
+            payload = [
+                {"date": date_str, "guild_id": int(guild_id), "user_id": user_id}
+                for user_id in chunk
+            ]
+            res = await self._execute(
+                "fetch dm report batch",
+                lambda c, p=payload: c.rpc(
+                    "voice_fetch_dm_report_batch", {"p_keys": p}
+                ),
+            )
+            for row in res.data or []:
+                try:
+                    sent.add(int(row["user_id"]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+        return sent
+
     async def mark_dm_report_sent(self, date_str: str, guild_id: int, user_id: int) -> None:
         row = {
             "date": date_str,
@@ -770,6 +870,15 @@ class SupabaseVoiceDatabase(VoiceStore):
 
     def _queue(self, kind: str, payload: dict) -> None:
         self._local.queue_outbox(kind, payload)
+        # Counting the queue on every queued row is a full table scan during
+        # exactly the outage window we care about. Check at most once per 25
+        # rows or 30 seconds.
+        self._outbox_since_check += 1
+        now = time.monotonic()
+        if self._outbox_since_check < 25 and now - self._outbox_checked_at < 30.0:
+            return
+        self._outbox_since_check = 0
+        self._outbox_checked_at = now
         pending = self._local.count_outbox()
         if pending > self._outbox_warn_rows and not self._outbox_warned:
             log.error(
@@ -783,27 +892,82 @@ class SupabaseVoiceDatabase(VoiceStore):
             self._outbox_warned = False
 
     async def flush_outbox(self) -> int:
-        """Apply queued operations in order; returns rows still pending."""
+        """Apply queued operations in order; returns rows still pending.
+
+        Strict ordering is preserved because session and guarded-delete rows
+        can depend on each other. Adjacent *idempotent* profile and DM-report
+        rows are merged into one batched request each (their SQL functions are
+        already set-based), so draining a large outage costs far fewer round
+        trips without changing what is written.
+        """
         while True:
             batch = self._local.fetch_outbox_batch(self._outbox_batch)
             if not batch:
                 break
             done_ids: list[int] = []
-            for op_id, kind, payload in batch:
+            failed = False
+            position = 0
+            while position < len(batch):
+                op_id, kind, payload = batch[position]
                 try:
-                    await self._apply_outbox_op(kind, payload)
+                    if kind in ("profile", "dm_report"):
+                        group: list[tuple[int, dict]] = []
+                        while position < len(batch) and batch[position][1] == kind:
+                            group.append((batch[position][0], batch[position][2]))
+                            position += 1
+                        await self._apply_outbox_group(kind, [item[1] for item in group])
+                        done_ids.extend(op_id for op_id, _ in group)
+                    else:
+                        await self._apply_outbox_op(kind, payload)
+                        done_ids.append(op_id)
+                        position += 1
                 except VoiceStoreUnavailable:
-                    break  # keep strict order; retry next cycle
+                    failed = True  # keep strict order; retry next cycle
+                    break
                 except Exception:  # noqa: BLE001 - never lose the queue loop
                     log.exception("Outbox operation %s (%s) failed unexpectedly", op_id, kind)
+                    failed = True
                     break
-                done_ids.append(op_id)
             if done_ids:
                 self._local.delete_outbox_rows(done_ids)
                 log.debug("Flushed %s voice outbox rows", len(done_ids))
-            if len(done_ids) < len(batch):
+            if failed or len(done_ids) < len(batch):
                 break
         return self._local.count_outbox()
+
+    async def _apply_outbox_group(self, kind: str, payloads: list[dict]) -> None:
+        """Apply a run of same-kind idempotent outbox rows in one request."""
+        if kind == "profile":
+            rows = [
+                {
+                    "guild_id": int(item["guild_id"]),
+                    "user_id": int(item["user_id"]),
+                    "display_name": item["display_name"],
+                    "username": item["username"],
+                    "avatar_url": item.get("avatar_url") or "",
+                }
+                for item in payloads
+            ]
+            for chunk in _chunks(rows, DEFAULT_PROFILE_CHUNK):
+                await self._execute(
+                    "outbox profile",
+                    lambda c, ch=chunk: c.rpc("voice_upsert_profiles", {"p_rows": ch}),
+                )
+            return
+        rows = [
+            {
+                "date": item["date"],
+                "guild_id": int(item["guild_id"]),
+                "user_id": int(item["user_id"]),
+            }
+            for item in payloads
+        ]
+        for chunk in _chunks(rows, DEFAULT_OUTBOX_BATCH):
+            await self._execute(
+                "outbox dm report",
+                lambda c, ch=chunk: c.table("voice_dm_reports")
+                .upsert(ch, on_conflict="date,guild_id,user_id", ignore_duplicates=True),
+            )
 
     async def _apply_outbox_op(self, kind: str, payload: dict) -> None:
         if kind == "session":

@@ -70,6 +70,9 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
                 alert_channel_id=cfg.alert_channel_id,
                 deaf_warning_seconds=cfg.deaf_warning_seconds,
                 renderer=self.renderer,
+                coalesce_seconds=cfg.write_coalesce_seconds,
+                # Bounded shutdown flush: two request timeouts, clamped.
+                shutdown_timeout=max(5.0, min(60.0, cfg.request_timeout * 2)),
             )
             # Attach tracker to bot so other components can access it if needed
             self.bot.voice_tracker = self.tracker  # type: ignore[attr-defined]
@@ -93,10 +96,16 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
             self.store.start()
 
     async def cog_unload(self) -> None:
+        # Bounded: flush coalesced time, close every open session, drain the
+        # outbox, then release the local SQLite handles.
         if self.tracker is not None:
             await self.tracker.stop()
         if self.store is not None:
             await self.store.stop()
+        try:
+            self.db.close()
+        except Exception:  # noqa: BLE001 - shutdown must never raise
+            log.debug("Could not close the local voice database", exc_info=True)
 
     # ------------------------------------------------------------------
     # Discord Event Listeners

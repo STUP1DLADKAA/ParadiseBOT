@@ -151,6 +151,22 @@ class VoiceStore(ABC):
         user_ids: Sequence[int] | None = None,
     ) -> dict[int, MemberProfile]: ...
 
+    async def upsert_member_profiles(self, rows: Sequence[MemberProfile]) -> None:
+        """Persist several member identities at once.
+
+        The default keeps every backend correct by delegating to
+        :meth:`upsert_member_profile`; network-backed stores override it with
+        a single batched upsert so N identities cost one round trip.
+        """
+        for row in rows:
+            await self.upsert_member_profile(
+                guild_id=row.guild_id,
+                user_id=row.user_id,
+                display_name=row.display_name,
+                username=row.username,
+                avatar_url=row.avatar_url,
+            )
+
     # ------------------------------------------------------------------
     # Leaderboard reads (Supabase is the source of truth)
     # ------------------------------------------------------------------
@@ -188,3 +204,27 @@ class VoiceStore(ABC):
 
     @abstractmethod
     async def mark_dm_report_sent(self, date_str: str, guild_id: int, user_id: int) -> None: ...
+
+    async def get_sent_dm_reports(
+        self, date_str: str, guild_id: int, user_ids: Sequence[int]
+    ) -> set[int]:
+        """Return which of ``user_ids`` already have a durable mark that day.
+
+        The default issues one query per user; stores that support a batched
+        lookup override it so a daily report run costs one query per guild
+        instead of one per member.
+        """
+        sent: set[int] = set()
+        for user_id in user_ids:
+            if await self.has_dm_report_sent(date_str, guild_id, user_id):
+                sent.add(int(user_id))
+        return sent
+
+    async def get_user_dm_preferences(
+        self, user_ids: Sequence[int]
+    ) -> dict[int, bool]:
+        """DM-report opt-in state for many users (default enabled)."""
+        preferences: dict[int, bool] = {}
+        for user_id in user_ids:
+            preferences[int(user_id)] = await self.get_user_dm_preference(int(user_id))
+        return preferences

@@ -4,6 +4,29 @@ The tracker talks to a :class:`~functions.voice.store.VoiceStore` (Supabase in
 production) and never to SQL directly. All persistence semantics — atomic
 session closes, midnight splitting, restart recovery, AFK exclusion, bounded
 heartbeats and the outage outbox — live in the store implementations.
+
+Write pipeline
+--------------
+A Discord voice event only mutates the in-memory session map. The resulting
+heartbeat is *coalesced* into one row per session and written by a single
+batched upsert, so a burst of mute/deafen/move events costs one request per
+window instead of one request per event. Two things stay immediate because
+crash safety depends on them:
+
+* a brand-new session (join / AFK transition / post-midnight rollover) is
+  written before the event handler returns, and
+* a session end is closed atomically before the handler returns.
+
+Everything else is written once per ``coalesce_seconds`` window (default 2 s,
+``VOICE_WRITE_COALESCE_SECONDS``), so the maximum persistence delay for a
+heartbeat is one window. Crash accuracy is unchanged because the periodic
+reconciliation heartbeat already bounded it to one reconcile interval.
+
+Every active-row write and every close runs under one persistence lock, which
+is what makes the coalescing safe: a delayed heartbeat can never be written
+for a session that has already been closed, so no ghost row can appear and
+no time can be double counted. Shutdown flushes all pending rows before
+closing the remaining sessions, within a bounded timeout.
 """
 
 from __future__ import annotations
@@ -25,6 +48,7 @@ from .models import (
     DailyUserStat,
     LeaderboardEntry,
     LeaderboardMember,
+    MemberProfile,
     PersistedActiveSession,
     VoicePeriod,
     format_duration,
@@ -35,7 +59,6 @@ from .store import VoiceStore, VoiceStoreError, VoiceStoreUnavailable
 from .time_windows import (
     IST,
     ensure_aware,
-    ist_date,
     ist_day_start_utc,
     next_ist_midnight,
     period_overlap_seconds,
@@ -84,6 +107,11 @@ MAX_HYDRATE_FETCHES = 50
 MAX_PROFILE_SIGNATURES = 4096
 # How long a partly-failed daily DM dispatch keeps retrying before giving up.
 DM_REPORT_RETRY_DAYS = 2
+# Coalescing window for heartbeat writes (seconds). A state change reaches
+# Supabase within this window; session starts and ends are written immediately.
+DEFAULT_COALESCE_SECONDS = 2.0
+# Upper bound on the final shutdown flush (seconds).
+DEFAULT_SHUTDOWN_TIMEOUT = 20.0
 
 
 class VoiceTracker:
@@ -100,6 +128,8 @@ class VoiceTracker:
         deaf_warning_seconds: float = DEAF_WARNING_DELAY_SECONDS,
         renderer: LeaderboardImageRenderer | None = None,
         clock: Callable[[], datetime] | None = None,
+        coalesce_seconds: float = DEFAULT_COALESCE_SECONDS,
+        shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
     ) -> None:
         self.bot = bot
         self.db = db
@@ -109,13 +139,23 @@ class VoiceTracker:
         self._renderer = renderer
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self.reconcile_interval = max(5.0, float(reconcile_interval))
+        # 0 disables coalescing (every state change written immediately).
+        self.coalesce_seconds = max(0.0, float(coalesce_seconds))
+        self.shutdown_timeout = max(1.0, float(shutdown_timeout))
         self.active_sessions: dict[tuple[int, int], ActiveVoiceSession] = {}
         self._profile_signatures: OrderedDict[
             tuple[int, int], tuple[str, str, str | None]
         ] = OrderedDict()
-        self._lock = asyncio.Lock()
+        # In-memory-only state lock: never held across an await, so Discord
+        # events never queue behind network I/O.
+        self._state_lock = asyncio.Lock()
+        # Serialises active-row writes and closes (ordering + no ghost rows).
+        self._persist_lock = asyncio.Lock()
+        self._dirty_active: dict[tuple[int, int], PersistedActiveSession] = {}
+        self._pending_profiles: dict[tuple[int, int], MemberProfile] = {}
         self._reconciliation_task: asyncio.Task[None] | None = None
         self._dm_report_task: asyncio.Task[None] | None = None
+        self._write_flush_task: asyncio.Task[None] | None = None
         self._deaf_warning_tasks: dict[tuple[int, int], asyncio.Task[None]] = {}
         self._deaf_warned: set[tuple[int, int]] = set()
         self._stopped = False
@@ -133,7 +173,7 @@ class VoiceTracker:
         return self._renderer
 
     def start_background_tasks(self) -> None:
-        """Start periodic reconciliation and daily DM reporting loops."""
+        """Start periodic reconciliation, the write flusher, and DM reporting."""
         if self._reconciliation_task is None or self._reconciliation_task.done():
             self._reconciliation_task = asyncio.create_task(
                 self._reconciliation_loop(), name="voice-reconciliation"
@@ -142,24 +182,63 @@ class VoiceTracker:
             self._dm_report_task = asyncio.create_task(
                 self._dm_report_loop(), name="voice-daily-dm-reports"
             )
+        self.start_write_flusher()
 
-    async def stop(self) -> None:
-        """Safely close active sessions and cancel background tasks on bot shutdown."""
+    def start_write_flusher(self) -> None:
+        """Start (or restart) the coalesced write flusher only."""
+        if self.coalesce_seconds <= 0:
+            return
+        if self._write_flush_task is None or self._write_flush_task.done():
+            self._write_flush_task = asyncio.create_task(
+                self._write_flush_loop(), name="voice-write-flush"
+            )
+
+    async def stop(self, *, timeout: float | None = None) -> None:
+        """Flush pending writes, close active sessions, cancel background tasks.
+
+        The flush is bounded (``timeout`` or :attr:`shutdown_timeout`) so a
+        hanging database can never block process shutdown indefinitely. If the
+        budget is exhausted the pending session time is still durable in the
+        store's local mirror/outbox and is reconciled on the next start.
+        """
         self._stopped = True
-        if self._reconciliation_task:
-            self._reconciliation_task.cancel()
-        if self._dm_report_task:
-            self._dm_report_task.cancel()
+        tasks = [self._reconciliation_task, self._dm_report_task, self._write_flush_task]
+        for task in tasks:
+            if task is not None:
+                task.cancel()
         for task in list(self._deaf_warning_tasks.values()):
             task.cancel()
-        if self._deaf_warning_tasks:
-            await asyncio.gather(*self._deaf_warning_tasks.values(), return_exceptions=True)
+        pending = [task for task in tasks if task is not None]
+        pending.extend(self._deaf_warning_tasks.values())
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        self._reconciliation_task = None
+        self._dm_report_task = None
+        self._write_flush_task = None
         self._deaf_warning_tasks.clear()
         self._deaf_warned.clear()
 
-        # Flush and close all active sessions
-        async with self._lock:
+        budget = self.shutdown_timeout if timeout is None else max(1.0, float(timeout))
+        try:
+            await asyncio.wait_for(self._shutdown_flush(), timeout=budget)
+        except asyncio.TimeoutError:
+            log.error(
+                "Voice shutdown flush exceeded %.0fs; pending session time stays in the "
+                "durable local mirror and is reconciled on the next start.",
+                budget,
+            )
+        except Exception:  # noqa: BLE001 - shutdown must always complete
+            log.exception("Voice shutdown flush failed")
+
+    async def _shutdown_flush(self) -> None:
+        """Write coalesced rows first, then close every open session."""
+        async with self._persist_lock:
             now = ensure_aware(self._clock()).astimezone(timezone.utc)
+            # Pending heartbeats are not written: each session is about to be
+            # closed, which records the same time from the persisted row (or
+            # the in-memory fallback) and removes the row. Identity writes are
+            # still flushed because nothing else would persist them.
+            await self._flush_profiles_locked()
             for (guild_id, user_id), session in list(self.active_sessions.items()):
                 try:
                     if not session.is_afk:
@@ -171,6 +250,7 @@ class VoiceTracker:
                 except Exception as err:
                     log.error("Error saving active session on shutdown: %s", err)
             self.active_sessions.clear()
+            self._dirty_active.clear()
 
     # ------------------------------------------------------------------
     # Voice State Updates (Section 5)
@@ -182,52 +262,90 @@ class VoiceTracker:
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        """Handle Discord voice state transitions: join, leave, move, mute/deaf."""
+        """Handle Discord voice state transitions: join, leave, move, mute/deaf.
+
+        The in-memory transition is computed first, without any network call.
+        Only a new session (written immediately for crash safety) or a session
+        end (closed atomically) touches the store synchronously; every other
+        transition is coalesced into the next batched heartbeat.
+        """
         if member.bot or not member.guild:
             return
 
-        guild = member.guild
-        guild_id = guild.id
+        guild_id = member.guild.id
         user_id = member.id
-        now = ensure_aware(self._clock()).astimezone(timezone.utc)
         key = (guild_id, user_id)
-
-        await self._remember_member(member)
-
+        now = ensure_aware(self._clock()).astimezone(timezone.utc)
         excluded = excluded_from_credit(member, after.channel, after)
-        async with self._lock:
+
+        # Identity refresh is queued in memory; the batched writer persists it.
+        self._queue_member_profile(member)
+
+        closed: ActiveVoiceSession | None = None
+        cleared: ActiveVoiceSession | None = None
+        started_session: ActiveVoiceSession | None = None
+        orphan_close = False
+
+        async with self._state_lock:
             session = self.active_sessions.get(key)
             if after.channel is None:
                 self._cancel_deaf_warning(key)
                 self.active_sessions.pop(key, None)
+                self._dirty_active.pop(key, None)
                 if session is not None and not session.is_afk:
-                    await self._persist_session(session, now)
+                    closed = session
                 elif session is not None:
-                    await self._clear_active_row(guild_id, user_id, started_before=session.started_at)
+                    cleared = session
                 else:
+                    orphan_close = True
+            else:
+                if session is not None and session.is_afk != excluded:
+                    if not session.is_afk:
+                        closed = session
+                    else:
+                        cleared = session
+                    session = None
+                if session is None:
+                    session = ActiveVoiceSession(
+                        guild_id=guild_id, user_id=user_id,
+                        channel_id=after.channel.id, started_at=now, is_afk=excluded,
+                    )
+                    self.active_sessions[key] = session
+                    started_session = session
+                else:
+                    moved = session.channel_id != after.channel.id
+                    if moved:
+                        session.channel_id = after.channel.id
+                    # A pure mute/deafen toggle does not change any persisted
+                    # field, so it is not written at all; the periodic
+                    # reconcile heartbeat keeps last_seen_at fresh.
+                    if moved or self.coalesce_seconds <= 0:
+                        self._queue_active(session, now)
+                session.is_muted = bool(after.self_mute or after.mute)
+                session.is_deaf = bool(after.self_deaf or after.deaf)
+
+        async with self._persist_lock:
+            if closed is not None:
+                await self._persist_session(closed, now)
+            if cleared is not None:
+                await self._clear_active_row(
+                    guild_id, user_id, started_before=cleared.started_at
+                )
+            if after.channel is None:
+                if orphan_close:
                     try:
                         await self.db.close_active_session(guild_id, user_id, now)
                     except VoiceStoreError:
                         log.debug("Could not close orphaned active row", exc_info=True)
                 return
+            if started_session is not None:
+                # Crash safety: a brand-new session is durable immediately.
+                await self._write_new_session_row(started_session, now)
+            elif self.coalesce_seconds <= 0 and self._dirty_active:
+                # Coalescing disabled: honour the legacy write-per-event mode.
+                await self._flush_active_locked()
 
-            if session is not None and session.is_afk != excluded:
-                if not session.is_afk:
-                    await self._persist_session(session, now)
-                else:
-                    await self._clear_active_row(guild_id, user_id, started_before=session.started_at)
-                session = None
-            if session is None:
-                session = ActiveVoiceSession(
-                    guild_id=guild_id, user_id=user_id,
-                    channel_id=after.channel.id, started_at=now, is_afk=excluded,
-                )
-                self.active_sessions[key] = session
-            session.channel_id = after.channel.id
-            session.is_muted = bool(after.self_mute or after.mute)
-            session.is_deaf = bool(after.self_deaf or after.deaf)
-            await self._persist_active_row(session, now)
-            self._sync_deaf_warning(member, after.channel, after)
+        self._sync_deaf_warning(member, after.channel, after)
 
     # ------------------------------------------------------------------
     # Deafen 30-second warning & alert channel resolution
@@ -399,7 +517,7 @@ class VoiceTracker:
         return None, None, False
 
     async def _persist_session(self, session: ActiveVoiceSession, ended_at: datetime) -> None:
-        """Record a completed session.
+        """Record a completed session (must hold ``self._persist_lock``).
 
         Delegates to the store's atomic close (record + row delete in one
         transaction, using the persisted row's own started_at) and falls back
@@ -432,89 +550,193 @@ class VoiceTracker:
             log.error("Failed to record voice session: %s", err)
 
     # ------------------------------------------------------------------
-    # Persistence helpers (identities + in-flight sessions survive restarts)
+    # Coalesced persistence (identities + in-flight sessions)
+    #
+    # Everything below is called with ``self._persist_lock`` held *unless*
+    # the name says otherwise, which is what keeps a delayed heartbeat from
+    # ever landing after its session was closed.
     # ------------------------------------------------------------------
 
-    async def _remember_profile(
-        self,
-        guild_id: int,
-        user_id: int,
-        display_name: str,
-        username: str,
-        avatar_url: str | None,
-    ) -> None:
-        """Persist an identity only when its process-local values changed."""
-        key = (int(guild_id), int(user_id))
-        signature = (display_name, username, avatar_url)
+    @staticmethod
+    def _profile_of(member) -> MemberProfile:
+        """Snapshot the identity fields we persist for a guild member."""
+        try:
+            avatar_url = str(member.display_avatar.url)
+        except Exception:  # noqa: BLE001 - avatars are optional
+            avatar_url = None
+        return MemberProfile(
+            guild_id=int(member.guild.id),
+            user_id=int(member.id),
+            display_name=str(member.display_name),
+            username=str(member.name),
+            avatar_url=avatar_url,
+        )
+
+    def _queue_profile(self, profile: MemberProfile) -> bool:
+        """Queue an identity write only when its visible values changed."""
+        key = (profile.guild_id, profile.user_id)
+        signature = (profile.display_name, profile.username, profile.avatar_url)
         if self._profile_signatures.get(key) == signature:
             self._profile_signatures.move_to_end(key)
-            return
-        try:
-            await self.db.upsert_member_profile(
-                guild_id=key[0],
-                user_id=key[1],
-                display_name=display_name,
-                username=username,
-                avatar_url=avatar_url,
-            )
-        except VoiceStoreError:
-            # Not durably stored — do not cache, so a later render retries.
-            log.debug("Could not persist member profile", exc_info=True)
-            return
-        self._profile_signatures[key] = signature
-        self._profile_signatures.move_to_end(key)
-        while len(self._profile_signatures) > MAX_PROFILE_SIGNATURES:
-            self._profile_signatures.popitem(last=False)
+            return False
+        self._pending_profiles[key] = profile
+        while len(self._pending_profiles) > MAX_PROFILE_SIGNATURES:
+            self._pending_profiles.pop(next(iter(self._pending_profiles)))
+        # Deliberately no wake-up: identity writes are not latency sensitive
+        # and waiting for the window keeps them batched behind, not in front
+        # of, a join's immediate crash-safety write.
+        return True
 
-    async def _remember_member(self, member: discord.Member) -> None:
-        """Persist a member's last-known identity; best effort, never fatal."""
+    def _queue_member_profile(self, member) -> None:
+        """Queue a member's last-known identity; best effort, never fatal."""
+        try:
+            self._queue_profile(self._profile_of(member))
+        except Exception:  # noqa: BLE001 - never break an event handler
+            log.debug("Could not queue member profile", exc_info=True)
+
+    def _queue_user_profile(self, guild_id: int, user) -> None:
+        """Queue identity for a user no longer in the guild (global fallback)."""
         try:
             avatar_url = None
             try:
-                avatar_url = str(member.display_avatar.url)
-            except Exception:
+                avatar_url = str(user.display_avatar.url)
+            except Exception:  # noqa: BLE001
                 avatar_url = None
-            await self._remember_profile(
-                guild_id=member.guild.id,
-                user_id=member.id,
-                display_name=str(member.display_name),
-                username=str(member.name),
-                avatar_url=avatar_url,
+            self._queue_profile(
+                MemberProfile(
+                    guild_id=int(guild_id),
+                    user_id=int(user.id),
+                    display_name=str(user.display_name),
+                    username=str(user.name),
+                    avatar_url=avatar_url,
+                )
             )
-        except Exception:
-            log.debug("Could not persist member profile", exc_info=True)
+        except Exception:  # noqa: BLE001
+            log.debug("Could not queue user profile", exc_info=True)
 
-    async def _remember_user(self, guild_id: int, user: discord.User) -> None:
-        """Persist identity for a user no longer in the guild (global fallback)."""
-        try:
-            await self._remember_profile(
-                guild_id=guild_id,
-                user_id=user.id,
-                display_name=str(user.display_name),
-                username=str(user.name),
-                avatar_url=str(user.display_avatar.url),
-            )
-        except Exception:
-            log.debug("Could not persist user profile", exc_info=True)
+    @staticmethod
+    def _active_snapshot(
+        session: ActiveVoiceSession, seen_at: datetime
+    ) -> PersistedActiveSession:
+        return PersistedActiveSession(
+            guild_id=session.guild_id,
+            user_id=session.user_id,
+            channel_id=session.channel_id,
+            started_at=session.started_at,
+            last_seen_at=seen_at,
+            is_afk=session.is_afk,
+        )
 
-    async def _persist_active_row(self, session: ActiveVoiceSession, seen_at: datetime) -> None:
-        """Persist/heartbeat an in-progress session so restarts never lose time."""
+    def _queue_active(self, session: ActiveVoiceSession, seen_at: datetime) -> None:
+        """Coalesce this session's heartbeat (one row per session, last wins)."""
+        self._dirty_active[(session.guild_id, session.user_id)] = self._active_snapshot(
+            session, seen_at
+        )
+
+    async def _write_new_session_row(
+        self, session: ActiveVoiceSession, seen_at: datetime
+    ) -> None:
+        """Write a brand-new session's row immediately (crash safety).
+
+        Must be called with ``self._persist_lock`` held.
+        """
+        self._dirty_active[(session.guild_id, session.user_id)] = self._active_snapshot(
+            session, seen_at
+        )
+        await self._flush_active_locked()
+
+    async def _flush_active_locked(self) -> int:
+        """Write every coalesced heartbeat in ONE batched upsert."""
+        if not self._dirty_active:
+            return 0
+        rows: list[PersistedActiveSession] = []
+        for key, row in list(self._dirty_active.items()):
+            self._dirty_active.pop(key, None)
+            session = self.active_sessions.get(key)
+            if (
+                session is None
+                or session.started_at != row.started_at
+                or session.is_afk != row.is_afk
+            ):
+                # The session ended or restarted after this snapshot was
+                # queued: writing it would resurrect a closed row.
+                continue
+            rows.append(row)
+        if not rows:
+            return 0
         try:
-            await self.db.upsert_active_session(
-                guild_id=session.guild_id,
-                user_id=session.user_id,
-                channel_id=session.channel_id,
-                started_at=session.started_at,
-                last_seen_at=seen_at,
-                is_afk=session.is_afk,
-            )
+            await self.db.heartbeat_active_sessions(rows)
+        except VoiceStoreError as err:
+            log.debug("Active session heartbeat failed: %s", err)
+            for row in rows:
+                self._dirty_active.setdefault((row.guild_id, row.user_id), row)
+            return 0
+        return len(rows)
+
+    async def _flush_profiles_locked(self) -> int:
+        """Persist every queued identity in ONE batched upsert."""
+        if not self._pending_profiles:
+            return 0
+        rows = list(self._pending_profiles.values())
+        self._pending_profiles.clear()
+        try:
+            await self.db.upsert_member_profiles(rows)
         except VoiceStoreError:
-            log.debug("Could not persist active session row", exc_info=True)
+            # Not durable yet — keep them queued (bounded) and retry.
+            log.debug("Could not persist member profiles", exc_info=True)
+            for row in rows:
+                self._pending_profiles.setdefault((row.guild_id, row.user_id), row)
+            return 0
+        for row in rows:
+            key = (row.guild_id, row.user_id)
+            self._profile_signatures[key] = (
+                row.display_name,
+                row.username,
+                row.avatar_url,
+            )
+            self._profile_signatures.move_to_end(key)
+        while len(self._profile_signatures) > MAX_PROFILE_SIGNATURES:
+            self._profile_signatures.popitem(last=False)
+        return len(rows)
+
+    async def flush_pending(self) -> int:
+        """Force every coalesced write to the store now (tests, shutdown)."""
+        async with self._persist_lock:
+            active = await self._flush_active_locked()
+            profiles = await self._flush_profiles_locked()
+        return active + profiles
+
+    async def _flush_profiles(self) -> int:
+        async with self._persist_lock:
+            return await self._flush_profiles_locked()
+
+    async def _write_flush_loop(self) -> None:
+        """Write coalesced heartbeats/identities at most once per window.
+
+        A fixed cadence (rather than "flush on the first event, then again on
+        the next") is what actually collapses sustained churn into one batched
+        request per ``coalesce_seconds``. Every queued row is durable within
+        one window; session starts and ends are still written immediately.
+        """
+        while not self._stopped:
+            try:
+                await asyncio.sleep(self.coalesce_seconds)
+            except asyncio.CancelledError:
+                break
+            if self._stopped:
+                break
+            try:
+                await self.flush_pending()
+            except asyncio.CancelledError:
+                break
+            except Exception:  # noqa: BLE001 - the flusher must never die
+                log.exception("Voice write flush failed")
 
     async def _clear_active_row(
         self, guild_id: int, user_id: int, *, started_before: datetime | None = None
     ) -> None:
         """Drop a persisted in-progress session row once it has been closed."""
+        self._dirty_active.pop((guild_id, user_id), None)
         try:
             await self.db.delete_active_session(
                 guild_id, user_id, started_before=started_before
@@ -527,35 +749,43 @@ class VoiceTracker:
     # ------------------------------------------------------------------
 
     async def reconcile_guilds(self) -> None:
-        """Scan all guilds and voice channels to recover/synchronize active sessions."""
-        now = ensure_aware(self._clock()).astimezone(timezone.utc)
-        current_connected_keys: set[tuple[int, int]] = set()
+        """Scan all guilds and voice channels to recover/synchronize active sessions.
 
-        async with self._lock:
-            # On first run after boot, resurrect sessions persisted before the
-            # restart so ongoing voice time is not lost. Runs once from local
-            # fallback state and once more when the store is fully online.
+        Two phases: an in-memory scan that never awaits the database, then one
+        persistence phase that performs a single batched heartbeat plus any
+        closes the scan implied. The expensive part (one RPC per interval)
+        is unchanged; what it no longer does is await per member.
+        """
+        now = ensure_aware(self._clock()).astimezone(timezone.utc)
+        connected: set[tuple[int, int]] = set()
+        afk_flips: list[ActiveVoiceSession] = []
+        stale: list[ActiveVoiceSession] = []
+
+        # Phase 1: restart recovery (bounded, once per boot / store bootstrap).
+        async with self._persist_lock:
             store_online = bool(getattr(self.db, "is_bootstrapped", True))
             if not self._recovered or (store_online and not self._recovered_remote):
                 self._recovered = True
                 if store_online:
                     self._recovered_remote = True
-                await self._recover_persisted_sessions(now)
+                async with self._state_lock:
+                    await self._recover_persisted_sessions(now)
 
+        # Phase 2: in-memory scan (no I/O, so events never queue behind it).
+        async with self._state_lock:
             for guild in self.bot.guilds:
-                afk_channel_id = guild.afk_channel.id if guild.afk_channel else None
                 for channel in guild.voice_channels + getattr(guild, "stage_channels", []):
                     for member in channel.members:
                         if member.bot:
                             continue
                         key = (guild.id, member.id)
-                        current_connected_keys.add(key)
+                        connected.add(key)
                         is_afk = excluded_from_credit(member, channel, member.voice)
 
-                        await self._remember_member(member)
+                        self._queue_member_profile(member)
 
-                        if key not in self.active_sessions:
-                            # Start new tracking session for user found in VC
+                        session = self.active_sessions.get(key)
+                        if session is None:
                             self.active_sessions[key] = ActiveVoiceSession(
                                 guild_id=guild.id,
                                 user_id=member.id,
@@ -566,20 +796,45 @@ class VoiceTracker:
                                 is_afk=is_afk,
                             )
                         else:
-                            # Update existing session channel & mute/deaf flags
-                            session = self.active_sessions[key]
                             if session.is_afk != is_afk:
-                                if not session.is_afk:
-                                    await self._persist_session(session, now)
-                                else:
-                                    await self._clear_active_row(guild.id, member.id, started_before=session.started_at)
-                                session.started_at = now
+                                # Creditability changed while we were not
+                                # watching: commit the old slice, start fresh.
+                                afk_flips.append(session)
+                                session = ActiveVoiceSession(
+                                    guild_id=guild.id,
+                                    user_id=member.id,
+                                    channel_id=channel.id,
+                                    started_at=now,
+                                    is_afk=is_afk,
+                                )
+                                self.active_sessions[key] = session
                             session.channel_id = channel.id
                             session.is_muted = bool(member.voice.self_mute or member.voice.mute) if member.voice else False
                             session.is_deaf = bool(member.voice.self_deaf or member.voice.deaf) if member.voice else False
                             session.is_afk = is_afk
 
                         self._sync_deaf_warning(member, channel, member.voice)
+
+            # Fans queued in memory; closed once, below, under the write lock.
+            for key in list(self.active_sessions.keys()):
+                if key not in connected:
+                    self._cancel_deaf_warning(key)
+                    self._dirty_active.pop(key, None)
+                    stale.append(self.active_sessions.pop(key))
+
+        # Phase 3: persistence (ordered, batched, and never racing a close).
+        async with self._persist_lock:
+            # Commit the creditable slice of any session whose AFK state
+            # changed, then drop the untracked AFK row.
+            for previous in afk_flips:
+                if not previous.is_afk:
+                    await self._persist_session(previous, now)
+                else:
+                    await self._clear_active_row(
+                        previous.guild_id,
+                        previous.user_id,
+                        started_before=previous.started_at,
+                    )
 
             # Split any ongoing sessions that crossed an IST midnight boundary
             # so pre-midnight hours are committed to the finished day and
@@ -590,40 +845,43 @@ class VoiceTracker:
             # write (one compact row per user, last_seen_at bumped), so a
             # crash loses at most one heartbeat interval.
             heartbeat_rows = [
-                PersistedActiveSession(
-                    guild_id=guild_id,
-                    user_id=user_id,
-                    channel_id=session.channel_id,
-                    started_at=session.started_at,
-                    last_seen_at=now,
-                    is_afk=session.is_afk,
-                )
-                for (guild_id, user_id), session in self.active_sessions.items()
+                self._active_snapshot(session, now)
+                for session in self.active_sessions.values()
             ]
+            self._dirty_active.clear()
             try:
                 await self.db.heartbeat_active_sessions(heartbeat_rows)
             except VoiceStoreError as err:
+                # Leave the snapshot queued so the cadence writer retries it
+                # instead of waiting for the next reconcile cycle.
                 log.debug("Active session heartbeat failed: %s", err)
+                for row in heartbeat_rows:
+                    self._dirty_active.setdefault(
+                        (row.guild_id, row.user_id), row
+                    )
 
-            # Safely close sessions for users no longer connected
-            for key in list(self.active_sessions.keys()):
-                if key not in current_connected_keys:
-                    self._cancel_deaf_warning(key)
-                    session = self.active_sessions.pop(key)
-                    if not session.is_afk:
-                        await self._persist_session(session, now)
-                    else:
-                        await self._clear_active_row(
-                            key[0], key[1], started_before=session.started_at
-                        )
+            # Identity refresh for everyone seen this scan: one batched upsert.
+            await self._flush_profiles_locked()
+
+            # Close sessions for users no longer connected.
+            for session in stale:
+                if not session.is_afk:
+                    await self._persist_session(session, now)
+                else:
+                    await self._clear_active_row(
+                        session.guild_id,
+                        session.user_id,
+                        started_before=session.started_at,
+                    )
 
     async def rollover_midnight_sessions(self, now: datetime | None = None) -> int:
         """Commit pre-midnight portions of ongoing sessions and reset start to 12:00 AM IST."""
         instant = ensure_aware(now or self._clock()).astimezone(timezone.utc)
-        async with self._lock:
+        async with self._persist_lock:
             return await self._rollover_midnight_sessions_unlocked(instant)
 
     async def _rollover_midnight_sessions_unlocked(self, now: datetime) -> int:
+        """Midnight split; must be called with ``self._persist_lock`` held."""
         today_start_utc = ist_day_start_utc(now.astimezone(IST).date())
         rolled = 0
         for (guild_id, user_id), session in list(self.active_sessions.items()):
@@ -635,8 +893,10 @@ class VoiceTracker:
                         guild_id, user_id, started_before=session.started_at
                     )
                 session.started_at = today_start_utc
-                await self._persist_active_row(session, now)
+                self._queue_active(session, now)
                 rolled += 1
+        if rolled:
+            await self._flush_active_locked()
         return rolled
 
     async def _recover_persisted_sessions(self, now: datetime) -> None:
@@ -662,7 +922,6 @@ class VoiceTracker:
             connected_channel_id = None
             currently_afk = False
             if guild is not None:
-                afk_channel_id = guild.afk_channel.id if guild.afk_channel else None
                 for channel in (
                     guild.voice_channels + getattr(guild, "stage_channels", [])
                 ):
@@ -772,13 +1031,18 @@ class VoiceTracker:
                 if elapsed:
                     time_map[u_id] = time_map.get(u_id, 0) + elapsed
 
-        # 3. Resolve identities for everyone on the board (cache -> HTTP -> DB)
+        # 3. Resolve identities for everyone on the board (cache -> HTTP -> DB).
+        #    The hydration step already reads (and returns) the persisted
+        #    profiles, so a render costs one profile read, not two.
         if hydrate:
-            await self.hydrate_member_profiles(guild, time_map.keys())
-        try:
-            profiles = await self.db.get_member_profiles(guild_id, list(time_map.keys()))
-        except VoiceStoreError:
-            profiles = {}
+            profiles = await self.hydrate_member_profiles(guild, time_map.keys())
+        else:
+            try:
+                profiles = await self.db.get_member_profiles(
+                    guild_id, list(time_map.keys())
+                )
+            except VoiceStoreError:
+                profiles = {}
 
         # 4. Sort by total_seconds DESC, user_id ASC
         sorted_users = sorted(
@@ -797,8 +1061,9 @@ class VoiceTracker:
                 display_name = guild_member.display_name
                 username = guild_member.name
                 avatar_url = guild_member.display_avatar.url
-                # Keep the profile fresh so restarts remember this member
-                await self._remember_member(guild_member)
+                # Keep the profile fresh so restarts remember this member.
+                # Queued in memory; one batched upsert is flushed below.
+                self._queue_member_profile(guild_member)
             else:
                 profile = profiles.get(u_id)
                 if profile:
@@ -827,6 +1092,10 @@ class VoiceTracker:
                 )
             )
 
+        if members:
+            # Freshly seen identities are written once per render, batched.
+            await self._flush_profiles()
+
         return members
 
     async def hydrate_member_profiles(
@@ -835,7 +1104,7 @@ class VoiceTracker:
         user_ids: Iterable[int],
         *,
         time_budget: float = 2.5,
-    ) -> None:
+    ) -> dict[int, MemberProfile]:
         """
         Make sure we know the name/avatar of every given user.
 
@@ -846,10 +1115,13 @@ class VoiceTracker:
         Bounded to ``time_budget`` seconds so an interaction response is
         never delayed past Discord's window; every successful fetch is
         persisted, so remaining users resolve on the following render.
+
+        Returns the persisted/known profiles so the caller never has to read
+        the same rows a second time.
         """
         ids = [int(u) for u in user_ids]
         if not ids:
-            return
+            return {}
 
         try:
             known = await self.db.get_member_profiles(guild.id, ids)
@@ -858,12 +1130,16 @@ class VoiceTracker:
 
         pending = [u for u in ids if guild.get_member(u) is None and u not in known]
         deadline = time.monotonic() + time_budget
+        fetched = False
         for u_id in pending[:MAX_HYDRATE_FETCHES]:
             if time.monotonic() > deadline:
                 break
             try:
                 member = await guild.fetch_member(u_id)
-                await self._remember_member(member)
+                profile = self._profile_of(member)
+                self._queue_profile(profile)
+                known[u_id] = profile
+                fetched = True
                 continue
             except discord.NotFound:
                 pass  # No longer in this guild; fall back to the global user
@@ -876,7 +1152,20 @@ class VoiceTracker:
             except discord.HTTPException as err:
                 log.debug("fetch_user(%s) failed: %s", u_id, err)
                 continue
-            await self._remember_user(guild.id, user)
+            self._queue_user_profile(guild.id, user)
+            known[u_id] = MemberProfile(
+                guild_id=guild.id,
+                user_id=u_id,
+                display_name=str(user.display_name),
+                username=str(user.name),
+                avatar_url=str(user.avatar_url) if user.avatar_url else None,
+            )
+            fetched = True
+
+        if fetched or self._pending_profiles:
+            # Durable before returning: the next render must not re-fetch.
+            await self._flush_profiles()
+        return known
 
     async def get_live_user_stats(
         self,
@@ -1271,6 +1560,35 @@ class VoiceTracker:
 
         blocked = len(blocked_guilds)
 
+        # One batched sent-mark lookup per guild instead of one query per
+        # member. The durable mark-before-send rule is unchanged below.
+        sent_marks: dict[int, set[int]] = {}
+        sent_candidates: dict[int, list[int]] = {}
+        for stat in stats_list:
+            if stat.guild_id in blocked_guilds:
+                continue
+            sent_candidates.setdefault(stat.guild_id, []).append(stat.user_id)
+        for guild_id, user_ids in sent_candidates.items():
+            try:
+                sent_marks[guild_id] = await self.db.get_sent_dm_reports(
+                    target_date_str, guild_id, user_ids
+                )
+            except VoiceStoreUnavailable as err:
+                log.warning(
+                    "Daily DM reports for guild %s postponed: %s", guild_id, err
+                )
+                blocked_guilds.add(guild_id)
+                blocked += 1
+
+        # One local settings query instead of one per candidate.
+        try:
+            preferences = await self.db.get_user_dm_preferences(
+                [stat.user_id for stat in stats_list]
+            )
+        except VoiceStoreError:
+            log.debug("Could not read DM preferences; assuming enabled", exc_info=True)
+            preferences = {}
+
         for stat in stats_list:
             guild_id = stat.guild_id
             user_id = stat.user_id
@@ -1278,19 +1596,11 @@ class VoiceTracker:
             if guild_id in blocked_guilds:
                 continue
 
-            try:
-                already_sent = await self.db.has_dm_report_sent(
-                    target_date_str, guild_id, user_id
-                )
-            except VoiceStoreUnavailable as err:
-                log.debug("Cannot verify DM report state for %s: %s", user_id, err)
-                blocked += 1
-                continue
-            if already_sent:
+            if user_id in sent_marks.get(guild_id, ()):
                 continue
 
             # Check user preference
-            if not await self.db.get_user_dm_preference(user_id):
+            if not preferences.get(user_id, True):
                 continue
 
             guild = self.bot.get_guild(guild_id)

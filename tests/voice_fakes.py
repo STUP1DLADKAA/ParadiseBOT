@@ -19,6 +19,7 @@ requires the owner's credentials.
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 from datetime import date, datetime, timedelta, timezone
 
@@ -57,6 +58,7 @@ class _FakeRpcBuilder:
         self._params = params or {}
 
     async def execute(self):
+        await self._client._record("rpc", self._fn, self._params)
         return _FakeResult(await self._client._run_rpc(self._fn, self._params))
 
 
@@ -118,6 +120,8 @@ class _FakeTableBuilder:
         return True
 
     async def execute(self):
+        mode = getattr(self, "_mode", "select")
+        await self._client._record("table", f"{self._table}:{mode}")
         if self._client.fail_mode:
             raise FakeNetworkError("simulated connection failure")
         table = self._client._tables[self._table]
@@ -142,8 +146,13 @@ class _FakeTableBuilder:
 class FakeSupabaseClient:
     """In-memory stand-in for ``supabase.AsyncClient`` (voice tables only)."""
 
-    def __init__(self):
+    def __init__(self, *, latency: float = 0.0):
         self.fail_mode = False
+        # Optional simulated network latency (seconds) applied to every call.
+        # Used by benchmarks and by tests that assert batching shapes.
+        self.latency = max(0.0, float(latency))
+        # Every executed call, in order: {"kind", "name", "detail"}.
+        self.calls: list[dict] = []
         self._id_counter = itertools.count(1)
         self._tables = {
             "voice_sessions": {},
@@ -157,6 +166,24 @@ class FakeSupabaseClient:
         self._session_identity = {}
         self.schema_version = 2
         self.schema_installed = True
+
+    # -- instrumentation ---------------------------------------------------
+
+    async def _record(self, kind: str, name: str, detail=None) -> None:
+        self.calls.append({"kind": kind, "name": name, "detail": detail})
+        if self.latency > 0:
+            await asyncio.sleep(self.latency)
+
+    def reset_calls(self) -> None:
+        self.calls.clear()
+
+    def call_counts(self) -> dict:
+        """Counters keyed by ``rpc:<fn>`` / ``table:<name:mode>``."""
+        counts: dict[str, int] = {}
+        for call in self.calls:
+            key = f"{call['kind']}:{call['name']}"
+            counts[key] = counts.get(key, 0) + 1
+        return dict(sorted(counts.items()))
 
     # -- client surface ---------------------------------------------------
 
