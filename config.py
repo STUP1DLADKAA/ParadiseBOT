@@ -183,6 +183,10 @@ class VoiceConfig:
     flush_interval: int = 30
     # Per-request timeout for Supabase calls (seconds).
     request_timeout: float = 15.0
+    # Coalescing window (seconds) for voice heartbeat writes. Discord voice
+    # state changes inside this window are merged into one batched upsert.
+    # 0 restores the legacy write-per-event behaviour.
+    write_coalesce_seconds: float = 2.0
 
     @property
     def supabase_configured(self) -> bool:
@@ -225,6 +229,9 @@ class VoiceConfig:
             ),
             flush_interval=max(5, _int(env.get("VOICE_FLUSH_INTERVAL"), 30)),
             request_timeout=max(5.0, _float(env.get("VOICE_SUPABASE_TIMEOUT"), 15.0)),
+            write_coalesce_seconds=min(
+                10.0, max(0.0, _float(env.get("VOICE_WRITE_COALESCE_SECONDS"), 2.0))
+            ),
         )
 
 
