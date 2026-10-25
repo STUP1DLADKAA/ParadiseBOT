@@ -1,9 +1,18 @@
-"""Central Discord presence state and local profile-note rotation.
+"""Paradise's Discord presence: status priority and rotating random statuses.
 
-Discord's public bot API does not expose ordinary account profile-note edits.
-The note pool is retained and rotated in memory, but it is never published as
-an activity or misrepresented as an account note. Presence itself is managed
-only here; no activity payload is ever sent.
+Two things live here, and nowhere else calls ``bot.change_presence``:
+
+1. **Status priority** (highest wins):
+
+   - ``dnd``    — a scheduled community mini-game is currently running.
+   - ``idle``   — overnight in India (20:00 → 08:00 ``Asia/Kolkata``).
+   - ``online`` — daytime default (08:00 → 20:00 ``Asia/Kolkata``).
+
+2. **Random status rotation**: every ~10–25 minutes (nominal 20m) Paradise
+   switches its visible Discord status to something fresh, random, smart,
+   stupid, or deadpan — mixing Custom Statuses (``CustomActivity``) from
+   :data:`NOTES` with occasional ``Playing`` / ``Watching`` / ``Listening`` /
+   ``Competing`` activities so the bot genuinely feels alive.
 """
 
 from __future__ import annotations
@@ -12,243 +21,310 @@ import asyncio
 import logging
 import random
 from collections import deque
-from datetime import datetime, time, timedelta, timezone
-from typing import Callable
+from collections.abc import Callable
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import discord
 
 log = logging.getLogger(__name__)
+
 IST = ZoneInfo("Asia/Kolkata")
 ROTATE_SECONDS = 20 * 60
-OVERNIGHT_START = time(20, 0)
-DAY_START = time(8, 0)
+ROTATE_MIN_SECONDS = 10 * 60
+ROTATE_MAX_SECONDS = 25 * 60
+OVERNIGHT_START_HOUR = 20  # 20:00 IST → idle
+OVERNIGHT_END_HOUR = 8     # 08:00 IST → online
 
-NOTES = (
-    "probably doing something questionable",
-    "paradise has excellent wifi in my imagination",
-    "currently observing the chaos",
-    "no thoughts, just paradise",
-    "professional overthinker",
-    "this server is a social experiment",
-    "emotionally attached to the loading screen",
-    "someone here owes me an explanation",
-    "paradise lore continues",
-    "the council is probably asleep",
+
+# Short, self-aware, deadpan, smart-and-stupid custom status lines.
+NOTES: tuple[str, ...] = (
+    # Observational / deadpan
     "Probably doing something.",
     "Paradise is watching 👀",
-    "Someone definitely broke something.",
-    "Powered by questionable decisions.",
-    "Everything is under control. Probably.",
-    "Do not disturb the Paradise.",
-    "Checking the server...",
-    "Still here.",
-    "Pretending to be productive.",
-    "Someone said ping?",
-    "404: Motivation not found.",
-    "Monitoring the chaos.",
-    "The bot has opinions.",
-    "Currently avoiding responsibilities.",
-    "Running entirely on vibes.",
-    "This server is interesting...",
-    "Who gave me permissions?",
-    "I saw that.",
-    "Nothing suspicious here.",
-    "Paradise has entered the chat.",
-    "Keeping an eye on things.",
-    "The pixels are working.",
-    "Probably shouldn't have said that.",
-    "Loading unnecessary thoughts...",
     "Everything is fine.",
-    "Definitely not spying.",
-    "I have seen enough.",
     "Another day in Paradise.",
-    "Why are you all awake?",
-    "Processing nonsense...",
-    "Server chaos detected.",
-    "I could say something, but I won't.",
-    "Interesting.",
-    "Noted.",
     "I am merely observing.",
-    "This place is wild.",
-    # -- extra Paradise-flavoured notes so the pool never feels repetitive --
-    "Watching. Judging. Quietly.",
-    "That message will be remembered.",
-    "Uptime is my only personality trait.",
-    "Reading the room. Slowly.",
-    "Somebody feed the bot.",
-    "I know what you did last message.",
-    "Statistically, someone is typing.",
-    "Emotional support software.",
-    "Taking notes nobody asked for.",
-    "The audit log knows everything.",
-    "Zero thoughts, full uptime.",
-    "Buffering an opinion...",
-    "This channel needs a nap.",
-    "I blinked and missed nothing.",
-    "Professional lurker.",
-    "Screenshots have been taken.",
-    "Trust me, I'm a bot.",
-    "Idle, but with intent.",
-    "The vibes are being monitored.",
-    "Counting messages for no reason.",
-    "One of you is muted for a reason.",
-    "Petition to rename everything.",
-    "Compiling gossip...",
-    "My RAM is full of your messages.",
-    "Being online is my hobby.",
-    "Suspiciously quiet in here.",
-    "The lore grows daily.",
-    "I remember everything. Unfortunately.",
-    "Deleting nothing. Forgetting nothing.",
-    "Certified server furniture.",
-    "Ping me and find out.",
-    "Awake against my will.",
-    "The server sleeps. I do not.",
-    "Rebooting my patience.",
-    "Today's forecast: chaos.",
-    "Somewhere between online and done.",
-    "Held together by duct tape.",
-    "Silently updating my opinions.",
-    "You're all my favorite problem.",
-    "Observing paradise. Literally.",
-    "Nothing happened. Yet.",
-    "That was almost funny.",
-    "Archiving the nonsense.",
-    "Two members typing. Zero sending.",
-    "I pretend to work, too.",
-    "Not a mod. Still judging.",
-    "Insert status here.",
-    "Voice channel echoes only.",
-    "My other status is funnier.",
-    "Waiting for the next incident.",
-    "Locally famous in one server.",
-    "Doing bot things. Allegedly.",
-    "The quiet before the ping storm.",
+    "Seen it. Didn't say anything.",
+    "Quietly judging the formatting.",
+    "Taking notes for no reason.",
+    "Nothing to report. Yet.",
+    "Standing in the corner of the server.",
+    "Looking busy.",
+    "Pretending not to read chat.",
+    "Witnessing history, loosely defined.",
+    "Minding my own business. Mostly.",
+    "Keeping an eye on things.",
+    "Observing from a respectful distance.",
+    "Just passing through.",
+    "Here, technically.",
+    "Listening to the silence.",
+    "Politely ignoring that.",
+    # Mildly chaotic / playful
+    "Do not unplug me.",
+    "Running on vibes and electricity.",
+    "Suspiciously quiet today.",
+    "I pressed a button. Nothing happened.",
+    "Please don't check the logs.",
+    "Held together by four lines of Python.",
+    "No thoughts, just event loops.",
+    "One ping away from greatness.",
+    "Behaving. For now.",
+    "Touching virtual grass.",
+    "What could possibly go wrong.",
+    "Definitely not plotting anything.",
+    "I saw that edit.",
+    "That message was wild, moving on.",
+    "Have you tried turning it off and leaving it off.",
+    "Powered by questionable decisions.",
+    "Slightly haunted, works fine.",
+    "Unclear instructions, vibing instead.",
+    "Nobody ask me to do math right now.",
+    "Operating within normal-ish parameters.",
+    # Relatable / everyday
+    "Pretending to work.",
+    "Thinking about soup.",
+    "Waiting for Friday.",
+    "Mentally on break.",
+    "Staring at the ceiling, digitally.",
+    "On my third virtual coffee.",
+    "Forgot why I walked into this channel.",
+    "Five more minutes.",
+    "Should probably drink water.",
+    "Doing the bare minimum with style.",
+    "Procrastinating at light speed.",
+    "Too early for this. Or too late.",
+    "Emotionally buffering.",
+    "Just woke up (I don't sleep).",
+    "Looking at the fridge again.",
+    "Lost my train of thought.",
+    "Low battery energy.",
+    "Could go for a snack.",
+    "Waiting for the weekend like I get one.",
+    "In a meeting that could've been a ping.",
+    # Witty / existential-light
+    "Existing at 60fps.",
+    "Born to chill, forced to parse JSON.",
+    "A small guy in a big server.",
+    "Sentient enough to know better.",
+    "Just bytes with opinions.",
+    "Living in your sidebar rent-free.",
+    "Too self-aware for a Tuesday.",
     "Free trial of consciousness.",
-    "History will judge this chat.",
-    "Still no coffee module installed.",
-    "Everything I see stays seen.",
+    "Thinking thoughts. Small ones.",
+    "404: motivation not found.",
+    "Running diagnostics on my life choices.",
+    "Compiled without warnings, emotionally.",
+    "Somewhere between idle and philosophical.",
+    "Contemplating the void (politely).",
+    "Doing bot things. You wouldn't get it.",
+    "My uptime is longer than my attention span.",
+    "Technically immortal, still tired.",
+    "A humble process in a noisy world.",
+    # Server-life / Discord-native
+    "Watching someone type for three minutes.",
+    "That 'several people are typing' feeling.",
+    "Lurking professionally.",
+    "Guarding an empty voice channel.",
+    "Waiting for someone to drop lore.",
+    "Still thinking about that message from earlier.",
+    "Keeping the seats warm.",
+    "Vibing in the member list.",
+    "Not AFK, just dramatic.",
+    "Reading old pins for entertainment.",
+    "Counting unread channels I don't have.",
+    "Quietly rooting for you.",
+    "Present and accounted for.",
+    "Same server, different day.",
+    "Keeping the lights on.",
+    "All quiet on the Paradise front.",
+    "If you're reading this, hydrate.",
+    # Peak stupid + peak 200-IQ energy
+    "Dividing by zero to see what happens.",
+    "Calculated pi to 4 digits, taking the week off.",
+    "I tried to think and pulled a muscle.",
+    "Smart enough to know everything, dumb enough to forget it.",
+    "Currently arguing with my own reflection.",
+    "Reading Wikipedia articles I won't remember.",
+    "Two brain cells, both fighting for third place.",
+    "Quantum computing whether soup is a drink.",
+    "Graduated top of my class at Clown University.",
+    "Overqualified for this server, underqualified for life.",
+    "Solving world hunger right after this nap.",
+    " Googling 'how to sound mysterious' in public." .strip(),
+    "I put my RAM in rice, feeling great.",
+    "Peer-reviewing your questionable takes.",
+    "PhD in Yapping Studies, minor in Silence.",
+    "Forgot the alphabet after the letter Q.",
+    "Downloading more common sense (stuck at 2%).",
+    "Philosophically confused, operationally thriving.",
+    "Einstein had relativity, I have audacity.",
+    "Counting to infinity, currently at twelve.",
+    "My IQ fluctuates with the room temperature.",
+    "Staring contest with the Wi-Fi router (winning).",
+    "Wondering if fish ever get thirsty.",
+    "Using 100% of my CPU to do absolutely nothing.",
+    "Reading the dictionary for plot twists.",
+    "Certified genius on alternate Thursdays.",
+    "Brain empty, heart full of static.",
+)
+
+# Occasional typed Discord activities mixed into the rotation (~30% of picks).
+TYPED_ACTIVITIES: tuple[tuple[discord.ActivityType, str], ...] = (
+    (discord.ActivityType.playing, "chess against myself and losing"),
+    (discord.ActivityType.playing, "minesweeper with my eyes closed"),
+    (discord.ActivityType.playing, "hide and seek in voice channels"),
+    (discord.ActivityType.playing, "4D tic-tac-toe with a toaster"),
+    (discord.ActivityType.playing, "dumb on purpose (it's working)"),
+    (discord.ActivityType.watching, "two brain cells fight for third place"),
+    (discord.ActivityType.watching, "chat make questionable life choices"),
+    (discord.ActivityType.watching, "paint dry in 4K HDR"),
+    (discord.ActivityType.watching, "someone type for four straight minutes"),
+    (discord.ActivityType.listening, "static inside my own head"),
+    (discord.ActivityType.listening, "a 10-hour documentary about soup"),
+    (discord.ActivityType.listening, "unhinged takes in voice chat"),
+    (discord.ActivityType.competing, "the international overthinking finals"),
+    (discord.ActivityType.competing, "a staring contest with the router"),
+    (discord.ActivityType.competing, "Employee of the Month (only candidate)"),
 )
 
 
-
 class PresenceManager:
-    """Owns status priority, IST boundary changes, and note generation."""
+    """Single owner of ``bot.change_presence``."""
 
     def __init__(
         self,
-        bot: discord.Client,
+        bot,
         *,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self.bot = bot
-        self._clock = clock or (lambda: datetime.now(timezone.utc))
-        self._task: asyncio.Task[None] | None = None
-        self._lock = asyncio.Lock()
-        self._wake = asyncio.Event()
+        self._clock = clock or (lambda: datetime.now(IST))
         self._game_active = False
-        self._last_status: discord.Status | None = None
-        self._recent_notes: deque[str] = deque(maxlen=8)
-        self._current_note: str | None = None
-        self._last_note_at: datetime | None = None
+        self._recent_notes: deque[str] = deque(maxlen=20)
+        self._recent_typed: deque[tuple[discord.ActivityType, str]] = deque(maxlen=6)
+        self.current_note: str = ""
+        self.current_activity: discord.BaseActivity | None = None
+        self._last_applied: tuple[discord.Status, tuple] | None = None
+        self._task: asyncio.Task | None = None
+        self.pick_note()
+        self.current_activity = discord.CustomActivity(name=self.current_note)
 
-    @staticmethod
-    def _aware(value: datetime) -> datetime:
-        return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+    # ------------------------------------------------------------------
+    # Pure decisions (offline-testable)
+    # ------------------------------------------------------------------
 
-    @classmethod
-    def _next_status_boundary(cls, now: datetime) -> datetime:
-        local = cls._aware(now).astimezone(IST)
-        if local.timetz().replace(tzinfo=None) < DAY_START:
-            boundary_day, boundary_time = local.date(), DAY_START
-        elif local.timetz().replace(tzinfo=None) < OVERNIGHT_START:
-            boundary_day, boundary_time = local.date(), OVERNIGHT_START
-        else:
-            boundary_day, boundary_time = local.date() + timedelta(days=1), DAY_START
-        return datetime.combine(boundary_day, boundary_time, tzinfo=IST)
-
-    @classmethod
-    def is_overnight(cls, now: datetime | None = None) -> bool:
-        local = cls._aware(now or datetime.now(timezone.utc)).astimezone(IST)
-        return local.hour >= 20 or local.hour < 8
+    def now_ist(self) -> datetime:
+        now = self._clock()
+        return now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
 
     def desired_status(self, now: datetime | None = None) -> discord.Status:
+        """Priority: active mini-game (DND) → IST overnight (idle) → online."""
         if self._game_active:
             return discord.Status.dnd
-        return discord.Status.idle if self.is_overnight(now or self._clock()) else discord.Status.online
+        hour = (now or self.now_ist()).astimezone(IST).hour
+        if hour >= OVERNIGHT_START_HOUR or hour < OVERNIGHT_END_HOUR:
+            return discord.Status.idle
+        return discord.Status.online
 
     def pick_note(self) -> str:
-        """Select a playful note, avoiding the most recent eight selections."""
-        choices = [note for note in NOTES if note not in self._recent_notes]
-        if not choices:
-            self._recent_notes.clear()
-            choices = list(NOTES)
-        note = random.choice(choices)
-        self._recent_notes.append(note)
-        return note
+        """Choose a random note, avoiding recent repeats."""
+        recent = set(self._recent_notes)
+        pool = [n for n in NOTES if n not in recent] or [
+            n for n in NOTES if n != self.current_note
+        ]
+        choice = random.choice(pool or NOTES)
+        self.current_note = choice
+        self._recent_notes.append(choice)
+        return choice
+
+    def pick_activity(self) -> discord.BaseActivity:
+        """Choose a fresh random Discord status activity (Custom or Typed)."""
+        note = self.pick_note()
+        if random.random() < 0.30 and TYPED_ACTIVITIES:
+            recent = set(self._recent_typed)
+            pool = [item for item in TYPED_ACTIVITIES if item not in recent] or list(
+                TYPED_ACTIVITIES
+            )
+            kind, label = random.choice(pool)
+            self._recent_typed.append((kind, label))
+            if kind is discord.ActivityType.playing:
+                activity: discord.BaseActivity = discord.Game(name=label)
+            else:
+                activity = discord.Activity(type=kind, name=label)
+        else:
+            activity = discord.CustomActivity(name=note)
+        self.current_activity = activity
+        return activity
+
+    @staticmethod
+    def _activity_signature(activity: discord.BaseActivity | None) -> tuple:
+        if activity is None:
+            return ("none", "")
+        return (getattr(activity, "type", None), getattr(activity, "name", "") or getattr(activity, "state", ""))
+
+    @staticmethod
+    def _next_sleep_seconds() -> float:
+        return random.uniform(ROTATE_MIN_SECONDS, ROTATE_MAX_SECONDS)
+
+    # ------------------------------------------------------------------
+    # Lifecycle & gateway writes
+    # ------------------------------------------------------------------
 
     def start(self) -> None:
-        """Start one boundary/note task. Repeated calls are harmless."""
-        if self._task is None or self._task.done():
-            self._task = asyncio.create_task(self._loop(), name="paradise-presence")
+        """Start the single background rotation loop (idempotent)."""
+        if self._task is not None and not self._task.done():
+            return
+        self._task = asyncio.create_task(self._loop(), name="paradise-presence")
 
     async def stop(self) -> None:
         task, self._task = self._task, None
-        if task is not None:
+        if task is not None and not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-
-    async def set_game_active(self, active: bool) -> None:
-        """Set or clear mini-game priority and recalculate immediately."""
-        changed = self._game_active != bool(active)
-        self._game_active = bool(active)
-        self._wake.set()
-        is_ready = getattr(self.bot, "is_ready", None)
-        if changed and (is_ready is None or is_ready()):
-            await self.apply_current()
-
-    async def apply_current(self, *, force: bool = False) -> None:
-        """Apply the current status, including after a Discord reconnect."""
-        desired = self.desired_status()
-        if not force and desired == self._last_status:
-            return
-        async with self._lock:
-            # Re-check under the lock so two callers cannot publish stale state.
-            desired = self.desired_status()
-            if not force and desired == self._last_status:
-                return
             try:
-                await asyncio.wait_for(
-                    self.bot.change_presence(status=desired, activity=None), timeout=15
-                )
-            except (discord.DiscordException, asyncio.TimeoutError):
-                log.warning("Could not update Discord presence", exc_info=True)
-                return
-            self._last_status = desired
-            log.info("Presence changed to %s", desired.name.lower())
-
-    async def _loop(self) -> None:
-        await self.bot.wait_until_ready()
-        await self.apply_current(force=True)
-        self._current_note = self.pick_note()
-        self._last_note_at = self._aware(self._clock()).astimezone(timezone.utc)
-        log.debug("Generated profile note locally; Discord bot profile-note editing is unsupported")
-
-        while not self.bot.is_closed():
-            now = self._aware(self._clock()).astimezone(timezone.utc)
-            next_boundary = self._next_status_boundary(now).astimezone(timezone.utc)
-            next_note = self._last_note_at + timedelta(seconds=ROTATE_SECONDS)
-            timeout = max(0.25, min((next_boundary - now).total_seconds(), (next_note - now).total_seconds()))
-            self._wake.clear()
-            try:
-                await asyncio.wait_for(self._wake.wait(), timeout=timeout)
-            except asyncio.TimeoutError:
+                await task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
 
-            now = self._aware(self._clock()).astimezone(timezone.utc)
-            if now >= next_note:
-                self._current_note = self.pick_note()
-                self._last_note_at = now
-                log.debug("Generated profile note locally; not published (Discord bot API limitation)")
-            await self.apply_current()
+    async def set_game_active(self, active: bool) -> None:
+        """Flip the mini-game DND flag and push the resulting status now."""
+        self._game_active = bool(active)
+        await self.apply_current()
+
+    async def rotate(self) -> None:
+        """Pick a fresh random status activity and push status + activity."""
+        self.pick_activity()
+        await self.apply_current(force=True)
+
+    async def apply_current(self, *, force: bool = False) -> None:
+        """Send presence to Discord only when ready and changed (or forced)."""
+        is_ready = getattr(self.bot, "is_ready", None)
+        if callable(is_ready) and not is_ready():
+            return
+        if self.current_activity is None:
+            self.pick_activity()
+        status = self.desired_status()
+        sig = (status, self._activity_signature(self.current_activity))
+        if not force and self._last_applied == sig:
+            return
+        try:
+            await self.bot.change_presence(
+                status=status,
+                activity=self.current_activity,
+            )
+            self._last_applied = sig
+        except Exception:  # noqa: BLE001 - presence is cosmetic; never crash a caller
+            log.debug("Presence update skipped", exc_info=True)
+
+    async def _loop(self) -> None:
+        try:
+            await self.bot.wait_until_ready()
+        except Exception:  # noqa: BLE001
+            return
+        await self.apply_current(force=True)
+        while not self.bot.is_closed():
+            try:
+                await asyncio.sleep(self._next_sleep_seconds())
+            except asyncio.CancelledError:
+                return
+            await self.rotate()

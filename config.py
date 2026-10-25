@@ -38,11 +38,10 @@ def _chance(raw: str | None, default: float) -> float:
 
 @dataclass(frozen=True, slots=True)
 class PersonalityConfig:
-    """Tuning for Paradise's rare passive personality (see functions/personality.py).
+    """Tuning for Paradise's passive personality & humour (see functions/personality.py).
 
-    All chances are rolled only on messages that actually match a known
-    pattern — most messages never even qualify. Keep these conservative:
-    the goal is "LMAO why did Paradise just say that?", never spam.
+    Controls contextual pattern reactions/replies, random sticker & meme drops,
+    unpredictable smart/stupid quips, and English-only nerd grammar corrections.
     """
 
     enabled: bool = True
@@ -50,12 +49,24 @@ class PersonalityConfig:
     reaction_chance: float = 0.045
     # Chance to send a short contextual reply instead (rarer; never both).
     reply_chance: float = 0.015
+    # Chance to reply to a casual message with a random Discord/vinyl sticker.
+    sticker_chance: float = 0.045
+    # Chance to reply with a dynamically rendered meme card of the message.
+    meme_chance: float = 0.045
+    # Chance to drop a spontaneous smart/stupid/unpredictable quip.
+    random_quip_chance: float = 0.035
+    # Chance to reply in nerd voice when an English sentence has a typo/grammar slip.
+    grammar_chance: float = 0.70
     # Seconds between ANY two personality actions, bot-wide.
     global_cooldown: int = 45
     # Seconds between personality actions in the same channel.
     channel_cooldown: int = 120
-    # Extra spacing for replies in the same channel (replies are the rare treat).
+    # Extra spacing for pattern replies in the same channel.
     reply_channel_cooldown: int = 600
+    # Per-channel spacing for stickers, memes, and spontaneous quips.
+    humour_cooldown: int = 150
+    # Per-channel spacing for English grammar/spelling nerd corrections.
+    grammar_cooldown: int = 90
 
     @classmethod
     def from_env(cls, env) -> "PersonalityConfig":
@@ -63,11 +74,17 @@ class PersonalityConfig:
             enabled=_bool(env.get("PERSONALITY_ENABLED"), True),
             reaction_chance=_chance(env.get("PERSONALITY_REACTION_CHANCE"), 0.045),
             reply_chance=_chance(env.get("PERSONALITY_REPLY_CHANCE"), 0.015),
+            sticker_chance=_chance(env.get("PERSONALITY_STICKER_CHANCE"), 0.045),
+            meme_chance=_chance(env.get("PERSONALITY_MEME_CHANCE"), 0.045),
+            random_quip_chance=_chance(env.get("PERSONALITY_QUIP_CHANCE"), 0.035),
+            grammar_chance=_chance(env.get("PERSONALITY_GRAMMAR_CHANCE"), 0.70),
             global_cooldown=_int(env.get("PERSONALITY_GLOBAL_COOLDOWN"), 45),
             channel_cooldown=_int(env.get("PERSONALITY_CHANNEL_COOLDOWN"), 120),
             reply_channel_cooldown=_int(
                 env.get("PERSONALITY_REPLY_CHANNEL_COOLDOWN"), 600
             ),
+            humour_cooldown=_int(env.get("PERSONALITY_HUMOUR_COOLDOWN"), 150),
+            grammar_cooldown=_int(env.get("PERSONALITY_GRAMMAR_COOLDOWN"), 90),
         )
 
 
