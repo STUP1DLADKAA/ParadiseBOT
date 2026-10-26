@@ -658,6 +658,30 @@ check("service_role can execute helpers and write", true);
 await db.exec("reset role");
 
 // ---------------------------------------------------------------------------
+// The two diagnostic queries published in supabase/README.md are executed
+// here verbatim, so the documentation cannot drift from the real schema.
+console.log("\n== 9. README diagnostic queries ==");
+{
+  const stalled = await q(`
+    select guild_id, user_id, started_at, credited_until,
+           now() - coalesce(credited_until, started_at) as uncredited
+    from voice_active_sessions
+    where now() - coalesce(credited_until, started_at) > interval '15 minutes'
+    order by uncredited desc`);
+  check("README: checkpoint-health query runs and returns a column set",
+    Array.isArray(stalled));
+}
+{
+  const corrections = await q(`
+    select guild_id, user_id, old_started_at, new_started_at, recorded_at
+    from voice_session_corrections
+    order by recorded_at desc
+    limit 50`);
+  check("README: corrections-audit query runs against the real columns",
+    Array.isArray(corrections));
+}
+
+// ---------------------------------------------------------------------------
 console.log("\n=================================================================");
 console.log(`RESULT: ${passed} passed, ${failed} failed`);
 if (failed > 0) {
