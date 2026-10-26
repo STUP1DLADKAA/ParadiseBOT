@@ -374,8 +374,62 @@ class TestOutageFallback(SupabaseStoreTestBase):
         with self.assertRaises(VoiceSchemaError):
             await self.store.verify_schema()
 
+    async def test_verify_schema_rejects_v1_and_points_at_both_migrations(self):
+        # v1 predates the IST calendar AND the checkpoint cursor.
+        self.fake.schema_version = 1
+        with self.assertRaises(VoiceSchemaError) as ctx:
+            await self.store.verify_schema()
+        self.assertIn("002_voice_ist_calendar.sql", str(ctx.exception))
+        self.assertIn("003_voice_checkpoint.sql", str(ctx.exception))
+
+    async def test_verify_schema_rejects_a_newer_database(self):
+        # A bot older than the schema must not run against it silently.
+        self.fake.schema_version = 4
+        with self.assertRaises(VoiceSchemaError) as ctx:
+            await self.store.verify_schema()
+        self.assertIn("newer", str(ctx.exception))
+
     async def test_verify_schema_ok(self):
+        self.assertEqual(await self.store.verify_schema(), 3)
+        self.assertTrue(self.store.supports_checkpoints)
+
+    async def test_verify_schema_accepts_v2_in_compatibility_mode(self):
+        """A v3 bot against a v2 database keeps working, without checkpointing.
+
+        This is what makes deploying the bot before the owner applies
+        migration 003 safe: tracking behaves exactly as it did before.
+        """
+        self.fake.schema_version = 2
         self.assertEqual(await self.store.verify_schema(), 2)
+        self.assertTrue(self.store._schema_ok)
+        self.assertFalse(self.store.supports_checkpoints)
+
+    async def test_checkpoint_is_a_noop_on_a_v2_database(self):
+        """Degraded mode must not fabricate a cursor or double-credit."""
+        self.fake.schema_version = 2
+        await self.store.verify_schema()
+        from functions.voice.models import PersistedActiveSession
+
+        row = PersistedActiveSession(
+            guild_id=1, user_id=10, channel_id=5,
+            started_at=_dt(2026, 3, 10, 1, 30), last_seen_at=_dt(2026, 3, 10, 2, 0),
+            is_afk=False,
+        )
+        self.fake.active[("1", "10")] = {
+            "guild_id": 1, "user_id": 10, "channel_id": 5,
+            "started_at": _dt(2026, 3, 10, 1, 30).isoformat(),
+            "last_seen_at": _dt(2026, 3, 10, 2, 0).isoformat(),
+            "is_afk": False, "credited_until": None, "updated_at": "",
+        }
+        result = await self.store.checkpoint_active_sessions(
+            [row], _dt(2026, 3, 10, 2, 0)
+        )
+        self.assertEqual(result, {})
+        # Nothing was credited, so the close still credits the whole session.
+        recorded = await self.store.close_active_session(
+            1, 10, _dt(2026, 3, 10, 2, 30)
+        )
+        self.assertEqual(recorded, 3600)
 
 
 class TestProfilesAndDmReports(SupabaseStoreTestBase):

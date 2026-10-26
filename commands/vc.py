@@ -30,9 +30,10 @@ log = logging.getLogger(__name__)
 SETUP_NEEDED_MESSAGE = (
     "voice tracking isn't configured yet. the owner needs to set "
     "`SUPABASE_URL` and `SUPABASE_SECRET_KEY` in `.env` and apply "
-    "`001_voice_activity.sql` followed by `002_voice_ist_calendar.sql` "
-    "in the Supabase SQL Editor (for an existing schema v1, apply only 002; "
-    "see `supabase/README.md`)."
+    "`001_voice_activity.sql`, `002_voice_ist_calendar.sql` and "
+    "`003_voice_checkpoint.sql` in the Supabase SQL Editor (for an existing "
+    "schema v1 apply 002 then 003; for v2 apply only 003; see "
+    "`supabase/README.md`)."
 )
 
 
@@ -73,6 +74,9 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
                 coalesce_seconds=cfg.write_coalesce_seconds,
                 # Bounded shutdown flush: two request timeouts, clamped.
                 shutdown_timeout=max(5.0, min(60.0, cfg.request_timeout * 2)),
+                # Durable checkpoints: bounds crash loss and makes manual
+                # Supabase corrections take effect without a restart.
+                checkpoint_seconds=cfg.checkpoint_seconds,
             )
             # Attach tracker to bot so other components can access it if needed
             self.bot.voice_tracker = self.tracker  # type: ignore[attr-defined]

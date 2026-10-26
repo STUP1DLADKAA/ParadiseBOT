@@ -48,6 +48,11 @@ TEXT_PRIMARY = (255, 255, 255)       # #FFFFFF
 TEXT_SECONDARY = (161, 161, 170)     # #A1A1AA
 TEXT_MUTED = (113, 113, 122)         # #71717A
 
+# List row geometry. Both the canvas-height calculation and the layout use
+# these, so a longer leaderboard can never run into the footer.
+ROW_HEIGHT = 64
+ROW_PITCH = 78
+
 # Podium Colors
 GOLD = (245, 158, 11)                # #F59E0B
 SILVER = (148, 163, 184)             # #94A3B8
@@ -62,6 +67,17 @@ def _create_circle_mask(size: int) -> Image.Image:
     draw = ImageDraw.Draw(mask)
     draw.ellipse((0, 0, big_size, big_size), fill=255)
     return mask.resize((size, size), Image.Resampling.LANCZOS)
+
+
+def _clamp_share(percentage: float) -> float:
+    """A share of the server total, pinned to a drawable, truthful range."""
+    try:
+        value = float(percentage)
+    except (TypeError, ValueError):
+        return 0.0
+    if value != value:  # NaN
+        return 0.0
+    return min(100.0, max(0.0, value))
 
 
 def _render_fallback_avatar(name: str, size: int, color_seed: int = 0) -> Image.Image:
@@ -266,7 +282,7 @@ class LeaderboardImageRenderer:
 
         header_height = 200
         podium_height = 310 if num_podium > 0 else 0
-        list_height = len(list_items) * 78 + (30 if list_items else 0)
+        list_height = len(list_items) * ROW_PITCH + (30 if list_items else 0)
         footer_height = 70
 
         HEIGHT = header_height + podium_height + list_height + footer_height
@@ -327,8 +343,15 @@ class LeaderboardImageRenderer:
         mins = (total_time_sec % 3600) // 60
         total_time_str = f"{hours}h {mins}m tracked" if hours > 0 else f"{mins}m tracked"
 
-        badge_w = 180
         badge_h = 56
+        badge_w = max(
+            180,
+            max(
+                draw.textbbox((0, 0), total_time_str, font=bold_font)[2],
+                draw.textbbox((0, 0), "SERVER TOTAL", font=mini_font)[2],
+            )
+            + 32,
+        )
         badge_x = WIDTH - 40 - badge_w
         badge_y = header_y + 30
         draw.rounded_rectangle(
@@ -410,10 +433,10 @@ class LeaderboardImageRenderer:
         if list_items:
             list_avatars = avatars[num_podium:] if page == 1 else avatars
             for i, (m, av) in enumerate(zip(list_items, list_avatars)):
-                row_y = current_y + i * 76
-                self._draw_list_row(canvas, draw, 40, row_y, WIDTH - 80, 64, m, av)
+                row_y = current_y + i * ROW_PITCH
+                self._draw_list_row(canvas, draw, 40, row_y, WIDTH - 80, ROW_HEIGHT, m, av)
 
-            current_y += len(list_items) * 76 + 15
+            current_y += len(list_items) * ROW_PITCH + 15
         elif num_podium == 0:
             empty_msg = "No voice activity recorded for this period."
             eb = draw.textbbox((0, 0), empty_msg, font=subtitle_font)
@@ -535,7 +558,9 @@ class LeaderboardImageRenderer:
 
         # Percentage
         pct_font = self._get_font("regular", 12)
-        pct_str = f"{member.percentage}% of server VC"
+        # Clamped for display as well: a share cannot exceed the server total,
+        # and the card must never print a number the data does not support.
+        pct_str = f"{_clamp_share(member.percentage)}% of server VC"
         pb = draw.textbbox((0, 0), pct_str, font=pct_font)
         pw = pb[2] - pb[0]
         draw.text((x + (w - pw) // 2, time_y + 36), pct_str, fill=TEXT_MUTED, font=pct_font)
@@ -560,46 +585,57 @@ class LeaderboardImageRenderer:
             width=1,
         )
 
-        # Rank badge
+        # Every column is measured rather than assumed, so a 3-digit rank, a
+        # long username and a multi-day duration cannot collide.
+
+        # Rank column
         rank_font = self._get_font("semibold", 15)
         rank_str = f"#{member.rank}"
-        draw.text((x + 20, y + (h - 18) // 2), rank_str, fill=TEXT_MUTED, font=rank_font)
+        rb = draw.textbbox((0, 0), rank_str, font=rank_font)
+        rank_w = max(46, (rb[2] - rb[0]) + 12)
+        draw.text((x + 20, y + (h - (rb[3] - rb[1])) // 2 - rb[1]), rank_str, fill=TEXT_MUTED, font=rank_font)
 
         # Avatar
         av_size = 40
-        av_x = x + 65
+        av_x = x + 20 + rank_w
         av_y = y + (h - av_size) // 2
         resized_av = avatar.resize((av_size, av_size), Image.Resampling.LANCZOS)
         canvas.paste(resized_av, (av_x, av_y), mask=resized_av)
 
-        # Name
-        name_font = self._get_font("semibold", 15)
-        name = self._truncate_text(draw, member.display_name, 350, name_font)
-        draw.text((av_x + av_size + 16, y + (h - 20) // 2), name, fill=TEXT_PRIMARY, font=name_font)
+        # Time is measured first because it is right-anchored; the bar and the
+        # name are then laid out against whatever space is actually left.
+        time_font = self._get_font("semibold", 15)
+        time_str = member.formatted_time
+        tb = draw.textbbox((0, 0), time_str, font=time_font)
+        tw = tb[2] - tb[0]
+        time_x = x + w - 24 - tw
+        draw.text((time_x, y + (h - 20) // 2), time_str, fill=TEXT_PRIMARY, font=time_font)
 
-        # Progress bar (percentage share)
-        bar_w = 160
+        # Progress bar (share of the server total), kept clear of both sides
+        bar_w = min(160, max(40, int(time_x - 28 - (av_x + av_size + 16) - 16)))
         bar_h = 6
-        bar_x = x + w - 340
+        bar_x = time_x - 28 - bar_w
         bar_y = y + (h - bar_h) // 2
         draw.rounded_rectangle(
             (bar_x, bar_y, bar_x + bar_w, bar_y + bar_h),
             radius=3,
             fill=SURFACE_LIGHT,
         )
-        fill_w = max(4, int(bar_w * (member.percentage / 100.0)))
+        # A share above 100% is impossible for real data but must not overflow
+        # the track if it ever is.
+        fill_w = max(4, min(bar_w, int(bar_w * (_clamp_share(member.percentage) / 100.0))))
         draw.rounded_rectangle(
             (bar_x, bar_y, bar_x + fill_w, bar_y + bar_h),
             radius=3,
             fill=ACCENT_PURPLE,
         )
 
-        # Time Pill
-        time_font = self._get_font("semibold", 15)
-        time_str = member.formatted_time
-        tb = draw.textbbox((0, 0), time_str, font=time_font)
-        tw = tb[2] - tb[0]
-        draw.text((x + w - tw - 24, y + (h - 20) // 2), time_str, fill=TEXT_PRIMARY, font=time_font)
+        # Name takes the remaining space instead of a fixed 350px
+        name_font = self._get_font("semibold", 15)
+        name_x = av_x + av_size + 16
+        name_max = max(40, bar_x - 16 - name_x)
+        name = self._truncate_text(draw, member.display_name, name_max, name_font)
+        draw.text((name_x, y + (h - 20) // 2), name, fill=TEXT_PRIMARY, font=name_font)
 
     def _truncate_text(
         self, draw: ImageDraw.ImageDraw, text: str, max_w: int, font: ImageFont.ImageFont

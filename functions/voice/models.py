@@ -27,7 +27,14 @@ class VoicePeriod(str, Enum):
 
 @dataclass(slots=True)
 class ActiveVoiceSession:
-    """An ongoing voice connection tracked in memory."""
+    """An ongoing voice connection tracked in memory.
+
+    ``started_at`` is when the session began. ``credited_until`` is the durable
+    checkpoint cursor mirrored from ``voice_active_sessions``: every second up
+    to that instant is already committed to ``voice_daily_stats``. The part of
+    the session that is still only live is therefore exactly
+    ``[credit_from, now)``, which is what :attr:`credit_from` exposes.
+    """
 
     guild_id: int
     user_id: int
@@ -36,6 +43,19 @@ class ActiveVoiceSession:
     is_muted: bool = False
     is_deaf: bool = False
     is_afk: bool = False
+    credited_until: datetime | None = None
+
+    @property
+    def credit_from(self) -> datetime:
+        """Start of the interval that has NOT been credited yet.
+
+        Never before ``started_at``, so an administrative correction that moves
+        the start later can shrink the live remainder, and one that moves it
+        earlier on an uncheckpointed session is honoured in full.
+        """
+        if self.credited_until is not None and self.credited_until > self.started_at:
+            return self.credited_until
+        return self.started_at
 
 
 @dataclass(slots=True)
@@ -106,7 +126,12 @@ class MemberProfile:
 
 @dataclass(slots=True)
 class PersistedActiveSession:
-    """A voice session that was still in progress when it was persisted."""
+    """A voice session that was still in progress when it was persisted.
+
+    ``credited_until`` is the durable checkpoint cursor (nullable; ``None``
+    means nothing has been credited for this session yet, so the whole
+    ``[started_at, now)`` interval is still live).
+    """
 
     guild_id: int
     user_id: int
@@ -114,6 +139,7 @@ class PersistedActiveSession:
     started_at: datetime
     last_seen_at: datetime
     is_afk: bool
+    credited_until: datetime | None = None
 
 
 # ---------------------------------------------------------------------------

@@ -108,7 +108,11 @@ def _chunks(items: Sequence, size: int):
 class SupabaseVoiceDatabase(VoiceStore):
     """VoiceStore implementation on Supabase PostgreSQL + SQLite fallback."""
 
-    SCHEMA_VERSION = 2
+    SCHEMA_VERSION = 3
+    # v2 predates durable checkpoints. A v3 bot against a v2 database keeps
+    # working exactly as before (no periodic checkpointing, close credits from
+    # started_at) so deploying the bot before the owner applies 003 is safe.
+    MIN_SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -136,6 +140,8 @@ class SupabaseVoiceDatabase(VoiceStore):
         self._maintenance_task: asyncio.Task | None = None
         self._stopped = False
         self._schema_ok = False
+        self._schema_version = 0
+        self._degraded_warned = False
         self._bootstrapped = False
         self._outbox_warned = False
         self._outbox_since_check = 0
@@ -308,18 +314,42 @@ class SupabaseVoiceDatabase(VoiceStore):
                 raise VoiceSchemaError(SCHEMA_MISSING_MESSAGE) from err
             raise
         version = _coerce_int(res.data, default=-1)
-        if version != self.SCHEMA_VERSION:
-            hint = (
-                "Apply supabase/migrations/002_voice_ist_calendar.sql in the SQL Editor."
-                if version < self.SCHEMA_VERSION
-                else "Update the bot to a version compatible with the database schema."
-            )
+        if version < self.MIN_SCHEMA_VERSION:
             raise VoiceSchemaError(
-                f"Supabase voice schema version {version} does not match the bot's "
-                f"expected version {self.SCHEMA_VERSION}. {hint}"
+                f"Supabase voice schema version {version} is older than the bot's "
+                f"minimum supported version {self.MIN_SCHEMA_VERSION}. Apply "
+                "supabase/migrations/002_voice_ist_calendar.sql (and then "
+                "003_voice_checkpoint.sql) in the SQL Editor."
             )
+        if version > self.SCHEMA_VERSION:
+            raise VoiceSchemaError(
+                f"Supabase voice schema version {version} is newer than the bot's "
+                f"expected version {self.SCHEMA_VERSION}. Update the bot to a "
+                "version compatible with the database schema."
+            )
+        if version < self.SCHEMA_VERSION and not self._degraded_warned:
+            self._degraded_warned = True
+            log.warning(
+                "Supabase voice schema is version %s; the bot needs %s for durable "
+                "voice checkpoints. Tracking continues in compatibility mode, but "
+                "in-progress time is only durable at session close until you apply "
+                "supabase/migrations/003_voice_checkpoint.sql in the SQL Editor.",
+                version,
+                self.SCHEMA_VERSION,
+            )
+        self._schema_version = version
         self._schema_ok = True
         return version
+
+    @property
+    def schema_version(self) -> int:
+        """The verified remote schema version (0 until verified)."""
+        return self._schema_version
+
+    @property
+    def supports_checkpoints(self) -> bool:
+        """True once a schema that can durably checkpoint a live session is verified."""
+        return self._schema_ok and self._schema_version >= 3
 
     # ------------------------------------------------------------------
     # User settings (local SQLite; shared with /settimezone)
@@ -394,12 +424,22 @@ class SupabaseVoiceDatabase(VoiceStore):
         *,
         fallback_channel_id: int | None = None,
         fallback_started_at: datetime | None = None,
+        fallback_credited_until: datetime | None = None,
     ) -> int | None:
         ended_at = _ensure_aware(ended_at)
 
+        def _credit_from(started: datetime, cursor: datetime | None) -> datetime:
+            """Never re-credit an interval a checkpoint already committed."""
+            if cursor is not None and _ensure_aware(cursor) > started:
+                return _ensure_aware(cursor)
+            return started
+
         def _fallback_values() -> tuple[datetime, int] | None:
             if fallback_started_at is not None and fallback_channel_id is not None:
-                return _ensure_aware(fallback_started_at), int(fallback_channel_id)
+                started = _credit_from(
+                    _ensure_aware(fallback_started_at), fallback_credited_until
+                )
+                return started, int(fallback_channel_id)
             return None
 
         async with self._active_lock:
@@ -417,7 +457,8 @@ class SupabaseVoiceDatabase(VoiceStore):
                 # Outage: queue the close from the freshest known state.
                 local = self._local.get_active_session(guild_id, user_id)
                 if local is not None:
-                    started, channel = local.started_at, local.channel_id
+                    started = _credit_from(local.started_at, local.credited_until)
+                    channel = local.channel_id
                 else:
                     fb = _fallback_values()
                     if fb is None:
@@ -460,7 +501,11 @@ class SupabaseVoiceDatabase(VoiceStore):
             local = self._local.get_active_session(guild_id, user_id)
             if local is not None and not local.is_afk:
                 recorded = await self.record_completed_session(
-                    guild_id, user_id, local.channel_id, local.started_at, ended_at
+                    guild_id,
+                    user_id,
+                    local.channel_id,
+                    _credit_from(local.started_at, local.credited_until),
+                    ended_at,
                 )
                 await self.delete_active_session(
                     guild_id, user_id, started_before=local.started_at
@@ -509,9 +554,17 @@ class SupabaseVoiceDatabase(VoiceStore):
 
     async def heartbeat_active_sessions(
         self, sessions: Sequence[PersistedActiveSession]
-    ) -> None:
+    ) -> dict[tuple[int, int], tuple[datetime, datetime | None]]:
+        """Bump liveness for many sessions and report the durable values back.
+
+        Uses ``voice_heartbeat_active_v2`` when the schema has it (v3+), which
+        returns each row's authoritative ``started_at`` / ``credited_until`` so
+        the tracker can reconcile its cache every cycle. On a v2 database it
+        falls back to the original count-returning function and reports
+        nothing.
+        """
         if not sessions:
-            return
+            return {}
         rows = [
             {
                 "guild_id": int(s.guild_id),
@@ -523,11 +576,13 @@ class SupabaseVoiceDatabase(VoiceStore):
             }
             for s in sessions
         ]
+        use_v2 = self.supports_checkpoints
+        fn = "voice_heartbeat_active_v2" if use_v2 else "voice_heartbeat_active"
         async with self._active_lock:
             try:
-                await self._execute(
+                res = await self._execute(
                     "heartbeat active sessions",
-                    lambda c: c.rpc("voice_heartbeat_active", {"p_rows": rows}),
+                    lambda c: c.rpc(fn, {"p_rows": rows}),
                 )
             except VoiceStoreUnavailable:
                 # Bounded local mirror (one row per user, last-write-wins).
@@ -541,11 +596,91 @@ class SupabaseVoiceDatabase(VoiceStore):
                         s.started_at,
                         s.last_seen_at,
                         s.is_afk,
+                        credited_until=s.credited_until,
                     )
-                return
+                return {}
             # Commit acknowledged: drop the now-redundant local mirrors.
             for s in sessions:
                 self._local.delete_active_session(s.guild_id, s.user_id)
+
+        known: dict[tuple[int, int], tuple[datetime, datetime | None]] = {}
+        if not use_v2:
+            return known
+        for row in res.data or []:
+            started = _parse_dt(row.get("o_started_at"))
+            if started is None:
+                continue
+            known[
+                (_coerce_int(row.get("o_guild_id")), _coerce_int(row.get("o_user_id")))
+            ] = (started, _parse_dt(row.get("o_cursor")))
+        return known
+
+    async def checkpoint_active_sessions(
+        self,
+        sessions: Sequence[PersistedActiveSession],
+        up_to: datetime,
+    ) -> dict[tuple[int, int], tuple[datetime, datetime]]:
+        """Atomically credit ``[cursor, up_to)`` and advance the cursor.
+
+        One RPC for the whole batch. ``voice_checkpoint_active_sessions`` locks
+        each row, credits only the part that has not been credited yet, and
+        advances the cursor in the same transaction — so a replay credits
+        nothing, an out-of-order call cannot rewind anything, and the cursor
+        never advances for time that was not saved.
+
+        Returns ``{(guild_id, user_id): (new_cursor, row_started_at)}``. The
+        echoed ``started_at`` lets the tracker adopt an administrative
+        Dashboard correction in the very same round trip.
+        """
+        if not sessions or not self.supports_checkpoints:
+            return {}
+        up_to = _ensure_aware(up_to)
+        rows = [
+            {
+                "guild_id": int(s.guild_id),
+                "user_id": int(s.user_id),
+                "up_to": _iso(up_to),
+            }
+            for s in sessions
+            if not s.is_afk  # AFK time is never credited (policy unchanged)
+        ]
+        if not rows:
+            return {}
+        async with self._active_lock:
+            try:
+                res = await self._execute(
+                    "checkpoint active sessions",
+                    lambda c: c.rpc("voice_checkpoint_active_sessions", {"p_rows": rows}),
+                )
+            except VoiceStoreUnavailable:
+                # Re-raised rather than swallowed: nothing was credited and no
+                # cursor moved, so the caller must be able to tell "failed"
+                # from "nothing to do" and report it. The next checkpoint
+                # simply covers a longer interval, so no time is lost and none
+                # can be double credited.
+                raise
+
+        cursors: dict[tuple[int, int], tuple[datetime, datetime]] = {}
+        credited_total = 0
+        for row in res.data or []:
+            key = (_coerce_int(row.get("o_guild_id")), _coerce_int(row.get("o_user_id")))
+            cursor = _parse_dt(row.get("o_cursor"))
+            if cursor is None:
+                continue
+            cursors[key] = (cursor, _parse_dt(row.get("o_started_at")) or cursor)
+            credited_total += _coerce_int(row.get("o_credited_seconds"))
+        if credited_total:
+            log.debug(
+                "Voice checkpoint credited %ss across %s live session(s)",
+                credited_total,
+                len(cursors),
+            )
+        # The local mirror only exists while Supabase is unreachable; once a
+        # checkpoint lands remotely the mirror is redundant and could otherwise
+        # resurrect a stale cursor during recovery.
+        for key in cursors:
+            self._local.delete_active_session(key[0], key[1])
+        return cursors
 
     async def delete_active_session(
         self, guild_id: int, user_id: int, *, started_before: datetime | None = None
@@ -582,11 +717,16 @@ class SupabaseVoiceDatabase(VoiceStore):
                 # sessions whose close is still queued locally — reading them
                 # now could double-count. Recovery uses local mirrors only.
                 return local_rows
+            # credited_until only exists from schema v3; asking a v2 database
+            # for it would fail the whole recovery read, so select it only
+            # when the verified schema actually has it.
+            columns = "guild_id,user_id,channel_id,started_at,last_seen_at,is_afk"
+            if self.supports_checkpoints:
+                columns += ",credited_until"
             try:
                 res = await self._execute(
                     "get active sessions",
-                    lambda c: c.table("voice_active_sessions")
-                    .select("guild_id,user_id,channel_id,started_at,last_seen_at,is_afk")
+                    lambda c: c.table("voice_active_sessions").select(columns)
                 )
             except VoiceStoreUnavailable as err:
                 log.warning("Active session recovery from Supabase skipped: %s", err)
@@ -608,6 +748,7 @@ class SupabaseVoiceDatabase(VoiceStore):
                 started_at=started,
                 last_seen_at=last_seen,
                 is_afk=bool(row.get("is_afk")),
+                credited_until=_parse_dt(row.get("credited_until")),
             )
             existing = merged.get(key)
             if existing is None or candidate.last_seen_at >= existing.last_seen_at:

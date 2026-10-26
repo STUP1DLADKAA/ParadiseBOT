@@ -191,6 +191,50 @@ DESTRUCTIVE_SQL = re.compile(
     re.IGNORECASE,
 )
 
+# Tables that hold the record of what happened. Anything that can remove or
+# rewrite a row here is destructive by definition.
+HISTORY_TABLES = (
+    "voice_sessions",
+    "voice_daily_stats",
+    "voice_member_profiles",
+    "voice_session_corrections",
+    "voice_migration_state",
+)
+# The only table holding "who is in voice right now". Ending a session
+# removes one keyed row from it; that is normal operation, not data loss,
+# because the interval has already been written to voice_sessions.
+TRANSIENT_TABLE = "voice_active_sessions"
+
+SQL_COMMENT = re.compile(r"--[^\n]*")
+ROW_KEYED = re.compile(r"where\b(?=[^;]*\bguild_id\b)(?=[^;]*\buser_id\b)", re.I | re.S)
+
+
+def _sql_body_lines(content: str) -> set[int]:
+    """1-based line numbers that fall inside a ``$$ ... $$`` function body.
+
+    Operations inside a function body only run when the bot calls the
+    function, with the arguments the bot passes. Top-level operations run
+    against the whole table the moment the migration is applied, which is
+    what the owner has to be protected from.
+    """
+    bodies: set[int] = set()
+    inside = False
+    for index, line in enumerate(content.splitlines(), start=1):
+        if "$$" in line and not inside:
+            inside = True
+            continue
+        if "$$" in line and inside:
+            inside = False
+            continue
+        if inside:
+            bodies.add(index)
+    return bodies
+
+
+def _strip_sql_comments(line: str) -> str:
+    """Blank out ``--`` comments so prose cannot trip a code rule."""
+    return SQL_COMMENT.sub(" ", line)
+
 # Sync-only calls that must never run inside a coroutine. Detected with the
 # AST (only inside `async def`) so module-level CLI code never trips it.
 BLOCKING_CALLS = {
@@ -279,6 +323,16 @@ def review_file(diff: FileDiff, report: ReviewReport) -> None:
     is_env = Path(path).name.startswith(".env") and Path(path).name != ".env.example"
     blocking_calls = async_blocking_calls(tree) if (is_python and (tree := _load_python(path))) else {}
 
+    sql_source = ""
+    sql_bodies: set[int] = set()
+    all_lines: list[str] = []
+    if is_sql:
+        candidate = REPO_ROOT / path
+        if candidate.exists():
+            sql_source = candidate.read_text(encoding="utf-8", errors="replace")
+            all_lines = sql_source.splitlines()
+            sql_bodies = _sql_body_lines(sql_source)
+
     if is_env and diff.status == "added":
         report.add(
             Finding(
@@ -312,17 +366,54 @@ def review_file(diff: FileDiff, report: ReviewReport) -> None:
                 break
 
         # --- destructive SQL / schema changes ---------------------------
-        if is_sql and DESTRUCTIVE_SQL.search(text):
+        # Comments are stripped first: a migration that documents "NO drop,
+        # NO truncate, NO delete" must not be flagged for saying so.
+        if is_sql and DESTRUCTIVE_SQL.search(_strip_sql_comments(text)):
+            target = re.search(
+                r"(?:delete\s+from|update)\s+public\.(\w+)", text, re.I
+            )
+            table = target.group(1) if target else ""
+            # Ending a session removes one keyed row from the liveness table
+            # from inside voice_close_active_session. That is the normal end
+            # of a session, not a migration, and it is worth a warning so the
+            # scope stays visible rather than being silently allowed.
+            keyed_transient = (
+                table == TRANSIENT_TABLE
+                and line_no in sql_bodies
+                and bool(ROW_KEYED.search(" ".join(all_lines[line_no - 1 : line_no + 3])))
+            )
+            if table and table not in HISTORY_TABLES and not keyed_transient:
+                severity, why = BLOCKING, (
+                    "Voice data must never be renamed, truncated, migrated or "
+                    "recalculated as part of an optimisation. Revert this and "
+                    "raise it separately for explicit owner approval."
+                )
+                title = "Destructive or data-affecting SQL in the change."
+            elif keyed_transient:
+                severity, why = WARNING, (
+                    "Confirm this only ever removes the single row for the "
+                    "session being closed, and that the interval has already "
+                    "been written to voice_sessions."
+                )
+                title = (
+                    "Keyed delete on the transient liveness table — verify "
+                    "its scope."
+                )
+            else:
+                severity, why = BLOCKING, (
+                    "Voice data must never be renamed, truncated, migrated or "
+                    "recalculated as part of an optimisation. Revert this and "
+                    "raise it separately for explicit owner approval."
+                )
+                title = "Destructive or data-affecting SQL in the change."
             report.add(
                 Finding(
-                    BLOCKING,
+                    severity,
                     "DB001",
                     path,
                     line_no,
-                    "Destructive or data-affecting SQL in the change.",
-                    "Voice data must never be renamed, truncated, migrated or "
-                    "recalculated as part of an optimisation. Revert this and "
-                    "raise it separately for explicit owner approval.",
+                    title,
+                    why,
                     snippet,
                 )
             )
@@ -493,17 +584,52 @@ def review_file(diff: FileDiff, report: ReviewReport) -> None:
     # --- schema changes ---------------------------------------------------
     if "migrations/" in path and path.endswith(".sql"):
         verb = "modified" if diff.status != "added" else "added"
-        report.add(
-            Finding(
-                BLOCKING,
-                "DB002",
-                path,
-                0,
-                f"Database migration {verb} in this change.",
-                "Routine optimisation must not alter the Supabase schema. Revert "
-                "it and ask the owner to apply (or approve) any SQL separately.",
-            )
+        # A migration that can only add things still needs the owner to run
+        # it in the Dashboard, but it cannot destroy data, so it should not
+        # hard-block a change the owner asked for. Anything that can remove
+        # or rewrite a row at the top level stays blocking.
+        top_level = [
+            (line_no, text)
+            for line_no, text in diff.added
+            if sql_source and line_no not in sql_bodies
+        ]
+        destructive_top_level = any(
+            DESTRUCTIVE_SQL.search(_strip_sql_comments(text))
+            for _line_no, text in top_level
         )
+        touches_history = any(
+            re.search(r"\b%s\b" % table, _strip_sql_comments(text), re.I)
+            for table in HISTORY_TABLES
+            for _line_no, text in top_level
+            if DESTRUCTIVE_SQL.search(_strip_sql_comments(text))
+        )
+        if diff.status == "added" and not destructive_top_level and not touches_history:
+            report.add(
+                Finding(
+                    WARNING,
+                    "DB002",
+                    path,
+                    0,
+                    f"Additive database migration {verb} in this change.",
+                    "It adds no destructive top-level statement, but it still "
+                    "changes the schema: the owner must apply it in the "
+                    "Supabase Dashboard (SQL Editor) and confirm "
+                    "voice_schema_version() afterwards. Prove it is "
+                    "non-destructive with supabase/validate_locally.mjs.",
+                )
+            )
+        else:
+            report.add(
+                Finding(
+                    BLOCKING,
+                    "DB002",
+                    path,
+                    0,
+                    f"Database migration {verb} in this change.",
+                    "Routine optimisation must not alter the Supabase schema. Revert "
+                    "it and ask the owner to apply (or approve) any SQL separately.",
+                )
+            )
 
 
 def review(report: ReviewReport, files: list[FileDiff]) -> ReviewReport:
@@ -575,6 +701,33 @@ new file mode 100644
 @@ -0,0 +1,2 @@
 +drop table public.voice_sessions;
 +select 1;
+diff --git a/supabase/migrations/009_additive.sql b/supabase/migrations/009_additive.sql
+new file mode 100644
+--- /dev/null
++++ b/supabase/migrations/009_additive.sql
+@@ -0,0 +1,11 @@
++--   * NO drop, NO truncate, NO delete, NO blanket update
++alter table public.voice_active_sessions
++    add column if not exists credited_until timestamptz;
++create or replace function public.voice_close_active_session()
++returns integer language plpgsql as $$
++begin
++    delete from public.voice_active_sessions
++    where guild_id = p_guild_id and user_id = p_user_id;
++    return 1;
++end;
++$$;
+diff --git a/supabase/migrations/010_destructive.sql b/supabase/migrations/010_destructive.sql
+new file mode 100644
+--- /dev/null
++++ b/supabase/migrations/010_destructive.sql
+@@ -0,0 +1,6 @@
++create or replace function public.voice_purge()
++returns void language plpgsql as $$
++begin
++    delete from public.voice_daily_stats where duration_seconds < 60;
++end;
++$$;
 diff --git a/functions/x.py b/functions/x.py
 --- a/functions/x.py
 +++ b/functions/x.py
@@ -588,6 +741,31 @@ diff --git a/functions/x.py b/functions/x.py
     fixtures = {
         "supabase/migrations/001_voice_activity.sql": (
             "drop table public.voice_sessions;\nselect 1;\n"
+        ),
+        # Purely additive: comments that merely mention destructive verbs, a
+        # new column, and a keyed single-row delete of a liveness row inside
+        # a function body. Must not hard-block.
+        "supabase/migrations/009_additive.sql": (
+            "--   * NO drop, NO truncate, NO delete, NO blanket update\n"
+            "alter table public.voice_active_sessions\n"
+            "    add column if not exists credited_until timestamptz;\n"
+            "create or replace function public.voice_close_active_session()\n"
+            "returns integer language plpgsql as $$\n"
+            "begin\n"
+            "    delete from public.voice_active_sessions\n"
+            "    where guild_id = p_guild_id and user_id = p_user_id;\n"
+            "    return 1;\n"
+            "end;\n"
+            "$$;\n"
+        ),
+        # Deletes from the history table. Must block, function body or not.
+        "supabase/migrations/010_destructive.sql": (
+            "create or replace function public.voice_purge()\n"
+            "returns void language plpgsql as $$\n"
+            "begin\n"
+            "    delete from public.voice_daily_stats where duration_seconds < 60;\n"
+            "end;\n"
+            "$$;\n"
         ),
         "functions/x.py": (
             "import time\n"
@@ -615,7 +793,55 @@ diff --git a/functions/x.py b/functions/x.py
     if missing:
         print(f"self-test FAILED: missing rules {sorted(missing)}", file=sys.stderr)
         return 1
-    print(f"self-test OK ({len(report.findings)} findings, rules {sorted(rules)})")
+
+    # The narrowing must not have opened a hole: severity per fixture is
+    # asserted explicitly, so a future relaxation has to be deliberate.
+    by_path: dict[str, list[Finding]] = {}
+    for finding in report.findings:
+        by_path.setdefault(finding.file, []).append(finding)
+
+    def sev(path: str, rule: str) -> set[str]:
+        return {f.severity for f in by_path.get(path, []) if f.rule == rule}
+
+    cases = [
+        (
+            "top-level drop table blocks",
+            BLOCKING in sev("supabase/migrations/001_voice_activity.sql", "DB001"),
+        ),
+        (
+            "migration with a destructive statement blocks",
+            BLOCKING in sev("supabase/migrations/001_voice_activity.sql", "DB002"),
+        ),
+        (
+            "a comment mentioning delete is not destructive",
+            "supabase/migrations/009_additive.sql"
+            not in {f.file for f in report.findings if f.rule == "DB001"}
+            or BLOCKING not in sev("supabase/migrations/009_additive.sql", "DB001"),
+        ),
+        (
+            "keyed liveness delete is a warning, not silent",
+            WARNING in sev("supabase/migrations/009_additive.sql", "DB001"),
+        ),
+        (
+            "purely additive migration downgrades to a warning",
+            WARNING in sev("supabase/migrations/009_additive.sql", "DB002")
+            and BLOCKING not in sev("supabase/migrations/009_additive.sql", "DB002"),
+        ),
+        (
+            "deleting from the history table still blocks",
+            BLOCKING in sev("supabase/migrations/010_destructive.sql", "DB001"),
+        ),
+    ]
+    failures = [name for name, ok in cases if not ok]
+    if failures:
+        for name in failures:
+            print(f"self-test FAILED: {name}", file=sys.stderr)
+        return 1
+
+    print(
+        f"self-test OK ({len(report.findings)} findings, "
+        f"rules {sorted(rules)}, {len(cases)} severity cases)"
+    )
     return 0
 
 

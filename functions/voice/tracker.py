@@ -112,6 +112,14 @@ DM_REPORT_RETRY_DAYS = 2
 DEFAULT_COALESCE_SECONDS = 2.0
 # Upper bound on the final shutdown flush (seconds).
 DEFAULT_SHUTDOWN_TIMEOUT = 20.0
+# How often an in-progress session is committed to voice_daily_stats. This
+# bounds how much time a hard crash can lose, and how long an administrative
+# Dashboard correction takes to be adopted. One batched RPC covers every live
+# session, so the request cost is constant in the number of users.
+DEFAULT_CHECKPOINT_SECONDS = 120.0
+# A live session whose durable checkpoint is older than this many checkpoint
+# intervals is worth a warning: accounting has stopped advancing.
+CHECKPOINT_STALE_MULTIPLIER = 4
 
 
 class VoiceTracker:
@@ -130,6 +138,7 @@ class VoiceTracker:
         clock: Callable[[], datetime] | None = None,
         coalesce_seconds: float = DEFAULT_COALESCE_SECONDS,
         shutdown_timeout: float = DEFAULT_SHUTDOWN_TIMEOUT,
+        checkpoint_seconds: float = DEFAULT_CHECKPOINT_SECONDS,
     ) -> None:
         self.bot = bot
         self.db = db
@@ -142,6 +151,11 @@ class VoiceTracker:
         # 0 disables coalescing (every state change written immediately).
         self.coalesce_seconds = max(0.0, float(coalesce_seconds))
         self.shutdown_timeout = max(1.0, float(shutdown_timeout))
+        # 0 disables periodic checkpointing (time is only durable at close).
+        self.checkpoint_seconds = max(0.0, float(checkpoint_seconds))
+        self._last_checkpoint_at: datetime | None = None
+        self._checkpoint_failures = 0
+        self._health_reported_at: datetime | None = None
         self.active_sessions: dict[tuple[int, int], ActiveVoiceSession] = {}
         self._profile_signatures: OrderedDict[
             tuple[int, int], tuple[str, str, str | None]
@@ -239,6 +253,13 @@ class VoiceTracker:
             # the in-memory fallback) and removes the row. Identity writes are
             # still flushed because nothing else would persist them.
             await self._flush_profiles_locked()
+            # Commit the in-progress interval first. If the close below is
+            # interrupted the credited time is already durable instead of
+            # depending on the shutdown handler completing.
+            try:
+                await self._checkpoint_sessions_unlocked(now, force=True)
+            except Exception as err:  # noqa: BLE001 - shutdown must continue
+                log.debug("Shutdown checkpoint skipped: %s", err)
             for (guild_id, user_id), session in list(self.active_sessions.items()):
                 try:
                     if not session.is_afk:
@@ -530,6 +551,7 @@ class VoiceTracker:
                 ended_at,
                 fallback_channel_id=session.channel_id,
                 fallback_started_at=session.started_at,
+                fallback_credited_until=session.credited_until,
             )
             if recorded is None:
                 # No persisted row anywhere — record straight from memory
@@ -538,7 +560,7 @@ class VoiceTracker:
                     guild_id=session.guild_id,
                     user_id=session.user_id,
                     channel_id=session.channel_id,
-                    started_at=session.started_at,
+                    started_at=session.credit_from,
                     ended_at=ended_at,
                 )
                 await self.db.delete_active_session(
@@ -625,6 +647,7 @@ class VoiceTracker:
             started_at=session.started_at,
             last_seen_at=seen_at,
             is_afk=session.is_afk,
+            credited_until=session.credited_until,
         )
 
     def _queue_active(self, session: ActiveVoiceSession, seen_at: datetime) -> None:
@@ -644,6 +667,48 @@ class VoiceTracker:
             session, seen_at
         )
         await self._flush_active_locked()
+
+    def _adopt_durable_state(
+        self,
+        known: dict[tuple[int, int], tuple[datetime, datetime | None]],
+    ) -> None:
+        """Reconcile the in-memory sessions with the durable rows.
+
+        Called with the ``started_at`` / ``credited_until`` the database just
+        reported for each heartbeated row. The database always wins, because
+        after migration 003 it is the only writer of ``started_at`` on an
+        existing row — so a difference means either an administrative
+        Dashboard correction or a second process advanced the cursor. Either
+        way, mirroring it immediately is what stops the displayed total from
+        drifting away from what has actually been credited.
+        """
+        if not known:
+            return
+        for (guild_id, user_id), (started_at, cursor) in known.items():
+            session = self.active_sessions.get((guild_id, user_id))
+            if session is None:
+                continue
+            if started_at != session.started_at:
+                log.info(
+                    "Adopting durable session start for user %s in guild %s: "
+                    "%s -> %s",
+                    user_id, guild_id, session.started_at.isoformat(),
+                    started_at.isoformat(),
+                )
+                session.started_at = started_at
+            if cursor is not None and (
+                session.credited_until is None or cursor > session.credited_until
+            ):
+                if session.credited_until is not None and cursor > session.credited_until:
+                    # Only another writer can have moved the cursor ahead of us.
+                    log.warning(
+                        "Checkpoint cursor for user %s in guild %s advanced outside "
+                        "this process (%s -> %s). If only one ParadiseBOT instance "
+                        "should be running, check for an overlapping deployment.",
+                        user_id, guild_id, session.credited_until.isoformat(),
+                        cursor.isoformat(),
+                    )
+                session.credited_until = cursor
 
     async def _flush_active_locked(self) -> int:
         """Write every coalesced heartbeat in ONE batched upsert."""
@@ -665,12 +730,13 @@ class VoiceTracker:
         if not rows:
             return 0
         try:
-            await self.db.heartbeat_active_sessions(rows)
+            known = await self.db.heartbeat_active_sessions(rows)
         except VoiceStoreError as err:
             log.debug("Active session heartbeat failed: %s", err)
             for row in rows:
                 self._dirty_active.setdefault((row.guild_id, row.user_id), row)
             return 0
+        self._adopt_durable_state(known)
         return len(rows)
 
     async def _flush_profiles_locked(self) -> int:
@@ -761,15 +827,50 @@ class VoiceTracker:
         afk_flips: list[ActiveVoiceSession] = []
         stale: list[ActiveVoiceSession] = []
 
+        # Nothing is observable before the gateway has delivered the guild
+        # cache. Reconciling now would see an empty server list, conclude every
+        # recovered session had ended, and close them at a stale last_seen_at.
+        # Waiting costs one interval and cannot lose credited time.
+        if not self.bot.guilds:
+            log.debug("Voice reconciliation deferred: no guilds cached yet")
+            return
+
         # Phase 1: restart recovery (bounded, once per boot / store bootstrap).
+        # The completion flags are set ONLY after recovery actually succeeded,
+        # so a store that is still bootstrapping (the normal case: cog_load
+        # starts this loop before store.start() finishes) or a transient
+        # database failure cannot permanently skip recovery and leave the bot
+        # tracking from a fabricated "now" start time.
         async with self._persist_lock:
             store_online = bool(getattr(self.db, "is_bootstrapped", True))
             if not self._recovered or (store_online and not self._recovered_remote):
-                self._recovered = True
-                if store_online:
-                    self._recovered_remote = True
                 async with self._state_lock:
-                    await self._recover_persisted_sessions(now)
+                    try:
+                        recovered = await self._recover_persisted_sessions(now)
+                    except VoiceStoreError:
+                        log.error(
+                            "Voice session recovery failed (database unreachable)",
+                            exc_info=True,
+                        )
+                        recovered = False
+                    except Exception:  # noqa: BLE001 - never lose the pass
+                        log.exception("Voice session recovery failed unexpectedly")
+                        recovered = False
+                if recovered:
+                    self._recovered = True
+                    if store_online:
+                        self._recovered_remote = True
+                        log.info(
+                            "Voice session recovery complete: %s active session(s) "
+                            "reconciled with Supabase",
+                            len(self.active_sessions),
+                        )
+                else:
+                    log.warning(
+                        "Voice session recovery incomplete; retrying on the next "
+                        "reconcile cycle (no session is closed and no start time "
+                        "is rewritten until it succeeds)"
+                    )
 
         # Phase 2: in-memory scan (no I/O, so events never queue behind it).
         async with self._state_lock:
@@ -786,6 +887,15 @@ class VoiceTracker:
 
                         session = self.active_sessions.get(key)
                         if session is None:
+                            if not self._recovered:
+                                # Recovery has not run yet, so the durable row
+                                # for this member has not been consulted. Skip
+                                # them for this cycle rather than starting the
+                                # clock from "now" and throwing away the time
+                                # the row already knows about. A user who joins
+                                # from now on is handled by the voice-state
+                                # event and is unaffected.
+                                continue
                             self.active_sessions[key] = ActiveVoiceSession(
                                 guild_id=guild.id,
                                 user_id=member.id,
@@ -850,7 +960,8 @@ class VoiceTracker:
             ]
             self._dirty_active.clear()
             try:
-                await self.db.heartbeat_active_sessions(heartbeat_rows)
+                known = await self.db.heartbeat_active_sessions(heartbeat_rows)
+                self._adopt_durable_state(known)
             except VoiceStoreError as err:
                 # Leave the snapshot queued so the cadence writer retries it
                 # instead of waiting for the next reconcile cycle.
@@ -859,6 +970,10 @@ class VoiceTracker:
                     self._dirty_active.setdefault(
                         (row.guild_id, row.user_id), row
                     )
+
+            # Commit the in-progress interval so credited time no longer lives
+            # only in process memory, and adopt any Dashboard correction.
+            await self._checkpoint_sessions_unlocked(now)
 
             # Identity refresh for everyone seen this scan: one batched upsert.
             await self._flush_profiles_locked()
@@ -887,32 +1002,47 @@ class VoiceTracker:
         for (guild_id, user_id), session in list(self.active_sessions.items()):
             if session.started_at < today_start_utc <= now:
                 if not session.is_afk:
+                    # Commits [credit_from, 00:00 IST] and removes the row, so
+                    # the finished day keeps exactly its own share.
                     await self._persist_session(session, today_start_utc)
                 else:
                     await self._clear_active_row(
                         guild_id, user_id, started_before=session.started_at
                     )
+                # Re-open the row at the new day's first instant. The cursor is
+                # cleared with it: the row is brand new, so nothing has been
+                # credited against it yet.
                 session.started_at = today_start_utc
+                session.credited_until = None
                 self._queue_active(session, now)
                 rolled += 1
         if rolled:
             await self._flush_active_locked()
         return rolled
 
-    async def _recover_persisted_sessions(self, now: datetime) -> None:
+    async def _recover_persisted_sessions(self, now: datetime) -> bool:
         """
         Restore in-flight sessions persisted before a restart/crash.
 
         - User still in voice  -> resume tracking from the ORIGINAL started_at
-          (their time is retained exactly, as if the restart never happened).
+          and the ORIGINAL checkpoint cursor (their time is retained exactly,
+          as if the restart never happened, and no checkpointed interval is
+          credited twice).
         - User gone while down -> close the session at the last heartbeat
           (last time they were confirmed connected).
+
+        Returns ``False`` when the persisted state could not be read, so the
+        caller retries instead of marking recovery done. A failed recovery must
+        never be mistaken for "there is nothing to recover".
         """
         try:
             persisted = await self.db.get_active_sessions()
         except VoiceStoreError:
             log.error("Could not load persisted voice sessions", exc_info=True)
-            return
+            return False
+        except Exception:  # noqa: BLE001 - recovery must never kill the loop
+            log.exception("Unexpected error loading persisted voice sessions")
+            return False
 
         for row in persisted:
             key = (row.guild_id, row.user_id)
@@ -955,12 +1085,23 @@ class VoiceTracker:
                 continue
 
             if connected_member is not None and not currently_afk:
-                # Still in voice: resume with the original start time.
+                # Still in voice: resume with the original start time AND the
+                # original checkpoint cursor, so the part of the session that
+                # was already committed is never credited a second time.
+                previous = self.active_sessions.get(key)
+                if previous is not None and previous.started_at != row.started_at:
+                    log.info(
+                        "Recovering session start for user %s in guild %s from the "
+                        "durable row (%s) instead of the in-memory value (%s)",
+                        row.user_id, row.guild_id, row.started_at.isoformat(),
+                        previous.started_at.isoformat(),
+                    )
                 self.active_sessions[key] = ActiveVoiceSession(
                     guild_id=row.guild_id,
                     user_id=row.user_id,
                     channel_id=connected_channel_id,
                     started_at=row.started_at,
+                    credited_until=row.credited_until,
                     is_muted=(
                         connected_member.voice.self_mute or connected_member.voice.mute
                         if connected_member.voice else False
@@ -985,6 +1126,162 @@ class VoiceTracker:
                     )
                 except VoiceStoreError as err:
                     log.error("Could not close stale active session: %s", err)
+        return True
+
+    # ------------------------------------------------------------------
+    # Durable checkpointing
+    # ------------------------------------------------------------------
+
+    async def _checkpoint_sessions_unlocked(
+        self, now: datetime, *, force: bool = False
+    ) -> int:
+        """Commit ``[cursor, now)`` for every live session, atomically.
+
+        Must be called with ``self._persist_lock`` held.
+
+        This is what stops credited voice time from living only in process
+        memory: the interval moves into ``voice_daily_stats`` and the durable
+        cursor advances in the same transaction. A crash afterwards can only
+        lose the interval since the last successful checkpoint, and a replayed
+        or out-of-order checkpoint credits nothing.
+
+        The same round trip echoes each row's own ``started_at``, so an
+        administrative Dashboard correction is adopted here too — the tracking
+        loop never writes ``started_at`` back over it.
+        """
+        if self.checkpoint_seconds <= 0:
+            return 0
+        if not getattr(self.db, "supports_checkpoints", False):
+            return 0
+        if not force:
+            if self._last_checkpoint_at is None:
+                # First pass only establishes the cadence. A brand-new session
+                # has almost nothing to credit, so checkpointing immediately
+                # would spend an RPC on a near-empty interval - and it would
+                # set credited_until before an admin had a chance to correct
+                # started_at after a bot restart. Crash loss stays bounded by
+                # checkpoint_seconds either way.
+                self._last_checkpoint_at = now
+                return 0
+            if (
+                now - self._last_checkpoint_at
+            ).total_seconds() < self.checkpoint_seconds:
+                return 0
+
+        rows = [
+            self._active_snapshot(session, now)
+            for session in self.active_sessions.values()
+            if not session.is_afk
+        ]
+        if not rows:
+            self._last_checkpoint_at = now
+            return 0
+
+        try:
+            results = await self.db.checkpoint_active_sessions(rows, now)
+        except VoiceStoreError as err:
+            # Nothing was credited, so no cursor moved. The next checkpoint
+            # simply covers a longer interval; nothing is lost or duplicated.
+            self._checkpoint_failures += 1
+            log.warning(
+                "Voice checkpoint failed (%s consecutive); the interval stays "
+                "uncredited and will be retried: %s",
+                self._checkpoint_failures, err,
+            )
+            return 0
+
+        self._checkpoint_failures = 0
+        # A clock that jumps backwards must not stall checkpointing forever.
+        if self._last_checkpoint_at is None or now > self._last_checkpoint_at:
+            self._last_checkpoint_at = now
+
+        adopted = 0
+        for (guild_id, user_id), (cursor, row_started_at) in results.items():
+            session = self.active_sessions.get((guild_id, user_id))
+            if session is None:
+                continue
+            if row_started_at != session.started_at:
+                log.info(
+                    "Adopting corrected session start for user %s in guild %s: "
+                    "%s -> %s",
+                    user_id, guild_id, session.started_at.isoformat(),
+                    row_started_at.isoformat(),
+                )
+                session.started_at = row_started_at
+                adopted += 1
+            if session.credited_until is None or cursor > session.credited_until:
+                session.credited_until = cursor
+        if adopted:
+            log.info("Adopted %s administrative session correction(s)", adopted)
+        return len(results)
+
+    async def checkpoint_sessions(self, now: datetime | None = None) -> int:
+        """Force a durable checkpoint now (tests, shutdown, manual recovery)."""
+        instant = ensure_aware(now or self._clock()).astimezone(timezone.utc)
+        async with self._persist_lock:
+            return await self._checkpoint_sessions_unlocked(instant, force=True)
+
+    def health_snapshot(self, now: datetime | None = None) -> dict[str, Any]:
+        """Cheap operational view of the tracking subsystem.
+
+        Reports the live session count and how stale the durable checkpoints
+        are, so a frozen session is visible in logs instead of only on a
+        user's leaderboard. Never logs user content.
+        """
+        instant = ensure_aware(now or self._clock()).astimezone(timezone.utc)
+        live = [s for s in self.active_sessions.values() if not s.is_afk]
+        uncredited = [
+            int((instant - s.credit_from).total_seconds()) for s in live
+        ]
+        stale_threshold = max(
+            60.0, self.checkpoint_seconds * CHECKPOINT_STALE_MULTIPLIER
+        )
+        stale = [n for n in uncredited if n > stale_threshold]
+        return {
+            "active_sessions": len(self.active_sessions),
+            "creditable_sessions": len(live),
+            "recovered": self._recovered,
+            "recovered_remote": self._recovered_remote,
+            "max_uncredited_seconds": max(uncredited, default=0),
+            "stale_sessions": len(stale),
+            "checkpoint_interval_seconds": self.checkpoint_seconds,
+            "consecutive_checkpoint_failures": self._checkpoint_failures,
+        }
+
+    async def report_health(self, now: datetime | None = None) -> dict[str, Any]:
+        """Log :meth:`health_snapshot` at most once per checkpoint interval."""
+        instant = ensure_aware(now or self._clock()).astimezone(timezone.utc)
+        snapshot = self.health_snapshot(instant)
+        if not snapshot["creditable_sessions"]:
+            return snapshot
+        interval = max(60.0, self.checkpoint_seconds)
+        if (
+            self._health_reported_at is not None
+            and (instant - self._health_reported_at).total_seconds() < interval
+        ):
+            return snapshot
+        self._health_reported_at = instant
+        if snapshot["stale_sessions"] or snapshot["consecutive_checkpoint_failures"]:
+            log.warning(
+                "Voice tracking health: %s live session(s), oldest uncredited "
+                "interval %ss, %s stale, %s consecutive checkpoint failure(s), "
+                "recovered=%s/%s",
+                snapshot["creditable_sessions"],
+                snapshot["max_uncredited_seconds"],
+                snapshot["stale_sessions"],
+                snapshot["consecutive_checkpoint_failures"],
+                snapshot["recovered"],
+                snapshot["recovered_remote"],
+            )
+        else:
+            log.info(
+                "Voice tracking healthy: %s live session(s), oldest uncredited "
+                "interval %ss, checkpoint every %.0fs",
+                snapshot["creditable_sessions"],
+                snapshot["max_uncredited_seconds"],
+                self.checkpoint_seconds,
+            )
+        return snapshot
 
     async def _reconciliation_loop(self) -> None:
         """Periodic background reconciliation (default: every 20 seconds)."""
@@ -992,6 +1289,9 @@ class VoiceTracker:
         while not self._stopped:
             try:
                 await self.reconcile_guilds()
+                # Throttled internally to at most one line per checkpoint
+                # interval, so a healthy server stays quiet.
+                await self.report_health()
             except asyncio.CancelledError:
                 break
             except Exception as err:
@@ -1021,12 +1321,16 @@ class VoiceTracker:
         db_entries = await self.db.get_leaderboard_data(guild_id, period.value, today_date)
         time_map: dict[int, int] = {e.user_id: e.total_seconds for e in db_entries}
 
-        # 2. Clip active sessions to this exact IST window. This also handles
-        #    an active session that crossed a boundary before it was closed.
+        # 2. Add only the part of each live session that has NOT been credited
+        #    yet, clipped to this exact IST window. Everything up to the
+        #    durable checkpoint cursor is already in the rows fetched above, so
+        #    counting from session.credit_from (rather than started_at) is what
+        #    keeps "committed + live" equal to the true session duration
+        #    instead of double-counting the checkpointed prefix.
         for (g_id, u_id), session in self.active_sessions.items():
             if g_id == guild_id and not session.is_afk:
                 elapsed = period_overlap_seconds(
-                    session.started_at, now, period.value, today_date, now=now
+                    session.credit_from, now, period.value, today_date, now=now
                 )
                 if elapsed:
                     time_map[u_id] = time_map.get(u_id, 0) + elapsed
@@ -1182,20 +1486,23 @@ class VoiceTracker:
         active_session = self.active_sessions.get(key)
         active_today = active_yesterday = active_week = active_month = active_all = 0
         if active_session and not active_session.is_afk:
+            # Uncredited remainder only; the checkpointed prefix is already in
+            # the breakdown returned by the database.
+            credit_from = active_session.credit_from
             active_today = period_overlap_seconds(
-                active_session.started_at, now, "today", today_date, now=now
+                credit_from, now, "today", today_date, now=now
             )
             active_yesterday = period_overlap_seconds(
-                active_session.started_at, now, "yesterday", today_date, now=now
+                credit_from, now, "yesterday", today_date, now=now
             )
             active_week = period_overlap_seconds(
-                active_session.started_at, now, "week", today_date, now=now
+                credit_from, now, "week", today_date, now=now
             )
             active_month = period_overlap_seconds(
-                active_session.started_at, now, "month", today_date, now=now
+                credit_from, now, "month", today_date, now=now
             )
             active_all = period_overlap_seconds(
-                active_session.started_at, now, "all_time", today_date, now=now
+                credit_from, now, "all_time", today_date, now=now
             )
 
         today_total = breakdown["today"] + active_today
@@ -1479,13 +1786,17 @@ class VoiceTracker:
         for (guild_id, user_id), session in self.active_sessions.items():
             if session.is_afk:
                 continue
+            # Uncredited remainder only — the checkpointed prefix is already in
+            # the daily rows fetched below, so adding the whole session here
+            # would double-count it in the report.
+            credit_from = session.credit_from
             today_seconds = period_overlap_seconds(
-                session.started_at, now, "today", target_date, now=now
+                credit_from, now, "today", target_date, now=now
             )
             if today_seconds:
                 live_today[(guild_id, user_id)] = today_seconds
             previous_seconds = period_overlap_seconds(
-                session.started_at, now, "today", day_before, now=now
+                credit_from, now, "today", day_before, now=now
             )
             if previous_seconds:
                 live_day_before[(guild_id, user_id)] = previous_seconds

@@ -70,21 +70,47 @@ class LocalVoiceStore(VoiceStore):
         *,
         fallback_channel_id: int | None = None,
         fallback_started_at: datetime | None = None,
+        fallback_credited_until: datetime | None = None,
     ) -> int | None:
         row = self.db.get_active_session(guild_id, user_id)
         if row is None:
-            return None
+            # No persisted row: fall back to the caller's in-memory session,
+            # crediting only what a checkpoint has not already credited.
+            if fallback_started_at is None or fallback_channel_id is None:
+                return None
+            started = fallback_started_at
+            if fallback_credited_until is not None and fallback_credited_until > started:
+                started = fallback_credited_until
+            if ended_at <= started:
+                self.db.delete_active_session(guild_id, user_id)
+                return 0
+            self.db.record_completed_session(
+                guild_id=guild_id,
+                user_id=user_id,
+                channel_id=fallback_channel_id,
+                started_at=started,
+                ended_at=ended_at,
+            )
+            self.db.delete_active_session(guild_id, user_id)
+            return max(0, int((ended_at - started).total_seconds()))
         self.db.delete_active_session(guild_id, user_id)
         if row.is_afk:
+            return 0
+        # Credit from the durable checkpoint cursor when there is one, so the
+        # already-checkpointed part of the session is not credited twice.
+        credit_from = row.started_at
+        if row.credited_until is not None and row.credited_until > credit_from:
+            credit_from = row.credited_until
+        if ended_at <= credit_from:
             return 0
         self.db.record_completed_session(
             guild_id=guild_id,
             user_id=user_id,
             channel_id=row.channel_id,
-            started_at=row.started_at,
+            started_at=credit_from,
             ended_at=ended_at,
         )
-        return max(0, int((ended_at - row.started_at).total_seconds()))
+        return max(0, int((ended_at - credit_from).total_seconds()))
 
     # -- active sessions ---------------------------------------------------
 
@@ -103,7 +129,8 @@ class LocalVoiceStore(VoiceStore):
 
     async def heartbeat_active_sessions(
         self, sessions: Sequence[PersistedActiveSession]
-    ) -> None:
+    ) -> dict[tuple[int, int], tuple[datetime, datetime | None]]:
+        known: dict[tuple[int, int], tuple[datetime, datetime | None]] = {}
         for s in sessions:
             self.db.upsert_active_session(
                 s.guild_id,
@@ -112,7 +139,15 @@ class LocalVoiceStore(VoiceStore):
                 s.started_at,
                 s.last_seen_at,
                 s.is_afk,
+                credited_until=s.credited_until,
             )
+            row = self.db.get_active_session(s.guild_id, s.user_id)
+            if row is not None:
+                known[(row.guild_id, row.user_id)] = (
+                    row.started_at,
+                    row.credited_until,
+                )
+        return known
 
     async def delete_active_session(
         self, guild_id: int, user_id: int, *, started_before: datetime | None = None

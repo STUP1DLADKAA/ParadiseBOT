@@ -164,7 +164,7 @@ class FakeSupabaseClient:
         }
         # (guild_id, user_id, started_at, ended_at) -> row
         self._session_identity = {}
-        self.schema_version = 2
+        self.schema_version = 3
         self.schema_installed = True
 
     # -- instrumentation ---------------------------------------------------
@@ -359,12 +359,17 @@ class FakeSupabaseClient:
         del self.active[key]
         if row["is_afk"]:
             return 0
+        # Credit only the part a checkpoint has not already credited.
+        started = row["started_at"]
+        cursor = row.get("credited_until")
+        if cursor is not None and _parse_dt(cursor) > _parse_dt(started):
+            started = cursor
         return self._rpc_voice_record_session(
             {
                 "p_guild_id": row["guild_id"],
                 "p_user_id": row["user_id"],
                 "p_channel_id": row["channel_id"],
-                "p_started_at": row["started_at"],
+                "p_started_at": started,
                 "p_ended_at": p["p_ended_at"],
             }
         )
@@ -377,6 +382,16 @@ class FakeSupabaseClient:
             last_seen = _parse_dt(r["last_seen_at"])
             if existing is not None and _parse_dt(existing["last_seen_at"]) > last_seen:
                 continue  # last-write-wins guard
+            if existing is not None:
+                # v3 contract: a heartbeat refreshes liveness only. started_at
+                # and credited_until are the durable values (and any Dashboard
+                # correction to them) and are never rewritten here.
+                existing["channel_id"] = r["channel_id"]
+                existing["last_seen_at"] = r["last_seen_at"]
+                existing["is_afk"] = bool(r.get("is_afk", False))
+                existing["updated_at"] = _now_iso()
+                applied += 1
+                continue
             self.active[key] = {
                 "guild_id": r["guild_id"],
                 "user_id": r["user_id"],
@@ -384,10 +399,71 @@ class FakeSupabaseClient:
                 "started_at": r["started_at"],
                 "last_seen_at": r["last_seen_at"],
                 "is_afk": bool(r.get("is_afk", False)),
+                "credited_until": None,
                 "updated_at": _now_iso(),
             }
             applied += 1
         return applied
+
+    def _rpc_voice_heartbeat_active_v2(self, p):
+        """Edit-safe heartbeat that echoes the durable values back."""
+        self._rpc_voice_heartbeat_active(p)
+        out = []
+        for r in p["p_rows"]:
+            key = (str(r["guild_id"]), str(r["user_id"]))
+            row = self.active.get(key)
+            if row is None:
+                continue
+            out.append(
+                {
+                    "o_guild_id": row["guild_id"],
+                    "o_user_id": row["user_id"],
+                    "o_started_at": row["started_at"],
+                    "o_cursor": row.get("credited_until"),
+                }
+            )
+        return out
+
+    def _rpc_voice_checkpoint_active_sessions(self, p):
+        """Mirrors the plpgsql function: locked, idempotent, monotonic."""
+        out = []
+        for r in p["p_rows"]:
+            key = (str(r["guild_id"]), str(r["user_id"]))
+            row = self.active.get(key)
+            if row is None:
+                continue  # already closed; nothing to checkpoint
+            if row["is_afk"]:
+                continue  # AFK time is never counted
+            up_to = _parse_dt(r["up_to"])
+            started = _parse_dt(row["started_at"])
+            cursor_raw = row.get("credited_until")
+            credit_from = _parse_dt(cursor_raw) if cursor_raw else started
+            new_cursor = max(credit_from, up_to)  # monotonic: never rewinds
+            credited = 0
+            if new_cursor > credit_from:
+                credited = self._rpc_voice_record_session(
+                    {
+                        "p_guild_id": row["guild_id"],
+                        "p_user_id": row["user_id"],
+                        "p_channel_id": row["channel_id"],
+                        "p_started_at": credit_from.isoformat(),
+                        "p_ended_at": new_cursor.isoformat(),
+                    }
+                )
+            row["credited_until"] = new_cursor.isoformat()
+            if _parse_dt(row["last_seen_at"]) < up_to:
+                row["last_seen_at"] = up_to.isoformat()
+            row["updated_at"] = _now_iso()
+            out.append(
+                {
+                    "o_guild_id": row["guild_id"],
+                    "o_user_id": row["user_id"],
+                    "o_credited_seconds": credited,
+                    "o_cursor": row["credited_until"],
+                    "o_started_at": row["started_at"],
+                }
+            )
+        return out
 
     def _rpc_voice_delete_active_if_older(self, p):
         key = (str(p["p_guild_id"]), str(p["p_user_id"]))
