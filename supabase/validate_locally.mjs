@@ -25,6 +25,7 @@ import { PGlite } from "@electric-sql/pglite";
 const here = dirname(fileURLToPath(import.meta.url));
 const baseMigrationSql = readFileSync(join(here, "migrations", "001_voice_activity.sql"), "utf8");
 const istMigrationSql = readFileSync(join(here, "migrations", "002_voice_ist_calendar.sql"), "utf8");
+const checkpointMigrationSql = readFileSync(join(here, "migrations", "003_voice_checkpoint.sql"), "utf8");
 
 const db = new PGlite();
 let passed = 0;
@@ -123,6 +124,255 @@ try {
 check("schema version is 2", (await scalar("select public.voice_schema_version()")) === 2);
 
 // ---------------------------------------------------------------------------
+console.log("\n== 0b. apply the additive checkpoint migration (003) ==");
+// Snapshot the data that must survive untouched, so the migration can be
+// proven non-destructive rather than merely asserted to be.
+const beforeCounts = {
+  sessions: Number(await scalar("select count(*) from public.voice_sessions")),
+  daily: Number(await scalar("select count(*) from public.voice_daily_stats")),
+  dailySeconds: Number(await scalar(
+    "select coalesce(sum(duration_seconds),0) from public.voice_daily_stats")),
+  sessionSeconds: Number(await scalar(
+    "select coalesce(sum(duration_seconds),0) from public.voice_sessions")),
+  profiles: Number(await scalar("select count(*) from public.voice_member_profiles")),
+};
+
+await db.exec(checkpointMigrationSql);
+await db.exec(checkpointMigrationSql);
+console.log("  ok   checkpoint migration applied and re-applied (idempotent)");
+passed++;
+
+check("schema version is 3", (await scalar("select public.voice_schema_version()")) === 3);
+check("voice_active_sessions gained credited_until",
+  Number(await scalar(
+    "select count(*) from information_schema.columns " +
+    "where table_name='voice_active_sessions' and column_name='credited_until'")) === 1);
+check("credited_until is nullable (existing rows stay valid)",
+  (await scalar(
+    "select is_nullable from information_schema.columns " +
+    "where table_name='voice_active_sessions' and column_name='credited_until'")) === "YES");
+
+const afterCounts = {
+  sessions: Number(await scalar("select count(*) from public.voice_sessions")),
+  daily: Number(await scalar("select count(*) from public.voice_daily_stats")),
+  dailySeconds: Number(await scalar(
+    "select coalesce(sum(duration_seconds),0) from public.voice_daily_stats")),
+  sessionSeconds: Number(await scalar(
+    "select coalesce(sum(duration_seconds),0) from public.voice_sessions")),
+  profiles: Number(await scalar("select count(*) from public.voice_member_profiles")),
+};
+check("migration preserved every voice_sessions row and every second",
+  afterCounts.sessions === beforeCounts.sessions
+  && afterCounts.sessionSeconds === beforeCounts.sessionSeconds,
+  `${JSON.stringify(beforeCounts)} -> ${JSON.stringify(afterCounts)}`);
+check("migration preserved every voice_daily_stats row and every second",
+  afterCounts.daily === beforeCounts.daily
+  && afterCounts.dailySeconds === beforeCounts.dailySeconds,
+  `${JSON.stringify(beforeCounts)} -> ${JSON.stringify(afterCounts)}`);
+check("migration preserved every member profile",
+  afterCounts.profiles === beforeCounts.profiles);
+
+// ---------------------------------------------------------------------------
+console.log("\n== 0c. durable checkpoint accounting (the incident fix) ==");
+const CG = 4242, CU = 9001, CC = 71;
+await db.query("delete from public.voice_active_sessions where guild_id=$1 and user_id=$2",
+  [CG, CU]);
+await db.query("delete from public.voice_daily_stats where guild_id=$1 and user_id=$2",
+  [CG, CU]);
+await db.query("delete from public.voice_sessions where guild_id=$1 and user_id=$2", [CG, CU]);
+
+// A session opens at 07:00 IST (01:30Z) and is still running.
+await db.query("select public.voice_heartbeat_active($1::jsonb)", [JSON.stringify([{
+  guild_id: CG, user_id: CU, channel_id: CC,
+  started_at: "2026-03-10T01:30:00+00:00", last_seen_at: "2026-03-10T01:30:00+00:00",
+  is_afk: false,
+}])]);
+
+const cp = async (rows) =>
+  q("select * from public.voice_checkpoint_active_sessions($1::jsonb)", [JSON.stringify(rows)]);
+
+// Test 1/2 — a 4-hour continuous session, checkpointed twice.
+let c1 = await cp([{ guild_id: CG, user_id: CU, up_to: "2026-03-10T03:30:00+00:00" }]);
+check("checkpoint credits exactly the interval since the cursor (2h)",
+  c1.length === 1 && c1[0].o_credited_seconds === 7200, JSON.stringify(c1));
+let c2 = await cp([{ guild_id: CG, user_id: CU, up_to: "2026-03-10T05:30:00+00:00" }]);
+check("next checkpoint credits only the new interval (2h), not the whole session",
+  c2.length === 1 && c2[0].o_credited_seconds === 7200, JSON.stringify(c2));
+
+// Test 3 — the same checkpoint replayed must credit nothing.
+let c3 = await cp([{ guild_id: CG, user_id: CU, up_to: "2026-03-10T05:30:00+00:00" }]);
+check("repeated checkpoint is credited exactly once (0s on replay)",
+  c3.length === 1 && c3[0].o_credited_seconds === 0, JSON.stringify(c3));
+
+// Test 4 — an out-of-order (older) checkpoint must not rewind the cursor.
+let c4 = await cp([{ guild_id: CG, user_id: CU, up_to: "2026-03-10T02:00:00+00:00" }]);
+const cursorAfter = await scalar(
+  "select credited_until from public.voice_active_sessions where guild_id=$1 and user_id=$2",
+  [CG, CU]);
+check("out-of-order checkpoint credits 0 and cannot rewind the cursor",
+  c4[0]?.o_credited_seconds === 0 && norm(cursorAfter) === "2026-03-10T05:30:00.000Z",
+  `${JSON.stringify(c4)} cursor=${norm(cursorAfter)}`);
+
+const committed = Number(await scalar(
+  "select coalesce(sum(duration_seconds),0) from public.voice_daily_stats " +
+  "where guild_id=$1 and user_id=$2", [CG, CU]));
+check("checkpoints accumulated exactly 4h in voice_daily_stats", committed === 14400, `got ${committed}`);
+
+// Test 5 — the final close must credit ONLY the uncredited remainder.
+const closed = await scalar(
+  "select public.voice_close_active_session($1,$2,$3)",
+  [CG, CU, "2026-03-10T07:30:00+00:00"]);
+const finalDaily = Number(await scalar(
+  "select coalesce(sum(duration_seconds),0) from public.voice_daily_stats " +
+  "where guild_id=$1 and user_id=$2", [CG, CU]));
+const finalSessions = Number(await scalar(
+  "select coalesce(sum(duration_seconds),0) from public.voice_sessions " +
+  "where guild_id=$1 and user_id=$2", [CG, CU]));
+check("close credits only the remainder (2h), never re-crediting the checkpoints",
+  closed === 7200, `got ${closed}`);
+check("checkpointed session totals exactly 6h (no double count, no loss)",
+  finalDaily === 21600 && finalSessions === 21600,
+  `daily=${finalDaily} sessions=${finalSessions}`);
+
+// Test 6 — the heartbeat must never clobber a Dashboard edit.
+await db.query("delete from public.voice_daily_stats where guild_id=$1 and user_id=$2", [CG, CU]);
+await db.query("delete from public.voice_sessions where guild_id=$1 and user_id=$2", [CG, CU]);
+await db.query("select public.voice_heartbeat_active($1::jsonb)", [JSON.stringify([{
+  guild_id: CG, user_id: CU, channel_id: CC,
+  started_at: "2026-03-10T01:30:00+00:00", last_seen_at: "2026-03-10T03:00:00+00:00",
+  is_afk: false,
+}])]);
+await db.query(
+  "update public.voice_active_sessions set started_at=$1 where guild_id=$2 and user_id=$3",
+  ["2026-03-10T00:30:00+00:00", CG, CU]);
+// The bot now heartbeats with its own (stale) in-memory start time.
+await db.query("select public.voice_heartbeat_active($1::jsonb)", [JSON.stringify([{
+  guild_id: CG, user_id: CU, channel_id: CC,
+  started_at: "2026-03-10T01:30:00+00:00", last_seen_at: "2026-03-10T03:00:20+00:00",
+  is_afk: false,
+}])]);
+const editedStart = await scalar(
+  "select started_at from public.voice_active_sessions where guild_id=$1 and user_id=$2",
+  [CG, CU]);
+check("heartbeat no longer reverts an admin edit to started_at",
+  norm(editedStart) === "2026-03-10T00:30:00.000Z", `got ${norm(editedStart)}`);
+const auditRows = await q(
+  "select old_started_at, new_started_at from public.voice_session_corrections " +
+  "where guild_id=$1 and user_id=$2 " +
+  "and old_started_at is distinct from new_started_at order by id", [CG, CU]);
+check("the administrative start-time correction is audited with old and new values",
+  auditRows.length === 1
+  && norm(auditRows[0].old_started_at) === "2026-03-10T01:30:00.000Z"
+  && norm(auditRows[0].new_started_at) === "2026-03-10T00:30:00.000Z",
+  JSON.stringify(auditRows));
+const editedCredit = await cp([{ guild_id: CG, user_id: CU, up_to: "2026-03-10T03:00:00+00:00" }]);
+check("the corrected start time is honoured in full (2.5h from 00:30Z)",
+  editedCredit[0]?.o_credited_seconds === 9000, JSON.stringify(editedCredit));
+check("the checkpoint echoes the corrected started_at so the bot can adopt it",
+  norm(editedCredit[0]?.o_started_at) === "2026-03-10T00:30:00.000Z",
+  String(norm(editedCredit[0]?.o_started_at)));
+await db.query("select public.voice_close_active_session($1,$2,$3)",
+  [CG, CU, "2026-03-10T03:00:00+00:00"]);
+
+// Test 7 — a checkpoint for a session that no longer exists is a silent no-op.
+const ghost = await cp([{ guild_id: CG, user_id: CU, up_to: "2026-03-10T09:00:00+00:00" }]);
+check("checkpointing a closed session is a no-op (no phantom credit)",
+  ghost.length === 0, JSON.stringify(ghost));
+
+// Test 8 — AFK rows are never credited by a checkpoint (policy unchanged).
+await db.query("select public.voice_heartbeat_active($1::jsonb)", [JSON.stringify([{
+  guild_id: CG, user_id: CU, channel_id: CC,
+  started_at: "2026-03-10T01:30:00+00:00", last_seen_at: "2026-03-10T01:30:00+00:00",
+  is_afk: true,
+}])]);
+const afkCp = await cp([{ guild_id: CG, user_id: CU, up_to: "2026-03-10T05:00:00+00:00" }]);
+check("checkpoint skips AFK rows (AFK time is never counted)",
+  afkCp.length === 0, JSON.stringify(afkCp));
+await db.query("delete from public.voice_active_sessions where guild_id=$1 and user_id=$2", [CG, CU]);
+
+// Test 8b — the v2 heartbeat reports the durable values back to the bot.
+await db.query("select public.voice_heartbeat_active($1::jsonb)", [JSON.stringify([{
+  guild_id: CG, user_id: CU, channel_id: CC,
+  started_at: "2026-03-10T01:30:00+00:00", last_seen_at: "2026-03-10T02:00:00+00:00",
+  is_afk: false,
+}])]);
+await db.query(
+  "update public.voice_active_sessions set started_at=$1, credited_until=$2 " +
+  "where guild_id=$3 and user_id=$4",
+  ["2026-03-10T00:30:00+00:00", "2026-03-10T01:50:00+00:00", CG, CU]);
+const hb2 = await q("select * from public.voice_heartbeat_active_v2($1::jsonb)", [JSON.stringify([{
+  guild_id: CG, user_id: CU, channel_id: CC,
+  started_at: "2026-03-10T01:30:00+00:00", last_seen_at: "2026-03-10T02:00:20+00:00",
+  is_afk: false,
+}])]);
+check("v2 heartbeat returns the authoritative started_at and cursor",
+  hb2.length === 1
+  && norm(hb2[0].o_started_at) === "2026-03-10T00:30:00.000Z"
+  && norm(hb2[0].o_cursor) === "2026-03-10T01:50:00.000Z",
+  JSON.stringify(hb2));
+check("v2 heartbeat still refreshes liveness",
+  norm(await scalar("select last_seen_at from public.voice_active_sessions " +
+    "where guild_id=$1 and user_id=$2", [CG, CU])) === "2026-03-10T02:00:20.000Z");
+check("v2 heartbeat never rewrites the durable started_at",
+  norm(await scalar("select started_at from public.voice_active_sessions " +
+    "where guild_id=$1 and user_id=$2", [CG, CU])) === "2026-03-10T00:30:00.000Z");
+await db.query("delete from public.voice_active_sessions where guild_id=$1 and user_id=$2", [CG, CU]);
+const hb2insert = await q("select * from public.voice_heartbeat_active_v2($1::jsonb)", [JSON.stringify([{
+  guild_id: CG, user_id: CU, channel_id: CC,
+  started_at: "2026-03-10T01:30:00+00:00", last_seen_at: "2026-03-10T02:00:00+00:00",
+  is_afk: false,
+}])]);
+check("v2 heartbeat inserts a brand-new session with its own started_at",
+  hb2insert.length === 1
+  && norm(hb2insert[0].o_started_at) === "2026-03-10T01:30:00.000Z"
+  && hb2insert[0].o_cursor === null,
+  JSON.stringify(hb2insert));
+await db.query("delete from public.voice_active_sessions where guild_id=$1 and user_id=$2", [CG, CU]);
+
+// Test 9 — the new table is RLS-locked like every other voice table.
+const correctionsRls = await scalar(
+  "select relrowsecurity from pg_class c join pg_namespace n on n.oid=c.relnamespace " +
+  "where n.nspname='public' and c.relname='voice_session_corrections'");
+check("voice_session_corrections has row level security enabled", correctionsRls === true);
+await db.exec("grant usage on schema public to anon;");
+await db.exec("grant select on public.voice_session_corrections to anon;");
+let anonCorrections = null;
+try {
+  await db.exec("set role anon");
+  anonCorrections = await q("select count(*) as c from public.voice_session_corrections");
+  await db.exec("reset role");
+} catch (e) {
+  await db.exec("reset role");
+  anonCorrections = [{ c: "permission denied" }];
+}
+check("anon sees zero correction rows (RLS, no policies)",
+  Number(anonCorrections[0].c) === 0, JSON.stringify(anonCorrections));
+let anonCheckpointErr = null;
+try {
+  await db.exec("set role anon");
+  await q("select * from public.voice_checkpoint_active_sessions('[]'::jsonb)");
+  await db.exec("reset role");
+} catch (e) {
+  await db.exec("reset role");
+  anonCheckpointErr = e.message;
+}
+check("anon cannot execute the checkpoint function",
+  /permission denied for function voice_checkpoint_active_sessions/.test(anonCheckpointErr ?? ""),
+  anonCheckpointErr ?? "no error");
+let anonHb2Err = null;
+try {
+  await db.exec("set role anon");
+  await q("select * from public.voice_heartbeat_active_v2('[]'::jsonb)");
+  await db.exec("reset role");
+} catch (e) {
+  await db.exec("reset role");
+  anonHb2Err = e.message;
+}
+check("anon cannot execute the v2 heartbeat function",
+  /permission denied for function voice_heartbeat_active_v2/.test(anonHb2Err ?? ""),
+  anonHb2Err ?? "no error");
+
+// ---------------------------------------------------------------------------
 console.log("\n== 1. voice_record_session: midnight splitting & retry safety ==");
 const G = 999, U = 101, C = 555;
 
@@ -193,12 +443,16 @@ check("older heartbeat loses (LWW)",
   norm(await scalar("select last_seen_at from public.voice_active_sessions where guild_id=$1 and user_id=301", [G])) === "2026-10-05T10:20:00.000Z",
   String(await scalar("select last_seen_at from public.voice_active_sessions where guild_id=$1 and user_id=301", [G])));
 
-// Newer heartbeat may move started_at backwards (restart recovery resumes).
+// A heartbeat only refreshes liveness. started_at is the durable session
+// origin and is set on INSERT only, so an in-memory value can never rewrite
+// it -- this is what makes Dashboard corrections and crash recovery safe.
 await scalar("select public.voice_heartbeat_active($1)", [JSON.stringify([
   { guild_id: G, user_id: 301, channel_id: C, started_at: "2026-10-05T09:30:00+00:00", last_seen_at: "2026-10-05T10:25:00+00:00", is_afk: false },
 ])]);
-check("newer heartbeat can resume an older started_at",
-  norm(await scalar("select started_at from public.voice_active_sessions where guild_id=$1 and user_id=301", [G])) === "2026-10-05T09:30:00.000Z");
+check("heartbeat refreshes liveness without rewriting the durable started_at",
+  norm(await scalar("select started_at from public.voice_active_sessions where guild_id=$1 and user_id=301", [G])) === "2026-10-05T10:00:00.000Z"
+  && norm(await scalar("select last_seen_at from public.voice_active_sessions where guild_id=$1 and user_id=301", [G])) === "2026-10-05T10:25:00.000Z",
+  norm(await scalar("select started_at from public.voice_active_sessions where guild_id=$1 and user_id=301", [G])));
 
 // Guarded delete: a delete for an older session leaves a newer row alone.
 await scalar("select public.voice_heartbeat_active($1)", [JSON.stringify([

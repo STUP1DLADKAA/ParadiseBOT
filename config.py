@@ -187,6 +187,12 @@ class VoiceConfig:
     # state changes inside this window are merged into one batched upsert.
     # 0 restores the legacy write-per-event behaviour.
     write_coalesce_seconds: float = 2.0
+    # How often an in-progress session is committed to voice_daily_stats
+    # (seconds). This bounds how much voice time a hard crash can lose, and
+    # how long a manual Supabase correction takes to be adopted. One batched
+    # RPC covers every live session regardless of how many users are in voice.
+    # 0 disables periodic checkpointing (time becomes durable only at close).
+    checkpoint_seconds: float = 120.0
 
     @property
     def supabase_configured(self) -> bool:
@@ -231,6 +237,9 @@ class VoiceConfig:
             request_timeout=max(5.0, _float(env.get("VOICE_SUPABASE_TIMEOUT"), 15.0)),
             write_coalesce_seconds=min(
                 10.0, max(0.0, _float(env.get("VOICE_WRITE_COALESCE_SECONDS"), 2.0))
+            ),
+            checkpoint_seconds=min(
+                3600.0, max(0.0, _float(env.get("VOICE_CHECKPOINT_SECONDS"), 120.0))
             ),
         )
 

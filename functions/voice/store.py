@@ -88,15 +88,50 @@ class VoiceStore(ABC):
         *,
         fallback_channel_id: int | None = None,
         fallback_started_at: datetime | None = None,
+        fallback_credited_until: datetime | None = None,
     ) -> int | None:
         """Atomically close a persisted active session.
 
         Uses the persisted row's own started_at/channel, records the session
-        and removes the row in one transaction. Returns the recorded seconds
+        and removes the row in one transaction. Only the interval that has not
+        already been credited by a checkpoint is recorded, so a close can never
+        double-count a checkpointed session. Returns the recorded seconds
         (0 for AFK or duplicates) or ``None`` when no active row exists.
         ``fallback_*`` values (from the in-memory session) are used only if
-        the row cannot be found or the store is unreachable.
+        the row cannot be found or the store is unreachable. When a fallback is
+        used the credited interval starts at
+        ``max(fallback_started_at, fallback_credited_until)`` so an interval
+        already credited by a checkpoint is never credited a second time.
         """
+
+    async def checkpoint_active_sessions(
+        self,
+        sessions: Sequence[PersistedActiveSession],
+        up_to: datetime,
+    ) -> dict[tuple[int, int], tuple[datetime, datetime]]:
+        """Commit ``[credited_until | started_at, up_to)`` for live sessions.
+
+        This is what makes an in-progress session durable: the credited part
+        moves out of process memory and into ``voice_daily_stats``, and the
+        cursor that marks it advances atomically with the credit.
+
+        Implementations must be idempotent (a replayed call credits nothing),
+        monotonic (an out-of-order call cannot rewind the cursor) and atomic
+        (the cursor never advances for time that was not saved). Returns
+        ``{(guild_id, user_id): (new_cursor, row_started_at)}`` so the caller
+        can mirror the cursor and adopt an administrative start-time
+        correction in the same round trip.
+
+        The default is a no-op, which keeps the pre-checkpoint behaviour for
+        stores that do not implement it; :class:`SupabaseVoiceDatabase`
+        overrides it.
+        """
+        return {}
+
+    @property
+    def supports_checkpoints(self) -> bool:
+        """Whether this store can durably checkpoint an in-progress session."""
+        return False
 
     # ------------------------------------------------------------------
     # Active sessions (restart/crash resilience)
@@ -117,8 +152,15 @@ class VoiceStore(ABC):
     @abstractmethod
     async def heartbeat_active_sessions(
         self, sessions: Sequence[PersistedActiveSession]
-    ) -> None:
-        """Batched heartbeat: bump last_seen_at for many sessions at once."""
+    ) -> dict[tuple[int, int], tuple[datetime, datetime | None]]:
+        """Batched heartbeat: bump last_seen_at for many sessions at once.
+
+        Returns ``{(guild_id, user_id): (started_at, credited_until)}`` as the
+        database currently holds them, so the caller can reconcile its cache
+        with the durable rows (and notice an administrative correction or a
+        second writer) in the same round trip. Stores that cannot report the
+        rows back return an empty mapping.
+        """
 
     @abstractmethod
     async def delete_active_session(

@@ -51,6 +51,20 @@ __all__ = [
 ]
 
 
+def _parse_optional(value) -> datetime | None:
+    """Parse a nullable ISO timestamp; a NULL/blank cell stays None.
+
+    A corrupt value is treated as "no checkpoint" rather than raising, so one
+    bad row can never stop recovery for every session.
+    """
+    if not value:
+        return None
+    try:
+        return _ensure_aware(datetime.fromisoformat(str(value)))
+    except (TypeError, ValueError):
+        return None
+
+
 def _ensure_aware(dt: datetime) -> datetime:
     """Guarantee a timezone-aware datetime (assume UTC when naive)."""
     if dt.tzinfo is None:
@@ -159,6 +173,7 @@ class VoiceDatabase:
                     started_at TEXT NOT NULL,
                     last_seen_at TEXT NOT NULL,
                     is_afk INTEGER NOT NULL DEFAULT 0,
+                    credited_until TEXT,
                     PRIMARY KEY (guild_id, user_id)
                 );
 
@@ -180,6 +195,20 @@ class VoiceDatabase:
                 CREATE INDEX IF NOT EXISTS idx_voice_daily_guild_user
                     ON voice_daily_stats(guild_id, user_id);
             """)
+            # Additive local-schema upgrade for databases created before the
+            # durable checkpoint cursor existed. SQLite has no IF NOT EXISTS
+            # for ADD COLUMN, so probe first; every existing row is preserved
+            # and the new column is nullable.
+            cols = {
+                row["name"]
+                for row in conn.execute(
+                    "PRAGMA table_info(voice_active_sessions)"
+                ).fetchall()
+            }
+            if "credited_until" not in cols:
+                conn.execute(
+                    "ALTER TABLE voice_active_sessions ADD COLUMN credited_until TEXT"
+                )
 
     # ------------------------------------------------------------------
     # User Settings (Timezone & DM Reports)
@@ -341,25 +370,40 @@ class VoiceDatabase:
         started_at: datetime,
         last_seen_at: datetime,
         is_afk: bool = False,
+        credited_until: datetime | None = None,
     ) -> None:
         """Persist (or heartbeat) an in-progress voice session.
 
         Mirrors the Supabase upsert: last-write-wins on ``last_seen_at`` so a
         delayed heartbeat can never clobber fresher local fallback state.
+
+        ``credited_until`` is the durable checkpoint cursor. It is mirrored here
+        so that recovering from the local fallback during a Supabase outage
+        cannot re-credit an interval that was already checkpointed remotely.
         """
         started_at = _ensure_aware(started_at)
         last_seen_at = _ensure_aware(last_seen_at)
+        cursor_iso = (
+            _ensure_aware(credited_until).isoformat() if credited_until else None
+        )
         with self._get_connection() as conn:
             conn.execute(
                 """
                 INSERT INTO voice_active_sessions (
-                    guild_id, user_id, channel_id, started_at, last_seen_at, is_afk
-                ) VALUES (?, ?, ?, ?, ?, ?)
+                    guild_id, user_id, channel_id, started_at, last_seen_at,
+                    is_afk, credited_until
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id, user_id) DO UPDATE SET
                     channel_id = excluded.channel_id,
                     started_at = excluded.started_at,
                     last_seen_at = excluded.last_seen_at,
-                    is_afk = excluded.is_afk
+                    is_afk = excluded.is_afk,
+                    -- Never rewind the checkpoint cursor: a stale mirror write
+                    -- must not make already-credited time creditable again.
+                    credited_until = max(
+                        coalesce(excluded.credited_until, ''),
+                        coalesce(voice_active_sessions.credited_until, '')
+                    )
                 WHERE excluded.last_seen_at >= voice_active_sessions.last_seen_at
                 """,
                 (
@@ -369,7 +413,17 @@ class VoiceDatabase:
                     started_at.isoformat(),
                     last_seen_at.isoformat(),
                     int(is_afk),
+                    cursor_iso,
                 ),
+            )
+            # max() over ISO strings leaves '' when both sides are NULL; keep
+            # the column a clean NULL rather than an empty string.
+            conn.execute(
+                """
+                UPDATE voice_active_sessions SET credited_until = NULL
+                WHERE guild_id = ? AND user_id = ? AND credited_until = ''
+                """,
+                (guild_id, user_id),
             )
 
     def get_active_session(self, guild_id: int, user_id: int) -> PersistedActiveSession | None:
@@ -377,7 +431,8 @@ class VoiceDatabase:
         with self._get_connection() as conn:
             cur = conn.execute(
                 """
-                SELECT guild_id, user_id, channel_id, started_at, last_seen_at, is_afk
+                SELECT guild_id, user_id, channel_id, started_at, last_seen_at,
+                       is_afk, credited_until
                 FROM voice_active_sessions
                 WHERE guild_id = ? AND user_id = ?
                 """,
@@ -398,6 +453,7 @@ class VoiceDatabase:
                 started_at=started_at,
                 last_seen_at=last_seen_at,
                 is_afk=bool(r["is_afk"]),
+                credited_until=_parse_optional(r["credited_until"]),
             )
 
     def delete_active_session(self, guild_id: int, user_id: int) -> None:
@@ -413,7 +469,8 @@ class VoiceDatabase:
         with self._get_connection() as conn:
             cur = conn.execute(
                 """
-                SELECT guild_id, user_id, channel_id, started_at, last_seen_at, is_afk
+                SELECT guild_id, user_id, channel_id, started_at, last_seen_at,
+                       is_afk, credited_until
                 FROM voice_active_sessions
                 """
             )
@@ -430,6 +487,7 @@ class VoiceDatabase:
                         guild_id=r["guild_id"],
                         user_id=r["user_id"],
                         channel_id=r["channel_id"],
+                        credited_until=_parse_optional(r["credited_until"]),
                         started_at=started_at,
                         last_seen_at=last_seen_at,
                         is_afk=bool(r["is_afk"]),
