@@ -24,6 +24,7 @@ EXTENSIONS = (
     "commands.fun",
     "commands.utility",
     "commands.vc",
+    "commands.clip",
     "commands.voice_presence",
     "commands.minigames",
     "commands.dictionary",
@@ -136,6 +137,12 @@ class ParadiseBot(commands.Bot):
             log.debug("AI startup validation skipped", exc_info=True)
 
     async def close(self) -> None:
+        clip_service = getattr(self, "voice_clip_service", None)
+        if clip_service is not None:
+            try:
+                await clip_service.shutdown()
+            except Exception:
+                log.debug("Voice clip shutdown failed", exc_info=True)
         try:
             await self.presence_manager.stop()
         except Exception:

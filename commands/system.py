@@ -24,6 +24,7 @@ HELP_BLURBS = {
     "translate": "translate a short text",
     "settimezone": "configure your personal timezone",
     "vc": "voice activity tracking and leaderboard card",
+    "clip": "save a recent voice clip via DM",
     "minigames": "automated Paradise games and leaderboard",
     "recipe": "recipes from ingredients you have",
     "summarize": "recap recent chat in this channel",
@@ -33,7 +34,7 @@ HELP_BLURBS = {
 HELP_GROUPS = {
     "🎲 fun": ("ping", "coinflip", "choose"),
     "🧰 useful": ("remind", "poll", "afk", "translate", "settimezone", "recipe"),
-    "🎙️ voice": ("vc",),
+    "🎙️ voice": ("vc", "clip"),
     "🎲 community": ("minigames",),
     "🤖 ai": ("summarize",),
 }
