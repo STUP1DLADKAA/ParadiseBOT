@@ -11,7 +11,7 @@ from collections import OrderedDict, deque
 import discord
 from discord.ext import commands, tasks
 
-from config import DictionaryConfig
+from config import DictionaryConfig, VoiceClipConfig
 from functions.dictionary.http import HttpClient, HttpError
 from functions.dictionary.models import Clip, SpeechRequest
 from functions.dictionary.playback import (
@@ -20,6 +20,7 @@ from functions.dictionary.playback import (
     resolve_ffmpeg_executable,
 )
 from functions.dictionary.pronounce import NeuralSpeechProvider, WebVoiceProvider
+from functions.voice_clip import ClipVoiceClient
 
 log = logging.getLogger(__name__)
 
@@ -346,7 +347,15 @@ class VoicePresence(commands.Cog):
                     return
                 await client.move_to(target)
             else:
-                await target.connect(timeout=CONNECT_TIMEOUT, self_deaf=True)
+                clip_cfg = getattr(getattr(self.bot, "config", None), "voice_clip", None)
+                if isinstance(clip_cfg, VoiceClipConfig) and clip_cfg.enabled:
+                    await target.connect(
+                        timeout=CONNECT_TIMEOUT,
+                        self_deaf=False,
+                        cls=ClipVoiceClient,
+                    )
+                else:
+                    await target.connect(timeout=CONNECT_TIMEOUT, self_deaf=True)
 
             await self._announce_unlocked(guild, target)
 

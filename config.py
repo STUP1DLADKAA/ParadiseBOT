@@ -245,6 +245,71 @@ class VoiceConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class VoiceClipConfig:
+    """Bounded rolling voice-clip buffer and export resource limits (/clip)."""
+
+    enabled: bool = True
+    # Hard-capped at 180 seconds per product requirement.
+    max_buffer_seconds: int = 180
+    # Maximum distinct active speaker streams retained per voice connection.
+    max_active_speakers: int = 32
+    # Maximum memory (bytes) consumed by buffered Opus frames per guild.
+    max_buffer_bytes: int = 24 * 1024 * 1024
+    # Concurrent active export jobs and bounded waiting queue capacity.
+    max_concurrent_exports: int = 1
+    max_queued_exports: int = 2
+    # Per-export deadline covering decode, mix and FFmpeg encode (seconds).
+    export_timeout_seconds: float = 30.0
+    # Safe Discord DM upload cap (~9.5 MiB, well under the 10 MiB default limit).
+    max_file_bytes: int = 9_961_472
+    # Upper bound on temporary output bytes across in-flight exports.
+    max_temp_disk_bytes: int = 32 * 1024 * 1024
+    # AAC-LC bitrate (kbps) at 48 kHz mono.
+    bitrate_kbps: int = 96
+    # Consent policy: "notice" (transparent channel notice + instant opt-out)
+    # or "opt_in" (captures only speakers who explicitly click Allow Recording).
+    consent_mode: str = "notice"
+    # Post a recording & consent notice in the voice channel text chat.
+    notice_enabled: bool = True
+
+    @classmethod
+    def from_env(cls, env) -> "VoiceClipConfig":
+        raw_mode = str(env.get("VOICE_CLIP_CONSENT_MODE", "notice") or "notice").strip().lower()
+        consent_mode = raw_mode if raw_mode in {"notice", "opt_in"} else "notice"
+        buffer_mb = max(2, min(128, _int(env.get("VOICE_CLIP_MAX_BUFFER_MB"), 24)))
+        temp_mb = max(4, min(256, _int(env.get("VOICE_CLIP_MAX_TEMP_MB"), 32)))
+        return cls(
+            enabled=_bool(env.get("VOICE_CLIP_ENABLED"), True),
+            max_buffer_seconds=max(
+                1, min(180, _int(env.get("VOICE_CLIP_MAX_SECONDS"), 180))
+            ),
+            max_active_speakers=max(
+                1, min(64, _int(env.get("VOICE_CLIP_MAX_SPEAKERS"), 32))
+            ),
+            max_buffer_bytes=buffer_mb * 1024 * 1024,
+            max_concurrent_exports=max(
+                1, min(4, _int(env.get("VOICE_CLIP_MAX_CONCURRENT_EXPORTS"), 1))
+            ),
+            max_queued_exports=max(
+                0, min(8, _int(env.get("VOICE_CLIP_MAX_QUEUED_EXPORTS"), 2))
+            ),
+            export_timeout_seconds=max(
+                5.0, min(120.0, _float(env.get("VOICE_CLIP_EXPORT_TIMEOUT"), 30.0))
+            ),
+            max_file_bytes=max(
+                262_144,
+                min(25 * 1024 * 1024, _int(env.get("VOICE_CLIP_MAX_FILE_BYTES"), 9_961_472)),
+            ),
+            max_temp_disk_bytes=temp_mb * 1024 * 1024,
+            bitrate_kbps=max(
+                48, min(192, _int(env.get("VOICE_CLIP_BITRATE_KBPS"), 96))
+            ),
+            consent_mode=consent_mode,
+            notice_enabled=_bool(env.get("VOICE_CLIP_NOTICE_ENABLED"), True),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class MiniGamesConfig:
     """Optional destination override for automated server mini-games."""
 
@@ -362,6 +427,9 @@ class Config:
     # Voice activity tracking and statistics.
     voice: VoiceConfig = VoiceConfig()
 
+    # Bounded rolling voice clip capture and DM export (/clip).
+    voice_clip: VoiceClipConfig = VoiceClipConfig()
+
     # Automated mini-game destination; scheduler settings are persisted in SQLite.
     minigames: MiniGamesConfig = MiniGamesConfig()
 
@@ -386,6 +454,7 @@ class Config:
             personality=PersonalityConfig.from_env(env),
             dictionary=DictionaryConfig.from_env(env),
             voice=VoiceConfig.from_env(env),
+            voice_clip=VoiceClipConfig.from_env(env),
             minigames=MiniGamesConfig.from_env(env),
             image_search=ImageSearchConfig.from_env(env),
         )
