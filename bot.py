@@ -32,6 +32,7 @@ EXTENSIONS = (
     "commands.ai",
     "commands.system",
     "commands.assistant",
+    "commands.edit",
 )
 
 
