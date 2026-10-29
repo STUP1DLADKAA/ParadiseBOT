@@ -36,6 +36,7 @@ EXTENSIONS = (
     "commands.assistant",
     "commands.edit",
     "commands.wake",
+    "commands.music",
 )
 
 
@@ -255,6 +256,14 @@ class ParadiseBot(commands.Bot):
         except Exception:
             log.exception("AFK handling failed")
 
+        # Music text commands ("!p song", "!skip", "!cmd") own the message
+        # before anything else looks at it — a prefix is an explicit command.
+        try:
+            if await self._maybe_music(message):
+                return
+        except Exception:
+            log.exception("Music command failed")
+
         # Explicit address (mention or reply): the assistant owns it.
         addressed = False
         try:
@@ -357,6 +366,15 @@ class ParadiseBot(commands.Bot):
 
     async def _maybe_wake(self, message: discord.Message) -> bool:
         cog = self.get_cog("Wake")
+        handler = getattr(cog, "handle_message", None)
+        if handler is None:
+            return False
+        return bool(await handler(message))
+
+    # -- Music (prefix commands: !p, !skip, !cmd) -------------------------------
+
+    async def _maybe_music(self, message: discord.Message) -> bool:
+        cog = self.get_cog("Music")
         handler = getattr(cog, "handle_message", None)
         if handler is None:
             return False

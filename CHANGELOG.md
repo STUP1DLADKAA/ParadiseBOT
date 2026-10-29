@@ -7,6 +7,29 @@ All notable changes to Paradise are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Music, in-process.** `/music …`, `!p`-style text commands, a `/cmd` button
+  panel, and voice requests in English, Hinglish and Devanagari
+  ("Hey Paradise play billie jean", "billie jean baja do", "अगला गाना लगाओ").
+  yt-dlp searches, FFmpeg decodes to 48 kHz stereo PCM, and a numpy mixer
+  plays it through one `discord.AudioSource` per guild
+  (`functions/music/`, `commands/music.py`, [docs/music.md](docs/music.md)).
+- **Ducking.** When Paradise answers while a song is playing, the music gain
+  ramps 1.0 → 0.15 → 1.0 around the sentence, so the answer is always
+  intelligible and the song never stops. Verified on a real FFmpeg stream
+  (`tests/test_music.py::test_ducking_on_a_real_stream`: 0.150 and 1.000).
+- `MUSIC_*` settings (15 keys), `yt-dlp` in `requirements.txt`, 71 new tests.
+
+### Changed
+- **"Hey Paradise" now answers in far more situations.** `WAKE_WORD_VC_ONLY`
+  used to mean "only in a voice channel's text chat"; sitting in a voice
+  channel now counts as well, so typing in `#general` while in the VC is
+  answered *and* spoken in the channel. Every ignored wake phrase is logged
+  at INFO, and a missing ElevenLabs key is reported at start-up instead of
+  silently producing text-only replies.
+- Wake-word answers are mixed into a playing song instead of waiting for it
+  to end.
+
+### Added
 - `DISCORD_GUILD_ID`: publish slash commands instantly to a chosen guild;
   leaving it blank registers them globally.
 - Operator allow-lists in `.env`: `EDIT_ALLOWED_USER_IDS`,

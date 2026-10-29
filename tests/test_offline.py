@@ -40,12 +40,15 @@ EXPECTED_COMMANDS = {
     "remind", "poll", "afk", "translate", "settimezone", "vc", "clip",
     "minigames", "recipe",
     "summarize", "help", "edit",
+    # Music lives under one group plus a panel command; the individual
+    # transports (play/skip/…) are *not* top-level commands.
+    "music", "cmd",
 }
 
-# Everything that must never come back: the whole music/TTS stack plus
-# commands removed in earlier passes.
+# Names that must never come back at the top level. Music now exists, but it
+# is reached through `/music <action>` and `!p`-style text commands — a dozen
+# top-level slash commands is exactly what this list keeps out.
 REMOVED_COMMANDS = {
-    # music
     "play", "pause", "resume", "skip", "previous", "stop", "queue",
     "nowplaying", "remove", "move", "clearqueue", "shuffle", "seek",
     "forward", "backward", "loop", "autoplay", "filter", "volume",
@@ -105,39 +108,44 @@ class TestCommandSet(unittest.TestCase):
         self.assertFalse(declared & REMOVED_COMMANDS)
         self.assertTrue(declared <= EXPECTED_COMMANDS, f"unexpected: {declared - EXPECTED_COMMANDS}")
 
-    def test_no_music_or_tts_modules_left(self):
-        # A music system and third-party TTS suites stay out of this bot. The
-        # owner's own ElevenLabs voice (functions/tts.py) is intentional and
-        # explicitly allowed — it is one small client, not a TTS framework.
+    def test_music_is_present_and_self_contained(self):
+        # Music is back — but in-process (yt-dlp + FFmpeg + a numpy mixer),
+        # never a Lavalink node or a TTS framework. Those stay gone.
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for path in (
-            "commands/music.py", "commands/voice.py", "functions/music",
-            "functions/lyrics.py", "functions/settings.py",
-            "lavalink",
-        ):
+        for path in ("commands/music.py", "functions/music/player.py",
+                     "functions/music/mixer.py", "functions/music/decoder.py"):
+            self.assertTrue(
+                os.path.exists(os.path.join(root, path)), f"{path} is missing"
+            )
+        for path in ("commands/voice.py", "functions/lyrics.py",
+                     "functions/settings.py", "lavalink", "node_modules"):
             self.assertFalse(
                 os.path.exists(os.path.join(root, path)),
-                f"{path} should have been removed",
+                f"{path} should not exist",
             )
         self.assertTrue(
             os.path.exists(os.path.join(root, "functions", "tts.py")),
             "functions/tts.py is the owner's voice provider",
         )
 
-    def test_no_music_or_tts_references_in_source(self):
+    def test_no_lavalink_or_tts_framework_is_imported(self):
+        # Comments may explain why Lavalink is not used; an import may not exist.
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         files = ["bot.py", "config.py"]
         for folder in ("commands", "functions"):
-            files.extend(
-                os.path.join(folder, name)
-                for name in os.listdir(os.path.join(root, folder))
-                if name.endswith(".py")
-            )
+            for base, _, names in os.walk(os.path.join(root, folder)):
+                files.extend(
+                    os.path.relpath(os.path.join(base, name), root)
+                    for name in names
+                    if name.endswith(".py")
+                )
+        banned = ("import lavalink", "from lavalink", "import wavelink",
+                  "from wavelink", "edge_tts", "import gtts", "from gtts")
         for relative in files:
             with open(os.path.join(root, relative), encoding="utf-8") as handle:
                 source = handle.read().lower()
-            for needle in ("lavalink", "edge_tts", "edge-tts", "ttsservice", "musicservice"):
-                self.assertNotIn(needle, source, f"{relative} still mentions {needle}")
+            for needle in banned:
+                self.assertNotIn(needle, source, f"{relative} imports {needle}")
 
     def test_help_covers_every_registered_command(self):
         # Every registered command (except /help itself) must appear in /help.
@@ -288,17 +296,20 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.personality.reaction_chance, 0.045)
         self.assertEqual(config.personality.reply_chance, 0.015)
 
-    def test_template_has_no_secrets_or_music(self):
+    def test_template_documents_music_without_secrets(self):
         path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env.example"
         )
         with open(path, encoding="utf-8") as handle:
             content = handle.read().lower()
-        # No leftovers from the removed music/TTS suites. (The owner's own
-        # ElevenLabs voice and its TTS_CACHE_DIR are deliberate, tested
-        # elsewhere — this guards against the old framework keys returning.)
-        for needle in ("lavalink", "edge_tts", "tts_engine", "tts_voice", "music_", "lyrics", "genius"):
+        # No leftover frameworks from the removed suites.
+        # A comment may say "no Lavalink node"; a *setting* for one may not.
+        for needle in ("lavalink_uri", "lavalink_host", "lavalink_password",
+                       "edge_tts", "tts_engine", "tts_voice", "lyrics", "genius"):
             self.assertNotIn(needle, content, f".env.example still mentions {needle}")
+        # The music block must exist and default to the 15 % duck.
+        self.assertIn("music_duck_volume=0.15", content)
+        self.assertIn("music_enabled=", content)
         self.assertIn("elevenlabs_voice_id=", content)
         self.assertIn("discord_token=", content)
 
@@ -729,26 +740,26 @@ class TestWiring(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_no_music_or_tts_extensions(self):
-        self.assertNotIn("commands.music", EXTENSIONS)
+    def test_music_extension_is_loaded(self):
+        self.assertIn("commands.music", EXTENSIONS)
         self.assertNotIn("commands.voice", EXTENSIONS)
 
     def test_dictionary_extension_is_loaded(self):
         self.assertIn("commands.dictionary", EXTENSIONS)
 
-    def test_modules_have_no_dead_music_imports(self):
-        # Importing every remaining module must not pull removed ones in.
+    def test_light_modules_do_not_pull_in_music(self):
+        # The music package pulls in numpy and FFmpeg plumbing; importing the
+        # bot's core modules must not pay for it.
         for name in (
-            "bot", "config", "commands.fun", "commands.utility", "commands.ai",
-            "commands.system", "commands.dictionary", "functions.ai",
-            "functions.helpers", "functions.personality", "functions.presence",
+            "config", "functions.helpers", "functions.personality",
+            "functions.presence",
         ):
             __import__(name)
-        for gone in (
-            "functions.music", "functions.lyrics",
-            "functions.settings", "commands.music", "commands.voice",
-        ):
+        for gone in ("functions.lyrics", "functions.settings", "commands.voice"):
             self.assertNotIn(gone, sys.modules, f"{gone} was imported somewhere")
+        self.assertNotIn(
+            "yt_dlp", sys.modules, "importing config must not load yt-dlp"
+        )
 
     def test_pattern_and_note_modules_expose_config(self):
         self.assertTrue(hasattr(personality_module, "PATTERNS"))
