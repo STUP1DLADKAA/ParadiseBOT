@@ -15,8 +15,10 @@ import os
 import sys
 import tarfile
 import tempfile
+import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -165,6 +167,47 @@ class AutoUpdateTest(unittest.IsolatedAsyncioTestCase):
         backup = self.root / "data" / "autoupdate_backup" / "latest" / "bot.py"
         self.assertTrue(backup.is_file())
         self.assertEqual(backup.read_text(), "print('old')\n")
+        await updater.close()
+
+    async def test_startup_check_is_skipped_after_repeated_crashes(self):
+        from functions import autoupdate as module
+
+        state_dir = Path(self.tmp.name) / "state"
+        state_dir.mkdir()
+        (state_dir / "autoupdate_state.json").write_text(
+            json.dumps(
+                {"starts": module.START_GUARD_LIMIT + 1, "last_start_at": time.time()}
+            ),
+            encoding="utf-8",
+        )
+        config = SimpleNamespace(
+            autoupdate=SimpleNamespace(
+                enabled=True,
+                repository="STUP1DLADKAA/ParadiseBOT",
+                branch="main",
+                state_dir=str(state_dir),
+                apply=True,
+                timeout=1.0,
+                startup_timeout=1.0,
+                check_on_start=True,
+            )
+        )
+        result = await module.run_startup_check(config, root=self.root)
+        self.assertEqual(result.status, "skipped")
+        # Nothing was downloaded, so the state still has no commit and the
+        # checkout is untouched.
+        state = json.loads((state_dir / "autoupdate_state.json").read_text())
+        self.assertNotIn("commit", state)
+        self.assertEqual((self.root / "bot.py").read_text(), "print('old')\n")
+
+    async def test_ready_event_clears_the_crash_counter(self):
+        updater = self._updater(self._good_archive())
+        updater.register_start()
+        updater.register_start()
+        self.assertEqual(json.loads(self.state.read_text())["starts"], 2)
+        updater.note_ready()
+        self.assertEqual(json.loads(self.state.read_text())["starts"], 0)
+        self.assertFalse(updater.crash_looping())
         await updater.close()
 
     async def test_report_mode_changes_nothing(self):

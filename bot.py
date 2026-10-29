@@ -180,6 +180,9 @@ class ParadiseBot(commands.Bot):
         await super().close()
 
     async def on_ready(self) -> None:
+        # Reaching Discord proves the code that is running works, so the
+        # auto-update crash-loop counter can be cleared.
+        autoupdate.note_ready(self.config)
         if not self._ready_logged:
             log.info(
                 "Paradise is online as %s (%s)",

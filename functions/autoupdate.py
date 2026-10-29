@@ -89,11 +89,17 @@ PROTECTED_SUFFIXES: tuple[str, ...] = (
 REQUIRED_FILES: tuple[str, ...] = ("bot.py", "requirements.txt")
 
 
+# A start-up update is skipped when the process keeps dying before it ever
+# reaches the ready event (a bad commit must not own the process forever).
+START_GUARD_WINDOW = 900.0
+START_GUARD_LIMIT = 3
+
+
 @dataclass(frozen=True, slots=True)
 class UpdateResult:
     """What one check did."""
 
-    status: str  # "disabled" | "up-to-date" | "updated" | "available" | "error"
+    status: str  # disabled|up-to-date|updated|available|skipped|error
     commit: str = ""
     changed: tuple[str, ...] = ()
     removed: tuple[str, ...] = ()
@@ -229,15 +235,13 @@ class AutoUpdater:
                     message="checkout already matched the latest revision",
                 )
 
-            self._write_state(
-                {
-                    "commit": latest,
-                    "applied_at": stamp,
-                    "files": sorted(changed),
-                    "pending_restart": True,
-                    "repository": self.repository,
-                    "branch": self.branch,
-                }
+            self._update_state(
+                commit=latest,
+                applied_at=stamp,
+                files=sorted(changed),
+                pending_restart=True,
+                repository=self.repository,
+                branch=self.branch,
             )
             return UpdateResult(
                 "updated",
@@ -518,6 +522,45 @@ class AutoUpdater:
         except OSError:
             log.debug("Could not persist auto-update state", exc_info=True)
 
+    # ------------------------------------------------------------------
+    # Crash-loop guard
+    #
+    # Auto-updating from a moving branch means a bad commit could take the bot
+    # down — and a supervisor would restart it straight back into the same bad
+    # code. If the process keeps starting without ever reaching the ready
+    # event, stop updating on start-up until a human looks at it.
+    # ------------------------------------------------------------------
+
+    def register_start(self) -> int:
+        """Count this start; consecutive quick starts mean a crash loop."""
+        state = self._read_state()
+        now = time.time()
+        try:
+            last = float(state.get("last_start_at") or 0.0)
+            starts = int(state.get("starts") or 0)
+        except (TypeError, ValueError):
+            last, starts = 0.0, 0
+        starts = starts + 1 if last and now - last <= START_GUARD_WINDOW else 1
+        self._update_state(starts=starts, last_start_at=round(now, 3))
+        return starts
+
+    def note_ready(self) -> None:
+        """We reached Discord: the current code runs, so reset the counter."""
+        if not self._read_state():
+            return
+        self._update_state(starts=0, last_ready_at=round(time.time(), 3))
+
+    def crash_looping(self) -> bool:
+        try:
+            return int(self._read_state().get("starts") or 0) > START_GUARD_LIMIT
+        except (TypeError, ValueError):
+            return False
+
+    def _update_state(self, **fields: object) -> None:
+        state = self._read_state()
+        state.update(fields)
+        self._write_state(state)
+
     def mark_restarted(self) -> None:
         """Clear the pending-restart flag once the new code is actually live."""
         state = self._read_state()
@@ -549,6 +592,8 @@ def report(result: UpdateResult, *, autoupdater: AutoUpdater | None = None) -> N
         log.info("✅ auto-update: already up to date (commit %s)", short)
     elif result.status == "available":
         log.warning("🔄 auto-update: %s", result.message or "update available")
+    elif result.status == "skipped":
+        log.warning("⏸️ auto-update: %s", result.message)
     elif result.status == "error":
         log.warning("⚠️ auto-update: %s", result.message)
     else:
@@ -569,12 +614,31 @@ async def run_startup_check(config, *, root: str | os.PathLike[str] | None = Non
     updater.timeout = min(
         updater.timeout, float(getattr(cfg, "startup_timeout", 20.0) or 20.0)
     )
+    updater.register_start()
+    if updater.crash_looping():
+        log.warning(
+            "auto-update: the bot has restarted %d times without becoming ready; "
+            "skipping the start-up update so it can stay up",
+            START_GUARD_LIMIT + 1,
+        )
+        return UpdateResult("skipped", message="start-up update skipped (crash loop guard)")
     try:
         result = await updater.check()
         report(result, autoupdater=updater)
         return result
     finally:
         await updater.close()
+
+
+def note_ready(config, *, root: str | os.PathLike[str] | None = None) -> None:
+    """Reset the crash-loop counter once the bot is actually online."""
+    cfg = getattr(config, "autoupdate", None)
+    if cfg is None:
+        return
+    try:
+        AutoUpdater.from_config(cfg, root=root).note_ready()
+    except Exception:  # noqa: BLE001 - bookkeeping must never break start-up
+        log.debug("Could not clear the auto-update start counter", exc_info=True)
 
 
 async def watch(
@@ -621,5 +685,6 @@ __all__ = [
     "UpdateResult",
     "report",
     "run_startup_check",
+    "note_ready",
     "watch",
 ]

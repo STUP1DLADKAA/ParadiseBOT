@@ -249,6 +249,8 @@ newest commit on `AUTO_UPDATE_BRANCH`:
   download changes nothing.
 * **Recoverable:** every replaced file is copied to
   `data/autoupdate_backup/latest/` before it is overwritten.
+* **Crash-loop guard:** if the process keeps starting without ever reaching
+  Discord, the start-up update is skipped so a bad commit cannot own the bot.
 * The applied commit lives in `data/autoupdate_state.json`, so this costs one
   GitHub API call per check (60/hour unauthenticated; set `GITHUB_TOKEN` to
   raise it).
