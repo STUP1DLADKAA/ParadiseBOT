@@ -39,7 +39,7 @@ EXPECTED_COMMANDS = {
     "ping", "coinflip", "choose",
     "remind", "poll", "afk", "translate", "settimezone", "vc", "clip",
     "minigames", "recipe",
-    "summarize", "help", "edit",
+    "summarize", "help", "edit", "voicewake",
     # Music lives under one group plus a panel command; the individual
     # transports (play/skip/…) are *not* top-level commands.
     "music", "cmd",

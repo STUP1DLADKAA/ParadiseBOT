@@ -31,6 +31,7 @@ HELP_BLURBS = {
     "summarize": "recap recent chat in this channel",
     "music": "play music and talk over it (ducking)",
     "cmd": "music control panel with buttons",
+    "voicewake": "spoken wake word status, pause and resume",
     "help": "this list",
 }
 
@@ -39,6 +40,7 @@ HELP_GROUPS = {
     "🧰 useful": ("remind", "poll", "afk", "translate", "settimezone", "recipe"),
     "🎙️ voice": ("vc", "clip", "edit"),
     "🎵 music": ("music", "cmd"),
+    "🎙 listening": ("voicewake",),
     "🎲 community": ("minigames",),
     "🤖 ai": ("summarize",),
 }

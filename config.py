@@ -651,6 +651,89 @@ class GeminiConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class VoiceWakeConfig:
+    """The wake word spoken out loud in a voice channel (functions/voice_wake).
+
+    Paradise listens to the channel it is already sitting in, waits for an
+    utterance to *finish*, transcribes it once, and only then decides whether
+    it was addressed — "hey paradise …" in English, Hinglish or Hindi.
+
+    This is the one feature that sends microphone audio to a third party, so
+    it is announced in the channel when it starts and it honours the existing
+    per-user voice-capture opt-out. Turn it off with ``VOICE_WAKE_ENABLED=false``
+    and everything else keeps working.
+    """
+
+    enabled: bool = True
+    #: "auto" (ElevenLabs Scribe, then Gemini), "elevenlabs", "gemini" or "off".
+    stt: str = "auto"
+    #: ISO-639-1 hint for the transcriber; blank lets it detect.
+    language: str = ""
+    #: Framed speech detection: a 20 ms frame above this fraction of full
+    #: scale counts as voice. ~0.012 is -38 dBFS.
+    energy_threshold: float = 0.012
+    #: How much voice must be heard before recording starts.
+    onset_ms: int = 60
+    #: Quiet gap that closes an utterance.
+    silence_ms: int = 700
+    #: Anything shorter than this is a door slam, not a sentence.
+    min_seconds: float = 0.6
+    #: Hard cap on one utterance (protects memory and the API bill).
+    max_seconds: float = 12.0
+    #: Per-user gap between two accepted requests.
+    cooldown: float = 3.0
+    #: Guild-wide ceiling, asked per minute, whatever the crowd size.
+    max_per_minute: int = 8
+    #: After a bare "hey paradise", how long the question may follow.
+    follow_up_seconds: float = 6.0
+    #: Speakers tracked at once.
+    max_speakers: int = 32
+    #: Post a one-time "listening for 'Hey Paradise'" notice in the channel.
+    announce: bool = True
+    #: Post the answer in the voice channel's text chat as well as speaking it.
+    post_text: bool = True
+    #: Say "haan?" when only the wake word was heard.
+    acknowledge: bool = True
+
+    @property
+    def listening(self) -> bool:
+        return bool(self.enabled and self.stt != "off")
+
+    @classmethod
+    def from_env(cls, env) -> "VoiceWakeConfig":
+        stt = str(env.get("VOICE_WAKE_STT", "auto") or "auto").strip().lower()
+        if stt not in {"auto", "elevenlabs", "gemini", "off"}:
+            stt = "auto"
+        return cls(
+            enabled=_bool(env.get("VOICE_WAKE_ENABLED"), True),
+            stt=stt,
+            language=str(env.get("VOICE_WAKE_LANGUAGE", "") or "").strip().lower()[:5],
+            energy_threshold=max(
+                0.0005, min(0.2, _float(env.get("VOICE_WAKE_THRESHOLD"), 0.012))
+            ),
+            onset_ms=max(20, min(400, _int(env.get("VOICE_WAKE_ONSET_MS"), 60))),
+            silence_ms=max(200, min(3000, _int(env.get("VOICE_WAKE_SILENCE_MS"), 700))),
+            min_seconds=max(
+                0.2, min(5.0, _float(env.get("VOICE_WAKE_MIN_SECONDS"), 0.6))
+            ),
+            max_seconds=max(
+                2.0, min(30.0, _float(env.get("VOICE_WAKE_MAX_SECONDS"), 12.0))
+            ),
+            cooldown=max(0.0, min(60.0, _float(env.get("VOICE_WAKE_COOLDOWN"), 3.0))),
+            max_per_minute=max(
+                1, min(60, _int(env.get("VOICE_WAKE_MAX_PER_MINUTE"), 8))
+            ),
+            follow_up_seconds=max(
+                2.0, min(30.0, _float(env.get("VOICE_WAKE_FOLLOWUP_SECONDS"), 6.0))
+            ),
+            max_speakers=max(1, min(128, _int(env.get("VOICE_WAKE_MAX_SPEAKERS"), 32))),
+            announce=_bool(env.get("VOICE_WAKE_ANNOUNCE"), True),
+            post_text=_bool(env.get("VOICE_WAKE_POST_TEXT"), True),
+            acknowledge=_bool(env.get("VOICE_WAKE_ACKNOWLEDGE"), True),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class MusicConfig:
     """In-process music with spoken answers mixed over it (commands/music.py).
 
@@ -774,6 +857,9 @@ class Config:
     # Music: yt-dlp search, FFmpeg decode, ducking mixer (commands/music.py).
     music: MusicConfig = MusicConfig()
 
+    # The wake word spoken out loud in a voice channel.
+    voice_wake: VoiceWakeConfig = VoiceWakeConfig()
+
     # Web image search for mention requests ("show me a picture of …").
     image_search: ImageSearchConfig = ImageSearchConfig()
 
@@ -815,6 +901,7 @@ class Config:
             elevenlabs=ElevenLabsConfig.from_env(env),
             wake=WakeConfig.from_env(env),
             music=MusicConfig.from_env(env),
+            voice_wake=VoiceWakeConfig.from_env(env),
             voice_presence=VoicePresenceConfig.from_env(env),
             autoupdate=AutoUpdateConfig.from_env(env),
             voice=VoiceConfig.from_env(env),

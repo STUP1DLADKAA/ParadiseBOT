@@ -299,6 +299,25 @@ class GeminiService:
         temperature: float,
         model: str = "",
     ) -> tuple[str, bool]:
+        parts: list[dict] = [{"text": prompt}]
+        return await self._post_parts(
+            parts,
+            system=system,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            model=model,
+        )
+
+    async def _post_parts(
+        self,
+        parts: list[dict],
+        *,
+        system: str = "",
+        max_tokens: int = 500,
+        temperature: float = 0.7,
+        model: str = "",
+    ) -> tuple[str, bool]:
+        """POST one ``contents`` payload; returns (text, was_truncated)."""
         if not self.configured:
             raise ParadiseError("Gemini isn't configured on this bot.")
         if self.disabled_reason:
@@ -311,7 +330,7 @@ class GeminiService:
 
         target = model or self.model
         payload: dict = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "contents": [{"role": "user", "parts": parts}],
             "generationConfig": {
                 "maxOutputTokens": max(128, int(max_tokens)),
                 "temperature": temperature,
@@ -351,6 +370,46 @@ class GeminiService:
             log.warning("Gemini returned an empty/unexpected payload: %s", str(data)[:200])
             raise ParadiseError("Gemini answered with nothing useful. try again.")
         return text, self._finish_reason(data) in {"max_tokens", "length"}
+
+    async def transcribe_audio(
+        self,
+        audio: bytes,
+        *,
+        prompt: str,
+        mime: str = "audio/wav",
+        model: str = "",
+        max_tokens: int = 256,
+        max_bytes: int = 8 * 1024 * 1024,
+    ) -> str:
+        """Ask Gemini to transcribe a short recording (inline, base64).
+
+        Used by the spoken wake word: the same API key that answers questions
+        also hears them, so no third subscription is needed. The audio is
+        sent as ``inline_data`` — a few hundred kilobytes for a sentence —
+        which keeps the request a single round trip.
+        """
+        import base64
+
+        if not audio:
+            return ""
+        if len(audio) > max_bytes:
+            raise ParadiseError("that recording is too long to transcribe.")
+        parts = [
+            {"text": prompt},
+            {
+                "inline_data": {
+                    "mime_type": mime,
+                    "data": base64.b64encode(audio).decode("ascii"),
+                }
+            },
+        ]
+        text, _ = await self._post_parts(
+            parts,
+            max_tokens=max_tokens,
+            temperature=0.0,
+            model=model,
+        )
+        return text
 
     async def reason(self, question: str, facts: list[str] | str, *, max_tokens: int = 500) -> str:
         """Grounded reasoning: answer *question* strictly from *facts*.

@@ -33,6 +33,12 @@ Design notes
   song drops to 15 % until the sentence ends (:mod:`functions.music`).
 * Every ignore reason is logged at INFO. Silence with no log line is the one
   failure mode that is impossible to debug from the outside.
+* **It can also hear you.** With ``VOICE_WAKE_ENABLED`` (the default) the
+  channel is monitored for speech: an utterance is recorded locally, sent to
+  speech-to-text once it *ends*, and only then checked for the wake phrase
+  (:mod:`functions.voice_wake`). Nothing is uploaded until you have finished
+  a sentence, per-user consent still applies, and the channel is told once
+  that Paradise is listening.
 """
 
 from __future__ import annotations
@@ -44,9 +50,10 @@ import re
 import time
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
-from config import WakeConfig
+from config import VoiceWakeConfig, WakeConfig
 from functions.dictionary.playback import (
     LINGER_SECONDS,
     playback_support,
@@ -54,6 +61,13 @@ from functions.dictionary.playback import (
 )
 from functions.helpers import ParadiseError, shorten, split_discord_text
 from functions.tts import SpeechClip, SpeechService, build_speech_service
+from functions.voice_wake import (
+    ElevenLabsTranscriber,
+    GeminiTranscriber,
+    SpeechToTextChain,
+    SpokenRequest,
+    SpokenWakeListener,
+)
 
 log = logging.getLogger(__name__)
 
@@ -128,6 +142,15 @@ class Wake(commands.Cog):
         self._workers: dict[int, asyncio.Task] = {}
         self._preload_task: asyncio.Task | None = None
         self._refusal_line: str = REFUSAL_LINES[0]
+
+        # Spoken wake word ("hey paradise", said out loud).
+        raw_wake = getattr(getattr(bot, "config", None), "voice_wake", None)
+        self.voice_wake: VoiceWakeConfig = (
+            raw_wake if isinstance(raw_wake, VoiceWakeConfig) else VoiceWakeConfig()
+        )
+        self.listener: SpokenWakeListener | None = None
+        self._announced: set[int] = set()
+        self._paused_guilds: set[int] = set()
         log.info("Wake word ready — %s", self.speech.describe())
         if not (self.speech.using_elevenlabs or any(
             provider.name in {"openai", "elevenlabs"} for provider in self.speech.providers
@@ -146,6 +169,60 @@ class Wake(commands.Cog):
         self._preload_task = asyncio.create_task(
             self._preload_refusal(), name="paradise-wake-preload"
         )
+        self._start_listener()
+
+    def _start_listener(self) -> None:
+        """Attach the spoken wake word to the voice receiver, if enabled."""
+        if not self.voice_wake.listening:
+            log.info("Spoken wake word disabled (VOICE_WAKE_ENABLED=false)")
+            return
+
+        chain = SpeechToTextChain(*self._stt_providers(self.voice_wake.stt))
+        if not chain.available:
+            log.warning(
+                "Spoken wake word idle: no speech-to-text provider. Set "
+                "ELEVENLABS_API_KEY (Scribe) or GEMINI_API_KEY."
+            )
+            return
+
+        self.listener = SpokenWakeListener(
+            stt=chain,
+            config=self.voice_wake,
+            on_request=self._on_spoken_request,
+            on_wake_only=self._on_spoken_wake_only,
+        )
+        service = getattr(self.bot, "voice_clip_service", None)
+        add_tap = getattr(service, "add_tap", None)
+        if add_tap is None:
+            log.warning(
+                "Spoken wake word idle: the voice receiver is not running "
+                "(the VoiceClip cog has to load before Wake)."
+            )
+            self.listener = None
+            return
+        add_tap(self._on_voice_packet)
+        # The listener task is created on first audio (start() is idempotent
+        # and needs a running loop, which the cog load already has).
+        asyncio.create_task(self.listener.start(), name="paradise-spoken-wake-start")
+
+    def _stt_providers(self, choice: str) -> list:
+        """Build the transcription chain for ``VOICE_WAKE_STT``."""
+        config = getattr(self.bot, "config", None)
+        eleven_key = getattr(getattr(config, "elevenlabs", None), "api_key", "") or ""
+        gemini = getattr(getattr(self.bot, "ai", None), "gemini", None)
+        providers: list = []
+        if choice in {"auto", "elevenlabs"}:
+            providers.append(ElevenLabsTranscriber(eleven_key, timeout=25.0))
+        if choice in {"auto", "gemini"}:
+            providers.append(GeminiTranscriber(gemini))
+        return providers
+
+    def _on_voice_packet(self, guild_id: int, user_id: int, packet) -> None:
+        """Receiver tap — runs on the voice UDP thread, so it must be cheap."""
+        listener = self.listener
+        if listener is None or guild_id in self._paused_guilds:
+            return
+        listener.tap(guild_id, user_id, packet)
 
     async def cog_unload(self) -> None:
         if self._preload_task is not None:
@@ -157,6 +234,16 @@ class Wake(commands.Cog):
             await asyncio.gather(*self._workers.values(), return_exceptions=True)
         self._workers.clear()
         self._queue.clear()
+        service = getattr(self.bot, "voice_clip_service", None)
+        remove_tap = getattr(service, "remove_tap", None)
+        if remove_tap is not None:
+            remove_tap(self._on_voice_packet)
+        if self.listener is not None:
+            listener, self.listener = self.listener, None
+            try:
+                await listener.stop()
+            except Exception:  # noqa: BLE001 - shutdown is best effort
+                log.debug("Listener shutdown failed", exc_info=True)
         try:
             await self.speech.close()
         except Exception:  # noqa: BLE001 - shutdown is best effort
@@ -260,17 +347,129 @@ class Wake(commands.Cog):
         return True
 
     # ------------------------------------------------------------------
+    # Spoken requests ("hey paradise …" heard in the channel)
+    # ------------------------------------------------------------------
+
+    async def _on_spoken_wake_only(self, guild_id: int, user_id: int) -> None:
+        """Only the wake word was heard: say "haan?" and wait for the question."""
+        if not self.voice_wake.acknowledge:
+            return
+        guild = self.bot.get_guild(guild_id) if hasattr(self.bot, "get_guild") else None
+        if guild is None:
+            return
+        member = guild.get_member(user_id)
+        channel = self._bot_voice_channel(guild)
+        if channel is None:
+            return
+        try:
+            clip = await self.speech.synthesize("haan? bolo.")
+        except Exception:  # noqa: BLE001 - an acknowledgement is optional
+            log.debug("Could not synthesise the acknowledgement", exc_info=True)
+            return
+        if clip is not None and clip.data:
+            await self._speak_clip(guild, member, channel, clip, failed=False)
+
+    async def _on_spoken_request(self, request: SpokenRequest) -> None:
+        """A recognised spoken wake phrase: answer it and say the answer."""
+        guild = self.bot.get_guild(request.guild_id) if hasattr(self.bot, "get_guild") else None
+        if guild is None:
+            return
+        member = guild.get_member(request.user_id)
+        channel = self._bot_voice_channel(guild)
+        asker = getattr(member, "display_name", "") or "someone"
+
+        # Music first: "play billie jean" is a command, not a question.
+        answer, failed = await self._answer_spoken(guild, member, channel, request.question, asker)
+        if channel is not None and self.voice_wake.post_text:
+            await self._post_text(channel, answer)
+        if channel is not None:
+            await self._speak_text(guild, member, channel, answer, failed=failed)
+
+    async def _answer_spoken(
+        self,
+        guild: discord.Guild,
+        member,
+        channel,
+        question: str,
+        asker: str,
+    ) -> tuple[str, bool]:
+        """Music → Gemini → refusal, exactly like the typed path."""
+        music = self.bot.get_cog("Music") if hasattr(self.bot, "get_cog") else None
+        handler = getattr(music, "handle_spoken_request", None)
+        if handler is not None and channel is not None:
+            try:
+                music_answer = await handler(
+                    guild=guild, member=member, channel=channel, text=question
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - never lose the answer
+                log.exception("Spoken music request failed")
+                music_answer = None
+            if music_answer:
+                return music_answer, False
+        return await self._answer_text(guild, asker, question)
+
+    @staticmethod
+    def _bot_voice_channel(guild) -> discord.VoiceChannel | discord.StageChannel | None:
+        client = getattr(guild, "voice_client", None)
+        channel = getattr(client, "channel", None)
+        if isinstance(channel, (discord.VoiceChannel, discord.StageChannel)):
+            return channel
+        return None
+
+    async def _post_text(self, channel, text: str) -> None:
+        sender = getattr(channel, "send", None)
+        if sender is None:
+            return
+        try:
+            await sender(text, allowed_mentions=discord.AllowedMentions.none())
+        except discord.DiscordException:
+            log.debug("Could not post the spoken answer", exc_info=True)
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after) -> None:
+        """Announce the listener once, when Paradise joins a voice channel."""
+        me = getattr(self.bot, "user", None)
+        if me is None or getattr(member, "id", None) != me.id:
+            return
+        channel = after.channel
+        guild = getattr(member, "guild", None)
+        if channel is None or guild is None:
+            return
+        if not self.voice_wake.announce or guild.id in self._announced:
+            return
+        self._announced.add(guild.id)
+        text = (
+            "🎙 **listening for “hey paradise”** — say it in this channel and i'll "
+            "answer out loud. audio is only sent to the speech service once you "
+            "finish a sentence; `/voicewake status` shows what i heard last, and "
+            "`/voicewake stop` turns it off here."
+        )
+        await self._post_text(channel, text)
+
+    # ------------------------------------------------------------------
     # Answering
     # ------------------------------------------------------------------
 
     async def _answer(self, message: discord.Message, question: str) -> tuple[str, bool]:
         """Return (answer text, was_it_the_rude_refusal)."""
+        return await self._answer_text(
+            message.guild,
+            getattr(message.author, "display_name", "someone"),
+            question,
+        )
+
+    async def _answer_text(
+        self, guild, asker: str, question: str
+    ) -> tuple[str, bool]:
+        """Ask Gemini (tool-free, spoken-friendly) and return (text, failed)."""
         ai = getattr(self.bot, "ai", None)
         if ai is None:
             return self._refusal(), True
         prompt = (
-            f"Server: {getattr(message.guild, 'name', 'a small server')}\n"
-            f"{message.author.display_name} asks: {question[:800]}"
+            f"Server: {getattr(guild, 'name', 'a small server')}\n"
+            f"{asker} asks: {question[:800]}"
         )
         try:
             answer = await ai.answer_quick(
@@ -334,7 +533,28 @@ class Wake(commands.Cog):
         channel = self._voice_channel_for(message)
         if channel is None and not music_active:
             return
+        await self._speak_text(
+            message.guild,
+            getattr(message, "author", None),
+            channel,
+            answer,
+            failed=failed,
+        )
 
+    async def _speak_text(
+        self,
+        guild,
+        member,
+        channel,
+        answer: str,
+        *,
+        failed: bool,
+    ) -> None:
+        """Synthesise *answer* and play it into *channel*."""
+        if not playback_support():
+            return
+        if channel is None:
+            return
         if failed:
             clip = await self.speech.speak_preloaded(
                 PRELOAD_KEY, self._refusal_line, language="en"
@@ -352,16 +572,22 @@ class Wake(commands.Cog):
                 return
         if clip is None or not clip.data:
             return
+        await self._speak_clip(guild, member, channel, clip, failed=failed)
+
+    async def _speak_clip(self, guild, member, channel, clip: SpeechClip, *, failed: bool) -> None:
+        """Play a ready clip: mixed over music when a song is playing."""
+        if channel is None or clip is None or not clip.data:
+            return
 
         # A song is playing: mix the answer into it (the song ducks to 15 %
         # and lifts back up when the sentence ends) instead of stopping it.
-        if await self._speak_over_music(message, clip):
+        if await self._speak_over_music(guild, clip):
             return
 
-        client = await self._ensure_voice_client(message.guild, channel)
+        client = await self._ensure_voice_client(guild, channel)
         if client is None:
             return
-        await self._enqueue(message.guild.id, clip)
+        await self._enqueue(guild.id, clip)
 
     def _music_player(self, guild_id: int):
         music = self.bot.get_cog("Music") if hasattr(self.bot, "get_cog") else None
@@ -371,9 +597,9 @@ class Wake(commands.Cog):
             return None
         return existing(guild_id)
 
-    async def _speak_over_music(self, message: discord.Message, clip: SpeechClip) -> bool:
+    async def _speak_over_music(self, guild, clip: SpeechClip) -> bool:
         """Duck the song and speak over it. True when the answer was handed over."""
-        player = self._music_player(getattr(message.guild, "id", 0))
+        player = self._music_player(getattr(guild, "id", 0))
         if player is None or not getattr(player, "playing_music", False):
             return False
         voice = getattr(player, "voice", None)
@@ -397,7 +623,7 @@ class Wake(commands.Cog):
             log.debug("Could not mix speech over the music", exc_info=True)
             return False
         if mixed:
-            log.info("Spoke over the music in guild %s (ducked)", message.guild.id)
+            log.info("Spoke over the music in guild %s (ducked)", getattr(guild, "id", "?"))
         return mixed
 
     def _voice_channel_for(
@@ -443,7 +669,10 @@ class Wake(commands.Cog):
             from functions.voice_clip import ClipVoiceClient
 
             clip_cfg = getattr(getattr(self.bot, "config", None), "voice_clip", None)
-            use_clip = bool(getattr(clip_cfg, "enabled", False))
+            wake_cfg = getattr(getattr(self.bot, "config", None), "voice_wake", None)
+            use_clip = bool(getattr(clip_cfg, "enabled", False)) or bool(
+                getattr(wake_cfg, "listening", False)
+            )
             return await channel.connect(
                 timeout=15.0,
                 self_deaf=False,
@@ -566,6 +795,89 @@ class Wake(commands.Cog):
             self._user_last = {
                 key: value for key, value in self._user_last.items() if value > cutoff
             }
+
+
+    # ------------------------------------------------------------------
+    # /voicewake — visibility and control for the listening microphone
+    # ------------------------------------------------------------------
+
+    voicewake = app_commands.Group(
+        name="voicewake",
+        description="Spoken wake word (“hey paradise”, said out loud)",
+        default_permissions=discord.Permissions(manage_guild=True),
+    )
+
+    @voicewake.command(name="status", description="Is Paradise listening, and what did it hear?")
+    async def voicewake_status(self, interaction: discord.Interaction) -> None:
+        guild_id = getattr(interaction, "guild_id", 0) or 0
+        listener = self.listener
+        lines: list[str] = []
+        if not self.voice_wake.listening:
+            lines.append("**off** — `VOICE_WAKE_ENABLED=false` in `.env`.")
+        elif listener is None:
+            lines.append(
+                "**idle** — enabled, but no speech-to-text provider is configured. "
+                "Set `ELEVENLABS_API_KEY` (Scribe) or `GEMINI_API_KEY`."
+            )
+        elif guild_id in self._paused_guilds:
+            lines.append("**paused here** — `/voicewake start` to resume.")
+        else:
+            lines.append("**listening** for “hey paradise” in this channel.")
+        if listener is not None:
+            stats = listener.stats
+            lines.append(f"`{listener.describe()}`")
+            lines.append(
+                f"utterances: {stats.segments} · transcribed: {stats.transcripts} · "
+                f"answered: {stats.triggers}"
+            )
+            if stats.last_transcript:
+                lines.append(f"last heard: “{discord.utils.escape_markdown(stats.last_transcript[:180])}”")
+        lines.append(
+            "audio is only sent after an utterance ends; `/clip` opt-out is honoured."
+        )
+        embed = discord.Embed(
+            title="🎙 Spoken wake word",
+            description="\n".join(lines),
+            colour=0x2E8B74,
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    @voicewake.command(name="stop", description="Stop listening in this server")
+    async def voicewake_stop(self, interaction: discord.Interaction) -> None:
+        guild_id = getattr(interaction, "guild_id", 0) or 0
+        self._paused_guilds.add(guild_id)
+        listener = self.listener
+        if listener is not None:
+            listener.reset_guild(guild_id)
+        await interaction.response.send_message(
+            "stopped listening here. `/voicewake start` turns it back on.",
+            ephemeral=True,
+        )
+
+    @voicewake.command(name="start", description="Resume listening in this server")
+    async def voicewake_start(self, interaction: discord.Interaction) -> None:
+        guild_id = getattr(interaction, "guild_id", 0) or 0
+        self._paused_guilds.discard(guild_id)
+        if not self.voice_wake.listening or self.listener is None:
+            await interaction.response.send_message(
+                "the spoken wake word is off for this bot (no key, or disabled in `.env`).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.send_message(
+            "listening again — say **hey paradise** and ask.", ephemeral=True
+        )
+
+    @voicewake.command(name="notice", description="Post the listening notice again")
+    async def voicewake_notice(self, interaction: discord.Interaction) -> None:
+        channel = getattr(interaction, "channel", None)
+        if channel is not None:
+            await self._post_text(
+                channel,
+                "🎙 **listening for “hey paradise”** — say it here and i'll answer "
+                "out loud. `/voicewake status` shows what i heard last.",
+            )
+        await interaction.response.send_message("posted.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:

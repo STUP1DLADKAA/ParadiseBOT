@@ -325,10 +325,26 @@ class Music(commands.Cog):
     # ------------------------------------------------------------------
 
     async def handle_voice_request(self, message: discord.Message, text: str) -> str | None:
-        """Handle a music request spoken after the wake word.
+        """Handle a *typed* music request after the wake word.
 
         Returns the sentence to speak, or ``None`` when this was not a music
         request at all (so the assistant answers it instead).
+        """
+        return await self.handle_spoken_request(
+            guild=message.guild,
+            member=message.author,
+            channel=self._channel_for(message),
+            text=text,
+        )
+
+    async def handle_spoken_request(
+        self, *, guild, member, channel, text: str
+    ) -> str | None:
+        """Same thing for a request that was *heard*, then transcribed.
+
+        The caller supplies the pieces the spoken path already knows (guild,
+        member, the channel the bot is in), so this works identically for
+        "hey paradise play x" typed, spoken, or coming from a panel button.
         """
         if not self.config.enabled:
             return None
@@ -337,11 +353,7 @@ class Music(commands.Cog):
             return None
         try:
             return await self.execute(
-                intent,
-                guild=message.guild,
-                member=message.author,
-                channel=self._channel_for(message),
-                surface="voice",
+                intent, guild=guild, member=member, channel=channel, surface="voice"
             )
         except ParadiseError as error:
             return str(error)
