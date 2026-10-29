@@ -651,6 +651,85 @@ class GeminiConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class MusicConfig:
+    """In-process music with spoken answers mixed over it (commands/music.py).
+
+    Paradise is its own music bot: yt-dlp searches, FFmpeg decodes, and a
+    numpy mixer ducks the song to ``duck_volume`` whenever the ElevenLabs
+    voice says something. See ``functions/music/__init__.py`` for why Lavalink
+    is not used (it owns the voice connection, so there would be no audio left
+    to duck and nothing to mix the answer into).
+    """
+
+    enabled: bool = True
+    # Playback level for music alone (0.0–2.0). The spoken voice is always 1.0.
+    volume: float = 0.5
+    # What the song drops to while Paradise talks. 0.15 = 15 %.
+    duck_volume: float = 0.15
+    # Length of the fade down/up, in milliseconds (a hard step clicks).
+    fade_ms: int = 240
+    # How many songs may wait in the queue.
+    max_queue: int = 50
+    # How many search hits to enqueue for a text query (1 = play the top hit).
+    search_results: int = 1
+    # Source used for text queries: ytsearch (YouTube) or scsearch (SoundCloud).
+    search_source: str = "ytsearch"
+    # Refuse tracks longer than this many seconds (0 = no limit).
+    max_track_seconds: int = 0
+    # Seconds to wait for a search/resolve before giving up.
+    search_timeout: float = 25.0
+    # Netscape cookies.txt for yt-dlp, when YouTube demands sign-in.
+    cookies_file: str = ""
+    # Optional HTTP(S) proxy for yt-dlp only. Never logged.
+    proxy: str = ""
+    # Leave the channel after this many idle seconds (0 = stay put).
+    idle_disconnect: float = 300.0
+    # "!" in front of play/skip/stop also works as a plain text command.
+    prefix: str = "!"
+    text_commands: bool = True
+    # Post the control panel automatically when a song starts.
+    auto_panel: bool = False
+
+    @property
+    def duck_label(self) -> str:
+        return f"{round(self.duck_volume * 100)}%"
+
+    @classmethod
+    def from_env(cls, env) -> "MusicConfig":
+        source = str(env.get("MUSIC_SEARCH_SOURCE", "ytsearch") or "").strip().lower()
+        if source not in {"ytsearch", "scsearch"}:
+            source = "ytsearch"
+        prefix = str(env.get("MUSIC_PREFIX", "!") or "").strip() or "!"
+        return cls(
+            enabled=_bool(env.get("MUSIC_ENABLED"), True),
+            volume=max(0.0, min(2.0, _float(env.get("MUSIC_VOLUME"), 0.5))),
+            duck_volume=max(
+                0.0, min(1.0, _float(env.get("MUSIC_DUCK_VOLUME"), 0.15))
+            ),
+            fade_ms=max(0, min(2000, _int(env.get("MUSIC_FADE_MS"), 240))),
+            max_queue=max(1, min(500, _int(env.get("MUSIC_MAX_QUEUE"), 50))),
+            search_results=max(
+                1, min(10, _int(env.get("MUSIC_SEARCH_RESULTS"), 1))
+            ),
+            search_source=source,
+            max_track_seconds=max(
+                0, _int(env.get("MUSIC_MAX_TRACK_SECONDS"), 0)
+            ),
+            search_timeout=max(
+                5.0, min(120.0, _float(env.get("MUSIC_SEARCH_TIMEOUT"), 25.0))
+            ),
+            cookies_file=str(env.get("MUSIC_COOKIES_FILE", "") or "").strip(),
+            proxy=str(env.get("MUSIC_PROXY", "") or "").strip(),
+            idle_disconnect=max(
+                0.0, min(86400.0, _float(env.get("MUSIC_IDLE_DISCONNECT"), 300.0))
+            ),
+            prefix=prefix[:3],
+            text_commands=_bool(env.get("MUSIC_TEXT_COMMANDS"), True),
+            auto_panel=_bool(env.get("MUSIC_AUTO_PANEL"), False),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     """Everything Paradise reads from the environment."""
 
@@ -692,6 +771,9 @@ class Config:
     # Automated mini-game destination; scheduler settings are persisted in SQLite.
     minigames: MiniGamesConfig = MiniGamesConfig()
 
+    # Music: yt-dlp search, FFmpeg decode, ducking mixer (commands/music.py).
+    music: MusicConfig = MusicConfig()
+
     # Web image search for mention requests ("show me a picture of …").
     image_search: ImageSearchConfig = ImageSearchConfig()
 
@@ -732,6 +814,7 @@ class Config:
             dictionary=DictionaryConfig.from_env(env),
             elevenlabs=ElevenLabsConfig.from_env(env),
             wake=WakeConfig.from_env(env),
+            music=MusicConfig.from_env(env),
             voice_presence=VoicePresenceConfig.from_env(env),
             autoupdate=AutoUpdateConfig.from_env(env),
             voice=VoiceConfig.from_env(env),

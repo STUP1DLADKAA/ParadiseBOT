@@ -29,6 +29,8 @@ HELP_BLURBS = {
     "minigames": "automated Paradise games and leaderboard",
     "recipe": "recipes from ingredients you have",
     "summarize": "recap recent chat in this channel",
+    "music": "play music and talk over it (ducking)",
+    "cmd": "music control panel with buttons",
     "help": "this list",
 }
 
@@ -36,6 +38,7 @@ HELP_GROUPS = {
     "🎲 fun": ("ping", "coinflip", "choose"),
     "🧰 useful": ("remind", "poll", "afk", "translate", "settimezone", "recipe"),
     "🎙️ voice": ("vc", "clip", "edit"),
+    "🎵 music": ("music", "cmd"),
     "🎲 community": ("minigames",),
     "🤖 ai": ("summarize",),
 }

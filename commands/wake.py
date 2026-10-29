@@ -27,6 +27,12 @@ Design notes
   never a disconnect — the bot stays where it is.
 * Text always works. Speech is best effort: no key, no PyNaCl or no ffmpeg
   simply means the answer is typed only.
+* **Music first.** "Hey Paradise play billie jean" is not a question, so it
+  goes to the music cog before Gemini sees it. When a song is already
+  playing, the spoken answer is *mixed into the same audio source* and the
+  song drops to 15 % until the sentence ends (:mod:`functions.music`).
+* Every ignore reason is logged at INFO. Silence with no log line is the one
+  failure mode that is impossible to debug from the outside.
 """
 
 from __future__ import annotations
@@ -123,6 +129,13 @@ class Wake(commands.Cog):
         self._preload_task: asyncio.Task | None = None
         self._refusal_line: str = REFUSAL_LINES[0]
         log.info("Wake word ready — %s", self.speech.describe())
+        if not (self.speech.using_elevenlabs or any(
+            provider.name in {"openai", "elevenlabs"} for provider in self.speech.providers
+        )):
+            log.warning(
+                "Wake word: no ElevenLabs key configured — answers will be typed, "
+                "and spoken only if the free web voice happens to be reachable."
+            )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -179,10 +192,15 @@ class Wake(commands.Cog):
             return False
         if message.author.bot or message.guild is None:
             return False
+
         channel = message.channel
-        if self.config.vc_only and not isinstance(
-            channel, (discord.VoiceChannel, discord.StageChannel)
-        ):
+        is_voice_chat = isinstance(channel, (discord.VoiceChannel, discord.StageChannel))
+        in_a_voice_channel = self._voice_channel_for(message) is not None
+        # ``vc_only`` used to mean "only in a voice channel's text chat", which
+        # silently ignored anyone typing in #general while sitting in the VC.
+        # Sitting in a voice channel now counts too: the answer is posted here
+        # and spoken in there.
+        if self.config.vc_only and not (is_voice_chat or in_a_voice_channel):
             return False
 
         question = match_wake(getattr(message, "content", "") or "")
@@ -193,10 +211,15 @@ class Wake(commands.Cog):
         if permissions is not None:
             perms = permissions(message.guild.me)
             if not getattr(perms, "send_messages", True):
+                log.info(
+                    "Wake phrase ignored: no send permission in channel %s",
+                    getattr(channel, "id", "?"),
+                )
                 return False
 
         wait = self._cooldown_remaining(message)
         if wait > 0:
+            log.debug("Wake phrase in cooldown (%.1fs); ignoring", wait)
             return True  # silently swallow a burst; no spam, no speech
 
         if not question:
@@ -205,7 +228,31 @@ class Wake(commands.Cog):
             )
             return True
 
+        log.info(
+            "Wake phrase from %s in guild %s: %r",
+            getattr(message.author, "display_name", "?"),
+            getattr(message.guild, "id", "?"),
+            question[:120],
+        )
         self._touch(message)
+
+        # Music requests are commands, not questions: they never reach Gemini.
+        music = self.bot.get_cog("Music") if hasattr(self.bot, "get_cog") else None
+        handler = getattr(music, "handle_voice_request", None)
+        if handler is not None:
+            try:
+                music_answer = await handler(message, question)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - never lose the answer
+                log.exception("Music request failed")
+                music_answer = None
+            if music_answer:
+                await self._reply_text(message, music_answer)
+                if self.config.speak:
+                    await self._speak(message, music_answer, failed=False)
+                return True
+
         answer, failed = await self._answer(message, question)
         await self._reply_text(message, answer)
         if self.config.speak:
@@ -276,8 +323,16 @@ class Wake(commands.Cog):
     async def _speak(self, message: discord.Message, answer: str, *, failed: bool) -> None:
         if not playback_support():
             return
+        # Music playing? The channel is the one the song is in, and the asker
+        # does not have to be sitting in it.
+        music_player = self._music_player(getattr(message.guild, "id", 0))
+        music_active = bool(
+            music_player is not None
+            and getattr(music_player, "playing_music", False)
+            and getattr(getattr(music_player, "voice", None), "is_connected", lambda: False)()
+        )
         channel = self._voice_channel_for(message)
-        if channel is None:
+        if channel is None and not music_active:
             return
 
         if failed:
@@ -298,10 +353,52 @@ class Wake(commands.Cog):
         if clip is None or not clip.data:
             return
 
+        # A song is playing: mix the answer into it (the song ducks to 15 %
+        # and lifts back up when the sentence ends) instead of stopping it.
+        if await self._speak_over_music(message, clip):
+            return
+
         client = await self._ensure_voice_client(message.guild, channel)
         if client is None:
             return
         await self._enqueue(message.guild.id, clip)
+
+    def _music_player(self, guild_id: int):
+        music = self.bot.get_cog("Music") if hasattr(self.bot, "get_cog") else None
+        service = getattr(music, "service", None)
+        existing = getattr(service, "existing", None)
+        if existing is None:
+            return None
+        return existing(guild_id)
+
+    async def _speak_over_music(self, message: discord.Message, clip: SpeechClip) -> bool:
+        """Duck the song and speak over it. True when the answer was handed over."""
+        player = self._music_player(getattr(message.guild, "id", 0))
+        if player is None or not getattr(player, "playing_music", False):
+            return False
+        voice = getattr(player, "voice", None)
+        if voice is None or not voice.is_connected():
+            return False
+        try:
+            from functions.music.decoder import decode_to_pcm
+
+            loop = asyncio.get_running_loop()
+            pcm = await loop.run_in_executor(None, decode_to_pcm, clip.data)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - fall back to the plain path
+            log.debug("Could not decode speech for mixing", exc_info=True)
+            return False
+        if not pcm:
+            return False
+        try:
+            mixed = await player.speak(pcm)
+        except Exception:  # noqa: BLE001
+            log.debug("Could not mix speech over the music", exc_info=True)
+            return False
+        if mixed:
+            log.info("Spoke over the music in guild %s (ducked)", message.guild.id)
+        return mixed
 
     def _voice_channel_for(
         self, message: discord.Message

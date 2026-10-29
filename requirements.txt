@@ -18,6 +18,10 @@ Pillow>=10.0,<13.0
 # Fast Damerau-Levenshtein matching for typo-tolerant dictionary searches.
 # A bounded pure-Python fallback remains available for minimal installs.
 rapidfuzz>=3.0,<4.0
+# Music search and stream resolution (YouTube, YouTube Music, SoundCloud, …).
+# Optional at runtime: without it the bot still answers questions, but
+# /music play reports that the owner has to install it.
+yt-dlp>=2024.8.6
 # Supabase — the authoritative voice-activity database (/vc leaderboard,
 # /vc stats). Official Python client, used server-side only with the
 # project's secret key. Voice tracking needs migrations 001_voice_activity.sql
