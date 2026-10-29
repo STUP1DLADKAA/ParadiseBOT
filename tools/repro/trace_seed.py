@@ -5,19 +5,15 @@ import asyncio
 import random
 import sys
 import tempfile
-import types
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 
-from functions.voice.database import VoiceDatabase  # noqa: E402
 from functions.voice.store import VoiceStoreUnavailable  # noqa: E402
-from functions.voice.supabase_database import SupabaseVoiceDatabase  # noqa: E402
 from functions.voice.time_windows import IST  # noqa: E402
-from functions.voice.tracker import VoiceTracker  # noqa: E402
 from voice_fakes import FakeSupabaseClient  # noqa: E402
 
 sys.path.insert(0, str(REPO / "tools" / "repro"))

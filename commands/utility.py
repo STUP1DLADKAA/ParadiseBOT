@@ -27,7 +27,9 @@ from functions.time import (
     resolve_timezone,
 )
 from functions.translate import resolve_language, translate_text
-from functions.translate import LANGUAGE_CODES  # noqa: F401 - re-exported for compatibility
+__all__ = ["LANGUAGE_CODES"]  # re-exported for compatibility
+
+from functions.translate import LANGUAGE_CODES  # noqa: F401
 from functions.voice.database import VoiceDatabase
 from functions.weather import OpenMeteoWeatherService
 

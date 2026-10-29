@@ -2,12 +2,10 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any
 
 import aiohttp
 
@@ -179,7 +177,7 @@ class CurrencyService:
 
         # Try live Frankfurter API
         try:
-            url = f"https://api.frankfurter.app/latest"
+            url = "https://api.frankfurter.app/latest"
             params = {"from": from_c.upper(), "to": to_c.upper()}
             async with aiohttp.ClientSession(
                 timeout=aiohttp.ClientTimeout(total=5)

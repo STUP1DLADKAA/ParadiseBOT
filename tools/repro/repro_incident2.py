@@ -12,11 +12,10 @@ Usage:  python3 tools/repro/repro_incident2.py
 from __future__ import annotations
 
 import asyncio
-import copy
 import sys
 import tempfile
 import types
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
@@ -24,7 +23,6 @@ sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 
 from functions.voice.database import VoiceDatabase  # noqa: E402
-from functions.voice.models import PersistedActiveSession  # noqa: E402
 from functions.voice.supabase_database import SupabaseVoiceDatabase  # noqa: E402
 from functions.voice.time_windows import IST  # noqa: E402
 from functions.voice.tracker import VoiceTracker  # noqa: E402

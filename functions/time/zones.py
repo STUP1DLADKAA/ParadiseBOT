@@ -5,8 +5,7 @@ from __future__ import annotations
 import logging
 import zoneinfo
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Sequence
+from datetime import datetime
 
 from rapidfuzz import fuzz, process
 

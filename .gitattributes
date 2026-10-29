@@ -1,0 +1,21 @@
+# Normalise line endings so the bot runs identically on Linux, macOS and
+# Windows, whatever a contributor's editor does.
+* text=auto eol=lf
+
+*.py      text diff=python
+*.md      text
+*.yml     text
+*.yaml    text
+*.json    text
+*.sql     text
+*.sh      text eol=lf
+
+# Binary assets — never diffed, never re-encoded.
+*.png     binary
+*.jpg     binary
+*.jpeg    binary
+*.ttf     binary
+*.otf     binary
+*.m4a     binary
+*.mp3     binary
+*.zip     binary

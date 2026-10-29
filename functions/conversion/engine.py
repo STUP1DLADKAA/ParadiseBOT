@@ -6,7 +6,7 @@ import logging
 
 from functions.helpers import ParadiseError
 from .currency import CurrencyService, resolve_currency
-from .models import ConversionCategory, ConversionResult
+from .models import ConversionResult
 from .parser import parse_conversion_query
 from .units import TEMP_UNITS, convert_standard_unit, convert_temperature, resolve_unit
 

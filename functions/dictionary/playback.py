@@ -54,10 +54,11 @@ class PlaybackSupport:
 
 def _has_nacl() -> bool:
     try:
-        import nacl  # noqa: F401
-    except ImportError:
+        import importlib.util
+
+        return importlib.util.find_spec("nacl") is not None
+    except (ImportError, ValueError):  # pragma: no cover - broken install
         return False
-    return True
 
 
 def resolve_ffmpeg_executable() -> str | None:

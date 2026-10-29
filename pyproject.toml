@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paradisebot"
+version = "2.0.0"
+description = "A Discord bot that answers with tools first and AI last — voice leaderboards, dictionary cards, weather cards, and spoken answers in your own voice."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "ParadiseBOT contributors" }]
+keywords = ["discord", "discord-bot", "voice", "leaderboard", "pillow", "gemini"]
+classifiers = [
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Communications :: Chat",
+]
+dependencies = [
+    "discord.py[voice]>=2.6,<3.0",
+    "imageio-ffmpeg>=0.5,<1.0",
+    "av>=14.0,<19.0",
+    "numpy>=1.26,<3.0",
+    "python-dotenv>=1.0,<2.0",
+    "aiohttp>=3.9,<4.0",
+    "Pillow>=10.0,<13.0",
+    "rapidfuzz>=3.0,<4.0",
+    "supabase>=2.32,<3.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/STUP1DLADKAA/ParadiseBOT"
+Issues = "https://github.com/STUP1DLADKAA/ParadiseBOT/issues"
+Changelog = "https://github.com/STUP1DLADKAA/ParadiseBOT/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0,<10.0", "pyflakes>=3.0,<4.0", "ruff>=0.6,<1.0"]
+
+[tool.setuptools]
+# The bot is run from the repository root (`python bot.py`), not installed as
+# a library; these entries only let `pip install -e .` work for tooling.
+py-modules = ["bot", "config"]
+packages = ["commands", "functions", "tools"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Tests are plain unittest classes; keep output readable and fail fast in CI
+# without hiding the first real error.
+addopts = "-ra"
+filterwarnings = [
+    "ignore::DeprecationWarning:discord.player",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = ["assets", "supabase/node_modules"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = [
+    "E501",  # long lines are fine in docstrings and tables
+    "B008",  # function calls in argument defaults (dataclass patterns)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402", "F401"]
+"tools/*" = ["E402"]
+"benchmarks/*" = ["E402"]

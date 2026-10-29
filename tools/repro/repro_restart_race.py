@@ -189,7 +189,7 @@ async def main():
         await tr2.reconcile_guilds()
     after = await shown(tr2, bot2)
     row3 = client.active[(str(GUILD_ID), str(USER_ID))]
-    print(f"\nAfter store bootstrap + deferred remote recovery")
+    print("\nAfter store bootstrap + deferred remote recovery")
     print(f"  _recovered_remote={tr2._recovered_remote}")
     print(f"  displayed daily total      : {hr(after)}")
     print(f"  voice_active_sessions row  : started_at={row3['started_at']}")
