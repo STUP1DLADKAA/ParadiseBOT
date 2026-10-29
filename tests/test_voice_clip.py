@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import glob
 import io
 import math
 import os
@@ -115,6 +114,22 @@ def _build_rtpsize_aead_datagram(
     nonce[:4] = struct.pack(">I", nonce_int & 0xFFFFFFFF)
     ciphertext = box.encrypt(plaintext, aad, bytes(nonce)).ciphertext
     return aad + ciphertext + bytes(nonce[:4])
+
+
+async def _wait_until(predicate, *, timeout: float = 5.0, interval: float = 0.01) -> bool:
+    """Wait for a real-socket condition instead of guessing a sleep duration.
+
+    The end-to-end test drives an OS UDP socket through the socket reader's
+    own thread, so "how long until the packets are buffered" depends on the
+    machine. Polling the observable state keeps the test fast on a fast box
+    and correct on a loaded CI runner.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        await asyncio.sleep(interval)
+    return bool(predicate())
 
 
 def _decode_m4a_to_mono_f32(path_or_bytes: str | bytes) -> tuple[np.ndarray, int, str]:
@@ -922,7 +937,13 @@ class TestRealUDPClipVoiceClientIntegration(unittest.IsolatedAsyncioTestCase):
                 sender_sock.sendto(dgram_b, recv_addr)
                 await asyncio.sleep(0.005)
 
-            await asyncio.sleep(0.05)
+            # Wait for the reader thread to actually buffer both speakers
+            # rather than assuming a fixed delay was long enough.
+            buffer = cog.service.get_buffer(guild.id)
+            await _wait_until(
+                lambda: (buffer.stats()["active_speakers"] or 0) >= 2
+                and (buffer.stats()["buffered_packets"] or 0) >= 4
+            )
 
             # 4. Invoke /clip as authorized user 922359954025885737
             delivered: list[tuple[str, bytes, str]] = []

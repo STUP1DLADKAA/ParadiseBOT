@@ -11,6 +11,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import aiohttp
 
+from functions.perf import shared_session
+
 from .models import EMPTY, OK, PROVIDER_ERROR, SearchResponse, SearchResult
 
 log = logging.getLogger(__name__)
@@ -84,16 +86,16 @@ class SearchEngine:
     # ------------------------------------------------------------------
 
     async def session(self) -> aiohttp.ClientSession:
-        """The shared session, created on first use."""
-        if self._session is not None and not self._session.closed:
-            return self._session
-        async with self._session_lock:
-            if self._session is None or self._session.closed:
-                self._session = aiohttp.ClientSession(
-                    timeout=aiohttp.ClientTimeout(total=self.timeout),
-                    headers={"User-Agent": USER_AGENT},
-                )
-        return self._session
+        """The pooled session, created on first use.
+
+        Uses the process-wide pool from :mod:`functions.perf`, so search,
+        weather, images and avatar fetches share one warm set of connections.
+        """
+        session = shared_session(
+            "search", timeout=self.timeout, headers={"User-Agent": USER_AGENT}
+        )
+        self._session = session
+        return session
 
     async def close(self) -> None:
         """Release the shared session (called on shutdown)."""

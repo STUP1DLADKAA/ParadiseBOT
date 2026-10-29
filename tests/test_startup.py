@@ -237,7 +237,11 @@ class TestBotStartupFlow(unittest.TestCase):
             bot.synchronizer.run = tracked_run
             bot.load_extension = fake_load
             bot.presence_manager.start = lambda: order.append("presence")
-            bot.loop = SimpleNamespace(create_task=lambda coro: coro.close())
+            # The real loop is not running here, so tasks are recorded and
+            # closed instead of scheduled (start-up must not need a live loop).
+            bot.loop = SimpleNamespace(
+                create_task=lambda coro, **kwargs: coro.close()
+            )
 
             await bot.setup_hook()
             return order, bot, tree

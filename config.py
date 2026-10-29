@@ -680,6 +680,10 @@ class Config:
     # Where preloaded speech clips are cached on disk (default data/tts_cache).
     tts_cache_dir: str = ""
 
+    # Warm fonts, card backdrops and the render pool at start-up so the first
+    # command is as fast as the thousandth. Costs one short burst of CPU.
+    prewarm: bool = True
+
     @property
     def ai_configured(self) -> bool:
         # Gemini is the primary provider; an OpenAI-compatible endpoint is a
@@ -705,6 +709,7 @@ class Config:
             voice_clip=VoiceClipConfig.from_env(env),
             minigames=MiniGamesConfig.from_env(env),
             image_search=ImageSearchConfig.from_env(env),
+            prewarm=_bool(env.get("PREWARM_ON_START"), True),
             tts_cache_dir=(
                 str(env.get("TTS_CACHE_DIR", "") or "").strip()
                 or os.path.join(

@@ -24,6 +24,8 @@ from urllib.parse import urlsplit
 
 import aiohttp
 
+from functions.perf import auto_http_limit as _auto_http_limit  # noqa: F401
+
 from .cache import RateLimiter
 
 log = logging.getLogger(__name__)
@@ -89,14 +91,17 @@ class HttpClient:
             if self._session is None or self._session.closed:
                 if self._closed:
                     raise HttpError("client is closed")
+                # A pool sized to the machine: dictionary, search, weather and
+                # image lookups share one warm set of connections instead of
+                # paying a TLS handshake per request.
+                limit = max(48, _auto_http_limit() // 2)
                 self._session = aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=self.timeout),
                     headers={"User-Agent": self.user_agent},
-                    # A wider pool: the box is no longer resource-starved, so
-                    # dictionary/search/weather lookups stop queueing behind
-                    # each other.
                     connector=aiohttp.TCPConnector(
-                        limit=48, limit_per_host=12, ttl_dns_cache=300
+                        limit=limit,
+                        limit_per_host=max(12, limit // 4),
+                        ttl_dns_cache=600,
                     ),
                 )
         return self._session

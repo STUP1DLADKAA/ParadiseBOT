@@ -15,6 +15,7 @@ network or avatar cache is involved and every assertion is deterministic.
 
 from __future__ import annotations
 
+import asyncio
 import io
 import os
 import sys
@@ -26,6 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 from PIL import Image
 
 from functions.voice import VoicePeriod
+from functions.voice.ui import leaderboard_subtitle
 from functions.voice.render import (
     CARD_BORDER,
     ROW_PITCH,
@@ -345,6 +347,175 @@ class TestLeaderboardImageRenderer(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsInstance(png_bytes, bytes)
         self.assertTrue(png_bytes.startswith(b"\x89PNG\r\n\x1a\n"))
+
+
+class TestHighDefinitionRendering(RenderCase):
+    """The card is drawn supersampled and down-sampled with LANCZOS."""
+
+    def test_output_is_always_the_design_width(self):
+        for scale in (1, 2, 3):
+            with self.subTest(scale=scale):
+                renderer = LeaderboardImageRenderer(scale=scale)
+                png = renderer._draw_canvas(
+                    "Paradise",
+                    VoicePeriod.TODAY,
+                    board(6),
+                    [None] * 6,
+                    "2026-03-10",
+                    1,
+                    6,
+                    None,
+                    None,
+                    None,
+                )
+                with Image.open(io.BytesIO(png)) as image:
+                    self.assertEqual(image.width, WIDTH)
+
+    def test_supersampling_produces_smoother_edges(self):
+        """A 2x render must contain intermediate tones a 1x render lacks."""
+
+        def unique_greys(png: bytes) -> int:
+            with Image.open(io.BytesIO(png)) as image:
+                rgb = image.convert("L")
+                # Sample the header area, which is all text + rules.
+                crop = rgb.crop((30, 20, 700, 190))
+                return len(set(crop.tobytes()))
+
+        members = board(3)
+        low = LeaderboardImageRenderer(scale=1)._draw_canvas(
+            "Paradise", VoicePeriod.TODAY, members, [None] * 3, None, 1, 3, None, None, None
+        )
+        high = LeaderboardImageRenderer(scale=2)._draw_canvas(
+            "Paradise", VoicePeriod.TODAY, members, [None] * 3, None, 1, 3, None, None, None
+        )
+        self.assertGreater(unique_greys(high), unique_greys(low))
+
+    def test_paging_is_identical_in_shape_across_scales(self):
+        members = board(14)
+        heights = {
+            scale: Image.open(
+                io.BytesIO(
+                    LeaderboardImageRenderer(scale=scale)._draw_canvas(
+                        "Paradise", VoicePeriod.WEEK, members, [None] * len(members),
+                        None, 1, len(members), None, None, None,
+                    )
+                )
+            ).height
+            for scale in (1, 2)
+        }
+        self.assertEqual(heights[1], heights[2])
+
+
+class TestRenderCache(unittest.IsolatedAsyncioTestCase):
+    """Deterministic data + a short TTL cache means paging back is instant."""
+
+    def setUp(self) -> None:
+        self.renderer = LeaderboardImageRenderer()
+
+    async def test_identical_requests_render_once(self):
+        members = board(6)
+        calls = {"n": 0}
+        original = self.renderer._draw_canvas
+
+        def counting(*args, **kwargs):
+            calls["n"] += 1
+            return original(*args, **kwargs)
+
+        self.renderer._draw_canvas = counting
+        try:
+            first = await self.renderer.render_leaderboard(
+                "Paradise", VoicePeriod.TODAY, members, "2026-03-10"
+            )
+            second = await self.renderer.render_leaderboard(
+                "Paradise", VoicePeriod.TODAY, members, "2026-03-10"
+            )
+        finally:
+            self.renderer._draw_canvas = original
+        self.assertEqual(calls["n"], 1)
+        self.assertEqual(first, second)
+
+    async def test_a_changed_percentage_is_not_served_from_cache(self):
+        members = board(4)
+        first = await self.renderer.render_leaderboard(
+            "Paradise", VoicePeriod.TODAY, members, None
+        )
+        changed = [
+            member(m.rank, m.display_name, m.total_seconds, percentage=m.percentage + 5)
+            for m in members
+        ]
+        second = await self.renderer.render_leaderboard(
+            "Paradise", VoicePeriod.TODAY, changed, None
+        )
+        self.assertNotEqual(first, second)
+
+    async def test_caching_can_be_disabled(self):
+        members = board(4)
+        a = await self.renderer.render_leaderboard(
+            "Paradise", VoicePeriod.TODAY, members, None, use_cache=False
+        )
+        b = await self.renderer.render_leaderboard(
+            "Paradise", VoicePeriod.TODAY, members, None, use_cache=False
+        )
+        self.assertEqual(a, b)  # identical data, identical pixels
+
+    async def test_two_identical_concurrent_requests_share_one_render(self):
+        members = board(5)
+        results = await asyncio.gather(
+            *(
+                self.renderer.render_leaderboard(
+                    "Paradise", VoicePeriod.WEEK, members, "2026-03-10"
+                )
+                for _ in range(3)
+            )
+        )
+        self.assertEqual(len(set(results)), 1)
+
+    async def test_the_render_never_blocks_the_event_loop(self):
+        """Drawing runs on the render pool, so a heartbeat still ticks."""
+
+        ticks = 0
+
+        async def heartbeat():
+            nonlocal ticks
+            for _ in range(20):
+                await asyncio.sleep(0.005)
+                ticks += 1
+
+        await asyncio.gather(
+            heartbeat(),
+            self.renderer.render_leaderboard(
+                "Paradise", VoicePeriod.MONTH, board(10), None, use_cache=False
+            ),
+        )
+        self.assertEqual(ticks, 20)
+
+
+class TestLeaderboardSubtitle(unittest.TestCase):
+    """One line of context under the title — never invented, always useful."""
+
+    def test_singular_member_count(self):
+        self.assertEqual(
+            leaderboard_subtitle(board(1), page=1, total_pages=1),
+            "1 member tracked",
+        )
+
+    def test_plural_and_live_members(self):
+        members = board(4)
+        members[0] = member(1, members[0].display_name, 7200, percentage=40.0)
+        members[0].is_active_now = True
+        members[1].is_active_now = True
+        text = leaderboard_subtitle(members, page=1, total_pages=1)
+        self.assertIn("4 members tracked", text)
+        self.assertIn("2 in voice right now", text)
+
+    def test_paging_is_mentioned_only_when_there_is_more_than_one_page(self):
+        self.assertNotIn("page", leaderboard_subtitle(board(3), page=1, total_pages=1))
+        self.assertIn(
+            "page 2 of 3", leaderboard_subtitle(board(30), page=2, total_pages=3)
+        )
+
+    def test_an_empty_board_is_honest(self):
+        self.assertEqual(leaderboard_subtitle([], page=1, total_pages=1), "0 members tracked")
 
 
 if __name__ == "__main__":
