@@ -5,7 +5,8 @@ Type it or say it — Paradise answers either way.
 ```
 you │ 🎙  "hey paradise, what's the capital of Rajasthan?"
     │        ↓ Opus → PCM 48 kHz → endpointing → WAV 16 kHz mono
-    │        ↓ speech-to-text: "Hey Paradise, what's the capital of Rajasthan?"
+    │        ↓ Whisper, on THIS machine: no key, no upload, works offline
+    │        "Hey Paradise, what's the capital of Rajasthan?"
     │        ↓ wake phrase found → the question is the rest of the sentence
 bot │ 🗣  "Jaipur is the capital of Rajasthan."
 ```
@@ -13,52 +14,96 @@ bot │ 🗣  "Jaipur is the capital of Rajasthan."
 If a song is playing, see [music](music.md): the song ducks to 15 % for the
 length of the answer and comes back up.
 
+## On-device by default
+
+Recognition runs **inside the bot**, on the bot's own CPU, through
+[faster-whisper](https://github.com/SYSTRAN/faster-whisper) — a CTranslate2
+build of OpenAI's Whisper. There is no API key, no account, no request, and no
+audio leaving the machine. It also works with the network unplugged, once the
+weights are on disk:
+
+```bash
+python -m pip install -r requirements-local-stt.txt   # once, ~250 MB of wheels
+python bot.py                                         # first utterance downloads
+                                                      # the model (75 MB for "small")
+```
+
+That is the whole setup. `VOICE_WAKE_STT=auto` (the default) means *local
+first*; `VOICE_WAKE_STT=local` means **local only** — the cloud providers are
+then never constructed, so a bug could not reach them.
+
+| | |
+| --- | --- |
+| Model | `small` — the smallest size that is good at Hindi/Hinglish (`VOICE_WAKE_STT_MODEL`) |
+| Speed | int8 on CPU; roughly 0.5–1.5× real time for a 3–5 s sentence on a normal VPS |
+| Memory | ~600 MB while loaded, freed after 15 minutes of silence (`VOICE_WAKE_STT_UNLOAD_AFTER`) |
+| Network | none, ever, after the first download |
+| Cost | nothing |
+
+The model is loaded on a background thread the first time somebody speaks, so
+start-up stays instant and the event loop is never blocked. Loading and
+inference both run on a dedicated one-thread executor: music, cards and
+heartbeats keep running while Whisper works.
+
+### Why not something smaller?
+
+Whisper `tiny` and `base` are ~3× faster and fine for English, but they turn
+Hinglish into nonsense. `small` is the point where "hey paradise, kal ka
+mausam kaisa hai" comes back intact. `medium` and `large-v3-turbo` are more
+accurate and considerably slower on CPU — try `VOICE_WAKE_STT_MODEL=large-v3-turbo`
+if the host has spare cores.
+
 ## What it costs, and when
 
-Nothing is uploaded until **you have finished speaking**:
+Nothing is uploaded, so the only thing worth bounding is CPU:
 
 * the bot decodes the channel's audio locally and watches 20 ms frames for
-  speech energy (the same threshold that a "is anyone talking" meter uses);
+  speech energy;
 * when a sentence starts, frames are kept in memory — 100 ms of pre-roll so the
   first syllable is never clipped;
 * when the sentence ends (700 ms of quiet, or 12 s, whichever comes first) the
-  utterance is down-mixed to 16 kHz mono and sent **once** to speech-to-text;
-* the transcript is matched against the wake phrase locally. Only if it is a
-  call does Gemini get the question and ElevenLabs speak the answer.
+  utterance is down-mixed to 16 kHz mono and handed to Whisper **once**;
+* the transcript is matched against the wake phrase. Only if it is a call does
+  Gemini get the question and ElevenLabs speak the answer.
 
 Silence, background noise, coughs and sentences that do not start with the wake
-phrase cost one STT request and nothing else.
+phrase cost a few hundred milliseconds of CPU and nothing else.
 
 ## Privacy, honestly
-
-This is the one feature that sends **microphone audio to a third party**. It is
-built to be visible rather than hidden:
 
 | | |
 | --- | --- |
 | When it listens | whenever Paradise is in a voice channel and `VOICE_WAKE_ENABLED=true` |
-| What is uploaded | one WAV per finished utterance, to ElevenLabs Scribe (or Gemini) |
-| What is stored | nothing on disk; the rolling buffers are in memory and bounded |
+| Where audio goes | **nowhere** — it is decoded and transcribed in this process |
+| What is written | nothing on disk; the rolling buffers are in memory and bounded |
+| What is stored | nothing; the audio is dropped as soon as it has been transcribed |
 | Who is ignored | anyone who opted out of voice capture (`/clip` consent) — dropped before the listener sees a packet |
 | How it is announced | a one-time notice in the channel when Paradise joins (`VOICE_WAKE_ANNOUNCE`) |
 | How to turn it off | `VOICE_WAKE_ENABLED=false`, or `/voicewake stop` per server |
-| How to see what it heard | `/voicewake status` shows the last transcript and counters |
+| How to see what it heard | `/voicewake status` shows the engine, the last transcript and counters |
 
-The audio never touches the bot's database, is never written to a file, and is
-discarded as soon as it has been transcribed.
+The `Gemini`/`ElevenLabs` recognisers still exist — some hosts (a tiny shared
+CPU, or an ARM board) cannot run Whisper — but they are only used when you ask
+for them explicitly, or when the local engine is not installed and
+`VOICE_WAKE_STT=auto` is left alone. `/voicewake status` always says which one
+is live:
+
+```
+speech-to-text: local whisper small (int8 on cpu, loaded) · threshold 0.012
+speech-to-text: local whisper (not installed), elevenlabs · threshold 0.012
+```
 
 ## Setup
 
-1. **A speech-to-text provider.** Either key already used by the bot works:
+1. **The dependency** (only if you want the wake word at all):
 
-   ```env
-   ELEVENLABS_API_KEY=...   # Scribe v1 — best Hindi/Hinglish, uses the same key
-   GEMINI_API_KEY=...       # audio inline in the normal Gemini request
-   VOICE_WAKE_STT=auto      # try ElevenLabs, then Gemini (default)
+   ```bash
+   python -m pip install -r requirements-local-stt.txt
    ```
 
-   `VOICE_WAKE_STT=elevenlabs` or `gemini` pins one; `off` disables listening
-   while leaving the typed wake word working.
+   Docker users get it automatically (`--build-arg INSTALL_LOCAL_STT=0` opts out).
+   Without it the bot starts normally, `/voicewake status` explains, and typing
+   "hey paradise" keeps working.
 
 2. **A receive-capable voice connection.** Paradise connects with its own
    `ClipVoiceClient` whenever the clip buffer *or* the wake word is enabled, so
@@ -71,12 +116,41 @@ discarded as soon as it has been transcribed.
 
 4. **Voice permissions:** *View Channel*, *Connect*, *Speak*.
 
+### Air-gapped or pre-downloaded models
+
+The weights are ordinary files. Copy a faster-whisper model directory (the one
+containing `model.bin`, `config.json`, `tokenizer.json`, `vocabulary.txt`) to the
+host and point at it:
+
+```env
+VOICE_WAKE_STT_MODEL_DIR=/opt/whisper/small
+VOICE_WAKE_STT_OFFLINE=true      # never touch the network, even on a typo
+```
+
+`VOICE_WAKE_STT_OFFLINE=false` with an *empty* `MODEL_DIR` restores the default:
+download into the Hugging Face cache on first use.
+
+### The cloud fallback (optional)
+
+```env
+VOICE_WAKE_STT=elevenlabs        # Scribe v1 with ELEVENLABS_API_KEY
+VOICE_WAKE_STT=gemini            # audio inline with GEMINI_API_KEY
+VOICE_WAKE_STT=auto              # local → elevenlabs → gemini (default)
+```
+
 ## Tuning
 
 | Key | Default | Meaning |
 | --- | --- | --- |
 | `VOICE_WAKE_ENABLED` | `true` | master switch |
-| `VOICE_WAKE_STT` | `auto` | `auto`, `elevenlabs`, `gemini` or `off` |
+| `VOICE_WAKE_STT` | `auto` | `auto`, `local`, `elevenlabs`, `gemini` or `off` |
+| `VOICE_WAKE_STT_MODEL` | `small` | Whisper size, or a path to a converted model |
+| `VOICE_WAKE_STT_DEVICE` | `cpu` | `cpu` or `cuda` |
+| `VOICE_WAKE_STT_COMPUTE` | `int8` | `int8`, `int8_float32` or `float32` |
+| `VOICE_WAKE_STT_THREADS` | `0` | CPU threads for inference; 0 = let CTranslate2 decide |
+| `VOICE_WAKE_STT_MODEL_DIR` | — | where the weights live / download to |
+| `VOICE_WAKE_STT_OFFLINE` | `false` | never touch the network |
+| `VOICE_WAKE_STT_UNLOAD_AFTER` | `900` | seconds of silence before the weights leave RAM; 0 = keep |
 | `VOICE_WAKE_LANGUAGE` | — | ISO-639-1 hint (`hi`, `en`); blank auto-detects |
 | `VOICE_WAKE_THRESHOLD` | `0.012` | how loud a frame must be to count as voice (~-38 dBFS) |
 | `VOICE_WAKE_ONSET_MS` | `60` | how much voice starts a recording |
@@ -94,20 +168,26 @@ discarded as soon as it has been transcribed.
 **It cuts me off.** Raise `VOICE_WAKE_SILENCE_MS` (900–1200) — the endpointing
 closes a sentence after that much quiet.
 
-**It never triggers.** Lower `VOICE_WAKE_THRESHOLD` to `0.006` and check
-`/voicewake status`: if the last transcript is empty, the STT provider is
-refusing (usually a missing or rate-limited key). The log line at start-up says
-which providers are live:
+**It never triggers.** Check `/voicewake status` first:
 
-```
-Spoken wake word listening — speech-to-text: elevenlabs, gemini (off) · threshold 0.012
-```
+* `local whisper (not installed)` → run `pip install -r requirements-local-stt.txt`;
+* `local whisper small (… , loaded)` and an empty last transcript → the audio is
+  below `VOICE_WAKE_THRESHOLD`; lower it to `0.006`;
+* `could not be loaded … not on this machine yet` → the one-time download has
+  never succeeded; run once with internet, or set `VOICE_WAKE_STT_MODEL_DIR`.
 
 **It transcribes everything and answers nothing.** That is normal: the wake
-phrase is what decides. Watch `/voicewake status`, which shows the last
-transcript — if it reads "he paradise" instead of "hey paradise", that is
-already handled (the matcher tolerates it); if it reads something unrelated, the
-utterance is being cut, so raise `VOICE_WAKE_SILENCE_MS`.
+phrase is what decides. `/voicewake status` shows the last transcript — if it
+reads "he paradise" instead of "hey paradise" that is already handled; if it
+reads something unrelated, the utterance is being cut, so raise
+`VOICE_WAKE_SILENCE_MS`.
+
+**It is slow on my VPS.** Use `VOICE_WAKE_STT_MODEL=base` (English-heavy
+servers) or `tiny`, and set `VOICE_WAKE_STT_THREADS` to the number of real
+cores. A 3 s question at `small`/int8 is typically 2–4 s on two shared vCPUs.
+
+**It eats 600 MB.** That is Whisper `small` in memory. `VOICE_WAKE_STT_UNLOAD_AFTER`
+lowers the idle window; `VOICE_WAKE_STT_MODEL=base` halves the footprint.
 
 ## What the matcher accepts
 
@@ -128,6 +208,9 @@ I said hey to paradise       → no
 the paradise hotel is nice   → no
 ```
 
+Whisper is also given "Hey Paradise." as a decoder prompt, so the phrase comes
+back spelled the way the matcher expects.
+
 ## How it fits together
 
 ```
@@ -140,8 +223,8 @@ functions/voice_wake/listener.py   queue → Opus decode → endpointing
 functions/voice_wake/segmenter.py  silence/onset rules, pre-roll, trimming
         │  WAV (16 kHz mono)
         ▼
-functions/voice_wake/stt.py        ElevenLabs Scribe → Gemini
-        │  "hey paradise …"
+functions/voice_wake/local_stt.py  faster-whisper on a one-thread executor
+        │  "hey paradise …"            (stt.py: ElevenLabs / Gemini, opt-in)
         ▼
 functions/voice_wake/phrases.py    wake phrase + question
         │
@@ -149,11 +232,16 @@ functions/voice_wake/phrases.py    wake phrase + question
 commands/wake.py                   music first, then Gemini, then speak (ElevenLabs)
 ```
 
-Every hop except the network calls is a pure function with tests:
+Every hop except the model itself is a pure function with tests:
 `tests/test_voice_wake.py` covers the endpointing boundaries, 17 phrase
-variants, the WAV encoder, the provider chain, rate limits, a failing
+variants, the WAV encoder, the provider chain, the on-device engine (threading,
+timeouts, load retry, idle unload, a missing dependency), rate limits, a failing
 provider, real Opus packets, real RTP decryption into the tap, and the cog
-wiring.
+wiring. Set `VOICE_WAKE_STT_MODEL_DIR` and run the suite to exercise real
+Whisper weights too.
+
+The answer still needs a brain: Gemini (or an OpenAI-compatible endpoint) writes
+it, ElevenLabs speaks it. Only the *listening* became local.
 
 Lavalink is absent for the same reason as in [music](music.md#why-not-lavalink-v4):
 it owns the voice connection, and a voice connection it owns delivers no audio

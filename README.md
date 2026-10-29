@@ -42,7 +42,7 @@ cannot answer:
 | --- | --- | --- |
 | `@Paradise <complex question>` | Gemini reasoning (or an OpenAI-compatible fallback) | optional |
 | `Hey Paradise …` in voice chat | fastest-first Gemini cascade, then spoken aloud | optional |
-| `Hey Paradise …` **spoken** in the channel | speech-to-text (ElevenLabs Scribe, else Gemini audio) → Gemini answer → your voice | optional |
+| `Hey Paradise …` **spoken** in the channel | **on-device** Whisper (faster-whisper, this CPU, no upload) → Gemini answer → your voice | optional |
 | `/summarize` | Gemini summary of pasted text | optional |
 | Passive personality | rare canned reactions/replies — **no model**, just local templates | never |
 | Music | yt-dlp search, FFmpeg decode, numpy mixing — **no model**, no cloud music API | never |
@@ -53,12 +53,14 @@ Pillow. There is no image generation anywhere in this repository, and image
 search returns *real* photos from Wikipedia/Wikimedia/Openverse instead of
 made-up ones.
 
-**4. What leaves the machine.** Two things, both opt-in by design: an utterance
-is sent to the speech-to-text service **only after you finish a sentence**
-(spoken wake word, off with `VOICE_WAKE_ENABLED=false`), and a question is sent
-to Gemini when it actually needs a model. Music, cards, voice tracking, the
-dictionary and every deterministic tool run locally. Nothing about your voice is
-stored: the buffers are in memory, bounded, and dropped after transcription.
+**4. What leaves the machine.** One thing: a question, sent to Gemini when it
+actually needs a model. Recognition of the **spoken** wake word runs on this
+machine — faster-whisper on this CPU, inside the bot, with no key and no
+upload — so your voice never leaves it. Music, cards, voice tracking, the
+dictionary and every deterministic tool run locally too. Nothing about your
+voice is stored: the buffers are in memory, bounded, and dropped after
+transcription. Cloud recognition exists as a fallback for hosts that cannot run
+Whisper, and is never chosen while the local engine is installed.
 [Full privacy notes](docs/voice-wake.md#privacy-honestly).
 
 With **no API key at all** the bot is fully functional: only free-form
@@ -75,7 +77,7 @@ unavailable.
 | **Voice leaderboards** | Supabase-backed tracking with crash-safe checkpoints, IST calendar windows, daily DM summaries and a rendered card with a podium, live indicators and share bars. |
 | **Cards, drawn in code** | Dictionary, weather, recipe, mini-game and leaderboard visuals are Pillow-rendered at 2× supersampling — deterministic, cacheable, never generated. |
 | **Your own voice** | Optional ElevenLabs voice for every spoken word, with an OpenAI-compatible and a free web fallback. Hindi, English and Hinglish. |
-| **"Hey Paradise"** | Type the phrase in a voice channel's text chat, **or just say it out loud**: answered in the chat *and* spoken in the channel, in the same voice. Spoken requests use speech-to-text (ElevenLabs Scribe or Gemini) after the sentence has ended. [Details](docs/voice-wake.md). |
+| **"Hey Paradise"** | Type the phrase in a voice channel's text chat, **or just say it out loud**: answered in the chat *and* spoken in the channel, in the same voice. Spoken requests are transcribed **on the bot's own CPU** (faster-whisper, no key, nothing uploaded) once the sentence has ended. [Details](docs/voice-wake.md). |
 | **Music, with talk-over** | "Hey Paradise play billie jean" — in English, Hinglish or Devanagari. The song plays, and every answer **ducks it to 15 %** for the length of the sentence, then lifts it back. Queue, loop, shuffle, pause, skip, volume, and a `/cmd` button panel. [How it works](docs/music.md). |
 | **Silent presence** | Follows the crowd into the busiest voice channel and says nothing when it arrives. |
 | **Mini-games** | A recoverable SQLite scheduler, four modular games, aggregate-only leaderboard. |
@@ -163,7 +165,8 @@ transport. Full setup, configuration and troubleshooting: **[docs/music.md](docs
 ## Quick start
 
 **Requirements:** Python 3.11+, a Discord bot token, and ~150 MB of disk for
-dependencies. Linux, macOS and Windows all work.
+dependencies (+250 MB if you also install on-device speech recognition).
+Linux, macOS and Windows all work.
 
 ```bash
 git clone https://github.com/STUP1DLADKAA/ParadiseBOT.git
@@ -172,6 +175,9 @@ cd ParadiseBOT
 python -m pip install -r requirements.txt
 cp .env.example .env          # then fill in DISCORD_TOKEN
 python bot.py
+
+# optional: hear the wake word out loud, transcribed on this machine
+python -m pip install -r requirements-local-stt.txt
 ```
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
@@ -205,7 +211,8 @@ unless stopped.
 | Instant slash commands | `DISCORD_GUILD_ID` | commands register globally (slow propagation) |
 | Voice leaderboards | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` + [3 SQL migrations](supabase/README.md) | `/vc` explains what to set up; nothing else breaks |
 | Music | nothing beyond `pip install -r requirements.txt` and FFmpeg | `/music play` says what is missing |
-| Spoken wake word | `ELEVENLABS_API_KEY` (Scribe) or `GEMINI_API_KEY` | typed "Hey Paradise" still works; `/voicewake status` explains |
+| Spoken wake word (on-device) | `pip install -r requirements-local-stt.txt` — no key at all | typed "Hey Paradise" still works; `/voicewake status` explains how to install it |
+| Spoken wake word (cloud fallback) | `VOICE_WAKE_STT=elevenlabs` + `ELEVENLABS_API_KEY`, or `gemini` + `GEMINI_API_KEY` | on-device recognition is used instead — no audio leaves the bot |
 | AI answers | `GEMINI_API_KEY` (or `AI_BASE_URL`/`AI_MODEL`) | tool/mention replies still work, no free-form reasoning |
 | Spoken answers in your voice | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | free fallback voice, or text only |
 | Weather alerts & midnight board | `VOICE_ALERT_CHANNEL_ID` | those two posts are skipped |
@@ -245,7 +252,7 @@ ParadiseBOT/
 │   ├── minigames/             recoverable scheduler + four games
 │   ├── recipes/               recipe engine and bundled recipe book
 │   ├── music/                 yt-dlp search, FFmpeg PCM, ducking mixer, queue, intents
-│   ├── voice_wake/            endpointing, wake-phrase matching, speech-to-text
+│   ├── voice_wake/            endpointing, wake-phrase matching, on-device whisper
 │   ├── tts.py                 ElevenLabs → OpenAI-compatible → free voice
 │   ├── gemini.py · ai.py      model cascade, provider chain, activation rules
 │   ├── perf.py                shared HTTP pools, render pool, start-up prewarm

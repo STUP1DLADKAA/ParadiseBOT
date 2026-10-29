@@ -5,7 +5,7 @@ This package makes the same thing work when you simply **say it out loud**:
 
     you │ 🎙 "hey paradise, what's the capital of Rajasthan?"
         │      ↓ Opus → PCM (48 kHz) → endpointing → WAV (16 kHz)
-        │      ↓ speech-to-text (ElevenLabs Scribe, or Gemini)
+        │      ↓ speech-to-text (on-device whisper; cloud only if asked)
     bot │ 🗣 "Jaipur is the capital of Rajasthan."
 
 Nothing is uploaded until something that sounds like speech has *ended*, and
@@ -16,11 +16,13 @@ Pieces:
 
 ``segmenter``  frames → utterances (energy endpointing, pre-roll, trimming)
 ``phrases``    transcript → "was that for me, and what did they ask?"
-``stt``        WAV → text (ElevenLabs Scribe → Gemini, in that order)
+``stt``        WAV → text (local whisper, then ElevenLabs Scribe, then Gemini)
+``local_stt``  the on-device engine: faster-whisper on this CPU, no network
 ``listener``   the tap, the rate limits and the callback into the bot
 """
 
 from .listener import ListenerStats, SpokenRequest, SpokenWakeListener
+from .local_stt import INSTALL_HINT, LocalWhisperTranscriber
 from .phrases import WakeMatch, find_wake, normalise
 from .segmenter import Segment, SpeechSegmenter, frame_rms
 from .stt import (
@@ -34,6 +36,8 @@ from .stt import (
 
 __all__ = [
     "ElevenLabsTranscriber",
+    "INSTALL_HINT",
+    "LocalWhisperTranscriber",
     "GeminiTranscriber",
     "ListenerStats",
     "Segment",

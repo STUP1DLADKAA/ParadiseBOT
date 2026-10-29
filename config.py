@@ -36,6 +36,18 @@ def _chance(raw: str | None, default: float) -> float:
     return value if 0.0 <= value <= 1.0 else default
 
 
+def _stt_model(raw: str | None) -> str:
+    """A Whisper size ("small", "large-v3-turbo") or a path to a model dir.
+
+    Kept forgiving on purpose: CTranslate2 also accepts the output directory of
+    its own converter, so anything path-shaped is passed through untouched.
+    """
+    value = "".join(
+        ch for ch in str(raw or "").strip() if ch.isalnum() or ch in "-._/:\\ "
+    ).strip()
+    return value or "small"
+
+
 def _ids(raw: str | None) -> tuple[int, ...]:
     """A comma/space separated list of Discord IDs; anything invalid is ignored."""
     text = str(raw or "").strip()
@@ -658,15 +670,35 @@ class VoiceWakeConfig:
     utterance to *finish*, transcribes it once, and only then decides whether
     it was addressed — "hey paradise …" in English, Hinglish or Hindi.
 
-    This is the one feature that sends microphone audio to a third party, so
-    it is announced in the channel when it starts and it honours the existing
-    per-user voice-capture opt-out. Turn it off with ``VOICE_WAKE_ENABLED=false``
-    and everything else keeps working.
+    Recognition runs **on this machine** by default: faster-whisper, in this
+    process, on this CPU, with no key and no upload (``functions/voice_wake/
+    local_stt.py``). The cloud providers still exist for machines that cannot
+    run Whisper, and ``VOICE_WAKE_STT=local`` forbids them outright.
+
+    Because a local transcription is never uploaded, nothing leaves the bot;
+    the channel is still told once that Paradise is listening and the existing
+    per-user voice-capture opt-out is still honoured. Turn it off with
+    ``VOICE_WAKE_ENABLED=false`` and everything else keeps working.
     """
 
     enabled: bool = True
-    #: "auto" (ElevenLabs Scribe, then Gemini), "elevenlabs", "gemini" or "off".
+    #: "auto" (local whisper, then ElevenLabs Scribe, then Gemini), "local",
+    #: "elevenlabs", "gemini" or "off".
     stt: str = "auto"
+    #: Whisper size for the local engine: tiny, base, small, medium, large-v3…
+    stt_model: str = "small"
+    #: torch-free CTranslate2 device: "cpu" (default) or "cuda".
+    stt_device: str = "cpu"
+    #: CTranslate2 precision: int8 (fast, default), int8_float32 or float32.
+    stt_compute: str = "int8"
+    #: CPU threads for inference; 0 lets CTranslate2 pick.
+    stt_threads: int = 0
+    #: Directory holding the model weights (downloads there on first run).
+    stt_model_dir: str = ""
+    #: Never touch the network: only use weights that are already on disk.
+    stt_offline: bool = False
+    #: Drop the weights from RAM after this much silence; 0 keeps them loaded.
+    stt_unload_after: float = 900.0
     #: ISO-639-1 hint for the transcriber; blank lets it detect.
     language: str = ""
     #: Framed speech detection: a 20 ms frame above this fraction of full
@@ -702,11 +734,24 @@ class VoiceWakeConfig:
     @classmethod
     def from_env(cls, env) -> "VoiceWakeConfig":
         stt = str(env.get("VOICE_WAKE_STT", "auto") or "auto").strip().lower()
-        if stt not in {"auto", "elevenlabs", "gemini", "off"}:
+        if stt not in {"auto", "local", "elevenlabs", "gemini", "off"}:
             stt = "auto"
         return cls(
             enabled=_bool(env.get("VOICE_WAKE_ENABLED"), True),
             stt=stt,
+            stt_model=_stt_model(env.get("VOICE_WAKE_STT_MODEL")),
+            stt_device=str(env.get("VOICE_WAKE_STT_DEVICE", "cpu") or "cpu")
+            .strip()
+            .lower(),
+            stt_compute=str(env.get("VOICE_WAKE_STT_COMPUTE", "int8") or "int8")
+            .strip()
+            .lower(),
+            stt_threads=max(0, min(64, _int(env.get("VOICE_WAKE_STT_THREADS"), 0))),
+            stt_model_dir=str(env.get("VOICE_WAKE_STT_MODEL_DIR", "") or "").strip(),
+            stt_offline=_bool(env.get("VOICE_WAKE_STT_OFFLINE"), False),
+            stt_unload_after=max(
+                0.0, min(86_400.0, _float(env.get("VOICE_WAKE_STT_UNLOAD_AFTER"), 900.0))
+            ),
             language=str(env.get("VOICE_WAKE_LANGUAGE", "") or "").strip().lower()[:5],
             energy_threshold=max(
                 0.0005, min(0.2, _float(env.get("VOICE_WAKE_THRESHOLD"), 0.012))
