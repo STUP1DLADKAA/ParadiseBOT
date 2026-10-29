@@ -55,8 +55,8 @@ they are written, and because a leaderboard should survive a bot restart.
    secret key** into `.env`:
 
    ```env
-   SUPABASE_URL=https://<your-project-ref>.supabase.co
-   SUPABASE_SECRET_KEY=<service_role key>
+   SUPABASE_URL=   # your project URL, from Project Settings → API
+   SUPABASE_SECRET_KEY=   # the service_role secret key from the same page
    ```
 
    > The service-role key bypasses row-level security. It belongs only in this

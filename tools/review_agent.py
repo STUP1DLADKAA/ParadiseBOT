@@ -171,6 +171,25 @@ def parse_diff(diff_text: str) -> list[FileDiff]:
 # Rules
 # ---------------------------------------------------------------------------
 
+#: Values that are obviously documentation, not a credential: ``<your-key>``,
+#: ``${VAR}``, ``xxx``, ``changeme``, ``...``. A doc showing the *shape* of a
+#: setting must not be reported as a leaked secret.
+PLACEHOLDER_VALUE = re.compile(
+    r"""(?ix)
+    ^(?:
+        <.*                       # <service_role key>  (closing > optional)
+      | \$\{.*\}                  # ${SUPABASE_SECRET_KEY}
+      | \[.*\]                    # [your key]
+      | \.{3,}                     # ...
+      | [x*]{3,}                  # xxx / ***
+      | (?:your|my|example)[-_\w]*
+      | (?:change|replace)[-_]?me
+      | (?:redacted|placeholder|insert[-_]?here|todo)
+      | (?:key|token|secret|value)[-_]?(?:here|goes[-_]?here)
+    )
+    """,
+)
+
 SECRET_PATTERNS = (
     (re.compile(r"sb_secret_[A-Za-z0-9_\-]{10,}"), "Supabase secret key"),
     (re.compile(r"sbp_[A-Za-z0-9]{20,}"), "Supabase personal token"),
@@ -229,6 +248,25 @@ def _sql_body_lines(content: str) -> set[int]:
         if inside:
             bodies.add(index)
     return bodies
+
+
+def _is_placeholder(text: str) -> bool:
+    """True when the credential-shaped values on this line are documented filler.
+
+    A *quoted* value is code, not documentation: ``KEY = "sb_secret_…"`` keeps
+    being reported even if it reads like a sample. Only bare ``KEY=<placeholder>``
+    forms are excused, and only when every value on the line is one.
+    """
+    values = re.findall(r"=\s*(\"[^\"]*\"|'[^']*'|[^\s\"'#]+)", text)
+    if not values:
+        return False
+    for raw in values:
+        value = raw.strip()
+        if value[:1] in ("\"", "'"):
+            return False
+        if not PLACEHOLDER_VALUE.match(value):
+            return False
+    return True
 
 
 def _strip_sql_comments(line: str) -> str:
@@ -350,7 +388,7 @@ def review_file(diff: FileDiff, report: ReviewReport) -> None:
 
         # --- secrets ---------------------------------------------------
         for pattern, label in SECRET_PATTERNS:
-            if pattern.search(text) and ".env.example" not in path:
+            if pattern.search(text) and ".env.example" not in path and not _is_placeholder(text):
                 report.add(
                     Finding(
                         BLOCKING,
