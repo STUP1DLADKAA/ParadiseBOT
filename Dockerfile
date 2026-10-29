@@ -19,8 +19,14 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
-COPY requirements.txt .
+COPY requirements.txt requirements-local-stt.txt ./
 RUN python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+# On-device speech-to-text for the spoken wake word (faster-whisper: runs on
+# this container's CPU, no API key, no audio ever leaves the machine).
+#   docker build --build-arg INSTALL_LOCAL_STT=0 …   to skip it (~250 MB)
+ARG INSTALL_LOCAL_STT=1
+RUN if [ "$INSTALL_LOCAL_STT" = "1" ]; then python -m pip install -r requirements-local-stt.txt; fi
 
 COPY . .
 RUN useradd --create-home --uid 10001 paradise \

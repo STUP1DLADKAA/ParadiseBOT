@@ -34,11 +34,12 @@ Design notes
 * Every ignore reason is logged at INFO. Silence with no log line is the one
   failure mode that is impossible to debug from the outside.
 * **It can also hear you.** With ``VOICE_WAKE_ENABLED`` (the default) the
-  channel is monitored for speech: an utterance is recorded locally, sent to
-  speech-to-text once it *ends*, and only then checked for the wake phrase
-  (:mod:`functions.voice_wake`). Nothing is uploaded until you have finished
-  a sentence, per-user consent still applies, and the channel is told once
-  that Paradise is listening.
+  channel is monitored for speech: an utterance is recorded locally and
+  transcribed **on this machine** once it *ends* — faster-whisper, no key, no
+  upload — before the wake phrase is checked (:mod:`functions.voice_wake`).
+  Cloud recognition is a fallback for hosts that cannot run Whisper, chosen
+  with ``VOICE_WAKE_STT``. Per-user consent still applies, and the channel is
+  told once that Paradise is listening.
 """
 
 from __future__ import annotations
@@ -62,8 +63,10 @@ from functions.dictionary.playback import (
 from functions.helpers import ParadiseError, shorten, split_discord_text
 from functions.tts import SpeechClip, SpeechService, build_speech_service
 from functions.voice_wake import (
+    INSTALL_HINT,
     ElevenLabsTranscriber,
     GeminiTranscriber,
+    LocalWhisperTranscriber,
     SpeechToTextChain,
     SpokenRequest,
     SpokenWakeListener,
@@ -179,10 +182,19 @@ class Wake(commands.Cog):
 
         chain = SpeechToTextChain(*self._stt_providers(self.voice_wake.stt))
         if not chain.available:
-            log.warning(
-                "Spoken wake word idle: no speech-to-text provider. Set "
-                "ELEVENLABS_API_KEY (Scribe) or GEMINI_API_KEY."
-            )
+            if self.voice_wake.stt == "local":
+                log.warning(
+                    "Spoken wake word idle: on-device speech-to-text is not "
+                    "installed. Run `%s`, or set VOICE_WAKE_STT=auto to allow "
+                    "the cloud providers.",
+                    INSTALL_HINT,
+                )
+            else:
+                log.warning(
+                    "Spoken wake word idle: no speech-to-text provider. Run "
+                    "`%s`, or set ELEVENLABS_API_KEY / GEMINI_API_KEY.",
+                    INSTALL_HINT,
+                )
             return
 
         self.listener = SpokenWakeListener(
@@ -206,11 +218,29 @@ class Wake(commands.Cog):
         asyncio.create_task(self.listener.start(), name="paradise-spoken-wake-start")
 
     def _stt_providers(self, choice: str) -> list:
-        """Build the transcription chain for ``VOICE_WAKE_STT``."""
+        """Build the transcription chain for ``VOICE_WAKE_STT``.
+
+        ``auto`` (the default) tries the on-device engine first: it is free,
+        private and offline, and the cloud providers exist only as a fallback
+        for machines that cannot run Whisper.
+        """
         config = getattr(self.bot, "config", None)
         eleven_key = getattr(getattr(config, "elevenlabs", None), "api_key", "") or ""
         gemini = getattr(getattr(self.bot, "ai", None), "gemini", None)
+        wake = self.voice_wake
         providers: list = []
+        if choice in {"auto", "local"}:
+            providers.append(
+                LocalWhisperTranscriber(
+                    model=getattr(wake, "stt_model", "small"),
+                    device=getattr(wake, "stt_device", "cpu"),
+                    compute_type=getattr(wake, "stt_compute", "int8"),
+                    threads=getattr(wake, "stt_threads", 0),
+                    model_dir=getattr(wake, "stt_model_dir", ""),
+                    offline=getattr(wake, "stt_offline", False),
+                    unload_after=getattr(wake, "stt_unload_after", 900.0),
+                )
+            )
         if choice in {"auto", "elevenlabs"}:
             providers.append(ElevenLabsTranscriber(eleven_key, timeout=25.0))
         if choice in {"auto", "gemini"}:
@@ -427,6 +457,15 @@ class Wake(commands.Cog):
         except discord.DiscordException:
             log.debug("Could not post the spoken answer", exc_info=True)
 
+    def _transcription_is_local(self) -> bool:
+        """True when the active chain can recognise speech without a network."""
+        providers = getattr(getattr(self.listener, "stt", None), "providers", [])
+        return any(
+            getattr(provider, "name", "") == "local"
+            and getattr(provider, "available", False)
+            for provider in providers
+        )
+
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after) -> None:
         """Announce the listener once, when Paradise joins a voice channel."""
@@ -440,11 +479,17 @@ class Wake(commands.Cog):
         if not self.voice_wake.announce or guild.id in self._announced:
             return
         self._announced.add(guild.id)
+        if self._transcription_is_local():
+            privacy = (
+                "your voice is transcribed on this machine, nothing is uploaded, "
+                "and only once you finish a sentence"
+            )
+        else:
+            privacy = "audio is only sent to the speech service once you finish a sentence"
         text = (
             "🎙 **listening for “hey paradise”** — say it in this channel and i'll "
-            "answer out loud. audio is only sent to the speech service once you "
-            "finish a sentence; `/voicewake status` shows what i heard last, and "
-            "`/voicewake stop` turns it off here."
+            f"answer out loud. {privacy}; `/voicewake status` shows what i heard "
+            "last, and `/voicewake stop` turns it off here."
         )
         await self._post_text(channel, text)
 
@@ -815,10 +860,17 @@ class Wake(commands.Cog):
         if not self.voice_wake.listening:
             lines.append("**off** — `VOICE_WAKE_ENABLED=false` in `.env`.")
         elif listener is None:
-            lines.append(
-                "**idle** — enabled, but no speech-to-text provider is configured. "
-                "Set `ELEVENLABS_API_KEY` (Scribe) or `GEMINI_API_KEY`."
-            )
+            if getattr(self.voice_wake, "stt", "auto") == "local":
+                lines.append(
+                    "**idle** — on-device speech-to-text is not installed. Run "
+                    f"`{INSTALL_HINT}`, then restart the bot."
+                )
+            else:
+                lines.append(
+                    "**idle** — enabled, but no speech-to-text provider is "
+                    f"available. Run `{INSTALL_HINT}` (on-device, no key), or set "
+                    "`ELEVENLABS_API_KEY` / `GEMINI_API_KEY`."
+                )
         elif guild_id in self._paused_guilds:
             lines.append("**paused here** — `/voicewake start` to resume.")
         else:
@@ -832,9 +884,15 @@ class Wake(commands.Cog):
             )
             if stats.last_transcript:
                 lines.append(f"last heard: “{discord.utils.escape_markdown(stats.last_transcript[:180])}”")
-        lines.append(
-            "audio is only sent after an utterance ends; `/clip` opt-out is honoured."
-        )
+        if listener is not None and self._transcription_is_local():
+            lines.append(
+                "transcription runs **on this machine** — no audio is uploaded — "
+                "and only after an utterance ends; `/clip` opt-out is honoured."
+            )
+        else:
+            lines.append(
+                "audio is only sent after an utterance ends; `/clip` opt-out is honoured."
+            )
         embed = discord.Embed(
             title="🎙 Spoken wake word",
             description="\n".join(lines),

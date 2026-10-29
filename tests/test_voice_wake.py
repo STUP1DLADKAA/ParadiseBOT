@@ -22,7 +22,10 @@ import asyncio
 import os
 import struct
 import sys
+import threading
+import time
 import unittest
+from types import SimpleNamespace
 
 import numpy as np
 
@@ -284,7 +287,8 @@ class TestTranscriptionChain(unittest.TestCase):
     def test_unavailable_chain_says_so(self):
         chain = SpeechToTextChain(ElevenLabsTranscriber(""))
         self.assertFalse(chain.available)
-        self.assertIn("(off)", chain.describe())
+        self.assertIn("elevenlabs", chain.describe())
+        self.assertIn("no key", chain.describe())
 
 
 # ---------------------------------------------------------------------------
@@ -809,3 +813,367 @@ class CogTest(unittest.IsolatedAsyncioTestCase):
     async def test_voicewake_commands_are_registered(self):
         names = {command.name for command in self.cog.voicewake.commands}
         self.assertEqual(names, {"status", "stop", "start", "notice"})
+
+
+# ---------------------------------------------------------------------------
+# On-device speech-to-text (faster-whisper): no key, no network, no upload
+# ---------------------------------------------------------------------------
+
+
+class FakeWhisperModel:
+    """The two attributes of a WhisperModel the transcriber actually uses."""
+
+    def __init__(self, text="hey paradise what's the time", delay=0.0, segments=None):
+        self.text = text
+        self.delay = delay
+        self.segments = segments
+        self.calls: list = []
+
+    def transcribe(self, audio, **options):
+        self.calls.append((np.asarray(audio), options, threading.current_thread().name))
+        if self.delay:
+            time.sleep(self.delay)
+        pieces = self.segments if self.segments is not None else [self.text]
+        info = SimpleNamespace(
+            language=options.get("language") or "en", language_probability=0.98
+        )
+        return iter([SimpleNamespace(text=piece) for piece in pieces]), info
+
+
+class LocalSTTTest(unittest.IsolatedAsyncioTestCase):
+    def wav(self, seconds: float = 0.5, rate: int = 16000) -> bytes:
+        count = int(rate * seconds)
+        tone = (np.sin(np.linspace(0, 2 * np.pi * 8, count)) * 9000).astype(np.int16)
+        return to_wav(tone, rate=rate, target_rate=rate)
+
+    def build(self, model: FakeWhisperModel | None = None, **kwargs):
+        from functions.voice_wake.local_stt import LocalWhisperTranscriber
+
+        model = model or FakeWhisperModel()
+        loads = []
+
+        def loader():
+            loads.append(model)
+            return model
+
+        transcriber = LocalWhisperTranscriber(loader=loader, **kwargs)
+        return transcriber, model, loads
+
+    async def test_a_sentence_comes_back_as_text(self):
+        transcriber, model, loads = self.build()
+        self.assertTrue(transcriber.available)
+        text = await transcriber.transcribe(self.wav(), language="hi")
+        self.assertEqual(text, "hey paradise what's the time")
+        self.assertEqual(len(loads), 1)
+        self.assertTrue(transcriber.loaded)
+        self.assertGreater(transcriber.last_audio_seconds, 0.4)
+
+    async def test_audio_reaches_the_model_as_16k_float32(self):
+        transcriber, model, _ = self.build()
+        await transcriber.transcribe(self.wav(seconds=0.5, rate=16000))
+        audio, options, _thread = model.calls[0]
+        self.assertEqual(audio.dtype, np.float32)
+        self.assertAlmostEqual(audio.size, 8000, delta=16)
+        self.assertLessEqual(float(np.abs(audio).max()), 1.0)
+        self.assertGreater(float(np.abs(audio).max()), 0.1)
+
+    async def test_the_decoder_is_steered_toward_the_wake_phrase(self):
+        transcriber, model, _ = self.build()
+        await transcriber.transcribe(self.wav(), language="hi")
+        _audio, options, _thread = model.calls[0]
+        self.assertIn("hey paradise", options["initial_prompt"].lower())
+        self.assertEqual(options["language"], "hi")
+        self.assertFalse(options["condition_on_previous_text"])
+        self.assertFalse(options["vad_filter"])
+
+    async def test_inference_runs_off_the_event_loop(self):
+        transcriber, model, _ = self.build(FakeWhisperModel(delay=0.05))
+        started = time.monotonic()
+        await asyncio.gather(transcriber.transcribe(self.wav()), asyncio.sleep(0.01))
+        self.assertGreaterEqual(time.monotonic() - started, 0.05)
+        _audio, _options, thread = model.calls[0]
+        self.assertNotEqual(thread, threading.current_thread().name)
+        self.assertTrue(thread.startswith("paradise-whisper"))
+
+    async def test_the_model_is_loaded_once(self):
+        transcriber, _model, loads = self.build()
+        await transcriber.transcribe(self.wav())
+        await transcriber.transcribe(self.wav())
+        self.assertEqual(len(loads), 1)
+
+    async def test_segments_are_joined_into_one_line(self):
+        transcriber, _model, _ = self.build(
+            FakeWhisperModel(segments=["hey paradise,", " play", " kesariya\n"])
+        )
+        self.assertEqual(await transcriber.transcribe(self.wav()), "hey paradise, play kesariya")
+
+    async def test_silence_is_never_transcribed(self):
+        transcriber, _model, loads = self.build()
+        self.assertEqual(await transcriber.transcribe(b""), "")
+        self.assertEqual(await transcriber.transcribe(to_wav(np.zeros(0, dtype=np.int16))), "")
+        self.assertEqual(loads, [])
+
+    async def test_a_48k_utterance_is_decimated(self):
+        transcriber, model, _ = self.build()
+        await transcriber.transcribe(self.wav(seconds=1.0, rate=48000))
+        audio, _options, _thread = model.calls[0]
+        self.assertAlmostEqual(audio.size, 16000, delta=64)
+
+    async def test_a_broken_model_is_explained_and_not_retried_every_time(self):
+        from functions.voice_wake.local_stt import LOAD_RETRY_SECONDS
+
+        now = [1000.0]
+        attempts = []
+
+        def loader():
+            attempts.append(now[0])
+            raise ConnectionError("no route to host")
+
+        from functions.voice_wake.local_stt import LocalWhisperTranscriber
+
+        transcriber = LocalWhisperTranscriber(loader=loader, clock=lambda: now[0])
+        with self.assertRaises(SpeechToTextUnavailable) as caught:
+            await transcriber.transcribe(self.wav())
+        self.assertIn("VOICE_WAKE_STT_MODEL_DIR", str(caught.exception))
+        self.assertIn("internet", str(caught.exception))
+        with self.assertRaises(SpeechToTextUnavailable):
+            await transcriber.transcribe(self.wav())
+        self.assertEqual(len(attempts), 1, "a failed load must not retry immediately")
+        now[0] += LOAD_RETRY_SECONDS + 1
+        with self.assertRaises(SpeechToTextUnavailable):
+            await transcriber.transcribe(self.wav())
+        self.assertEqual(len(attempts), 2, "after the cooldown it may try again")
+
+    async def test_the_chain_falls_back_to_the_cloud_when_local_fails(self):
+        def broken():
+            raise RuntimeError("ctranslate2 could not open the model")
+
+        from functions.voice_wake.local_stt import LocalWhisperTranscriber
+
+        local = LocalWhisperTranscriber(loader=broken)
+        chain = SpeechToTextChain(
+            local, FakeTranscriber(text="hey paradise skip this song")
+        )
+        self.assertEqual(
+            await chain.transcribe(self.wav()), "hey paradise skip this song"
+        )
+        self.assertIn("VOICE_WAKE_STT_MODEL_DIR", local.load_error)
+
+    async def test_idle_unload_frees_the_model(self):
+        transcriber, _model, loads = self.build(unload_after=0.01)
+        await transcriber.transcribe(self.wav())
+        self.assertTrue(transcriber.loaded)
+        await asyncio.sleep(0.08)
+        self.assertFalse(transcriber.loaded, "the weights should be dropped when idle")
+        await transcriber.transcribe(self.wav())
+        self.assertEqual(len(loads), 2, "and loaded again on the next sentence")
+
+    async def test_a_stuck_decode_times_out(self):
+        transcriber, _model, _ = self.build(FakeWhisperModel(delay=0.4))
+        transcriber.timeout = 0.05
+        with self.assertRaises(SpeechToTextUnavailable):
+            await transcriber.transcribe(self.wav())
+
+    async def test_missing_dependency_is_reported_not_crashed(self):
+        from unittest.mock import patch
+
+        from functions.voice_wake.local_stt import (
+            INSTALL_HINT,
+            LocalWhisperTranscriber,
+        )
+
+        with patch("importlib.util.find_spec", return_value=None):
+            transcriber = LocalWhisperTranscriber()
+            self.assertFalse(transcriber.installed)
+            self.assertFalse(transcriber.available)
+            self.assertIn("not installed", transcriber.describe())
+            with self.assertRaises(SpeechToTextUnavailable) as caught:
+                await transcriber.transcribe(self.wav())
+            self.assertIn(INSTALL_HINT, str(caught.exception))
+
+    def test_describe_names_the_model_and_precision(self):
+        from functions.voice_wake.local_stt import LocalWhisperTranscriber
+
+        transcriber = LocalWhisperTranscriber(loader=lambda: None, model="small")
+        self.assertEqual(transcriber.name, "local")
+        self.assertIn("whisper small", transcriber.describe())
+        self.assertIn("int8", transcriber.describe())
+
+    async def test_close_releases_the_thread(self):
+        transcriber, _model, _ = self.build()
+        await transcriber.transcribe(self.wav())
+        await transcriber.close()
+        self.assertFalse(transcriber.available)
+        self.assertFalse(transcriber.loaded)
+        with self.assertRaises(SpeechToTextUnavailable):
+            await transcriber.transcribe(self.wav())
+
+
+class TestLocalSTTConfig(unittest.TestCase):
+    def test_defaults_are_on_device_enough(self):
+        config = VoiceWakeConfig.from_env({})
+        self.assertEqual(config.stt_model, "small")
+        self.assertEqual(config.stt_device, "cpu")
+        self.assertEqual(config.stt_compute, "int8")
+        self.assertFalse(config.stt_offline)
+        self.assertEqual(config.stt_unload_after, 900.0)
+
+    def test_a_local_only_chain_is_selectable(self):
+        self.assertEqual(
+            VoiceWakeConfig.from_env({"VOICE_WAKE_STT": "local"}).stt, "local"
+        )
+
+    def test_settings_are_sanitised(self):
+        config = VoiceWakeConfig.from_env(
+            {
+                "VOICE_WAKE_STT_MODEL": "large-v3-turbo",
+                "VOICE_WAKE_STT_THREADS": "999",
+                "VOICE_WAKE_STT_UNLOAD_AFTER": "-5",
+                "VOICE_WAKE_STT_OFFLINE": "1",
+            }
+        )
+        self.assertEqual(config.stt_model, "large-v3-turbo")
+        self.assertLessEqual(config.stt_threads, 64)
+        self.assertEqual(config.stt_unload_after, 0.0)
+        self.assertTrue(config.stt_offline)
+
+
+@unittest.skipUnless(
+    os.environ.get("VOICE_WAKE_STT_MODEL_DIR"),
+    "set VOICE_WAKE_STT_MODEL_DIR to a real faster-whisper model to run Whisper itself",
+)
+class TestRealWhisper(unittest.IsolatedAsyncioTestCase):
+    """Opt-in: real weights, real decode. `VOICE_WAKE_STT_MODEL_DIR=/models/small`."""
+
+    async def test_a_synthesised_sentence_is_transcribed(self):
+        from functions.voice_wake.local_stt import LocalWhisperTranscriber
+
+        model_dir = os.environ["VOICE_WAKE_STT_MODEL_DIR"]
+        transcriber = LocalWhisperTranscriber(
+            model_dir=model_dir, offline=True, unload_after=0.0
+        )
+        text = await transcriber.transcribe(self.wav())
+        self.assertIsInstance(text, str)
+
+    def wav(self, seconds: float = 1.0) -> bytes:
+        count = int(16000 * seconds)
+        tone = (np.sin(np.linspace(0, 2 * np.pi * 220, count)) * 9000).astype(np.int16)
+        return to_wav(tone, rate=16000, target_rate=16000)
+
+
+class TestProviderOrder(unittest.IsolatedAsyncioTestCase):
+    """`VOICE_WAKE_STT` decides who recognises speech, and local comes first."""
+
+    async def asyncSetUp(self):
+        from types import SimpleNamespace as NS
+
+        from commands.wake import Wake
+
+        self.bot = NS(
+            user=NS(id=1),
+            ai=NS(gemini=NS(available=True)),
+            guilds=[],
+            config=Config(
+                elevenlabs=NS(api_key="xi-key"),
+                wake=WakeConfig(speak=False),
+                voice_wake=VoiceWakeConfig(enabled=False),
+            ),
+            voice_clip_service=NS(add_tap=lambda fn: None, remove_tap=lambda fn: None),
+            get_cog=lambda name: None,
+            get_guild=lambda gid: None,
+        )
+        self.cog = Wake(self.bot)
+
+    def names(self, choice: str) -> list[str]:
+        return [provider.name for provider in self.cog._stt_providers(choice)]
+
+    def test_auto_tries_the_machine_before_the_internet(self):
+        self.assertEqual(self.names("auto"), ["local", "elevenlabs", "gemini"])
+
+    def test_local_only_means_local_only(self):
+        self.assertEqual(self.names("local"), ["local"])
+
+    def test_the_cloud_is_still_reachable_on_request(self):
+        self.assertEqual(self.names("elevenlabs"), ["elevenlabs"])
+        self.assertEqual(self.names("gemini"), ["gemini"])
+
+    def test_local_settings_reach_the_transcriber(self):
+        from types import SimpleNamespace as NS
+
+        from commands.wake import Wake
+        from functions.voice_wake.local_stt import LocalWhisperTranscriber
+
+        bot = NS(
+            user=self.bot.user,
+            ai=self.bot.ai,
+            guilds=[],
+            config=Config(
+                elevenlabs=NS(api_key="xi-key"),
+                wake=WakeConfig(speak=False),
+                voice_wake=VoiceWakeConfig(
+                    enabled=True,
+                    stt_model="base",
+                    stt_compute="float32",
+                    stt_offline=True,
+                    stt_unload_after=0.0,
+                ),
+            ),
+            voice_clip_service=self.bot.voice_clip_service,
+        )
+        cog = Wake(bot)
+        (provider,) = cog._stt_providers("local")
+        self.assertIsInstance(provider, LocalWhisperTranscriber)
+        self.assertEqual(provider.model, "base")
+        self.assertEqual(provider.compute_type, "float32")
+        self.assertTrue(provider.offline)
+        self.assertEqual(provider.unload_after, 0.0)
+
+
+def _whisper_installed() -> bool:
+    import importlib.util
+
+    try:
+        return importlib.util.find_spec("faster_whisper") is not None
+    except (ImportError, ValueError):  # pragma: no cover - broken install
+        return False
+
+
+@unittest.skipUnless(_whisper_installed(), "faster-whisper is not installed")
+class TestRealWhisperAudioContract(unittest.IsolatedAsyncioTestCase):
+    """The array we hand over must be what real Whisper code expects.
+
+    ``FeatureExtractor`` is the first thing a real ``WhisperModel`` runs: it
+    turns float32 mono audio into the 80-channel log-mel spectrogram the encoder
+    consumes. Feeding it proves the dtype, the scale and the 16 kHz assumption
+    without needing 75 MB of weights.
+    """
+
+    async def test_our_pcm_becomes_a_whisper_spectrogram(self):
+        from faster_whisper.feature_extractor import FeatureExtractor
+
+        from functions.voice_wake.local_stt import LocalWhisperTranscriber
+
+        seen = {}
+
+        class Model:
+            def transcribe(self, audio, **options):
+                features = FeatureExtractor()(audio)
+                seen["shape"] = features.shape
+                seen["dtype"] = features.dtype
+                seen["level"] = float(np.sqrt(np.mean(features**2)))
+                seen["options"] = options
+                return iter([]), SimpleNamespace(language="en", language_probability=0.9)
+
+        transcriber = LocalWhisperTranscriber(loader=Model)
+        tone = (np.sin(np.linspace(0, 2 * np.pi * 220, 32000)) * 9000).astype(np.int16)
+        await transcriber.transcribe(to_wav(tone, rate=16000, target_rate=16000), language="hi")
+
+        rows, columns = seen["shape"]
+        self.assertEqual(rows, 80, "whisper's mel filterbank has 80 channels")
+        # 2 s of audio → 200 frames of 10 ms, plus the padded context window.
+        self.assertGreaterEqual(columns, 199)
+        self.assertLessEqual(columns, 3200)
+        self.assertEqual(seen["dtype"], np.float32)
+        self.assertGreater(seen["level"], 0.1)
+        self.assertEqual(seen["options"]["language"], "hi")
+        self.assertIn("hey paradise", seen["options"]["initial_prompt"].lower())

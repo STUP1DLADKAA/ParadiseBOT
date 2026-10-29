@@ -120,6 +120,25 @@ Hey Paradise what's the capital of Rajasthan?
   channels are ignored.
 * Text always works. Speech needs PyNaCl + ffmpeg (both in `requirements.txt`).
 
+### Saying it out loud — transcribed on your own CPU
+
+The wake word also works when **spoken** in the channel, and the recognition
+runs inside the bot (faster-whisper, no key, no upload):
+
+```bash
+python -m pip install -r requirements-local-stt.txt   # once, ~250 MB
+```
+
+* The first utterance downloads the model (75 MB for `small`) into the Hugging
+  Face cache; after that it is fully offline. `VOICE_WAKE_STT_MODEL_DIR` points
+  at weights you already have, `VOICE_WAKE_STT_OFFLINE=true` forbids the network.
+* `VOICE_WAKE_STT=local` guarantees no audio ever leaves the machine; `auto`
+  (the default) tries the local engine first and only falls back to
+  `ELEVENLABS_API_KEY`/`GEMINI_API_KEY` recognition when Whisper is not
+  installed.
+* It joins undeafened because a deafened client receives no audio at all.
+* Full guide: [docs/voice-wake.md](voice-wake.md).
+
 ---
 
 ## 5. Voice presence: silent joins

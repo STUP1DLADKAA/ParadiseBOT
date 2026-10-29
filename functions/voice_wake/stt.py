@@ -234,6 +234,17 @@ class GeminiTranscriber:
         return " ".join(str(text or "").split()).strip()
 
 
+def _describe_provider(provider: Transcriber) -> str:
+    """One short label per backend, e.g. "local whisper small (int8 on cpu)"."""
+    describe = getattr(provider, "describe", None)
+    label = describe() if callable(describe) else getattr(provider, "name", "?")
+    if provider.available:
+        return label
+    if "(off)" in label or "not " in label or "no " in label:
+        return label  # the provider already says why it is unavailable
+    return f"{label} (off)"
+
+
 class SpeechToTextChain:
     """Try each backend in order; report the first usable transcript."""
 
@@ -248,10 +259,7 @@ class SpeechToTextChain:
     def describe(self) -> str:
         if not self.providers:
             return "speech-to-text: none"
-        names = ", ".join(
-            f"{provider.name}{'' if provider.available else ' (off)'}"
-            for provider in self.providers
-        )
+        names = ", ".join(_describe_provider(provider) for provider in self.providers)
         return f"speech-to-text: {names}"
 
     async def transcribe(self, wav: bytes, *, language: str = "") -> str:

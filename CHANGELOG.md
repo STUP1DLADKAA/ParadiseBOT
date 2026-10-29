@@ -6,19 +6,34 @@ All notable changes to Paradise are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **Speech recognition now runs on the bot's own CPU.** The wake word is
+  transcribed by faster-whisper inside the process — no API key, no upload,
+  works offline once the weights are downloaded — so `VOICE_WAKE_STT=auto`
+  never touches ElevenLabs or Gemini while the local engine is installed.
+  `pip install -r requirements-local-stt.txt` enables it (the Docker image does
+  it by default); `VOICE_WAKE_STT=local` forbids the cloud entirely. Loading and
+  inference run on a dedicated one-thread executor, the model is freed after 15
+  minutes of silence, and a missing dependency, a failed download or a stuck
+  decode is reported in plain words instead of going silent.
+  New keys: `VOICE_WAKE_STT_MODEL`, `_DEVICE`, `_COMPUTE`, `_THREADS`,
+  `_MODEL_DIR`, `_OFFLINE`, `_UNLOAD_AFTER`. [docs/voice-wake.md](docs/voice-wake.md).
+
 ### Added
 - **The wake word can be spoken.** Paradise listens to the voice channel it is
   already in, waits for an utterance to end, transcribes it once
-  (ElevenLabs Scribe, else Gemini audio), and only then checks for
+  (on-device Whisper, with Scribe/Gemini as an opt-in fallback), and only then checks for
   "hey paradise" — English, Hinglish and Devanagari, including the usual
   speech-to-text mis-hearings ("he paradise", "pair of dice", "अरे पैराडाइज़").
-  `functions/voice_wake/`, `/voicewake status|stop|start|notice`,
+  Transcribed on-device by default (see above).
+  `functions/voice_wake/`, `requirements-local-stt.txt`,
+  `/voicewake status|stop|start|notice`,
   [docs/voice-wake.md](docs/voice-wake.md).
 - Per-utterance endpointing: energy-based VAD, 100 ms pre-roll, 700 ms silence
-  to close, 12 s hard cap, and down-mixing to 16 kHz mono before upload.
-- `VOICE_WAKE_*` settings (15 keys), a receive-tap hook on the voice receiver
+  to close, 12 s hard cap, and down-mixing to 16 kHz mono before recognition.
+- 22 `VOICE_WAKE_*` settings, a receive-tap hook on the voice receiver
   (`VoiceClipService.add_tap`) so other features can observe audio safely, and
-  45 new tests including real Opus and real RTP-decryption paths.
+  68 new tests including real Opus, real RTP-decryption and real Whisper paths.
 
 ### Changed
 - The voice receiver now runs when **either** the clip buffer or the spoken wake
