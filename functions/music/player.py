@@ -130,6 +130,18 @@ class GuildPlayer:
                 return factory()
             except Exception:  # noqa: BLE001 - fall back to the default client
                 log.debug("voice client class lookup failed", exc_info=True)
+        # Without the presence cog, decide here: a receive-capable client is
+        # required whenever the clip buffer or the spoken wake word is on.
+        config = getattr(self.service.bot, "config", None)
+        if bool(getattr(getattr(config, "voice_clip", None), "enabled", False)) or bool(
+            getattr(getattr(config, "voice_wake", None), "listening", False)
+        ):
+            try:
+                from functions.voice_clip import ClipVoiceClient
+
+                return ClipVoiceClient
+            except Exception:  # noqa: BLE001 - optional dependency
+                log.debug("ClipVoiceClient unavailable", exc_info=True)
         return discord.VoiceClient
 
     def detach(self) -> None:

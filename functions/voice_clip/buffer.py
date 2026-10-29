@@ -246,6 +246,16 @@ class RollingAudioBuffer:
                 self._received_any_audio = True
             return True
 
+    def epoch_for(self, user_id: int) -> int:
+        """Current stream epoch for ``user_id`` (0 when never seen).
+
+        Read-only and lock-free for the caller's convenience: a wrong-by-one
+        epoch only tells an observer to reset its decoder one packet early.
+        """
+        with self._lock:
+            stream = self._speakers.get(int(user_id))
+            return int(getattr(stream, "stream_epoch", 0)) if stream is not None else 0
+
     def mark_speaker_discontinuity(self, user_id: int) -> None:
         """Increment stream epoch when a speaker leaves/reconnects mid-buffer."""
         with self._lock:

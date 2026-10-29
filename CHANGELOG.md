@@ -7,6 +7,27 @@ All notable changes to Paradise are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The wake word can be spoken.** Paradise listens to the voice channel it is
+  already in, waits for an utterance to end, transcribes it once
+  (ElevenLabs Scribe, else Gemini audio), and only then checks for
+  "hey paradise" — English, Hinglish and Devanagari, including the usual
+  speech-to-text mis-hearings ("he paradise", "pair of dice", "अरे पैराडाइज़").
+  `functions/voice_wake/`, `/voicewake status|stop|start|notice`,
+  [docs/voice-wake.md](docs/voice-wake.md).
+- Per-utterance endpointing: energy-based VAD, 100 ms pre-roll, 700 ms silence
+  to close, 12 s hard cap, and down-mixing to 16 kHz mono before upload.
+- `VOICE_WAKE_*` settings (15 keys), a receive-tap hook on the voice receiver
+  (`VoiceClipService.add_tap`) so other features can observe audio safely, and
+  45 new tests including real Opus and real RTP-decryption paths.
+
+### Changed
+- The voice receiver now runs when **either** the clip buffer or the spoken wake
+  word needs it (`VoiceClipService.receiving_wanted`), so `VOICE_CLIP_ENABLED`
+  can stay off.
+- The channel is told once, on first join, that Paradise is listening; anyone
+  who opted out of voice capture is dropped before the listener sees a packet.
+
+### Added
 - **Music, in-process.** `/music …`, `!p`-style text commands, a `/cmd` button
   panel, and voice requests in English, Hinglish and Devanagari
   ("Hey Paradise play billie jean", "billie jean baja do", "अगला गाना लगाओ").

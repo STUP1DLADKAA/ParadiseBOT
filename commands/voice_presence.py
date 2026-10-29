@@ -384,9 +384,17 @@ class VoicePresence(commands.Cog):
             await self._on_joined(guild, target)
 
     def _voice_client_class(self):
-        """The receive-capable client when clipping is on, else the default."""
+        """The receive-capable client when anything needs to hear the channel.
+
+        That is the clip buffer *or* the spoken wake word: both are fed by the
+        same receiver, so connecting with the plain client would make the wake
+        word silently deaf.
+        """
         clip_cfg = getattr(getattr(self.bot, "config", None), "voice_clip", None)
-        if bool(getattr(clip_cfg, "enabled", False)):
+        wake_cfg = getattr(getattr(self.bot, "config", None), "voice_wake", None)
+        if bool(getattr(clip_cfg, "enabled", False)) or bool(
+            getattr(wake_cfg, "listening", False)
+        ):
             return ClipVoiceClient
         return discord.VoiceClient
 

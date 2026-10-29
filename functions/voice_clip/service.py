@@ -98,6 +98,9 @@ class VoiceClipService:
         self._lock = threading.Lock()
         self._buffers: dict[int, RollingAudioBuffer] = {}
         self._routers: dict[int, VoiceReceiveRouter] = {}
+        #: Observers of accepted packets (the spoken wake word listens here).
+        #: Shared list, read on the UDP thread, guarded by ``_lock`` on write.
+        self._taps: list = []
 
         self.consent = ConsentManager(
             mode=self.config.consent_mode,
@@ -116,6 +119,41 @@ class VoiceClipService:
     @property
     def enabled(self) -> bool:
         return bool(self.config.enabled)
+
+    @property
+    def receiving_wanted(self) -> bool:
+        """Should voice connections use the receive-capable client?
+
+        The receiver is what makes a spoken wake word possible, so it is
+        needed when *either* the clip buffer or voice listening is on.
+        """
+        wake = getattr(getattr(self.bot, "config", None), "voice_wake", None)
+        return bool(self.config.enabled or getattr(wake, "listening", False))
+
+    # ------------------------------------------------------------------
+    # Packet taps (spoken wake word)
+    # ------------------------------------------------------------------
+
+    def add_tap(self, tap) -> None:
+        """Register an observer called with ``(guild_id, user_id, packet)``."""
+        with self._lock:
+            if tap not in self._taps:
+                self._taps.append(tap)
+
+    def remove_tap(self, tap) -> None:
+        with self._lock:
+            try:
+                self._taps.remove(tap)
+            except ValueError:
+                pass
+
+    def _fan_out(self, guild_id: int, user_id: int, packet) -> None:
+        taps = list(self._taps)
+        for tap in taps:
+            try:
+                tap(guild_id, user_id, packet)
+            except Exception:  # noqa: BLE001 - an observer must not break audio
+                log.debug("voice clip tap failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Buffer & Receiver Attachment
@@ -173,6 +211,11 @@ class VoiceClipService:
             old_router = self._routers.pop(gid, None)
             if old_router is not None:
                 old_router.reset()
+            gid_for_tap = gid
+
+            def tap(user_id: int, packet, _gid: int = gid_for_tap) -> None:
+                self._fan_out(_gid, user_id, packet)
+
             router = VoiceReceiveRouter(
                 guild_id=gid,
                 buffer=buf,
@@ -180,6 +223,7 @@ class VoiceClipService:
                 is_bot_user=_is_bot,
                 dave_state_getter=_dave_state,
                 clock=self._clock,
+                taps=[tap],
             )
             self._routers[gid] = router
         return router
