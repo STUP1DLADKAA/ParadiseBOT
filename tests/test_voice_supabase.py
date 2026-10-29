@@ -383,13 +383,13 @@ class TestOutageFallback(SupabaseStoreTestBase):
 
     async def test_verify_schema_rejects_a_newer_database(self):
         # A bot older than the schema must not run against it silently.
-        self.fake.schema_version = 4
+        self.fake.schema_version = 5
         with self.assertRaises(VoiceSchemaError) as ctx:
             await self.store.verify_schema()
         self.assertIn("newer", str(ctx.exception))
 
     async def test_verify_schema_ok(self):
-        self.assertEqual(await self.store.verify_schema(), 3)
+        self.assertEqual(await self.store.verify_schema(), 4)
         self.assertTrue(self.store.supports_checkpoints)
 
     async def test_verify_schema_accepts_v2_in_compatibility_mode(self):
@@ -762,8 +762,12 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(blocked, 0)
         alert_channel.send.assert_awaited_once()
         sent_kwargs = alert_channel.send.call_args.kwargs
-        self.assertIn("Daily Voice Leaderboard — October 25, 2026", sent_kwargs["embed"].title)
-        self.assertIn("4h", sent_kwargs["embed"].footer.text)
+        # The card itself carries the day and the total; the embed only frames
+        # it, so there is no second headline to read twice.
+        embed = sent_kwargs["embed"]
+        self.assertIsNone(embed.title)
+        self.assertEqual(embed.image.url, "attachment://daily_vc_leaderboard.png")
+        self.assertEqual(embed.footer.text, "Paradise")
 
         # Calling again for the same date is idempotent (no duplicate post).
         blocked_again = await self.tracker.dispatch_daily_channel_leaderboard("2026-10-25")

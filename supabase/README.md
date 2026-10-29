@@ -18,16 +18,33 @@ queue while Supabase is unreachable.
 3. For a new database, run [`migrations/001_voice_activity.sql`](migrations/001_voice_activity.sql) first.
 4. Run [`migrations/002_voice_ist_calendar.sql`](migrations/002_voice_ist_calendar.sql) second.
 5. Run [`migrations/003_voice_checkpoint.sql`](migrations/003_voice_checkpoint.sql) third.
+6. Run [`migrations/004_voice_credit_carry.sql`](migrations/004_voice_credit_carry.sql) fourth.
 
 Each migration is transactional and safe to re-run. If the project already has
-schema version 1, apply migrations 002 **and** 003. If it is already at 2,
-apply **only migration 003**. The bot requires schema version **3**.
+schema version 1, apply migrations 002, 003 **and** 004. At version 2, apply
+**003 and 004**. At version 3, apply **only 004**. The bot requires schema
+version **4**.
+
+> **What 004 fixes.** A day in a voice channel used to be credited a few
+> minutes short — 24 hours landed in the database as ~23 h 51 m. The checkpoint
+> credited a whole number of seconds but then moved its cursor to the requested
+> instant, so every fraction of a second the `floor()` discarded was lost, and
+> that happened once per checkpoint window all day long. 004 advances the cursor
+> by the seconds that were actually credited, so the remainder is credited by
+> the next checkpoint instead of disappearing, and the session close rounds the
+> final partial second. Nothing else changes: same tables, same columns, same
+> AFK rule, same IST splitting. Re-running 003 rolls it back.
 
 > **The bot can be deployed before 003 is applied.** Against a version-2
 > database it runs in a documented *degraded mode*: tracking continues, but
 > checkpointing is a silent no-op and the older heartbeat is used. It logs one
 > warning at startup. Applying 003 removes the degradation at the next
 > restart — no data is lost either way, and 003 is purely additive.
+>
+> **The bot also works against a version-3 database**, which has the checkpoint
+> but not the fractional carry. Even without 004 the bot itself never loses
+> time (the client always snapshots whole-second boundaries), so 004 matters
+> for any writer that does not, and for the final partial second at close.
 
 Migration 002 changes no tables: it replaces the reporting
 functions and safely rebuckets eligible daily aggregates, while preserving:

@@ -9,10 +9,10 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import VoiceConfig
-from functions.helpers import Colour
 from functions.voice import (
     IMAGE_PAGE_SIZE,
     LeaderboardImageRenderer,
+    leaderboard_image_embed,
     leaderboard_subtitle,
     LeaderboardView,
     VoiceDatabase,
@@ -30,10 +30,9 @@ log = logging.getLogger(__name__)
 SETUP_NEEDED_MESSAGE = (
     "voice tracking isn't configured yet. the owner needs to set "
     "`SUPABASE_URL` and `SUPABASE_SECRET_KEY` in `.env` and apply "
-    "`001_voice_activity.sql`, `002_voice_ist_calendar.sql` and "
-    "`003_voice_checkpoint.sql` in the Supabase SQL Editor (for an existing "
-    "schema v1 apply 002 then 003; for v2 apply only 003; see "
-    "`supabase/README.md`)."
+    "the migrations in "
+    "`supabase/migrations/` (001, 002, 003, 004 — in order) in the Supabase "
+    "SQL Editor, then restart. See `supabase/README.md`."
 )
 
 
@@ -205,20 +204,17 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
                 members=members,
                 page=1,
                 page_size=IMAGE_PAGE_SIZE,
-                subtitle_override=(
-                    f"Server: {interaction.guild.name}   ·   "
-                    + leaderboard_subtitle(
-                        members, page=1, total_pages=total_pages
-                    )
+                subtitle_override=leaderboard_subtitle(
+                    members, page=1, total_pages=total_pages
                 ),
             )
             file = discord.File(io.BytesIO(image_bytes), filename="voice_leaderboard.png")
-            embed = discord.Embed(
-                title=f"🎙️ Voice Activity Leaderboard — {selected_period.label}",
-                colour=Colour.ACCENT,
+            embed = leaderboard_image_embed(
+                interaction.guild,
+                selected_period,
+                page=1,
+                total_pages=total_pages,
             )
-            embed.set_image(url="attachment://voice_leaderboard.png")
-            embed.set_footer(text=f"Server: {interaction.guild.name} • Page 1 of {total_pages}")
             msg = await interaction.followup.send(embed=embed, file=file, view=view)
             view.message = msg
         else:

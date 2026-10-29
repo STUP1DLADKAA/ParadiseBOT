@@ -407,3 +407,82 @@ the code but emitted as one message):
 **Suggested alert thresholds:** any `stale_sessions > 0` sustained for more
 than two cycles; any `max_uncredited_seconds > 900`; any non-zero consecutive
 checkpoint failure count lasting more than 5 minutes.
+
+---
+
+## K. Follow-up: the missing nine minutes (migration 004)
+
+A second, independent shortfall was reported after this document was written:
+**24 hours in a channel showed up as ~23 h 51 m.** The checkpoint machinery
+described above was working exactly as designed — the loss came from one line
+of arithmetic inside `voice_checkpoint_active_sessions`.
+
+### What was wrong
+
+`voice_record_session` credits a **whole** number of seconds (it floors
+`ended_at - started_at`). The checkpoint then advanced its cursor to the
+*requested* instant, not to the instant it had actually credited:
+
+```sql
+-- migration 003
+v_new := greatest(v_from, v_up_to);
+v_secs := voice_record_session(v_from, v_new);   -- floors
+update voice_active_sessions set credited_until = v_new;   -- un-floored
+```
+
+Every checkpoint therefore discarded its fractional second, and it could never
+be recovered — the next interval started *after* the fraction, not before it:
+
+```
+from = 12:00:00.70   up_to = 12:02:00.40   → credits 119 s
+cursor = 12:02:00.40 → 12:02:00.00–12:02:00.40 is credited nowhere
+```
+
+With the default window (`VOICE_CHECKPOINT_SECONDS=120`) there are 720
+checkpoints in a day. Each loses up to a second, and because the reconcile loop
+keeps a roughly fixed phase, the fractions correlate instead of cancelling:
+a random 20 s ± 1 s jitter reproduces **344 s lost in 24 hours** with the
+original arithmetic (`TestFractionalSecondCarry` in
+`tests/test_voice_checkpoint.py` asserts both halves of this — that v3 loses
+minutes, and that v4 loses at most a second). The longer the stay, the bigger
+the loss, which is why it only ever showed up on the marathon sessions.
+
+### What changed
+
+1. **`supabase/migrations/004_voice_credit_carry.sql`** advances the cursor by
+   the seconds that were actually credited:
+
+   ```sql
+   v_cursor := v_from + make_interval(secs => v_secs);
+   ```
+
+   A discarded fraction now simply stays inside `[cursor, up_to)` and is
+   credited by the next checkpoint. A replayed or out-of-order call credits 0,
+   so it still cannot move the cursor — idempotency and monotonicity are
+   unchanged. The close function rounds its final partial second to the
+   nearest whole second instead of flooring it.
+
+2. **`SupabaseVoiceDatabase`** snaps every boundary to a whole second before it
+   is sent (`_credit_boundary`), so a bot talking to a schema-3 database — or a
+   future writer that does not carry the fraction — cannot reintroduce the
+   loss. Time inside the current second is credited by the next checkpoint,
+   which is at most one window later.
+
+3. **Schema version 4.** The bot accepts 3 (it simply logs that the carry is
+   missing and keeps working, with the client-side snapping above), refuses
+   2-and-below for checkpointing exactly as before, and refuses 5+.
+
+### Verification
+
+* `supabase/validate_locally.mjs` §0d runs migration 004 against real
+  PostgreSQL (PGlite), replays the old arithmetic on identical boundaries, and
+  asserts: the carry loses < 1 s across 60 checkpoints, the cursor trails the
+  request by the pending fraction only, a replay credits 0 and does not move
+  the cursor, close keeps the last half-second, and the v3 arithmetic
+  demonstrably loses time (that last assertion is what stops the bug from being
+  "fixed" by a test that passes either way).
+* `tests/test_voice_checkpoint.py::TestLongSessionAccounting` runs the real
+  tracker for 24 simulated hours with a jittery clock and asserts the credited
+  total equals the elapsed total ±1 s.
+* The in-memory Supabase fake in `tests/voice_fakes.py` mirrors the new SQL, so
+  every existing checkpoint test now exercises the carry semantics.
