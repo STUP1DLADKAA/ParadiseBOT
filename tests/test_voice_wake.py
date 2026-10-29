@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import shutil
 import struct
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -812,7 +814,7 @@ class CogTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_voicewake_commands_are_registered(self):
         names = {command.name for command in self.cog.voicewake.commands}
-        self.assertEqual(names, {"status", "stop", "start", "notice"})
+        self.assertEqual(names, {"status", "stop", "start", "notice", "download"})
 
 
 # ---------------------------------------------------------------------------
@@ -1089,6 +1091,9 @@ class TestProviderOrder(unittest.IsolatedAsyncioTestCase):
 
     def test_auto_tries_the_machine_before_the_internet(self):
         self.assertEqual(self.names("auto"), ["local", "elevenlabs", "gemini"])
+        # Kept, so /voicewake can report on the model files after the fact.
+        self.assertIsNotNone(self.cog.local_stt)
+        self.assertEqual(self.cog.local_stt.name, "local")
 
     def test_local_only_means_local_only(self):
         self.assertEqual(self.names("local"), ["local"])
@@ -1096,6 +1101,7 @@ class TestProviderOrder(unittest.IsolatedAsyncioTestCase):
     def test_the_cloud_is_still_reachable_on_request(self):
         self.assertEqual(self.names("elevenlabs"), ["elevenlabs"])
         self.assertEqual(self.names("gemini"), ["gemini"])
+        self.assertIsNone(self.cog.local_stt, "no local engine means no model to fetch")
 
     def test_local_settings_reach_the_transcriber(self):
         from types import SimpleNamespace as NS
@@ -1177,3 +1183,432 @@ class TestRealWhisperAudioContract(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(seen["level"], 0.1)
         self.assertEqual(seen["options"]["language"], "hi")
         self.assertIn("hey paradise", seen["options"]["initial_prompt"].lower())
+
+
+# ---------------------------------------------------------------------------
+# The weights arrive by themselves
+# ---------------------------------------------------------------------------
+
+
+def _fake_snapshot(root, model="small", honour=True) -> str:
+    """Create the on-disk layout faster-whisper's cache uses, and return it."""
+    snapshot = os.path.join(
+        root, f"models--Systran--faster-whisper-{model}", "snapshots", "abc123"
+    )
+    os.makedirs(snapshot, exist_ok=True)
+    if honour:
+        with open(os.path.join(snapshot, "model.bin"), "wb") as handle:
+            handle.write(b"\x00" * 2048)
+        with open(os.path.join(snapshot, "config.json"), "w", encoding="utf-8") as handle:
+            handle.write("{}")
+    return snapshot
+
+
+class TestModelFiles(unittest.TestCase):
+    """`prepare_model_files` — deciding, fetching, and never raising."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="whisper-cache-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def test_an_existing_snapshot_is_found_without_the_network(self):
+        from functions.voice_wake.local_stt import find_cached_model
+
+        snapshot = _fake_snapshot(self.tmp)
+        self.assertEqual(find_cached_model("small", self.tmp), snapshot)
+
+    def test_a_half_written_snapshot_is_not_mistaken_for_a_model(self):
+        from functions.voice_wake.local_stt import find_cached_model
+
+        _fake_snapshot(self.tmp, honour=False)
+        self.assertEqual(find_cached_model("small", self.tmp), "")
+
+    def test_a_custom_model_id_maps_to_its_own_cache_folder(self):
+        from functions.voice_wake.local_stt import _repo_dir_name
+
+        self.assertEqual(
+            _repo_dir_name("deepdml/faster-whisper-large-v3-turbo-ct2"),
+            "models--deepdml--faster-whisper-large-v3-turbo-ct2",
+        )
+        self.assertEqual(_repo_dir_name("small"), "models--Systran--faster-whisper-small")
+
+    def test_a_direct_model_directory_is_recognised(self):
+        from functions.voice_wake.local_stt import STATUS_READY, download_model_files
+
+        model_dir = os.path.join(self.tmp, "converted-small")
+        os.makedirs(model_dir)
+        with open(os.path.join(model_dir, "model.bin"), "wb") as handle:
+            handle.write(b"\x00" * 16)
+
+        def must_not_download(*args, **kwargs):  # pragma: no cover - asserted below
+            raise AssertionError("a directory that holds the model needs no download")
+
+        status, path, _message = download_model_files(
+            model_dir, downloader=must_not_download
+        )
+        self.assertEqual(status, STATUS_READY)
+        self.assertEqual(path, model_dir)
+
+    def test_a_cached_model_is_reported_ready_and_not_downloaded_again(self):
+        from functions.voice_wake.local_stt import STATUS_READY, download_model_files
+
+        snapshot = _fake_snapshot(self.tmp)
+        calls = []
+
+        def downloader(model, **options):  # pragma: no cover - asserted below
+            calls.append(model)
+            return ""
+
+        status, path, _message = download_model_files(
+            "small", model_dir=self.tmp, downloader=downloader
+        )
+        self.assertEqual(status, STATUS_READY)
+        self.assertEqual(path, snapshot)
+        self.assertEqual(calls, [])
+
+    def test_a_missing_model_is_downloaded_into_the_configured_directory(self):
+        from functions.voice_wake.local_stt import (
+            STATUS_DOWNLOADED,
+            STATUS_READY,
+            download_model_files,
+        )
+
+        calls = []
+
+        def downloader(model, **options):
+            calls.append((model, options))
+            return _fake_snapshot(options["cache_dir"], model)
+
+        status, path, _message = download_model_files(
+            "small", model_dir=self.tmp, downloader=downloader
+        )
+        self.assertEqual(status, STATUS_DOWNLOADED)
+        self.assertEqual(calls[0][0], "small")
+        self.assertEqual(calls[0][1]["cache_dir"], self.tmp)
+        self.assertTrue(path.startswith(self.tmp))
+        # …and the second start-up is a no-op, because the files are there now.
+        self.assertEqual(
+            download_model_files("small", model_dir=self.tmp)[0], STATUS_READY
+        )
+
+    def test_offline_never_touches_the_network(self):
+        from functions.voice_wake.local_stt import STATUS_OFFLINE, download_model_files
+
+        def must_not_download(*args, **kwargs):  # pragma: no cover - asserted below
+            raise AssertionError("offline mode must not fetch anything")
+
+        status, path, message = download_model_files(
+            "small", model_dir=self.tmp, offline=True, downloader=must_not_download
+        )
+        self.assertEqual(status, STATUS_OFFLINE)
+        self.assertEqual(path, "")
+        self.assertIn("VOICE_WAKE_STT_OFFLINE", message)
+        self.assertIn("VOICE_WAKE_STT_MODEL_DIR", message)
+
+    def test_a_dead_network_is_a_sentence_not_an_exception(self):
+        from functions.voice_wake.local_stt import STATUS_FAILED, download_model_files
+
+        def downloader(*args, **kwargs):
+            raise ConnectionError("getaddrinfo failed")
+
+        status, path, message = download_model_files(
+            "small", model_dir=self.tmp, downloader=downloader
+        )
+        self.assertEqual(status, STATUS_FAILED)
+        self.assertEqual(path, "")
+        self.assertIn("could not be downloaded", message)
+        self.assertIn("VOICE_WAKE_STT_MODEL_DIR", message)
+
+    def test_the_tool_reports_the_installed_dependency(self):
+        """`python tools/fetch_whisper_model.py --check` is honest about state."""
+        import subprocess
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        result = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(root, "tools", "fetch_whisper_model.py"),
+                "small",
+                "--dir",
+                self.tmp,
+                "--check",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        # Nothing cached: 1, "not on this machine". Never a traceback.
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("not on this machine", result.stdout)
+        self.assertNotIn("Traceback", result.stderr)
+
+        _fake_snapshot(self.tmp)
+        result = subprocess.run(
+            [
+                sys.executable,
+                os.path.join(root, "tools", "fetch_whisper_model.py"),
+                "small",
+                "--dir",
+                self.tmp,
+                "--check",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("on disk", result.stdout)
+
+
+class TestPrepareAtStartup(unittest.IsolatedAsyncioTestCase):
+    """`LocalWhisperTranscriber.prepare()` — the start-up fetch."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="whisper-cache-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def transcriber(self, **kwargs):
+        from functions.voice_wake.local_stt import LocalWhisperTranscriber
+
+        options = {
+            "model": "small",
+            "model_dir": self.tmp,
+            "unload_after": 0.0,
+        }
+        options.update(kwargs)
+        return LocalWhisperTranscriber(**options)
+
+    async def test_an_injected_model_needs_no_files(self):
+        from functions.voice_wake.local_stt import STATUS_READY
+
+        transcriber = self.transcriber(loader=SimpleNamespace(transcribe=None))
+        self.assertEqual(await transcriber.prepare(), STATUS_READY)
+        self.assertTrue(transcriber.prepared)
+
+    async def test_the_files_are_fetched_on_the_executor_not_the_loop(self):
+        from functions.voice_wake.local_stt import STATUS_DOWNLOADED
+
+        seen = {}
+
+        def downloader(model, **options):
+            seen["thread"] = threading.current_thread().name
+            return _fake_snapshot(options["cache_dir"], model)
+
+        transcriber = self.transcriber(downloader=downloader)
+        status = await transcriber.prepare()
+        self.assertEqual(status, STATUS_DOWNLOADED)
+        self.assertTrue(transcriber.prepared)
+        self.assertIn("paradise-whisper", seen["thread"])
+        self.assertIn("on disk", transcriber.describe_model())
+
+    async def test_preparing_twice_downloads_once(self):
+        from functions.voice_wake.local_stt import STATUS_DOWNLOADED, STATUS_READY
+
+        calls = []
+
+        def downloader(model, **options):
+            calls.append(model)
+            return _fake_snapshot(options["cache_dir"], model)
+
+        transcriber = self.transcriber(downloader=downloader)
+        self.assertEqual(await transcriber.prepare(), STATUS_DOWNLOADED)
+        self.assertEqual(await transcriber.prepare(), STATUS_DOWNLOADED)
+        self.assertEqual(calls, ["small"])
+        # A fresh process finds the files already there and fetches nothing.
+        def must_not_download(*args, **kwargs):  # pragma: no cover - asserted below
+            raise AssertionError("the files are already on disk")
+
+        self.assertEqual(
+            await self.transcriber(downloader=must_not_download).prepare(), STATUS_READY
+        )
+
+    async def test_a_missing_dependency_is_reported_not_raised(self):
+        from functions.voice_wake.local_stt import STATUS_NOT_INSTALLED
+
+        transcriber = self.transcriber()
+        transcriber._installed = False
+        self.assertEqual(await transcriber.prepare(), STATUS_NOT_INSTALLED)
+        self.assertFalse(transcriber.prepared)
+        self.assertIn("not installed", transcriber.describe_model())
+
+    async def test_offline_without_files_says_so(self):
+        from functions.voice_wake.local_stt import STATUS_OFFLINE
+
+        def must_not_download(*args, **kwargs):  # pragma: no cover - asserted below
+            raise AssertionError("offline mode must not fetch anything")
+
+        transcriber = self.transcriber(offline=True, downloader=must_not_download)
+        self.assertEqual(await transcriber.prepare(), STATUS_OFFLINE)
+        self.assertIn("OFFLINE=true", transcriber.describe_model())
+
+    async def test_a_failed_download_can_succeed_later(self):
+        from functions.voice_wake.local_stt import STATUS_DOWNLOADED, STATUS_FAILED
+
+        attempts = []
+
+        def downloader(model, **options):
+            attempts.append(model)
+            if len(attempts) == 1:
+                raise OSError("network is unreachable")
+            return _fake_snapshot(options["cache_dir"], model)
+
+        transcriber = self.transcriber(downloader=downloader)
+        self.assertEqual(await transcriber.prepare(), STATUS_FAILED)
+        self.assertIn("download failed", transcriber.describe_model())
+        # The wake word still works: a later attempt gets the files.
+        self.assertEqual(await transcriber.prepare(), STATUS_DOWNLOADED)
+        self.assertTrue(transcriber.prepared)
+
+    async def test_a_download_that_hangs_gives_up(self):
+        from functions.voice_wake.local_stt import STATUS_FAILED
+
+        def downloader(*args, **kwargs):
+            time.sleep(3)
+            return ""
+
+        transcriber = self.transcriber(downloader=downloader)
+        status = await transcriber.prepare(timeout=1.0)
+        self.assertIn(status, {STATUS_FAILED})
+        self.assertIn("took too long", transcriber.prepare_message)
+
+    async def test_offline_hands_ctranslate2_a_real_model_directory(self):
+        """The download root holds snapshots, not `model.bin`; offline must resolve."""
+        from functions.voice_wake import local_stt
+
+        snapshot = _fake_snapshot(self.tmp)
+        seen = {}
+
+        class FakeModel:
+            def __init__(self, source, **options):
+                seen["source"] = source
+                seen["options"] = options
+
+        original = local_stt._import_backend
+        local_stt._import_backend = lambda: FakeModel
+        self.addCleanup(setattr, local_stt, "_import_backend", original)
+
+        model = self.transcriber(offline=True)._build_model()
+        self.assertIsInstance(model, FakeModel)
+        self.assertEqual(seen["source"], snapshot)
+        self.assertTrue(seen["options"]["local_files_only"])
+        self.assertEqual(seen["options"]["download_root"], self.tmp)
+
+
+class TestWakeFetchesTheModelAtStartup(unittest.IsolatedAsyncioTestCase):
+    """The cog decides *whether* to fetch, and says what happened."""
+
+    def cog(self, **voice_wake):
+        from commands.wake import Wake
+
+        bot = SimpleNamespace(
+            user=SimpleNamespace(id=1),
+            ai=SimpleNamespace(gemini=SimpleNamespace(available=False)),
+            guilds=[],
+            config=Config(
+                elevenlabs=SimpleNamespace(api_key=""),
+                wake=WakeConfig(speak=False),
+                voice_wake=VoiceWakeConfig(**{"enabled": True, "stt": "local", **voice_wake}),
+            ),
+            voice_clip_service=SimpleNamespace(add_tap=lambda fn: None, remove_tap=lambda fn: None),
+            get_cog=lambda name: None,
+            get_guild=lambda gid: None,
+        )
+        return Wake(bot)
+
+    def local(self, status="ready"):
+        calls = []
+
+        class Local:
+            prepare_status = ""
+            model_path = ""
+            prepare_message = ""
+
+            async def prepare(self, **kwargs):
+                calls.append(kwargs)
+                self.prepare_status = status
+                return status
+
+            def describe_model(self):
+                return f"whisper small: {status}"
+
+        return Local(), calls
+
+    async def test_startup_fetches_the_model_in_the_background(self):
+        cog = self.cog()
+        cog.local_stt, _calls = self.local()
+        cog._prepare_local_model()
+        self.assertIsNotNone(cog._prepare_task)
+        await cog._prepare_task
+        self.assertEqual(cog.local_stt.prepare_status, "ready")
+
+    async def test_preload_can_be_switched_off(self):
+        cog = self.cog(stt_preload=False)
+        cog.local_stt, _calls = self.local()
+        cog._prepare_local_model()
+        self.assertIsNone(cog._prepare_task)
+
+    async def test_a_disabled_wake_word_fetches_nothing(self):
+        cog = self.cog()
+        cog.voice_wake = VoiceWakeConfig(enabled=False)
+        cog.local_stt, _calls = self.local()
+        cog._prepare_local_model()
+        self.assertIsNone(cog._prepare_task)
+
+    async def test_the_cloud_only_chain_has_nothing_to_fetch(self):
+        cog = self.cog(stt="gemini")
+        self.assertEqual([p.name for p in cog._stt_providers("gemini")], ["gemini"])
+        self.assertIsNone(cog.local_stt)
+
+    def test_the_config_default_is_on(self):
+        self.assertTrue(VoiceWakeConfig.from_env({}).stt_preload)
+        self.assertFalse(VoiceWakeConfig.from_env({"VOICE_WAKE_STT_PRELOAD": "0"}).stt_preload)
+
+    async def test_the_command_fetches_on_demand(self):
+        cog = self.cog()
+        local, calls = self.local(status="downloaded")
+        cog.local_stt = local
+        interaction = _FakeInteraction()
+        await cog.voicewake_download.callback(cog, interaction)
+        self.assertTrue(interaction.deferred)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("downloaded", interaction.last_message)
+
+    async def test_the_command_explains_offline_mode(self):
+        cog = self.cog(stt_offline=True)
+        local, calls = self.local()
+        cog.local_stt = local
+        interaction = _FakeInteraction()
+        await cog.voicewake_download.callback(cog, interaction)
+        self.assertEqual(calls, [])
+        self.assertIn("OFFLINE", interaction.last_message)
+
+
+class _FakeInteraction:
+    """Just enough of `discord.Interaction` for the reply paths we use."""
+
+    def __init__(self):
+        self.deferred = False
+        self.last_message = ""
+
+    @property
+    def response(self):
+        outer = self
+
+        class Response:
+            async def defer(inner, **kwargs):
+                outer.deferred = True
+
+            async def send_message(inner, content="", **kwargs):
+                outer.last_message = content
+
+        return Response()
+
+    @property
+    def followup(self):
+        outer = self
+
+        class Followup:
+            async def send(inner, content="", **kwargs):
+                outer.last_message = content
+
+        return Followup()

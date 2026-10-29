@@ -133,9 +133,13 @@ runs inside the bot (faster-whisper, no key, no upload):
 python -m pip install -r requirements-local-stt.txt   # once, ~250 MB
 ```
 
-* The first utterance downloads the model (75 MB for `small`) into the Hugging
-  Face cache; after that it is fully offline. `VOICE_WAKE_STT_MODEL_DIR` points
-  at weights you already have, `VOICE_WAKE_STT_OFFLINE=true` forbids the network.
+* The model itself (75 MB for `small`) is downloaded once **at start-up**, in
+  the background — `pip` installs the engine, not the weights — and after that
+  it is fully offline. `python tools/fetch_whisper_model.py small --dir …` does
+  the same fetch before the bot runs (useful when building an image), and
+  `/voicewake download` retries on demand. `VOICE_WAKE_STT_MODEL_DIR` points at
+  weights you already have, `VOICE_WAKE_STT_OFFLINE=true` forbids the network,
+  and `VOICE_WAKE_STT_PRELOAD=false` moves the fetch back to first use.
 * `VOICE_WAKE_STT=local` guarantees no audio ever leaves the machine; `auto`
   (the default) tries the local engine first and only falls back to
   `ELEVENLABS_API_KEY`/`GEMINI_API_KEY` recognition when Whisper is not

@@ -14,8 +14,17 @@ All notable changes to Paradise are recorded here. The format follows
   speech-to-text mis-hearings ("he paradise", "pair of dice", "अरे पैराडाइज़").
   Transcribed on-device by default (see above).
   `functions/voice_wake/`, `requirements-local-stt.txt`,
-  `/voicewake status|stop|start|notice`,
+  `/voicewake status|stop|start|notice|download`,
   [docs/voice-wake.md](docs/voice-wake.md).
+- **The Whisper model downloads itself.** `pip` installs the engine; the 75 MB
+  of weights are fetched once at start-up, on the Whisper worker thread, so the
+  first "hey paradise" is not also the first download. `/voicewake status` shows
+  the model line, `/voicewake download` retries on demand, and
+  `python tools/fetch_whisper_model.py small --dir /opt/whisper` does the same
+  fetch before the bot runs (Docker: `--build-arg WHISPER_MODEL=small`).
+  `VOICE_WAKE_STT_PRELOAD=false` restores download-on-first-use. Container
+  images keep the weights on the `/app/data` volume (`HF_HOME`), so a rebuilt
+  container does not fetch them again.
 - Per-utterance endpointing: energy-based VAD, 100 ms pre-roll, 700 ms silence
   to close, 12 s hard cap, and down-mixing to 16 kHz mono before recognition.
 - 22 `VOICE_WAKE_*` settings, a receive-tap hook on the voice receiver

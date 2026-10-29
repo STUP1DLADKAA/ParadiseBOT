@@ -15,11 +15,20 @@ Installing it is one command and one dependency tree::
 
     pip install -r requirements-local-stt.txt
 
-The first run downloads the model once (75 MB for ``small``) into the usual
-Hugging Face cache; after that it is a local file and the feature works
-offline. Set ``VOICE_WAKE_STT_MODEL_DIR`` to a directory that already holds the
-model to skip the download entirely, and ``VOICE_WAKE_STT_OFFLINE=true`` to
-refuse to touch the network even if the model is missing.
+``pip`` installs the *engine*; the weights are not a Python package and no
+requirements file can carry them. So the bot fetches them itself: at start-up it
+checks for the model files and, if they are missing, downloads them once in the
+background (75 MB for ``small``) while Discord is still connecting. By the time
+anyone says "hey paradise" the files are already local, and from then on the
+feature works with no network at all. :func:`prepare_model_files` is the same
+logic as a standalone call, for building images ahead of time::
+
+    python tools/fetch_whisper_model.py small
+
+Set ``VOICE_WAKE_STT_MODEL_DIR`` to a directory that already holds the model to
+skip the download entirely, ``VOICE_WAKE_STT_OFFLINE=true`` to refuse to touch
+the network even if the model is missing, and ``VOICE_WAKE_STT_PRELOAD=false``
+to keep start-up silent and only download on first use.
 
 Nothing here blocks the event loop: loading and inference both run on a
 dedicated one-thread executor, so Whisper never delays music, cards or gateway
@@ -32,8 +41,10 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import logging
+import os
 import time
 from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 from typing import Any, Callable
 
 import numpy as np
@@ -57,6 +68,13 @@ DEFAULT_TIMEOUT = 120.0
 #: After a failed load (usually "no network the very first time"), wait this
 #: long before trying again instead of re-downloading on every utterance.
 LOAD_RETRY_SECONDS = 60.0
+
+# Outcome of :meth:`LocalWhisperTranscriber.prepare` / :func:`prepare_model_files`.
+STATUS_READY = "ready"          # the files are on disk
+STATUS_DOWNLOADED = "downloaded"  # they were fetched just now
+STATUS_NOT_INSTALLED = "not-installed"  # faster-whisper itself is missing
+STATUS_OFFLINE = "offline"      # offline mode and no files to use
+STATUS_FAILED = "failed"        # the network, or the disk, said no
 
 
 #: Exception names that mean "the weights are not here and cannot be fetched".
@@ -92,6 +110,181 @@ def describe_load_failure(error: BaseException) -> str:
     )
 
 
+def default_cache_dir() -> str:
+    """Where faster-whisper would put the weights if asked for a model by name."""
+    try:  # huggingface_hub is a faster-whisper dependency, so this is free
+        from huggingface_hub.constants import HF_HUB_CACHE
+
+        return str(HF_HUB_CACHE)
+    except Exception:  # noqa: BLE001 - older/absent hub: mirror its documented default
+        pass
+    try:
+        home = os.environ.get("HF_HOME") or ""
+        base = Path(home).expanduser() if home else Path.home() / ".cache" / "huggingface"
+        return str(base / "hub")
+    except (OSError, RuntimeError):  # no HOME on this machine
+        return ""
+
+
+def _repo_id(model: str) -> str:
+    """The Hugging Face repo a size resolves to (``small`` → Systran/…-small)."""
+    try:
+        from faster_whisper.utils import _MODELS
+
+        if model in _MODELS:
+            return str(_MODELS[model])
+    except Exception:  # noqa: BLE001 - engine absent: fall back to the default org
+        pass
+    return model if "/" in model else f"Systran/faster-whisper-{model}"
+
+
+def _repo_dir_name(model: str) -> str:
+    """The Hugging Face cache folder for a model, e.g. ``small``."""
+    return "models--" + _repo_id(model).replace("/", "--")
+
+
+def find_cached_model(model: str, cache_dir: str = "") -> str:
+    """Return the cached snapshot for ``model``, or ``""`` when it is not there.
+
+    Checked before any network call so a machine that already has the weights
+    never touches the internet just to be told so.
+    """
+    root = Path(cache_dir or default_cache_dir()).expanduser()
+    snapshots = root / _repo_dir_name(model) / "snapshots"
+    try:
+        entries = sorted(snapshots.iterdir(), key=lambda item: item.name)
+    except (OSError, AttributeError):
+        return ""
+    for entry in entries:
+        if (entry / "model.bin").is_file():
+            return str(entry)
+    return ""
+
+
+def looks_like_model_dir(path: str) -> bool:
+    """True for a converted-model directory (``model.bin`` + ``config.json``)."""
+    if not path:
+        return False
+    folder = Path(path).expanduser()
+    return (folder / "model.bin").is_file()
+
+
+def directory_size(path: str) -> int:
+    """Bytes under ``path``, following the snapshot's symlinks."""
+    total = 0
+    try:
+        for item in Path(path).expanduser().rglob("*"):
+            try:
+                if item.is_file():
+                    total += item.stat().st_size
+            except OSError:
+                continue
+    except OSError:
+        return 0
+    return total
+
+
+def human_size(size: int) -> str:
+    if size <= 0:
+        return "unknown size"
+    megabytes = size / (1024 * 1024)
+    if megabytes >= 1024:
+        return f"{megabytes / 1024:.1f} GB"
+    if megabytes >= 10:
+        return f"{megabytes:.0f} MB"
+    return f"{megabytes:.1f} MB"
+
+
+def _download_backend() -> Callable[..., str]:
+    """faster-whisper's own downloader (a thin wrapper over huggingface_hub)."""
+    try:
+        from faster_whisper.utils import download_model
+    except Exception as error:  # noqa: BLE001 - any import failure is fatal here
+        log.info("faster-whisper unavailable: %s", error)
+        raise SpeechToTextUnavailable(
+            f"on-device speech-to-text is not installed ({INSTALL_HINT})"
+        ) from None
+    return download_model
+
+
+def download_model_files(
+    model: str = DEFAULT_MODEL,
+    *,
+    model_dir: str = "",
+    offline: bool = False,
+    downloader: Callable[..., str] | None = None,
+) -> tuple[str, str, str]:
+    """Make sure the weights for ``model`` are on this machine.
+
+    Returns ``(status, path, message)`` where ``status`` is one of the
+    ``STATUS_*`` constants. Never raises for a missing network: the caller gets
+    ``STATUS_FAILED`` and a sentence an operator can act on, so start-up can
+    carry on and the next attempt can succeed.
+    """
+    model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
+    raw = (model_dir or "").strip()
+    cache_dir = Path(raw).expanduser() if raw else None
+
+    # A path to a converted model is the model; nothing to fetch.
+    if looks_like_model_dir(model):
+        return STATUS_READY, str(Path(model).expanduser()), "the model is a local directory"
+
+    cached = find_cached_model(model, "" if cache_dir is None else str(cache_dir))
+    if cached:
+        return STATUS_READY, cached, "already on disk"
+
+    if offline:
+        return (
+            STATUS_OFFLINE,
+            "",
+            f"whisper {model} is not on this machine and VOICE_WAKE_STT_OFFLINE=true "
+            "forbids downloading it; copy a model directory over and point "
+            "VOICE_WAKE_STT_MODEL_DIR at it",
+        )
+
+    fetch = downloader
+    if fetch is None:
+        try:
+            fetch = _download_backend()
+        except SpeechToTextUnavailable as error:
+            return STATUS_NOT_INSTALLED, "", str(error)
+
+    options: dict[str, Any] = {"local_files_only": False}
+    if cache_dir is not None:
+        options["cache_dir"] = str(cache_dir)
+    started = time.monotonic()
+    try:
+        path = fetch(model, **options)
+    except Exception as error:  # noqa: BLE001 - network, disk, hub outage…
+        log.debug("whisper %s download failed", model, exc_info=True)
+        return STATUS_FAILED, "", describe_load_failure(error)
+
+    path = str(path or "") or find_cached_model(
+        model, "" if cache_dir is None else str(cache_dir)
+    )
+    log.info(
+        "downloaded whisper %s (%s) in %.1fs → %s",
+        model,
+        human_size(directory_size(path)),
+        max(0.0, time.monotonic() - started),
+        path or "the Hugging Face cache",
+    )
+    return STATUS_DOWNLOADED, path, "downloaded just now"
+
+
+def prepare_model_files(
+    model: str = DEFAULT_MODEL,
+    *,
+    model_dir: str = "",
+    offline: bool = False,
+    downloader: Callable[..., str] | None = None,
+) -> tuple[str, str, str]:
+    """Alias kept explicit for readers of ``tools/fetch_whisper_model.py``."""
+    return download_model_files(
+        model, model_dir=model_dir, offline=offline, downloader=downloader
+    )
+
+
 def _import_backend() -> Any:
     """Import faster-whisper, or explain precisely what is missing."""
     try:
@@ -123,6 +316,7 @@ class LocalWhisperTranscriber:
         prompt: str = WAKE_PROMPT,
         beam_size: int = 1,
         loader: Callable[[], Any] | None = None,
+        downloader: Callable[..., str] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.model = (model or DEFAULT_MODEL).strip() or DEFAULT_MODEL
@@ -137,6 +331,7 @@ class LocalWhisperTranscriber:
         self.beam_size = max(1, int(beam_size or 1))
 
         self._loader = loader
+        self._downloader = downloader
         self._clock = clock
         self._model: Any = None
         self._loaded_error = ""
@@ -145,10 +340,18 @@ class LocalWhisperTranscriber:
         self._installed: bool | None = None
         self._last_used = 0.0
         self._lock = asyncio.Lock()
+        self._prepare_lock = asyncio.Lock()
         self._unload_handle: asyncio.TimerHandle | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._executor: ThreadPoolExecutor | None = None
         self._closed = False
+
+        #: Where the weights were found/fetched (blank until prepare()).
+        self.model_path = ""
+        #: One of the STATUS_* constants; blank means "not looked yet".
+        self.prepare_status = ""
+        #: Why the last prepare() did not end with usable files, in words.
+        self.prepare_message = ""
 
         #: Seconds the last utterance took to transcribe (for /voicewake status).
         self.last_seconds = 0.0
@@ -160,7 +363,8 @@ class LocalWhisperTranscriber:
     @property
     def installed(self) -> bool:
         """Is the optional dependency present? (Cheap: no import, no model.)"""
-        if self._loader is not None:
+        if self._loader is not None or self._downloader is not None:
+            # An injected loader/downloader *is* the engine for this instance.
             return True
         if self._installed is None:
             try:
@@ -183,6 +387,26 @@ class LocalWhisperTranscriber:
         """Whether the weights are in memory right now."""
         return self._model is not None
 
+    @property
+    def prepared(self) -> bool:
+        """Whether the weights are known to be on disk (downloaded or found)."""
+        return self.prepare_status in {STATUS_READY, STATUS_DOWNLOADED}
+
+    def describe_model(self) -> str:
+        """One line about the *files*, for logs and ``/voicewake status``."""
+        if not self.installed:
+            return f"whisper {self.model}: not installed ({INSTALL_HINT})"
+        if self.prepared:
+            where = self.model_path or self.model_dir or "the Hugging Face cache"
+            return f"whisper {self.model}: on disk · {where}"
+        if self.prepare_status == STATUS_OFFLINE:
+            return f"whisper {self.model}: not on disk, and OFFLINE=true forbids fetching it"
+        if self.prepare_status == STATUS_FAILED:
+            return f"whisper {self.model}: download failed — {self.prepare_message}"
+        if self.loaded:
+            return f"whisper {self.model}: loaded in memory"
+        return f"whisper {self.model}: not downloaded yet"
+
     def describe(self) -> str:
         if not self.installed:
             return "local whisper (not installed)"
@@ -190,6 +414,62 @@ class LocalWhisperTranscriber:
             f"local whisper {self.model} ({self.compute_type} on {self.device}, "
             f"{'loaded' if self.loaded else 'idle'})"
         )
+
+    # -- model files -----------------------------------------------------
+
+    async def prepare(self, *, timeout: float = 900.0) -> str:
+        """Fetch the weights now instead of on the first utterance.
+
+        Called once at start-up so "hey paradise" works the moment somebody
+        says it, rather than after a one-time download. Runs on the same
+        one-thread executor as inference, so the gateway heartbeat and every
+        command keep running while it downloads. Never raises: the outcome is
+        returned as a ``STATUS_*`` string and kept for :meth:`describe_model`.
+        """
+        if self.prepared or self._closed:
+            return self.prepare_status
+        if self._loader is not None:
+            # A loader hands the model over directly (tests, embeddings): there
+            # is nothing on disk to fetch.
+            self.prepare_status = STATUS_READY
+            self.prepare_message = ""
+            return self.prepare_status
+        if not self.installed and self._downloader is None:
+            self.prepare_status = STATUS_NOT_INSTALLED
+            self.prepare_message = f"on-device speech-to-text is not installed ({INSTALL_HINT})"
+            return self.prepare_status
+        async with self._prepare_lock:
+            if self.prepared or self._closed:  # another caller got there first
+                return self.prepare_status
+            self._remember_loop()
+            loop = asyncio.get_running_loop()
+            try:
+                status, path, message = await asyncio.wait_for(
+                    loop.run_in_executor(
+                        self._executor,
+                        lambda: download_model_files(
+                            self.model,
+                            model_dir=self.model_dir,
+                            offline=self.offline,
+                            downloader=self._downloader,
+                        ),
+                    ),
+                    timeout=max(1.0, float(timeout or 900.0)),
+                )
+            except asyncio.TimeoutError:
+                status, path, message = (
+                    STATUS_FAILED,
+                    "",
+                    "the model download took too long; it will be retried on the next start-up",
+                )
+            except Exception as error:  # noqa: BLE001 - start-up must not die here
+                status, path, message = STATUS_FAILED, "", describe_load_failure(error)
+            self.prepare_status = status
+            self.prepare_message = "" if status in {STATUS_READY, STATUS_DOWNLOADED} else message
+            if path:
+                self.model_path = path
+            log.info("on-device model %s", self.describe_model())
+            return status
 
     # -- transcription ---------------------------------------------------
 
@@ -324,7 +604,20 @@ class LocalWhisperTranscriber:
             options["download_root"] = self.model_dir
         if self.offline:
             options["local_files_only"] = True
-        source = self.model_dir if self.offline and self.model_dir else self.model
+        # Offline: hand CTranslate2 a real model directory, not the download
+        # root it was cached under (the snapshot holds model.bin; the root does
+        # not). A path the operator pointed at directly still wins.
+        source = self.model
+        if self.offline:
+            if looks_like_model_dir(self.model):
+                source = str(Path(self.model).expanduser())
+            elif self.model_dir and looks_like_model_dir(self.model_dir):
+                source = str(Path(self.model_dir).expanduser())
+            else:
+                cached = find_cached_model(
+                    self.model, self.model_dir or ""
+                ) or find_cached_model(self.model)
+                source = cached or self.model_dir or self.model
         return WhisperModel(source, **options)
 
     # -- idle unload -----------------------------------------------------
@@ -376,6 +669,18 @@ __all__ = [
     "DEFAULT_MODEL",
     "INSTALL_HINT",
     "LocalWhisperTranscriber",
+    "STATUS_DOWNLOADED",
+    "STATUS_FAILED",
+    "STATUS_NOT_INSTALLED",
+    "STATUS_OFFLINE",
+    "STATUS_READY",
     "WAKE_PROMPT",
+    "default_cache_dir",
     "describe_load_failure",
+    "directory_size",
+    "download_model_files",
+    "find_cached_model",
+    "human_size",
+    "looks_like_model_dir",
+    "prepare_model_files",
 ]

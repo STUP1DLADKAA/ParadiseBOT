@@ -697,6 +697,8 @@ class VoiceWakeConfig:
     stt_model_dir: str = ""
     #: Never touch the network: only use weights that are already on disk.
     stt_offline: bool = False
+    #: Fetch the weights at start-up (once) instead of on the first utterance.
+    stt_preload: bool = True
     #: Drop the weights from RAM after this much silence; 0 keeps them loaded.
     stt_unload_after: float = 900.0
     #: ISO-639-1 hint for the transcriber; blank lets it detect.
@@ -749,6 +751,7 @@ class VoiceWakeConfig:
             stt_threads=max(0, min(64, _int(env.get("VOICE_WAKE_STT_THREADS"), 0))),
             stt_model_dir=str(env.get("VOICE_WAKE_STT_MODEL_DIR", "") or "").strip(),
             stt_offline=_bool(env.get("VOICE_WAKE_STT_OFFLINE"), False),
+            stt_preload=_bool(env.get("VOICE_WAKE_STT_PRELOAD"), True),
             stt_unload_after=max(
                 0.0, min(86_400.0, _float(env.get("VOICE_WAKE_STT_UNLOAD_AFTER"), 900.0))
             ),

@@ -7,9 +7,13 @@
 # works without it; with it installed, `VOICE_WAKE_STT=local` makes the wake
 # word 100% local.
 #
-# The model weights are not in here — the first utterance downloads the size
-# chosen by VOICE_WAKE_STT_MODEL (75 MB for `small`) into the Hugging Face
-# cache, once. See docs/voice-wake.md.
+# The model weights are not in here, and no requirements file can carry them:
+# they are 75 MB of data, not a package. The bot fetches them itself at start-up
+# (once, into the Hugging Face cache), or ahead of time with
+#
+#     python tools/fetch_whisper_model.py small --dir /opt/whisper
+#
+# See docs/voice-wake.md.
 -r requirements.txt
 
 # CTranslate2 build of Whisper + its runtime. Includes ctranslate2, tokenizers,
