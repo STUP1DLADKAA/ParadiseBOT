@@ -21,7 +21,6 @@ from unittest.mock import AsyncMock, MagicMock, patch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from functions.voice import (
-    VOICE_ALERT_CHANNEL_ID,
     VoiceDatabase,
     VoicePeriod,
     VoiceTracker,
@@ -475,6 +474,11 @@ def _voice_state(channel=None):
     return MagicMock(channel=channel, self_mute=False, mute=False, self_deaf=False, deaf=False)
 
 
+#: A test-owned alert channel. The tracker must not depend on a
+#: deployment-specific default, and neither should these tests.
+ALERT_CHANNEL_ID = 4242
+
+
 class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
     """End-to-end tracker tests on the Supabase store (fake client)."""
 
@@ -485,7 +489,9 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
         self.store = SupabaseVoiceDatabase(self.local, client=self.fake)
         self.store._bootstrapped = True
         self.mock_bot = MagicMock()
-        self.tracker = VoiceTracker(self.mock_bot, self.store)
+        self.tracker = VoiceTracker(
+            self.mock_bot, self.store, alert_channel_id=ALERT_CHANNEL_ID
+        )
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -605,10 +611,10 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
 
     async def test_deaf_time_excluded_except_exempt_user(self):
         guild = _make_mock_guild()
-        alert_channel = MagicMock(id=VOICE_ALERT_CHANNEL_ID, guild=guild)
+        alert_channel = MagicMock(id=ALERT_CHANNEL_ID, guild=guild)
         alert_channel.send = AsyncMock()
         guild.get_channel.side_effect = (
-            lambda cid: alert_channel if cid == VOICE_ALERT_CHANNEL_ID else None
+            lambda cid: alert_channel if cid == ALERT_CHANNEL_ID else None
         )
         guild.get_channel_or_thread.side_effect = guild.get_channel.side_effect
         self.mock_bot.get_guild.return_value = guild
@@ -658,10 +664,10 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
 
     async def test_short_deaf_under_30s_cancels_warning(self):
         guild = _make_mock_guild()
-        alert_channel = MagicMock(id=VOICE_ALERT_CHANNEL_ID, guild=guild)
+        alert_channel = MagicMock(id=ALERT_CHANNEL_ID, guild=guild)
         alert_channel.send = AsyncMock()
         guild.get_channel_or_thread.side_effect = (
-            lambda cid: alert_channel if cid == VOICE_ALERT_CHANNEL_ID else None
+            lambda cid: alert_channel if cid == ALERT_CHANNEL_ID else None
         )
         self.mock_bot.get_guild.return_value = guild
         self.tracker.deaf_warning_seconds = 0.08
@@ -681,10 +687,10 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
 
     async def test_muted_user_still_detected_and_counted_without_warning(self):
         guild = _make_mock_guild()
-        alert_channel = MagicMock(id=VOICE_ALERT_CHANNEL_ID, guild=guild)
+        alert_channel = MagicMock(id=ALERT_CHANNEL_ID, guild=guild)
         alert_channel.send = AsyncMock()
         guild.get_channel_or_thread.side_effect = (
-            lambda cid: alert_channel if cid == VOICE_ALERT_CHANNEL_ID else None
+            lambda cid: alert_channel if cid == ALERT_CHANNEL_ID else None
         )
         self.tracker.deaf_warning_seconds = 0.02
 
@@ -720,10 +726,10 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
     async def test_join_8pm_leave_after_midnight_rollover_and_daily_channel_leaderboard(self):
         guild = _make_mock_guild()
         guild.name = "Paradise"
-        alert_channel = MagicMock(id=VOICE_ALERT_CHANNEL_ID, guild=guild)
+        alert_channel = MagicMock(id=ALERT_CHANNEL_ID, guild=guild)
         alert_channel.send = AsyncMock()
         guild.get_channel_or_thread.side_effect = (
-            lambda cid: alert_channel if cid == VOICE_ALERT_CHANNEL_ID else None
+            lambda cid: alert_channel if cid == ALERT_CHANNEL_ID else None
         )
         self.mock_bot.guilds = [guild]
         self.mock_bot.get_guild.return_value = guild

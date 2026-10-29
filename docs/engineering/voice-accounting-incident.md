@@ -44,7 +44,7 @@ channel as a brand-new join, inventing `started_at = now`. The old heartbeat
 wrote that invented value back over the durable row.
 
 Measured against the pre-fix tree, with a user in voice for 6 hours across a
-restart (`tools/repro_restart_race.py`):
+restart (`tools/repro/repro_restart_race.py`):
 
 ```
 TIME LOST BY THE RESTART RACE: 5h59m00s
@@ -106,7 +106,7 @@ specifically required the restart-during-bootstrap race.
 | `tests/test_voice_checkpoint.py` | **new**, 962 lines, 38 tests. |
 | `tests/test_voice_render.py` | +16 tests; the 4 pre-existing tests retained. |
 | `tests/test_voice_supabase.py`, `tests/voice_fakes.py` | schema-v3 policy tests; fake client at v3. |
-| `tools/repro_restart_race.py`, `repro_incident.py`, `repro_incident2.py`, `fuzz_voice.py`, `trace_seed.py` | **new** reproducers and fuzzer. |
+| `tools/repro/repro_restart_race.py`, `repro_incident.py`, `repro_incident2.py`, `fuzz_voice.py`, `trace_seed.py` | **new** reproducers and fuzzer. |
 | `tools/review_agent.py` | DB001/DB002 no longer fire on SQL comments. |
 
 Nothing was deleted. Test and `def` names were diffed between `main` and
@@ -207,7 +207,7 @@ every heartbeat, so an edit is adopted within ~20 s rather than reverted.
 To also grant a corrected interval, move `credited_until` back with it. To
 revoke time, correct `voice_daily_stats` for the affected day(s) directly.
 
-This was reproduced explicitly (`tools/repro_incident2.py`, scenario 3):
+This was reproduced explicitly (`tools/repro/repro_incident2.py`, scenario 3):
 
 ```
 [PASS] manual edit persists across tracking cycles
@@ -269,9 +269,9 @@ Everything below was actually run in this repository.
 | New checkpoint suite | `pytest tests/test_voice_checkpoint.py -q` | **38 passed** |
 | Renderer suite | `pytest tests/test_voice_render.py -q` | **20 passed, 7 subtests** |
 | Schema + behaviour | `cd supabase && node validate_locally.mjs` | **93 passed, 0 failed**, exit 0 |
-| Randomised accounting | `python tools/fuzz_voice.py 40` | **0/40 iterations violated the invariant** |
-| Restart race | `python tools/repro_restart_race.py` | **0h00m00s lost** (pre-fix: 5h59m00s) |
-| Incident reproducers | `python tools/repro_incident.py` / `repro_incident2.py` | A/B/D all **False**; **9/9 invariants held** |
+| Randomised accounting | `python tools/repro/fuzz_voice.py 40` | **0/40 iterations violated the invariant** |
+| Restart race | `python tools/repro/repro_restart_race.py` | **0h00m00s lost** (pre-fix: 5h59m00s) |
+| Incident reproducers | `python tools/repro/repro_incident.py` / `repro_incident2.py` | A/B/D all **False**; **9/9 invariants held** |
 | Static review gate | `python tools/review_agent.py --base main --fail-on blocking` | **0 blocking**, exit 0 |
 | Pipeline smoke | `python benchmarks/voice_pipeline.py` | runs end to end; shutdown recorded 150 s of 150 s expected |
 
@@ -344,7 +344,7 @@ SQL, which this change deliberately does not provide.
 | An admin moves `credited_until` back into already-credited time | low | intentional and honoured — it grants that time again. Documented in §E and logged to `voice_session_corrections` |
 | Two instances running at once | low | the durable cursor is adopted within one cycle and a WARNING names the likely cause; totals stay correct because crediting is idempotent |
 | Checkpoint write volume | low | one batched RPC per interval; `benchmark` covers the loop |
-| The fuzzer is deterministic per seed | low | `tools/fuzz_voice.py <iterations>` takes a count; `tools/trace_seed.py <seed> <ticks>` replays one seed tick by tick |
+| The fuzzer is deterministic per seed | low | `tools/repro/fuzz_voice.py <iterations>` takes a count; `tools/repro/trace_seed.py <seed> <ticks>` replays one seed tick by tick |
 
 **Not a risk, but worth stating:** this change never rewrites history. If a
 user's `voice_daily_stats` was already wrong before this fix, it stays wrong —

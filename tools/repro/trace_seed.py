@@ -9,7 +9,7 @@ import types
 from datetime import datetime, timedelta
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 
@@ -20,7 +20,7 @@ from functions.voice.time_windows import IST  # noqa: E402
 from functions.voice.tracker import VoiceTracker  # noqa: E402
 from voice_fakes import FakeSupabaseClient  # noqa: E402
 
-sys.path.insert(0, str(REPO / "tools"))
+sys.path.insert(0, str(REPO / "tools" / "repro"))
 import fuzz_voice as fz  # noqa: E402
 
 

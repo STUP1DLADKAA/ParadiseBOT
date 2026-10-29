@@ -7,7 +7,7 @@ Supabase outages, other users, channel moves) is randomised around them.
 
 Any decrease is printed with the exact seed and event log that produced it.
 
-Usage:  python3 tools/fuzz_voice.py [iterations]
+Usage:  python3 tools/repro/fuzz_voice.py [iterations]
 """
 
 from __future__ import annotations
@@ -20,7 +20,7 @@ import types
 from datetime import datetime, timedelta
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 

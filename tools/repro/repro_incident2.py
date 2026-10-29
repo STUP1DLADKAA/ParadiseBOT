@@ -6,7 +6,7 @@ the in-memory fake client and asserts the accounting invariant:
     displayed daily seconds for a user must never decrease while they remain
     connected, and must never lose previously credited time.
 
-Usage:  python3 tools/repro_incident2.py
+Usage:  python3 tools/repro/repro_incident2.py
 """
 
 from __future__ import annotations
@@ -19,7 +19,7 @@ import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 

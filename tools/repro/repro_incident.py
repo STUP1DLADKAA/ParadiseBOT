@@ -10,7 +10,7 @@ fake client that emulates the PostgreSQL functions, and the real VoiceTracker.
 No network, no credentials, no production data.
 
 Usage:
-    python3 tools/repro_incident.py
+    python3 tools/repro/repro_incident.py
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import types
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 

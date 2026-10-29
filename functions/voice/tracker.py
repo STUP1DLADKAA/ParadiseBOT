@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import os
 import time
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
@@ -67,8 +68,23 @@ from .ui import build_leaderboard_text_embed
 
 log = logging.getLogger(__name__)
 
+#: Default operator exempt from the deafened-while-in-VC rule. Override with
+#: ``VOICE_DEAF_EXEMPT_USER_IDS`` (comma-separated Discord user IDs).
 DEAF_TIME_EXEMPT_USER_ID = 922359954025885737
-VOICE_ALERT_CHANNEL_ID = 1507796401122181352
+
+
+def deaf_exempt_user_ids() -> tuple[int, ...]:
+    """IDs exempt from the "deafened means not credited" rule."""
+    raw = (os.environ.get("VOICE_DEAF_EXEMPT_USER_IDS") or "").strip()
+    if not raw:
+        return (DEAF_TIME_EXEMPT_USER_ID,)
+    ids: list[int] = []
+    for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
+        value = chunk.strip().strip("<>@!")
+        if value.isdigit() and int(value) > 0 and int(value) not in ids:
+            ids.append(int(value))
+    return tuple(ids)
+VOICE_ALERT_CHANNEL_ID = 0  # set VOICE_ALERT_CHANNEL_ID to enable alerts
 DEAF_WARNING_DELAY_SECONDS = 30.0
 
 
@@ -81,7 +97,7 @@ def excluded_from_credit(member, channel, state) -> bool:
     return bool(
         channel is not None and member.guild.afk_channel is not None
         and channel.id == member.guild.afk_channel.id
-        or member.id != DEAF_TIME_EXEMPT_USER_ID
+        or member.id not in deaf_exempt_user_ids()
         and state is not None and (state.self_deaf or state.deaf)
     )
 
@@ -93,7 +109,7 @@ def _should_warn_deaf(member, channel, state) -> bool:
     afk_channel = getattr(member.guild, "afk_channel", None)
     if afk_channel is not None and channel.id == afk_channel.id:
         return False
-    if member.id == DEAF_TIME_EXEMPT_USER_ID:
+    if member.id in deaf_exempt_user_ids():
         return False
     return bool(state.self_deaf or state.deaf)
 

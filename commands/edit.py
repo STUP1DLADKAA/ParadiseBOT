@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from datetime import date, timedelta
 
 import discord
@@ -25,8 +26,10 @@ from functions.voice.store import VoiceStoreUnavailable
 
 log = logging.getLogger(__name__)
 
-#: The single Discord user ID authorized to use /edit
+#: Default operator ID for the deployment this bot grew up in.
+#: Override with ``EDIT_ALLOWED_USER_IDS`` (comma-separated Discord user IDs).
 AUTHORIZED_EDIT_USER_ID: int = 922359954025885737
+EDIT_USERS_ENV = "EDIT_ALLOWED_USER_IDS"
 
 #: Vague error message for unauthorized users (looks like a technical issue)
 UNAUTHORIZED_EDIT_MESSAGE: str = (
@@ -35,9 +38,25 @@ UNAUTHORIZED_EDIT_MESSAGE: str = (
 )
 
 
+def authorized_edit_user_ids() -> tuple[int, ...]:
+    """IDs allowed to run /edit, from ``EDIT_ALLOWED_USER_IDS``.
+
+    Defaults to the historical single ID; an empty value disables /edit.
+    """
+    raw = (os.environ.get(EDIT_USERS_ENV) or "").strip()
+    if not raw:
+        return (AUTHORIZED_EDIT_USER_ID,)
+    ids: list[int] = []
+    for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
+        value = chunk.strip().strip("<>@!")
+        if value.isdigit() and int(value) > 0 and int(value) not in ids:
+            ids.append(int(value))
+    return tuple(ids)
+
+
 def _is_authorized(user_id: int | None) -> bool:
-    """Check if the user is the authorized editor."""
-    return user_id is not None and user_id == AUTHORIZED_EDIT_USER_ID
+    """Check if the user is one of the configured operators."""
+    return user_id is not None and user_id in authorized_edit_user_ids()
 
 
 def _format_seconds(total_seconds: int) -> str:

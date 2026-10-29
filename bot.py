@@ -92,7 +92,12 @@ class ParadiseBot(commands.Bot):
         # Commands are registered ONLY in the home guild (instant, no duplicates)
         # — global sync is disabled to prevent double-registration.
         self.synchronizer = CommandSynchronizer(
-            self, guild_id=PRIMARY_GUILD_ID, sync_global=False
+            self,
+            # Discord propagates guild commands instantly; global ones can take
+            # an hour. Set DISCORD_GUILD_ID for instant registration, or leave
+            # it blank to publish globally.
+            guild_id=config.guild_id or PRIMARY_GUILD_ID,
+            sync_global=not config.guild_id,
         )
         self.commands_ready = False
         self.autoupdate_task: asyncio.Task | None = None
