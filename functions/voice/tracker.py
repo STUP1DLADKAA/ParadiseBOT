@@ -42,8 +42,6 @@ from typing import Any, Callable, Iterable
 
 import discord
 
-from functions.helpers import Colour
-
 from .models import (
     ActiveVoiceSession,
     DailyUserStat,
@@ -52,8 +50,6 @@ from .models import (
     MemberProfile,
     PersistedActiveSession,
     VoicePeriod,
-    format_duration,
-    format_duration_diff,
 )
 from .render import LeaderboardImageRenderer
 from .store import VoiceStore, VoiceStoreError, VoiceStoreUnavailable
@@ -64,7 +60,11 @@ from .time_windows import (
     next_ist_midnight,
     period_overlap_seconds,
 )
-from .ui import build_leaderboard_text_embed
+from .ui import (
+    build_daily_dm_embed,
+    build_leaderboard_text_embed,
+    leaderboard_image_embed,
+)
 
 log = logging.getLogger(__name__)
 
@@ -1685,8 +1685,6 @@ class VoiceTracker:
 
         date_display = target_date.strftime("%B %d, %Y")
         short_date = target_date.strftime("%b %d, %Y")
-        total_server_seconds = sum(m.total_seconds for m in members)
-
         file: discord.File | None = None
         try:
             image_bytes = await self.renderer.render_leaderboard(
@@ -1696,26 +1694,26 @@ class VoiceTracker:
                 date_str=short_date,
                 page=1,
                 page_size=10,
-                title_override=f"DAILY LEADERBOARD • {short_date.upper()}",
+                # The day it reports on, named the way a calendar names it.
+                title_override=target_date.strftime("%A"),
+                subtitle_override=(
+                    f"{len(members)} {'person' if len(members) == 1 else 'people'}"
+                ),
             )
             file = discord.File(
                 io.BytesIO(image_bytes), filename="daily_vc_leaderboard.png"
             )
-            embed = discord.Embed(
-                title=f"🎙️ Daily Voice Leaderboard — {date_display}",
-                colour=Colour.ACCENT,
-            )
-            if not members:
-                embed.description = (
-                    f"No voice activity was recorded on **{date_display}**."
-                )
-            embed.set_image(url="attachment://daily_vc_leaderboard.png")
-            embed.set_footer(
-                text=(
-                    f"Server: {guild.name} • "
-                    f"Server Total: {format_duration(total_server_seconds)} • "
-                    f"{len(members)} tracked member{'s' if len(members) != 1 else ''}"
-                )
+            # The card already carries the day, the server and the total, so
+            # the embed only adds a line when there is something to say.
+            embed = leaderboard_image_embed(
+                guild,
+                VoicePeriod.TODAY,
+                filename="daily_vc_leaderboard.png",
+                caption=(
+                    None
+                    if members
+                    else "Nobody was in voice that day."
+                ),
             )
         except Exception:
             log.warning(
@@ -1725,7 +1723,7 @@ class VoiceTracker:
             embed = build_leaderboard_text_embed(
                 guild, VoicePeriod.TODAY, members, page=1, page_size=10
             )
-            embed.title = f"🎙️ Daily Voice Leaderboard — {date_display}"
+            embed.title = date_display
             file = None
 
         try:
@@ -1784,7 +1782,6 @@ class VoiceTracker:
             log.error("Invalid target_date_str for DM reports: %s", target_date_str)
             return 0
 
-        date_display = target_date.strftime("%B %d, %Y")
         day_before = target_date - timedelta(days=1)
 
         try:
@@ -1944,34 +1941,28 @@ class VoiceTracker:
                 blocked += 1  # Discord hiccup — retry next cycle
                 continue
 
-            # Calculate server rank for that date
+            # Where this person landed that day, and how big the room was.
             guild_board = board_cache.get(guild_id, [])
             user_rank = next(
                 (e.rank for e in guild_board if e.user_id == user_id), None
             )
-            rank_str = f"#{user_rank}" if user_rank else "Unranked"
+            people = len(guild_board)
 
-            # Server total for that date
-            server_total_str = format_duration(total_cache.get(guild_id, 0))
-
-            # Compared with the day before
+            # The same figure for the day before, so the DM can compare.
             prev_board = prev_board_cache.get(guild_id, [])
             day_before_sec = next(
-                (e.total_seconds for e in prev_board if e.user_id == user_id), 0
+                (e.total_seconds for e in prev_board if e.user_id == user_id), None
             )
-            diff_sec = stat.duration_seconds - day_before_sec
-            diff_str = format_duration_diff(diff_sec)
 
-            # Build DM message
-            user_voice_str = format_duration(stat.duration_seconds)
-            dm_text = (
-                f"**Your Paradise VC Report**\n\n"
-                f"📅 {date_display}\n"
-                f"🎙️ Voice time: {user_voice_str}\n"
-                f"🏆 Server rank: {rank_str}\n"
-                f"👥 Server total: {server_total_str}\n"
-                f"📈 Compared with yesterday: {diff_str}\n\n"
-                f"Keep talking. Paradise was definitely not quiet today."
+            # A short, human report rather than a data dump.
+            dm_embed = build_daily_dm_embed(
+                guild_name=getattr(guild, "name", "your server"),
+                target_date=target_date,
+                seconds=stat.duration_seconds,
+                rank=user_rank,
+                people=people,
+                server_total_seconds=total_cache.get(guild_id, 0),
+                previous_seconds=day_before_sec,
             )
 
             # Mark BEFORE sending: the mark is durable (direct write or the
@@ -1980,7 +1971,7 @@ class VoiceTracker:
             await self.db.mark_dm_report_sent(target_date_str, guild_id, user_id)
 
             try:
-                await user.send(dm_text)
+                await user.send(embed=dm_embed)
                 log.info("Sent daily VC report to user %s (%s)", user_id, user.name)
             except discord.Forbidden:
                 log.debug("Could not DM user %s: DMs disabled/closed", user_id)

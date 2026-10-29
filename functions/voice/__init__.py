@@ -31,6 +31,7 @@ from .tracker import (
 from .ui import (
     IMAGE_PAGE_SIZE,
     TEXT_PAGE_SIZE,
+    leaderboard_image_embed,
     leaderboard_subtitle,
     LeaderboardView,
     build_leaderboard_text_embed,
@@ -62,6 +63,7 @@ __all__ = [
     "build_leaderboard_text_embed",
     "IMAGE_PAGE_SIZE",
     "TEXT_PAGE_SIZE",
+    "leaderboard_image_embed",
     "leaderboard_subtitle",
     "build_user_stats_embed",
     "format_duration",

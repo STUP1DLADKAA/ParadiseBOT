@@ -20,6 +20,26 @@ Rendering strategy
 The card scales its height with the number of rows, so a full page can never
 collide with the footer, and every column is measured rather than assumed so
 long, Unicode or RTL names cannot overrun a duration.
+
+Design
+------
+A page, not a poster. White cards on a very light grey page, one accent colour
+per period, and grey for everything except the numbers people came to read.
+There are two reasons for the restraint: it reads instantly on a phone at 3 a.m.
+in Discord's dark theme, and it leaves no room for decoration to compete with
+the data. Specifically —
+
+* **One type ladder.** A 44 px period title, a 15 px name, a 26 px time in the
+  podium and a 32 px group total; nothing else is large.
+* **One list, one sheet.** Ranks 4 and below live inside a single grouped card
+  with hairline separators, like a settings list, instead of one boxed row per
+  person. Fewer containers means less to parse.
+* **Real shadows, drawn as pixels.** ``_lift`` pre-blends two faint offsets
+  against the page colour, because ``ImageDraw`` replaces rather than blends
+  RGBA fills (see the comment there — it is a two-line bug that turns a soft
+  shadow into a black border).
+* **No emoji in the card.** They render at different sizes on every platform and
+  break the line rhythm; the medals are a word ("1st") and a colour.
 """
 
 from __future__ import annotations
@@ -61,6 +81,8 @@ _AVATAR_CACHE: OrderedDict[str, tuple[float, Image.Image]] = OrderedDict()
 # ---------------------------------------------------------------------------
 
 WIDTH = 1000
+#: Page margin. Every column is measured from this, not assumed.
+PAD = 44
 ROW_HEIGHT = 64
 ROW_PITCH = 78
 HEADER_HEIGHT = 200
@@ -72,39 +94,45 @@ DEFAULT_SCALE = 2
 _MAX_SCALE = 3
 
 # ---------------------------------------------------------------------------
-# Palette — "Dark Paradise"
+# Palette — light, quiet, and mostly grey.
 # ---------------------------------------------------------------------------
+# The card is a document, not a poster: white paper on a faint grey page, one
+# accent colour per period, and grey for everything that is not the number the
+# reader came for. Apple's system colours are used verbatim where they fit, and
+# the text greys are their label / secondaryLabel / tertiaryLabel values.
 
-BG_TOP = (23, 18, 43)                # #17122B
-BG_BOTTOM = (8, 7, 15)               # #08070F
-SURFACE_COLOR = (25, 21, 40)         # card
-SURFACE_LIGHT = (38, 32, 59)         # chips / tracks
-CARD_BORDER = (58, 50, 88)           # #3A3258
-TRACK_COLOR = (52, 45, 78)           # progress-bar track (readable on any card)
-CARD_BORDER_SOFT = (44, 38, 70)
-ACCENT_PURPLE = (139, 92, 246)       # #8B5CF6
-ACCENT_CYAN = (56, 189, 248)         # #38BDF8
-ACCENT_TEAL = (45, 212, 191)         # #2DD4BF
-ACCENT_PINK = (244, 114, 182)        # #F472B6
-TEXT_PRIMARY = (245, 245, 250)       # near-white
-TEXT_SECONDARY = (163, 163, 182)
-TEXT_MUTED = (116, 116, 138)
+BG_TOP = (255, 255, 255)             # #FFFFFF
+BG_BOTTOM = (242, 242, 247)          # #F2F2F7 systemGroupedBackground
+SURFACE_COLOR = (255, 255, 255)      # card
+SURFACE_LIGHT = (247, 247, 249)      # chips / tracks
+CARD_BORDER = (226, 226, 231)        # #E2E2E7 hairline
+CARD_BORDER_SOFT = (238, 238, 242)   # inner separators
+TRACK_COLOR = (237, 237, 241)        # progress-bar track
+ACCENT_PURPLE = (94, 92, 230)        # #5E5CE6 systemIndigo
+ACCENT_CYAN = (0, 122, 255)          # #007AFF systemBlue
+ACCENT_BLUE = (0, 113, 227)          # #0071E3 (links, focus)
+ACCENT_TEAL = (48, 176, 199)         # #30B0C7
+ACCENT_PINK = (255, 55, 95)          # #FF375F systemPink
+ACCENT_ORANGE = (255, 159, 10)       # #FF9F0A systemOrange
+TEXT_PRIMARY = (29, 29, 31)          # #1D1D1F label
+TEXT_SECONDARY = (110, 110, 115)     # #6E6E73 secondaryLabel
+TEXT_MUTED = (142, 142, 147)         # #8E8E93 tertiaryLabel
 
-GOLD = (250, 204, 21)                # #FACC15
-GOLD_DEEP = (180, 130, 10)
-SILVER = (203, 213, 225)             # #CBD5E1
-SILVER_DEEP = (130, 142, 160)
-BRONZE = (251, 146, 60)              # #FB923C
-BRONZE_DEEP = (160, 86, 24)
+GOLD = (255, 179, 0)                 # #FFB300
+GOLD_DEEP = (255, 149, 0)            # #FF9500
+SILVER = (174, 174, 178)             # #AEAEB2
+SILVER_DEEP = (142, 142, 147)
+BRONZE = (197, 139, 91)              # #C58B5B
+BRONZE_DEEP = (163, 106, 61)
 
-LIVE_GREEN = (52, 211, 153)
+LIVE_GREEN = (52, 199, 89)           # #34C759
 
 _PERIOD_ACCENT = {
     VoicePeriod.TODAY: ACCENT_CYAN,
     VoicePeriod.YESTERDAY: ACCENT_PURPLE,
-    VoicePeriod.WEEK: ACCENT_PURPLE,
+    VoicePeriod.WEEK: ACCENT_CYAN,
     VoicePeriod.MONTH: ACCENT_TEAL,
-    VoicePeriod.ALL_TIME: GOLD,
+    VoicePeriod.ALL_TIME: ACCENT_ORANGE,
 }
 
 _MEDAL_RAMPS = {
@@ -133,61 +161,28 @@ def _with_alpha(color: tuple[int, int, int], alpha: int) -> tuple[int, int, int,
 # ---------------------------------------------------------------------------
 
 
-@lru_cache(maxsize=4)
-def _radial_glow(size: int, color: tuple[int, int, int], strength: int) -> Image.Image:
-    """A soft circular glow, built small and scaled up (cheap and smooth)."""
-    size = max(8, int(size))
-    ramp = Image.radial_gradient("L")  # 0 at the centre, 255 at the edge
-    ramp = ImageOps.invert(ramp)
-    # Square the falloff so the glow fades out gently instead of linearly.
-    ramp = ramp.point(lambda v: int((v / 255.0) ** 2.2 * 255))
-    alpha = ramp.point(lambda v: int(v * (strength / 255.0)))
-    glow = Image.new("RGBA", ramp.size, _with_alpha(color, 255))
-    glow.putalpha(alpha)
-    return glow.resize((size, size), Image.Resampling.BICUBIC)
-
-
 @lru_cache(maxsize=16)
 def _background(width: int, height: int, accent: tuple[int, int, int]) -> Image.Image:
-    """Gradient backdrop with ambient glows. Cached per canvas size."""
+    """White-to-grey page with one very faint accent wash at the top.
+
+    Cached per canvas size, so the gradient is built once per shape of card
+    rather than once per render.
+    """
     width = max(1, int(width))
     height = max(1, int(height))
     ramp = Image.linear_gradient("L").resize((width, height), Image.Resampling.BILINEAR)
     canvas = ImageOps.colorize(ramp, black=BG_TOP, white=BG_BOTTOM).convert("RGBA")
 
-    glows = (
-        (-0.10, -0.02, 0.85, accent, 58),
-        (0.72, -0.20, 0.62, ACCENT_CYAN, 28),
-        (0.30, 0.02, 0.55, _mix(accent, ACCENT_PINK, 0.35), 14),
-    )
-    for fx, fy, fsize, colour, strength in glows:
-        size = int(width * fsize)
-        if size < 16:
-            continue
-        glow = _radial_glow(size, colour, strength).resize(
-            (size, size), Image.Resampling.BILINEAR
-        )
-        canvas.alpha_composite(glow, (int(width * fx), int(height * fy)))
-
-    # A whisper of vignette to keep the eye on the content: transparent in the
-    # middle, gently darker toward the edges.
-    vignette = _vignette(width, height)
-    canvas.alpha_composite(vignette)
+    # A single soft wash behind the header only: enough to give the page a
+    # temperature, far too little to compete with the type. A one-pixel
+    # gradient stretched to the full width keeps it perfectly even.
+    band = min(300, max(80, height // 3))
+    fade = Image.linear_gradient("L").resize((1, band), Image.Resampling.BILINEAR)
+    fade = fade.point(lambda v: int((1.0 - v / 255.0) ** 1.6 * 22))
+    wash = Image.new("RGBA", (width, band), _with_alpha(accent, 255))
+    wash.putalpha(fade.resize((width, band), Image.Resampling.BILINEAR))
+    canvas.alpha_composite(wash, (0, 0))
     return canvas
-
-
-@lru_cache(maxsize=8)
-def _vignette(width: int, height: int) -> Image.Image:
-    """Darkened edges, transparent centre — a proper vignette, not a wash."""
-    width = max(1, int(width))
-    height = max(1, int(height))
-    mask = Image.radial_gradient("L").resize((width, height), Image.Resampling.BILINEAR)
-    # radial_gradient is black (0) at the centre and white (255) at the edge;
-    # keep the centre clear and ramp the alpha in only near the border.
-    mask = mask.point(lambda v: int(max(0, (v - 150)) / 105.0 * 120))
-    vignette = Image.new("RGBA", (width, height), (0, 0, 0, 255))
-    vignette.putalpha(mask)
-    return vignette
 
 
 @lru_cache(maxsize=32)
@@ -257,6 +252,20 @@ _AVATAR_PALETTE = (
     (147, 51, 234),
     (46, 139, 116),
 )
+
+
+@lru_cache(maxsize=4)
+def _radial_glow(size: int, color: tuple[int, int, int], strength: int) -> Image.Image:
+    """A soft circular glow, built small and scaled up (cheap and smooth)."""
+    size = max(8, int(size))
+    ramp = Image.radial_gradient("L")  # 0 at the centre, 255 at the edge
+    ramp = ImageOps.invert(ramp)
+    # Square the falloff so the glow fades out gently instead of linearly.
+    ramp = ramp.point(lambda v: int((v / 255.0) ** 2.2 * 255))
+    alpha = ramp.point(lambda v: int(v * (strength / 255.0)))
+    glow = Image.new("RGBA", ramp.size, _with_alpha(color, 255))
+    glow.putalpha(alpha)
+    return glow.resize((size, size), Image.Resampling.BICUBIC)
 
 
 @lru_cache(maxsize=256)
@@ -729,6 +738,7 @@ class LeaderboardImageRenderer:
             accent=accent,
             title_override=title_override,
             subtitle_override=subtitle_override,
+            live_count=sum(1 for m in members if m.is_active_now),
         )
 
         if num_podium:
@@ -741,6 +751,13 @@ class LeaderboardImageRenderer:
             )
 
         if list_items:
+            # One grouped sheet for the whole list, not a box per person.
+            self._draw_list_container(
+                painter,
+                layout.list_y,
+                layout.list_y + len(list_items) * ROW_PITCH + 6,
+                accent,
+            )
             for index, member in enumerate(list_items):
                 avatar = list_avatars[index] if index < len(list_avatars) else None
                 if avatar is None:
@@ -753,6 +770,7 @@ class LeaderboardImageRenderer:
                     member,
                     avatar,
                     accent=accent,
+                    last=index == len(list_items) - 1,
                 )
         elif num_podium == 0:
             self._draw_empty_state(
@@ -788,88 +806,120 @@ class LeaderboardImageRenderer:
         accent: tuple[int, int, int],
         title_override: str | None,
         subtitle_override: str | None,
+        live_count: int = 0,
     ) -> None:
-        pill_font = self._font("semibold", 11)
-        title_font = self._font("display", 36)
-        sub_font = self._font("medium", 15)
-        label_font = self._font("semibold", 10)
-        total_font = self._font("display", 30)
+        """Eyebrow, title, one line of context, and the one number that matters.
 
-        # Brand pill with a live dot.
-        pill_h = 26
-        pill_text = "PARADISE · VOICE ACTIVITY"
-        text_w = p.measure(pill_text, pill_font)[0]
-        pill_w = text_w + 52
-        p.rect((40, 34, 40 + pill_w, 34 + pill_h), radius=pill_h / 2, fill=SURFACE_LIGHT,
-               outline=CARD_BORDER_SOFT, width=1)
-        p.ellipse((52, 34 + 9, 60, 34 + 17), fill=accent)
-        p.text((68, 34 + pill_h / 2), pill_text, font=pill_font, fill=TEXT_SECONDARY, anchor="lm")
+        No pills, no boxed statistics, no shouting: the server is a quiet grey
+        line, the period is the headline, and the group's total time sits on the
+        right where a reader's eye lands after the title.
+        """
+        eyebrow_font = self._font("medium", 13)
+        title_font = self._font("display", 44)
+        sub_font = self._font("regular", 15)
+        small_font = self._font("regular", 12)
+        stat_label_font = self._font("regular", 13)
+        stat_font = self._font("display", 32)
 
-        # Title: period (bright) + date (muted) on one line.
-        if title_override:
-            main_title = title_override
-            p.text((40, 72), main_title, font=title_font, fill=TEXT_PRIMARY)
-        else:
-            headline = period.label.upper()
-            p.text((40, 72), headline, font=title_font, fill=TEXT_PRIMARY)
-            if date_str:
-                head_w = p.measure(headline, title_font)[0]
-                # A thin divider dot, drawn rather than typed (font-independent).
-                dot_x = 40 + head_w + 18
-                p.ellipse((dot_x, 72 + 20, dot_x + 6, 72 + 26), fill=accent)
-                p.text((dot_x + 16, 72), date_str.upper(), font=title_font, fill=TEXT_MUTED)
+        title = title_override or period.label
+        p.text(
+            (PAD, 40),
+            self._truncate(p, guild_name, 560, eyebrow_font),
+            font=eyebrow_font,
+            fill=TEXT_MUTED,
+        )
+        p.text(
+            (PAD, 62),
+            self._truncate(p, title, 560, title_font),
+            font=title_font,
+            fill=TEXT_PRIMARY,
+        )
 
-        # Subtitle line.
         if subtitle_override:
             subtitle = subtitle_override
         else:
-            subtitle = (
-                f"Server: {guild_name}   ·   {total_count} member"
-                f"{'' if total_count == 1 else 's'} tracked"
+            if total_count:
+                parts = [f"{total_count} {'person' if total_count == 1 else 'people'}"]
+            else:
+                parts = ["nobody yet"]
+            if live_count:
+                parts.append(
+                    f"{live_count} in a call right now" if live_count > 1 else "1 in a call now"
+                )
+            subtitle = "  ·  ".join(parts)
+        p.text((PAD, 122), subtitle, font=sub_font, fill=TEXT_SECONDARY)
+        if date_str:
+            p.text((PAD, 146), date_str, font=small_font, fill=TEXT_MUTED)
+
+        # The group's total, right-aligned, with no container around it.
+        right = WIDTH - PAD
+        p.text((right, 44), "Time together", font=stat_label_font, fill=TEXT_MUTED, anchor="ra")
+        p.text(
+            (right, 64),
+            _compact_duration(total_seconds) if total_seconds else "—",
+            font=stat_font,
+            fill=TEXT_PRIMARY if total_seconds else TEXT_MUTED,
+            anchor="ra",
+        )
+
+    def _lift(
+        self,
+        p: _Painter,
+        box,
+        *,
+        radius: float,
+        strength: int = 10,
+        spread: float = 2.0,
+    ) -> None:
+        """A two-pixel shadow, drawn as a couple of very faint rounded rects.
+
+        A real Gaussian blur at 2× supersampling costs more than the whole card
+        is worth; two slightly offset rectangles a few percent darker than the
+        page survive the LANCZOS down-sample as a soft edge and cost
+        microseconds.
+        """
+        x0, y0, x1, y1 = box
+        # Two passes only: a tight contact shadow and a wider, fainter one.
+        #
+        # ImageDraw does not alpha-blend a fill onto an RGBA canvas — it
+        # *replaces* the pixel, alpha included — so a translucent grey would
+        # survive the later RGB conversion as a solid dark line. The shadow is
+        # therefore pre-blended against the page colour, which is all it ever
+        # sits on.
+        for offset, alpha in ((spread * 0.6, strength), (spread, max(2, strength // 2))):
+            p.rect(
+                (x0, y0 + offset, x1, y1 + offset),
+                radius=radius + offset * 0.5,
+                fill=_mix(BG_BOTTOM, (23, 23, 30), alpha / 255.0),
             )
-        p.text((40, 128), subtitle, font=sub_font, fill=TEXT_SECONDARY)
 
-        # Server-total stat card (right aligned).
-        card_w, card_h = 214, 108
-        card_x = WIDTH - 40 - card_w
-        card_y = 36
-        self._glass_card(p, (card_x, card_y, card_x + card_w, card_y + card_h), accent, radius=16)
-        p.text((card_x + 18, card_y + 16), "SERVER TOTAL", font=label_font, fill=TEXT_MUTED)
-        p.text(
-            (card_x + 18, card_y + 36),
-            _compact_duration(total_seconds),
-            font=total_font,
-            fill=TEXT_PRIMARY,
-        )
-        # Progress strip: a full-width accent ramp, purely decorative but it
-        # ties the accent colour into the card.
-        strip = _horizontal_ramp(
-            p.px(card_w - 36), p.px(4), accent, _mix(accent, ACCENT_PINK, 0.5)
-        )
-        p.paste(strip, (card_x + 18, card_y + card_h - 26))
-        p.text(
-            (card_x + 18, card_y + card_h - 18),
-            f"{_format_hours_minutes(total_seconds)} of tracked voice",
-            font=self._font("regular", 10),
-            fill=TEXT_MUTED,
-        )
-
-
-    def _glass_card(
+    def _card(
         self,
         p: _Painter,
         box,
         accent: tuple[int, int, int],
         *,
-        radius: float = 18,
+        radius: float = 20,
         fill: tuple[int, int, int] | None = None,
         outline: tuple[int, int, int] | None = None,
-        tint: float = 0.05,
+        tint: float = 0.0,
         width: float = 1,
+        shadow: int = 10,
     ) -> None:
-        """A card with a faint accent tint and a one-pixel border."""
-        base = fill or _mix(SURFACE_COLOR, accent, tint)
-        p.rect(box, radius=radius, fill=(*base, 235), outline=outline or CARD_BORDER_SOFT, width=width)
+        """White card, hairline border, the faintest lift off the page."""
+        if shadow:
+            self._lift(p, box, radius=radius, strength=shadow)
+        base = fill or (_mix(SURFACE_COLOR, accent, tint) if tint else SURFACE_COLOR)
+        p.rect(
+            box,
+            radius=radius,
+            fill=(*base, 255),
+            outline=outline or CARD_BORDER,
+            width=width,
+        )
+
+    # Kept under its old name: the daily report and the leaderboard both call it.
+    _glass_card = _card
 
     def _draw_podium(
         self,
@@ -878,21 +928,21 @@ class LeaderboardImageRenderer:
         members: list[LeaderboardMember],
         avatars: list[Image.Image],
     ) -> None:
-        card_w, gap = 280, 25
+        card_w, gap = 288, 20
         order = {3: [1, 0, 2], 2: [0, 1], 1: [0]}[len(members)]
         total_w = len(members) * card_w + (len(members) - 1) * gap
         start_x = (WIDTH - total_w) // 2
-        # All three cards share a baseline; the winner is simply taller, so the
-        # bottom row of content (bar + share) lines up across the podium.
+        # Shared baseline: the winner's card is simply taller, so the bars and
+        # percentages line up right across the row.
         baseline = top + 292
-        short_h, tall_h = 274, 300
+        short_h, tall_h = 266, 292
 
         for slot, member_index in enumerate(order):
             member = members[member_index]
             avatar = avatars[member_index]
             x = start_x + slot * (card_w + gap)
             rank = member.rank if member.rank <= 3 else member_index + 1
-            accent, deep = _MEDAL_RAMPS.get(rank, (ACCENT_PURPLE, ACCENT_PURPLE))
+            accent, deep = _MEDAL_RAMPS.get(rank, (ACCENT_CYAN, ACCENT_BLUE))
             card_h = tall_h if rank == 1 else short_h
             self._draw_podium_card(
                 p, x, baseline - card_h, card_w, card_h, member, avatar, accent, deep, rank
@@ -911,62 +961,37 @@ class LeaderboardImageRenderer:
         deep: tuple[int, int, int],
         rank: int,
     ) -> None:
-        """One podium card. Content is anchored to the card bottom so a taller
-        winner card stays visually balanced with the runners-up."""
+        """One podium card: portrait, name, time, a bar, and how much of the room."""
         cx = x + w / 2
-        self._glass_card(
+        winner = rank == 1
+        self._card(
             p,
             (x, y, x + w, y + h),
             accent,
-            radius=20,
-            tint=0.10 if rank == 1 else 0.05,
-            outline=_mix(CARD_BORDER, accent, 0.55 if rank == 1 else 0.25),
-            width=1.6 if rank == 1 else 1,
+            radius=24,
+            tint=0.05 if winner else 0.0,
+            outline=_mix(CARD_BORDER, accent, 0.30 if winner else 0.0),
+            width=1,
+            shadow=14 if winner else 9,
         )
 
-        av_size = 86 if rank == 1 else 76
-        pct_y = y + h - 22
-        bar_y = y + h - 42
-        time_y = y + h - 66
-        name_y = y + h - 96
-        av_centre = name_y - 18 - av_size / 2
-        coin_size = 34 if rank == 1 else 30
-        coin_y = av_centre - av_size / 2 - 10 - coin_size
+        # Position, as a word rather than a coin.
+        place = {1: "1st", 2: "2nd", 3: "3rd"}.get(rank, f"{rank}th")
+        place_font = self._font("semibold", 12)
+        p.text((cx, y + 22), place, font=place_font, fill=_mix(accent, TEXT_SECONDARY, 0.35), anchor="ma")
 
-        # Crown for the winner, drawn as a polygon (no glyph dependency).
-        if rank == 1:
-            crown_y = coin_y - 22
-            p.polygon(
-                [
-                    (cx - 14, crown_y + 12),
-                    (cx - 14, crown_y + 2),
-                    (cx - 6.5, crown_y + 8),
-                    (cx, crown_y + 1),
-                    (cx + 6.5, crown_y + 8),
-                    (cx + 14, crown_y + 2),
-                    (cx + 14, crown_y + 12),
-                ],
-                fill=accent,
-            )
+        av_size = 84 if winner else 76
+        pct_y = y + h - 20
+        bar_y = y + h - 40
+        time_y = y + h - 62
+        name_y = y + h - 92
+        av_centre = name_y - 30 - av_size / 2
 
-        # Medal coin with the rank inside.
-        coin = _vertical_ramp(p.px(coin_size), p.px(coin_size), accent, deep).convert("RGBA")
-        p.paste(coin, (cx - coin_size / 2, coin_y), mask=_create_circle_mask(p.px(coin_size)))
-        p.text(
-            (cx, coin_y + coin_size / 2),
-            str(rank),
-            font=self._font("display", 17),
-            fill=(24, 19, 36),
-            anchor="mm",
-        )
-
-        # Avatar with a gradient ring.
-        ring_size = av_size + 12
-        ring = _vertical_ramp(p.px(ring_size), p.px(ring_size), accent, deep).convert("RGBA")
-        p.paste(
-            ring,
-            (cx - ring_size / 2, av_centre - ring_size / 2),
-            mask=_create_circle_mask(p.px(ring_size)),
+        # A single quiet ring, not a gradient halo.
+        ring_size = av_size + 6
+        p.ellipse(
+            (cx - ring_size / 2, av_centre - ring_size / 2, cx + ring_size / 2, av_centre + ring_size / 2),
+            fill=_mix(accent, (255, 255, 255), 0.82),
         )
         p.paste(
             avatar.resize((p.px(av_size), p.px(av_size)), Image.Resampling.LANCZOS),
@@ -974,36 +999,42 @@ class LeaderboardImageRenderer:
             mask=_create_circle_mask(p.px(av_size)),
         )
 
-        name_font = self._font("semibold", 17 if rank == 1 else 16)
-        name = self._truncate(p, member.display_name, w - 32, name_font)
-        p.text((cx, name_y), name, font=name_font, fill=TEXT_PRIMARY, anchor="ms")
-
-        time_font = self._font("display", 25 if rank == 1 else 22)
+        name_font = self._font("semibold", 17)
+        p.text(
+            (cx, name_y),
+            self._truncate(p, member.display_name, w - 40, name_font),
+            font=name_font,
+            fill=TEXT_PRIMARY,
+            anchor="ms",
+        )
         p.text(
             (cx, time_y),
             member.formatted_time,
-            font=time_font,
-            fill=accent,
+            font=self._font("display", 26),
+            fill=TEXT_PRIMARY,
             anchor="ms",
         )
 
         share = _clamp_share(member.percentage)
-        bar_w = w - 76
+        bar_w = w - 84
         bar_x = cx - bar_w / 2
-        p.rect((bar_x, bar_y, bar_x + bar_w, bar_y + 5), radius=2.5, fill=TRACK_COLOR)
+        p.rect((bar_x, bar_y, bar_x + bar_w, bar_y + 4), radius=2, fill=TRACK_COLOR)
         if share > 0:
             filled = max(3.0, bar_w * share / 100.0)
-            ramp = _horizontal_ramp(
-                p.px(filled), p.px(5), accent, _mix(accent, (255, 255, 255), 0.35)
-            )
-            p.paste(ramp, (bar_x, bar_y))
+            p.rect((bar_x, bar_y, bar_x + filled, bar_y + 4), radius=2, fill=accent)
         p.text(
             (cx, pct_y),
-            f"{share:.1f}% of server voice",
-            font=self._font("regular", 11),
+            f"{share:.0f}% of the time",
+            font=self._font("regular", 12),
             fill=TEXT_MUTED,
             anchor="ma",
         )
+
+    def _draw_list_container(
+        self, p: _Painter, top: int, bottom: int, accent: tuple[int, int, int]
+    ) -> None:
+        """The grouped list: one white sheet, rows separated by hairlines."""
+        self._card(p, (PAD, top, WIDTH - PAD, bottom), accent, radius=22, shadow=10)
 
     def _draw_list_row(
         self,
@@ -1013,131 +1044,112 @@ class LeaderboardImageRenderer:
         avatar: Image.Image,
         *,
         accent: tuple[int, int, int],
+        last: bool = False,
     ) -> None:
-        x, w, h = 40, WIDTH - 80, ROW_HEIGHT
-        self._glass_card(
-            p,
-            (x, y, x + w, y + h),
-            accent,
-            radius=14,
-            tint=0.03 if member.rank > 3 else 0.07,
-            fill=SURFACE_COLOR,
-        )
+        h = ROW_HEIGHT
+        left, right = PAD, WIDTH - PAD
+        centre = y + h / 2
 
-        # Rank chip.
-        rank_font = self._font("semibold", 14)
-        rank_text = f"#{member.rank}"
-        rank_w = max(38, p.measure(rank_text, rank_font)[0] + 20)
-        chip_h = 26
-        p.rect(
-            (x + 14, y + (h - chip_h) / 2, x + 14 + rank_w, y + (h + chip_h) / 2),
-            radius=8,
-            fill=SURFACE_LIGHT,
-            outline=CARD_BORDER_SOFT,
-        )
+        # Hairline separator, inset to the text column like a grouped table.
+        if not last:
+            p.line(
+                [(left + 44, y + h), (right - 18, y + h)],
+                fill=_mix(CARD_BORDER_SOFT, (255, 255, 255), 0.45),
+                width=1,
+            )
+
+        rank_font = self._font("semibold", 13)
         p.text(
-            (x + 14 + rank_w / 2, y + h / 2),
-            rank_text,
+            (left + 22, centre),
+            str(member.rank),
             font=rank_font,
-            fill=_mix(TEXT_MUTED, accent, 0.6),
-            anchor="mm",
+            fill=TEXT_MUTED,
+            anchor="lm",
         )
 
-        # Avatar.
         av_size = 40
-        av_x = x + 14 + rank_w + 12
+        av_x = left + 44
         p.paste(
             avatar.resize((p.px(av_size), p.px(av_size)), Image.Resampling.LANCZOS),
-            (av_x, y + (h - av_size) / 2),
+            (av_x, centre - av_size / 2),
             mask=_create_circle_mask(p.px(av_size)),
         )
 
-        # Right column: duration on top, share underneath.
-        time_font = self._font("semibold", 16)
+        time_font = self._font("semibold", 15)
         time_text = member.formatted_time
         time_w = p.measure(time_text, time_font)[0]
-        time_x = x + w - 20 - time_w
-        p.text((time_x, y + 14), time_text, font=time_font, fill=TEXT_PRIMARY)
+        time_x = right - 18 - time_w
+        p.text((right - 18, centre - 7), time_text, font=time_font, fill=TEXT_PRIMARY, anchor="rm")
 
         share = _clamp_share(member.percentage)
         share_font = self._font("regular", 11)
-        share_text = f"{share:.1f}%"
-        share_w = p.measure(share_text, share_font)[0]
-        p.text((x + w - 20 - share_w, y + 38), share_text, font=share_font, fill=TEXT_MUTED)
+        p.text(
+            (right - 18, centre + 12),
+            f"{share:.0f}%",
+            font=share_font,
+            fill=TEXT_MUTED,
+            anchor="rm",
+        )
 
-        # Name (left of the duration column), plus a live indicator.
         name_font = self._font("semibold", 15)
-        name_x = av_x + av_size + 14
-        name_max = max(60, time_x - 40 - name_x)
-        name = self._truncate(p, member.display_name, name_max, name_font)
-        p.text((name_x, y + 13), name, font=name_font, fill=TEXT_PRIMARY)
-
+        name_x = av_x + av_size + 16
         if member.is_active_now:
-            live_font = self._font("semibold", 9)
-            live_text = "LIVE"
-            live_w = p.measure(live_text, live_font)[0] + 22
-            p.rect(
-                (name_x, y + 34, name_x + live_w, y + 48),
-                radius=7,
-                fill=_mix(SURFACE_LIGHT, LIVE_GREEN, 0.22),
-                outline=_mix(CARD_BORDER, LIVE_GREEN, 0.5),
-            )
-            p.ellipse((name_x + 6, y + 38, name_x + 12, y + 44), fill=LIVE_GREEN)
-            p.text(
-                (name_x + 16, y + 38.5),
-                live_text,
-                font=live_font,
-                fill=_mix(TEXT_PRIMARY, LIVE_GREEN, 0.5),
-            )
-            bar_x = name_x + live_w + 12
-        else:
-            bar_x = name_x
+            # A green dot, the way a presence dot works everywhere else.
+            p.ellipse((name_x, centre - 12, name_x + 7, centre - 5), fill=LIVE_GREEN)
+            name_x += 15
+        name_max = max(60, time_x - 26 - name_x)
+        p.text(
+            (name_x, centre - 8),
+            self._truncate(p, member.display_name, name_max, name_font),
+            font=name_font,
+            fill=TEXT_PRIMARY,
+            anchor="lm",
+        )
 
-        # Share bar under the name.
-        bar_y = y + 36
-        bar_w = max(24.0, time_x - 24 - bar_x)
-        p.rect((bar_x, bar_y, bar_x + bar_w, bar_y + 5), radius=2.5, fill=TRACK_COLOR)
+        bar_y = centre + 9
+        bar_w = max(24.0, time_x - 40 - name_x)
+        p.rect((name_x, bar_y, name_x + bar_w, bar_y + 3), radius=1.5, fill=TRACK_COLOR)
         if share > 0:
             filled = max(3.0, bar_w * share / 100.0)
-            ramp = _horizontal_ramp(
-                p.px(filled), p.px(5), accent, _mix(accent, ACCENT_CYAN, 0.45)
-            )
-            p.paste(ramp, (bar_x, bar_y))
+            p.rect((name_x, bar_y, name_x + filled, bar_y + 3), radius=1.5, fill=accent)
 
     def _draw_empty_state(
         self, p: _Painter, top: int, bottom: int, accent: tuple[int, int, int]
     ) -> None:
-        """A deliberate empty state: icon, headline, hint — centred in the body."""
+        """A deliberate empty state: a quiet icon, a plain sentence, a hint."""
         centre = (top + bottom) / 2
-        icon_cy = centre - 58
+        icon_cy = centre - 54
 
-        # Headphones, drawn from primitives so it needs no icon font.
-        ring = _mix(SURFACE_LIGHT, accent, 0.18)
-        p.rect((WIDTH / 2 - 32, icon_cy - 34, WIDTH / 2 + 32, icon_cy + 34), radius=32,
-               fill=(*ring, 120), outline=_mix(CARD_BORDER, accent, 0.35), width=1)
-        p.draw.arc(
-            (p.px(WIDTH / 2 - 20), p.px(icon_cy - 20), p.px(WIDTH / 2 + 20), p.px(icon_cy + 20)),
-            start=180, end=360, fill=accent, width=p.px(3),
+        p.ellipse(
+            (WIDTH / 2 - 34, icon_cy - 34, WIDTH / 2 + 34, icon_cy + 34),
+            fill=_mix(SURFACE_LIGHT, accent, 0.08),
         )
-        for dx in (-20, 20):
+        p.draw.arc(
+            (p.px(WIDTH / 2 - 21), p.px(icon_cy - 22), p.px(WIDTH / 2 + 21), p.px(icon_cy + 20)),
+            start=180,
+            end=360,
+            fill=TEXT_MUTED,
+            width=p.px(2.5),
+        )
+        for dx in (-21, 21):
             p.rect(
-                (WIDTH / 2 + dx - 4, icon_cy - 2, WIDTH / 2 + dx + 4, icon_cy + 14),
+                (WIDTH / 2 + dx - 4, icon_cy - 3, WIDTH / 2 + dx + 4, icon_cy + 13),
                 radius=4,
-                fill=accent,
+                fill=TEXT_MUTED,
             )
 
         p.text(
-            (WIDTH / 2, centre + 16),
-            "No voice activity recorded for this period",
+            (WIDTH / 2, centre + 20),
+            "No one has been in a call yet",
             font=self._font("semibold", 19),
-            fill=TEXT_SECONDARY,
+            fill=TEXT_PRIMARY,
             anchor="mm",
         )
         p.text(
-            (WIDTH / 2, centre + 46),
-            "Join a voice channel — the board fills itself in.",
+            (WIDTH / 2, centre + 50),
+            "Join a voice channel and this fills itself in.",
             font=self._font("regular", 14),
-            fill=TEXT_MUTED,
+            fill=TEXT_SECONDARY,
             anchor="mm",
         )
 
@@ -1156,9 +1168,9 @@ class LeaderboardImageRenderer:
         """
         draw = ImageDraw.Draw(canvas)
         header_rule = HEADER_HEIGHT - 34
-        draw.line([(40, header_rule), (WIDTH - 40, header_rule)], fill=CARD_BORDER, width=1)
+        draw.line([(PAD, header_rule), (WIDTH - PAD, header_rule)], fill=CARD_BORDER_SOFT, width=1)
         draw.line(
-            [(40, layout.footer_y - 12), (WIDTH - 40, layout.footer_y - 12)],
+            [(PAD, layout.footer_y - 12), (WIDTH - PAD, layout.footer_y - 12)],
             fill=CARD_BORDER,
             width=1,
         )
@@ -1166,18 +1178,22 @@ class LeaderboardImageRenderer:
         brand_font = self._font("semibold", 12, scale=1)
         meta_font = self._font("regular", 11, scale=1)
 
-        draw.ellipse((40, layout.footer_y + 3, 48, layout.footer_y + 11), fill=accent)
-        draw.text((56, layout.footer_y + 1), "Paradise", font=brand_font, fill=TEXT_SECONDARY)
+        draw.text((PAD, layout.footer_y + 1), "Paradise", font=brand_font, fill=TEXT_SECONDARY)
         brand_w = draw.textbbox((0, 0), "Paradise", font=brand_font)[2]
         draw.text(
-            (56 + brand_w + 8, layout.footer_y + 2),
-            "· voice statistics",
+            (PAD + brand_w + 8, layout.footer_y + 2),
+            "· voice",
             font=meta_font,
             fill=TEXT_MUTED,
         )
-        right = f"Page {page}"
+        right = f"page {page}"
         right_w = draw.textbbox((0, 0), right, font=meta_font)[2]
-        draw.text((WIDTH - 40 - right_w, layout.footer_y + 2), right, font=meta_font, fill=TEXT_MUTED)
+        draw.text(
+            (WIDTH - PAD - right_w, layout.footer_y + 2),
+            right,
+            font=meta_font,
+            fill=TEXT_MUTED,
+        )
 
     # -- helpers -------------------------------------------------------
 
@@ -1234,17 +1250,20 @@ def prewarm() -> None:
     try:
         renderer = LeaderboardImageRenderer(scale=DEFAULT_SCALE)
         for role, size in (
-            ("display", 36),
-            ("display", 30),
-            ("display", 24),
-            ("display", 17),
+            ("display", 44),
+            ("display", 32),
+            ("display", 26),
+            ("semibold", 19),
             ("semibold", 17),
-            ("semibold", 16),
             ("semibold", 15),
-            ("semibold", 14),
-            ("medium", 15),
+            ("semibold", 13),
+            ("semibold", 12),
+            ("medium", 13),
+            ("regular", 15),
+            ("regular", 14),
+            ("regular", 13),
+            ("regular", 12),
             ("regular", 11),
-            ("regular", 10),
         ):
             renderer._font(role, size)
         for height in (MIN_HEIGHT, 620, 720, 900):

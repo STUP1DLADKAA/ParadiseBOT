@@ -441,7 +441,9 @@ class TestVoiceTracker(unittest.IsolatedAsyncioTestCase):
         await self.tracker.dispatch_daily_dm_reports("2026-10-01")
 
         mock_user.send.assert_awaited_once()
-        self.assertIn("Voice time: 10m", mock_user.send.call_args.args[0])
+        embed = mock_user.send.call_args.kwargs["embed"]
+        self.assertIn("10m", embed.description)
+        self.assertIn("You spent **10m** in voice on", embed.description)
         self.assertTrue(self.db.has_dm_report_sent("2026-10-01", guild_id, user_id))
 
     async def test_dispatch_daily_dm_reports(self):
@@ -471,13 +473,12 @@ class TestVoiceTracker(unittest.IsolatedAsyncioTestCase):
 
         await self.tracker.dispatch_daily_dm_reports(date_str)
 
-        # Verify DM was sent with expected report text
+        # Verify the DM reads like a report a person would send.
         mock_user.send.assert_called_once()
-        sent_text = mock_user.send.call_args[0][0]
-        self.assertIn("Your Paradise VC Report", sent_text)
-        self.assertIn("September 30, 2026", sent_text)
-        self.assertIn("3h 42m", sent_text)
-        self.assertIn("Keep talking. Paradise was definitely not quiet today.", sent_text)
+        embed = mock_user.send.call_args.kwargs["embed"]
+        self.assertEqual(embed.title, "Wednesday, 30 September")
+        self.assertIn("You spent **3h 42m** in voice on Wednesday.", embed.description)
+        self.assertEqual(embed.footer.text, "Paradise Server")
 
         # Verify marked as sent so no duplicate
         self.assertTrue(self.db.has_dm_report_sent(date_str, guild_id, user_id))

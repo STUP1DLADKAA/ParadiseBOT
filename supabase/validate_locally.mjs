@@ -26,6 +26,7 @@ const here = dirname(fileURLToPath(import.meta.url));
 const baseMigrationSql = readFileSync(join(here, "migrations", "001_voice_activity.sql"), "utf8");
 const istMigrationSql = readFileSync(join(here, "migrations", "002_voice_ist_calendar.sql"), "utf8");
 const checkpointMigrationSql = readFileSync(join(here, "migrations", "003_voice_checkpoint.sql"), "utf8");
+const carryMigrationSql = readFileSync(join(here, "migrations", "004_voice_credit_carry.sql"), "utf8");
 
 const db = new PGlite();
 let passed = 0;
@@ -142,7 +143,7 @@ await db.exec(checkpointMigrationSql);
 console.log("  ok   checkpoint migration applied and re-applied (idempotent)");
 passed++;
 
-check("schema version is 3", (await scalar("select public.voice_schema_version()")) === 3);
+check("schema version is 3 (after 003)", (await scalar("select public.voice_schema_version()")) === 3);
 check("voice_active_sessions gained credited_until",
   Number(await scalar(
     "select count(*) from information_schema.columns " +
@@ -371,6 +372,88 @@ try {
 check("anon cannot execute the v2 heartbeat function",
   /permission denied for function voice_heartbeat_active_v2/.test(anonHb2Err ?? ""),
   anonHb2Err ?? "no error");
+
+// ---------------------------------------------------------------------------
+console.log("\n== 0d. the fractional second a long session used to lose ==");
+// A 24-hour stay was credited as ~23 h 51 m. The checkpoint credited an INTEGER
+// number of seconds and then moved the cursor to the request's un-floored
+// instant, so the fraction the floor discarded was unrecoverable — hundreds of
+// times a day. 004 advances the cursor by the credited seconds instead.
+
+await db.exec(carryMigrationSql);
+await db.exec(carryMigrationSql);
+console.log("  ok   carry migration applied and re-applied (idempotent)");
+passed++;
+
+check("schema version is 4", (await scalar("select public.voice_schema_version()")) === 4);
+
+{
+  const CARRY_GUILD = 991;
+  const startMs = Date.parse("2026-10-05T00:00:00.700Z"); // mid-second start
+  const iso = (ms) => new Date(ms).toISOString();
+
+  // Jittery boundaries: a reconcile loop sleeps ~120 s plus whatever the last
+  // round trip cost. The fractions never line up, which is why the old loss
+  // accumulated instead of cancelling out.
+  const boundaries = [];
+  let next = startMs;
+  for (let i = 0; i < 60; i++) {
+    next += 120_400 + (i % 7) * 31;
+    boundaries.push(next);
+  }
+  const elapsed = (boundaries[boundaries.length - 1] - startMs) / 1000;
+
+  await scalar("select public.voice_heartbeat_active($1)", [JSON.stringify([
+    { guild_id: CARRY_GUILD, user_id: 501, channel_id: 7001, started_at: iso(startMs), last_seen_at: iso(startMs), is_afk: false },
+  ])]);
+  let carried = 0;
+  let cursor = null;
+  for (const boundary of boundaries) {
+    const row = (await q("select * from public.voice_checkpoint_active_sessions($1)", [
+      JSON.stringify([{ guild_id: CARRY_GUILD, user_id: 501, up_to: iso(boundary) }]),
+    ]))[0];
+    carried += Number(row.o_credited_seconds);
+    cursor = norm(row.o_cursor);
+  }
+  check("the credit carry loses less than a second in 60 checkpoints",
+    elapsed - carried < 1,
+    `elapsed ${elapsed}s but credited ${carried}s`);
+  check("the cursor trails the request by the pending fraction only",
+    (boundaries[boundaries.length - 1] - Date.parse(cursor)) < 1000,
+    `cursor ${cursor}`);
+
+  const replay = (await q("select * from public.voice_checkpoint_active_sessions($1)", [
+    JSON.stringify([{ guild_id: CARRY_GUILD, user_id: 501, up_to: iso(boundaries[boundaries.length - 1]) }]),
+  ]))[0];
+  check("a replayed checkpoint credits nothing and does not move the cursor",
+    Number(replay.o_credited_seconds) === 0 && norm(replay.o_cursor) === cursor,
+    `credited ${replay.o_credited_seconds}, cursor ${norm(replay.o_cursor)}`);
+
+  const closed = await scalar("select public.voice_close_active_session($1,$2,$3)",
+    [CARRY_GUILD, 501, iso(startMs + elapsed * 1000 + 600)]);
+  check("close keeps the last half-second instead of flooring it",
+    Number(closed) >= 1, `recorded ${closed}`);
+  check("close removed the active row",
+    Number(await scalar("select count(*) from public.voice_active_sessions where guild_id=$1 and user_id=501", [CARRY_GUILD])) === 0);
+
+  // The old arithmetic, reproduced exactly, on the same boundaries.
+  await scalar("select public.voice_heartbeat_active($1)", [JSON.stringify([
+    { guild_id: CARRY_GUILD, user_id: 502, channel_id: 7001, started_at: iso(startMs), last_seen_at: iso(startMs), is_afk: false },
+  ])]);
+  let legacy = 0;
+  let legacyCursor = startMs;
+  for (const boundary of boundaries) {
+    const secs = await scalar("select public.voice_record_session($1,$2,$3,$4,$5)",
+      [CARRY_GUILD, 502, 7001, iso(legacyCursor), iso(boundary)]);
+    legacy += Number(secs ?? 0);
+    legacyCursor = boundary; // v3: the cursor jumped to the request instant
+    await q("update public.voice_active_sessions set credited_until=$3 where guild_id=$1 and user_id=$2",
+      [CARRY_GUILD, 502, iso(boundary)]);
+  }
+  check("the old arithmetic demonstrably lost time (the reported bug)",
+    elapsed - legacy > 5,
+    `elapsed ${elapsed}s: v3 credited ${legacy}s, v4 credited ${carried}s`);
+}
 
 // ---------------------------------------------------------------------------
 console.log("\n== 1. voice_record_session: midnight splitting & retry safety ==");

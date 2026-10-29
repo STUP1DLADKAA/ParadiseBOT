@@ -960,3 +960,139 @@ class TestV2Compatibility(CheckpointTestBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ===========================================================================
+# Test — the fractional second a long session used to lose
+# ===========================================================================
+
+
+class _LegacyCheckpointModel:
+    """A literal transcription of the v3 SQL, kept only to document the bug."""
+
+    def __init__(self, start: datetime) -> None:
+        self.cursor = start
+        self.total = 0
+
+    def checkpoint(self, up_to: datetime) -> None:
+        span = (up_to - self.cursor).total_seconds()
+        if span <= 0:
+            return
+        credited = int(span)  # voice_record_session() floors
+        self.total += credited
+        self.cursor = up_to  # v3: the un-floored instant, fraction discarded
+
+
+class _CarriedCheckpointModel:
+    """A literal transcription of migration 004."""
+
+    def __init__(self, start: datetime) -> None:
+        self.cursor = start
+        self.total = 0
+
+    def checkpoint(self, up_to: datetime) -> None:
+        target = max(self.cursor, up_to)
+        span = (target - self.cursor).total_seconds()
+        if span <= 0:
+            return
+        credited = int(span)
+        self.total += credited
+        self.cursor = self.cursor + timedelta(seconds=credited)  # carry
+
+
+def _jittery_steps(*, hours: float, seed: int = 7):
+    """The intervals a real reconcile loop produces (20 s ± latency)."""
+    import random
+
+    rng = random.Random(seed)
+    total = 0.0
+    while total < hours * 3600:
+        step = rng.uniform(19.5, 21.5)
+        total += step
+        yield step
+
+
+def _jittery_outputs(start: datetime, *, hours: float, window: float, seed: int = 7):
+    """Checkpoint boundaries a real reconcile loop would produce.
+
+    The loop sleeps ~20 s *plus* the latency of whatever it just did, so the
+    boundaries do not share a fractional part — which is exactly why the lost
+    fractions never cancelled out and the loss grew with the length of the stay.
+    """
+    now = start
+    last = start
+    for step in _jittery_steps(hours=hours, seed=seed):
+        now += timedelta(seconds=step)
+        if (now - last).total_seconds() >= window:
+            yield now
+            last = now
+
+
+class TestFractionalSecondCarry(unittest.TestCase):
+    """A 24-hour stay was credited as ~23 h 51 m. It was never the heartbeat."""
+
+    def test_the_old_arithmetic_loses_minutes_on_a_jittery_loop(self):
+        start = ist(2026, 3, 10, 0, 0) + timedelta(milliseconds=700)
+        model = _LegacyCheckpointModel(start)
+        for boundary in _jittery_outputs(start, hours=24, window=120):
+            model.checkpoint(boundary)
+        lost = 24 * 3600 - model.total
+        # Order of minutes, growing with the length of the stay — the report.
+        self.assertGreater(lost, 120, f"expected a systematic loss, got {lost}s")
+        self.assertLess(lost, 900)
+
+    def test_carrying_the_fraction_loses_nothing(self):
+        start = ist(2026, 3, 10, 0, 0) + timedelta(milliseconds=700)
+        model = _CarriedCheckpointModel(start)
+        for boundary in _jittery_outputs(start, hours=24, window=120):
+            model.checkpoint(boundary)
+        lost = 24 * 3600 - model.total
+        self.assertLessEqual(lost, 1, f"lost {lost}s in a day")
+
+    def test_a_replayed_checkpoint_still_credits_nothing(self):
+        start = ist(2026, 3, 10, 0, 0)
+        model = _CarriedCheckpointModel(start)
+        boundary = start + timedelta(seconds=120)
+        model.checkpoint(boundary)
+        first = model.total
+        model.checkpoint(boundary)  # same call again
+        self.assertEqual(model.total, first)
+        self.assertEqual(model.cursor, boundary)
+
+
+class TestLongSessionAccounting(CheckpointTestBase):
+    """End to end, through the tracker, with a deliberately jittery clock."""
+
+    async def test_a_whole_day_of_voice_credits_a_whole_day(self):
+        self.tracker.checkpoint_seconds = 120.0
+        # Join mid-second: the very first interval is fractional too.
+        self.clock.now = self.start + timedelta(milliseconds=700)
+        member = self.member()
+        await self.join(member)
+
+        elapsed = 0.0
+        for step in _jittery_steps(hours=24):
+            self.clock.advance(step)
+            elapsed += step
+            await self.tracker.reconcile_guilds()
+            await self.tracker.rollover_midnight_sessions(self.clock.now)
+
+        credited = sum(
+            row["duration_seconds"]
+            for (guild, user, _day), row in self.client.daily.items()
+            if guild == str(GUILD_ID) and user == str(USER_ID)
+        ) + self.live()
+        # The session really lasted `elapsed` seconds (the last tick overshoots
+        # 24 h a little). Every one of them must be credited, ±1 s.
+        self.assertGreaterEqual(credited, int(elapsed) - 1)
+        self.assertLessEqual(credited, int(elapsed) + 1, f"credited {credited}s")
+
+    def test_the_migration_that_fixes_it_is_present(self):
+        import pathlib
+
+        sql = pathlib.Path(
+            "supabase/migrations/004_voice_credit_carry.sql"
+        ).read_text()
+        self.assertIn("make_interval(secs => v_secs)", sql)
+        self.assertIn("select 4;", sql)
+        self.assertIn("round(extract(epoch from (p_ended_at - v_from)))", sql)

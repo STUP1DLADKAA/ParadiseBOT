@@ -6,19 +6,6 @@ All notable changes to Paradise are recorded here. The format follows
 
 ## [Unreleased]
 
-### Changed
-- **Speech recognition now runs on the bot's own CPU.** The wake word is
-  transcribed by faster-whisper inside the process — no API key, no upload,
-  works offline once the weights are downloaded — so `VOICE_WAKE_STT=auto`
-  never touches ElevenLabs or Gemini while the local engine is installed.
-  `pip install -r requirements-local-stt.txt` enables it (the Docker image does
-  it by default); `VOICE_WAKE_STT=local` forbids the cloud entirely. Loading and
-  inference run on a dedicated one-thread executor, the model is freed after 15
-  minutes of silence, and a missing dependency, a failed download or a stuck
-  decode is reported in plain words instead of going silent.
-  New keys: `VOICE_WAKE_STT_MODEL`, `_DEVICE`, `_COMPUTE`, `_THREADS`,
-  `_MODEL_DIR`, `_OFFLINE`, `_UNLOAD_AFTER`. [docs/voice-wake.md](docs/voice-wake.md).
-
 ### Added
 - **The wake word can be spoken.** Paradise listens to the voice channel it is
   already in, waits for an utterance to end, transcribes it once
@@ -41,6 +28,41 @@ All notable changes to Paradise are recorded here. The format follows
   can stay off.
 - The channel is told once, on first join, that Paradise is listening; anyone
   who opted out of voice capture is dropped before the listener sees a packet.
+- **The `/vc` leaderboard is a page now, not a poster.** White cards on a light
+  grey page, one accent per period, a 44 px period title, one grouped list
+  instead of a box per person, hairline separators, real (drawn) shadows and
+  never a second headline in the embed. Contrast is tested: primary text is
+  AAA on white, secondary is AA, and accents stay visible.
+- **The daily DM reads like a report from a person.** One line naming the day,
+  one about your own time, one comparison in words ("42m more than Tuesday"),
+  then two numbers: where you landed and what the whole server did. No emoji
+  labels, no "Keep talking. Paradise was definitely not quiet today." The daily
+  channel post uses the same framing.
+- `/vc stats` groups its numbers the way a settings screen would; leaderboard
+  paging is a quiet "page 2 of 3" in the footer only.
+- **Speech recognition now runs on the bot's own CPU.** The wake word is
+  transcribed by faster-whisper inside the process — no API key, no upload,
+  works offline once the weights are downloaded — so `VOICE_WAKE_STT=auto`
+  never touches ElevenLabs or Gemini while the local engine is installed.
+  `pip install -r requirements-local-stt.txt` enables it (the Docker image does
+  it by default); `VOICE_WAKE_STT=local` forbids the cloud entirely. Loading and
+  inference run on a dedicated one-thread executor, the model is freed after 15
+  minutes of silence, and a missing dependency, a failed download or a stuck
+  decode is reported in plain words instead of going silent.
+  New keys: `VOICE_WAKE_STT_MODEL`, `_DEVICE`, `_COMPUTE`, `_THREADS`,
+  `_MODEL_DIR`, `_OFFLINE`, `_UNLOAD_AFTER`. [docs/voice-wake.md](docs/voice-wake.md).
+
+### Fixed
+- **A long stay in a voice channel was credited a few minutes short.** 24 hours
+  in a channel landed in the database as ~23 h 51 m. The checkpoint credited a
+  whole number of seconds and then moved its cursor to the requested instant,
+  so the fraction each `floor()` discarded was lost — once per checkpoint
+  window, ~720 times a day, which is minutes by the end of a day and scales
+  with how long somebody stays. Migration `004_voice_credit_carry.sql` advances
+  the cursor by the seconds that were actually credited, the close path rounds
+  its final partial second, and the bot snaps its own boundaries to whole
+  seconds so this cannot come back. Details:
+  [docs/engineering/voice-accounting-incident.md §K](docs/engineering/voice-accounting-incident.md).
 
 ### Added
 - **Music, in-process.** `/music …`, `!p`-style text commands, a `/cmd` button

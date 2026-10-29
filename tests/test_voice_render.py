@@ -496,7 +496,7 @@ class TestLeaderboardSubtitle(unittest.TestCase):
     def test_singular_member_count(self):
         self.assertEqual(
             leaderboard_subtitle(board(1), page=1, total_pages=1),
-            "1 member tracked",
+            "1 person",
         )
 
     def test_plural_and_live_members(self):
@@ -505,8 +505,8 @@ class TestLeaderboardSubtitle(unittest.TestCase):
         members[0].is_active_now = True
         members[1].is_active_now = True
         text = leaderboard_subtitle(members, page=1, total_pages=1)
-        self.assertIn("4 members tracked", text)
-        self.assertIn("2 in voice right now", text)
+        self.assertIn("4 people", text)
+        self.assertIn("2 in a call right now", text)
 
     def test_paging_is_mentioned_only_when_there_is_more_than_one_page(self):
         self.assertNotIn("page", leaderboard_subtitle(board(3), page=1, total_pages=1))
@@ -515,8 +515,203 @@ class TestLeaderboardSubtitle(unittest.TestCase):
         )
 
     def test_an_empty_board_is_honest(self):
-        self.assertEqual(leaderboard_subtitle([], page=1, total_pages=1), "0 members tracked")
+        self.assertEqual(leaderboard_subtitle([], page=1, total_pages=1), "0 people")
 
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+# ---------------------------------------------------------------------------
+# The daily DM: a report a person would send, not a data dump.
+# ---------------------------------------------------------------------------
+
+
+class TestDailyDm(unittest.TestCase):
+    def build(self, **kwargs):
+        from datetime import date
+
+        from functions.voice.ui import build_daily_dm_embed
+
+        defaults = dict(
+            guild_name="Paradise Hub",
+            target_date=date(2025, 10, 1),  # a Wednesday
+            seconds=3 * 3600 + 42 * 60,
+            rank=2,
+            people=14,
+            server_total_seconds=21 * 3600 + 10 * 60,
+            previous_seconds=3 * 3600,
+        )
+        defaults.update(kwargs)
+        return build_daily_dm_embed(**defaults)
+
+    def test_the_heading_names_the_day_not_a_timestamp(self):
+        embed = self.build()
+        self.assertEqual(embed.title, "Wednesday, 1 October")
+        self.assertNotIn("2025-10-01", embed.title)
+        self.assertNotIn("T", embed.title)
+
+    def test_the_first_sentence_is_your_own_time(self):
+        embed = self.build()
+        self.assertTrue(
+            embed.description.startswith("You spent **3h 42m** in voice on Wednesday."),
+            embed.description,
+        )
+
+    def test_comparison_is_written_in_words(self):
+        self.assertIn("42m more than Tuesday.", self.build().description)
+        self.assertIn(
+            "10m less than Tuesday.",
+            self.build(seconds=30 * 60, previous_seconds=40 * 60).description,
+        )
+        self.assertIn(
+            "About the same as Tuesday.",
+            self.build(seconds=3600, previous_seconds=3600 + 120).description,
+        )
+
+    def test_no_comparison_when_there_was_nothing_to_compare(self):
+        text = self.build(previous_seconds=None).description
+        self.assertNotIn("Tuesday", text)
+
+    def test_fields_carry_the_numbers_without_repeating_the_sentence(self):
+        embed = self.build()
+        names = [field.name for field in embed.fields]
+        self.assertEqual(names, ["On the board", "Everyone together"])
+        self.assertEqual(embed.fields[0].value, "#2, out of 14")
+        self.assertEqual(embed.fields[1].value, "21h 10m")
+        self.assertEqual(embed.footer.text, "Paradise Hub")
+
+    def test_a_quiet_day_is_not_dressed_up(self):
+        embed = self.build(seconds=0, rank=None, people=0, previous_seconds=0)
+        self.assertEqual(embed.description, "You weren't in voice on Wednesday.")
+        self.assertEqual(embed.fields[0].value, "—")
+
+    def test_a_good_day_gets_one_true_line_and_no_more(self):
+        embed = self.build(seconds=7 * 3600, rank=1, people=9)
+        self.assertIn("You had the most time in voice that day.", embed.description)
+        self.assertEqual(embed.description.count("."), 3)  # three sentences, period.
+
+    def test_no_emoji_and_no_shouting(self):
+        embed = self.build()
+        text = embed.description + (embed.title or "")
+        for character in "🎙️🏆📅📈👥":
+            self.assertNotIn(character, text)
+        self.assertEqual(embed.title, embed.title.title())
+
+
+class TestLeaderboardFraming(unittest.TestCase):
+    """The embed frames the card; it must not say everything twice."""
+
+    def embed(self, **kwargs):
+        from functions.voice.ui import leaderboard_image_embed
+
+        return leaderboard_image_embed(
+            type("G", (), {"name": "Paradise Hub"})(),
+            VoicePeriod.TODAY,
+            **kwargs,
+        )
+
+    def test_no_second_headline(self):
+        self.assertIsNone(self.embed(page=1, total_pages=1).title)
+
+    def test_the_image_is_the_attachment(self):
+        self.assertEqual(
+            self.embed().image.url, "attachment://voice_leaderboard.png"
+        )
+        self.assertEqual(
+            self.embed(filename="daily_vc_leaderboard.png").image.url,
+            "attachment://daily_vc_leaderboard.png",
+        )
+
+    def test_the_footer_stays_quiet_unless_there_are_pages(self):
+        self.assertEqual(self.embed(page=1, total_pages=1).footer.text, "Paradise Hub")
+        self.assertEqual(
+            self.embed(page=2, total_pages=3).footer.text, "Paradise Hub  ·  page 2 of 3"
+        )
+
+    def test_a_caption_is_only_used_when_given(self):
+        self.assertIsNone(self.embed().description)
+        self.assertEqual(
+            self.embed(caption="Nobody was in voice that day.").description,
+            "Nobody was in voice that day.",
+        )
+
+
+# ---------------------------------------------------------------------------
+# The redesign: a light page, readable type, and no accidental black borders.
+# ---------------------------------------------------------------------------
+
+
+def _relative_luminance(rgb) -> float:
+    def channel(value: float) -> float:
+        value /= 255.0
+        return value / 12.92 if value <= 0.04045 else ((value + 0.055) / 1.055) ** 2.4
+
+    r, g, b = (channel(c) for c in rgb[:3])
+    return 0.2126 * r + 0.7152 * g + 0.0722 * b
+
+
+def contrast(a, b) -> float:
+    first, second = _relative_luminance(a), _relative_luminance(b)
+    lighter, darker = max(first, second), min(first, second)
+    return (lighter + 0.05) / (darker + 0.05)
+
+
+class TestLightDesign(RenderCase):
+    """The look is Apple-ish: white cards, quiet greys, one accent."""
+
+    def test_the_page_is_light_and_the_text_is_dark(self):
+        from functions.voice import render as module
+
+        for name in ("BG_TOP", "BG_BOTTOM", "SURFACE_COLOR", "SURFACE_LIGHT"):
+            colour = getattr(module, name)
+            self.assertGreater(
+                _relative_luminance(colour), 0.85, f"{name} should be near-white"
+            )
+        self.assertLess(_relative_luminance(module.TEXT_PRIMARY), 0.05)
+
+    def test_primary_and_secondary_text_pass_contrast(self):
+        from functions.voice import render as module
+
+        card = module.SURFACE_COLOR
+        # WCAG AA needs 4.5:1 for body text; the primary tone is AAA.
+        self.assertGreater(contrast(module.TEXT_PRIMARY, card), 7.0)
+        self.assertGreater(contrast(module.TEXT_SECONDARY, card), 4.5)
+        self.assertGreater(contrast(module.TEXT_MUTED, card), 3.0)
+
+    def test_the_rendered_card_has_no_dark_edges_or_boxes(self):
+        """A translucent RGBA fill would survive as a black hairline."""
+        _, image = self.render(board(6))
+        dark = [
+            (x, y)
+            for y in range(0, image.height, 7)
+            for x in range(0, image.width, 7)
+            if _relative_luminance(image.getpixel((x, y))) < 0.05
+        ]
+        # Only glyph pixels may be that dark, and glyphs are sparse; a border
+        # would light up an entire row or column.
+        rows: dict[int, int] = {}
+        for _x, y in dark:
+            rows[y] = rows.get(y, 0) + 1
+        self.assertLess(max(rows.values() or [0]), image.width // 8, "a rule went dark")
+
+    def test_the_card_stays_inside_discords_limits_after_the_redesign(self):
+        png, image = self.render(board(10))
+        self.assertLess(len(png), DISCORD_ATTACHMENT_LIMIT)
+        self.assertEqual(image.width, WIDTH)
+
+    def test_every_period_accent_is_visible_on_white(self):
+        """Accents fill bars and dots, not body text, so 2:1 is the bar to clear.
+
+        systemOrange sits at 2.06:1 on white — the same as Apple's own use of
+        it for small solid shapes — and anything paler than that disappears at
+        1× on a phone screen.
+        """
+        from functions.voice import render as module
+
+        for period, accent in module._PERIOD_ACCENT.items():
+            self.assertGreater(
+                contrast(accent, module.SURFACE_COLOR),
+                1.9,
+                f"{period.value} accent {accent} is too pale to see",
+            )

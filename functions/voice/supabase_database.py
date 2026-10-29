@@ -30,7 +30,7 @@ import asyncio
 import inspect
 import logging
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Sequence
 
 from .database import VoiceDatabase
@@ -78,6 +78,23 @@ def _ensure_aware(dt: datetime) -> datetime:
     return dt
 
 
+def _credit_boundary(value: datetime, *, nearest: bool = False) -> datetime:
+    """Snap a credit boundary to a whole second.
+
+    ``voice_record_session`` credits a whole number of seconds and floors the
+    difference, so a fractional boundary throws that fraction away — once per
+    checkpoint, which is minutes over a long session (that is how a 24-hour
+    stay used to end up as 23 h 51 m). Snapping the boundary makes every
+    interval an exact number of seconds, so the floor has nothing to discard.
+    ``nearest=True`` is used for the end of a session, where the point is to
+    keep the last half-second instead of dropping it.
+    """
+    value = _ensure_aware(value)
+    if nearest:
+        return (value + timedelta(microseconds=500_000)).replace(microsecond=0)
+    return value.replace(microsecond=0)
+
+
 def _iso(dt: datetime | None) -> str | None:
     if dt is None:
         return None
@@ -110,7 +127,7 @@ def _chunks(items: Sequence, size: int):
 class SupabaseVoiceDatabase(VoiceStore):
     """VoiceStore implementation on Supabase PostgreSQL + SQLite fallback."""
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 4
     # v2 predates durable checkpoints. A v3 bot against a v2 database keeps
     # working exactly as before (no periodic checkpointing, close credits from
     # started_at) so deploying the bot before the owner applies 003 is safe.
@@ -329,7 +346,8 @@ class SupabaseVoiceDatabase(VoiceStore):
                 f"Supabase voice schema version {version} is older than the bot's "
                 f"minimum supported version {self.MIN_SCHEMA_VERSION}. Apply "
                 "supabase/migrations/002_voice_ist_calendar.sql (and then "
-                "003_voice_checkpoint.sql) in the SQL Editor."
+                "003_voice_checkpoint.sql, 004_voice_credit_carry.sql) in the SQL "
+                "Editor."
             )
         if version > self.SCHEMA_VERSION:
             raise VoiceSchemaError(
@@ -340,10 +358,10 @@ class SupabaseVoiceDatabase(VoiceStore):
         if version < self.SCHEMA_VERSION and not self._degraded_warned:
             self._degraded_warned = True
             log.warning(
-                "Supabase voice schema is version %s; the bot needs %s for durable "
-                "voice checkpoints. Tracking continues in compatibility mode, but "
-                "in-progress time is only durable at session close until you apply "
-                "supabase/migrations/003_voice_checkpoint.sql in the SQL Editor.",
+                "Supabase voice schema is version %s; the bot needs %s. Tracking "
+                "continues, but without 004_voice_credit_carry.sql each checkpoint "
+                "window can shave up to a second off a long session. Apply the "
+                "missing migration in the SQL Editor.",
                 version,
                 self.SCHEMA_VERSION,
             )
@@ -436,7 +454,8 @@ class SupabaseVoiceDatabase(VoiceStore):
         fallback_started_at: datetime | None = None,
         fallback_credited_until: datetime | None = None,
     ) -> int | None:
-        ended_at = _ensure_aware(ended_at)
+        # Nearest whole second: the tail of a session is kept, not floored.
+        ended_at = _credit_boundary(ended_at, nearest=True)
 
         def _credit_from(started: datetime, cursor: datetime | None) -> datetime:
             """Never re-credit an interval a checkpoint already committed."""
@@ -644,7 +663,9 @@ class SupabaseVoiceDatabase(VoiceStore):
         """
         if not sessions or not self.supports_checkpoints:
             return {}
-        up_to = _ensure_aware(up_to)
+        # Whole seconds: see _credit_boundary. Time inside the current second
+        # is simply credited by the next checkpoint.
+        up_to = _credit_boundary(up_to)
         rows = [
             {
                 "guild_id": int(s.guild_id),

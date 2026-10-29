@@ -164,7 +164,7 @@ class FakeSupabaseClient:
         }
         # (guild_id, user_id, started_at, ended_at) -> row
         self._session_identity = {}
-        self.schema_version = 3
+        self.schema_version = 4
         self.schema_installed = True
 
     # -- instrumentation ---------------------------------------------------
@@ -438,18 +438,22 @@ class FakeSupabaseClient:
             started = _parse_dt(row["started_at"])
             cursor_raw = row.get("credited_until")
             credit_from = _parse_dt(cursor_raw) if cursor_raw else started
-            new_cursor = max(credit_from, up_to)  # monotonic: never rewinds
+            target = max(credit_from, up_to)  # monotonic: never rewinds
             credited = 0
-            if new_cursor > credit_from:
+            if target > credit_from:
                 credited = self._rpc_voice_record_session(
                     {
                         "p_guild_id": row["guild_id"],
                         "p_user_id": row["user_id"],
                         "p_channel_id": row["channel_id"],
                         "p_started_at": credit_from.isoformat(),
-                        "p_ended_at": new_cursor.isoformat(),
+                        "p_ended_at": target.isoformat(),
                     }
                 )
+            # Migration 004: the cursor advances by the seconds that were
+            # actually credited, so the fraction the integer floor discarded
+            # stays inside the next interval instead of being thrown away.
+            new_cursor = credit_from + timedelta(seconds=max(0, int(credited or 0)))
             row["credited_until"] = new_cursor.isoformat()
             if _parse_dt(row["last_seen_at"]) < up_to:
                 row["last_seen_at"] = up_to.isoformat()

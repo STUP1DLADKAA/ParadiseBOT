@@ -48,9 +48,13 @@ they are written, and because a leaderboard should survive a bot restart.
    - [`supabase/migrations/001_voice_activity.sql`](../supabase/migrations/001_voice_activity.sql)
    - [`supabase/migrations/002_voice_ist_calendar.sql`](../supabase/migrations/002_voice_ist_calendar.sql)
    - [`supabase/migrations/003_voice_checkpoint.sql`](../supabase/migrations/003_voice_checkpoint.sql)
+   - [`supabase/migrations/004_voice_credit_carry.sql`](../supabase/migrations/004_voice_credit_carry.sql)
+     — apply this one even if you already have 003: without it every
+     checkpoint can shave a fraction of a second off a long session, which adds
+     up to minutes over a day.
 
    Each file is transactional and safe to re-run. The bot requires schema
-   version 3 and refuses to track until it sees it (it says so in the log).
+   version 4 and refuses to track until it sees it (it says so in the log).
 3. Project Settings → API → copy the **project URL** and the **service_role
    secret key** into `.env`:
 
