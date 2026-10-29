@@ -110,6 +110,7 @@ class VoiceClipService:
             max_file_bytes=self.config.max_file_bytes,
             max_temp_disk_bytes=self.config.max_temp_disk_bytes,
             bitrate_kbps=self.config.bitrate_kbps,
+            audio_filter=getattr(self.config, "audio_filter", ""),
         )
 
     @property
@@ -255,7 +256,9 @@ class VoiceClipService:
                 getattr(me_voice, "self_deaf", False) or getattr(me_voice, "deaf", False)
             ):
                 raise ClipUnavailableError(
-                    "Voice capture is unavailable while the bot is deafened."
+                    "voice capture is unavailable while i'm deafened — Discord "
+                    "doesn't send audio to a deafened client, and i can't "
+                    "override a moderator's deafen. Un-deafen me and try again."
                 )
 
         buf = self.get_buffer(guild.id)

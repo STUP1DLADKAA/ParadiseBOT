@@ -170,7 +170,7 @@ class TestSynchronizer(unittest.TestCase):
 
     def test_global_sync_also_runs_when_enabled(self):
         tree = FakeTree(["ping"])
-        sync = CommandSynchronizer(fake_bot(tree))
+        sync = CommandSynchronizer(fake_bot(tree), sync_global=True)
         report = run(sync.run())
         self.assertEqual(tree.sync_calls, [TARGET_GUILD, None])
         self.assertTrue(report.global_ok)
@@ -190,7 +190,9 @@ class TestSynchronizer(unittest.TestCase):
 
     def test_global_failure_does_not_break_guild_sync(self):
         tree = FakeTree(["ping"], fail_global=True)
-        sync = CommandSynchronizer(fake_bot(tree))
+        # Global sync is opt-in (production publishes to the home guild only),
+        # so this test asks for it explicitly.
+        sync = CommandSynchronizer(fake_bot(tree), sync_global=True)
 
         report = run(sync.run())
 

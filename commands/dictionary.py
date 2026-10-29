@@ -710,7 +710,9 @@ class Dictionary(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.settings = getattr(bot.config, "dictionary", None)
-        self.feature = DictionaryFeature(self.settings)
+        self.feature = DictionaryFeature(
+            self.settings, elevenlabs=getattr(bot.config, "elevenlabs", None)
+        )
         self._user_last: dict[int, float] = {}
         self._channel_last: dict[int, float] = {}
         log.info("Dictionary ready — %s", self.feature.describe())

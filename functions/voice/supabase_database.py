@@ -27,6 +27,7 @@ is never logged, never echoed in errors, and never exposed to Discord.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import time
 from datetime import date, datetime, timezone
@@ -103,6 +104,7 @@ def _coerce_int(value: Any, default: int = 0) -> int:
 def _chunks(items: Sequence, size: int):
     for i in range(0, len(items), size):
         yield items[i : i + size]
+
 
 
 class SupabaseVoiceDatabase(VoiceStore):
@@ -266,10 +268,18 @@ class SupabaseVoiceDatabase(VoiceStore):
     # ------------------------------------------------------------------
 
     async def _execute(self, description: str, build):
-        client = await self._ensure_client()
         started = time.perf_counter()
         try:
-            result = await build(client).execute()
+            client = await self._ensure_client()
+            # ``build`` may hand back a query builder (all supported releases)
+            # or, on some client builds, a coroutine that resolves to one.
+            # ``execute()`` is always the coroutine that performs the request.
+            query = build(client)
+            if inspect.isawaitable(query):
+                query = await query
+            result = query.execute()
+            if inspect.isawaitable(result):
+                result = await result
         except VoiceStoreUnavailable:
             self._record_request(description, started, failed=True)
             raise
@@ -946,6 +956,71 @@ class SupabaseVoiceDatabase(VoiceStore):
             except (KeyError, TypeError, ValueError):
                 continue
         return records
+
+    # ------------------------------------------------------------------
+    # Manual daily corrections (/edit)
+    # ------------------------------------------------------------------
+
+    async def adjust_daily_stat(
+        self,
+        guild_id: int,
+        user_id: int,
+        day: date,
+        delta_seconds: int,
+    ) -> int | None:
+        """Atomically-ish add ``delta_seconds`` to one day's total.
+
+        Reads the current value, clamps at zero and upserts the row. The
+        upsert (not a blind UPDATE) is what makes the very first edit of a
+        day work instead of silently matching zero rows — the old
+        implementation tried to UPDATE, found nothing, and then crashed on a
+        request-builder misuse, which is what broke ``/edit``.
+
+        Returns the new total, or ``None`` when the database rejected it.
+        """
+        day_iso = day.isoformat()
+        gid, uid = int(guild_id), int(user_id)
+        delta = int(delta_seconds)
+        try:
+            current = await self._execute(
+                "edit read daily stat",
+                lambda c: c.table("voice_daily_stats")
+                .select("duration_seconds")
+                .eq("guild_id", gid)
+                .eq("user_id", uid)
+                .eq("date", day_iso)
+                .limit(1),
+            )
+        except VoiceStoreUnavailable as err:
+            log.warning("Could not read the daily stat for /edit: %s", err)
+            return None
+
+        rows = current.data or []
+        before = _coerce_int(rows[0].get("duration_seconds")) if rows else 0
+        after = max(0, before + delta)
+        row = {
+            "guild_id": gid,
+            "user_id": uid,
+            "date": day_iso,
+            "duration_seconds": after,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            result = await self._execute(
+                "edit daily stat",
+                lambda c: c.table("voice_daily_stats")
+                .upsert(row, on_conflict="guild_id,user_id,date")
+                .select("duration_seconds"),
+            )
+        except VoiceStoreUnavailable as err:
+            log.warning("Could not write the daily stat for /edit: %s", err)
+            return None
+
+        written = result.data or []
+        if written:
+            return _coerce_int(written[0].get("duration_seconds"), after)
+        # PostgREST can answer without a representation; the upsert still ran.
+        return after
 
     # ------------------------------------------------------------------
     # Daily DM report state

@@ -201,6 +201,15 @@ class LocalVoiceStore(VoiceStore):
     ) -> dict[str, int]:
         return self.db.get_user_breakdown(guild_id, user_id, target_date)
 
+    async def adjust_daily_stat(
+        self,
+        guild_id: int,
+        user_id: int,
+        day: date,
+        delta_seconds: int,
+    ) -> int | None:
+        return self.db.adjust_daily_stat(guild_id, user_id, day, delta_seconds)
+
     async def get_daily_server_total(self, guild_id: int, date_str: str) -> int:
         return self.db.get_daily_server_total(guild_id, date_str)
 

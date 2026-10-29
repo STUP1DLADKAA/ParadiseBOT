@@ -713,6 +713,40 @@ class VoiceDatabase:
                 "all_time": int(row["all_time_sec"]),
             }
 
+    def adjust_daily_stat(
+        self,
+        guild_id: int,
+        user_id: int,
+        day: date,
+        delta_seconds: int,
+    ) -> int:
+        """Add ``delta_seconds`` to one day's total, clamped at zero.
+
+        Shared by ``/edit`` and the local (test/fallback) store. Returns the
+        resulting total for that day.
+        """
+        day_str = day.isoformat()
+        gid, uid = int(guild_id), int(user_id)
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                "SELECT duration_seconds FROM voice_daily_stats "
+                "WHERE guild_id = ? AND user_id = ? AND date = ?",
+                (gid, uid, day_str),
+            )
+            row = cur.fetchone()
+            before = int(row["duration_seconds"]) if row else 0
+            after = max(0, before + int(delta_seconds))
+            conn.execute(
+                """
+                INSERT INTO voice_daily_stats (guild_id, user_id, date, duration_seconds)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(guild_id, user_id, date) DO UPDATE SET
+                    duration_seconds = excluded.duration_seconds
+                """,
+                (gid, uid, day_str, after),
+            )
+        return after
+
     def get_daily_server_total(self, guild_id: int, date_str: str) -> int:
         with self._get_connection() as conn:
             cur = conn.execute(

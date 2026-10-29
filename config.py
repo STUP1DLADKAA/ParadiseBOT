@@ -36,6 +36,23 @@ def _chance(raw: str | None, default: float) -> float:
     return value if 0.0 <= value <= 1.0 else default
 
 
+def _csv(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
+    """A comma/space separated list of identifiers, de-duplicated in order."""
+    text = str(raw or "").strip()
+    if not text:
+        return default
+    seen: set[str] = set()
+    out: list[str] = []
+    for chunk in text.replace(";", ",").split(","):
+        for token in chunk.split():
+            value = token.strip()
+            if not value or value in seen:
+                continue
+            seen.add(value)
+            out.append(value)
+    return tuple(out) or default
+
+
 @dataclass(frozen=True, slots=True)
 class PersonalityConfig:
     """Tuning for Paradise's passive personality & humour (see functions/personality.py).
@@ -103,7 +120,7 @@ class DictionaryConfig:
     timeout: float = 8.0
     # Looked-up words are cached; these bound that cache.
     cache_ttl: int = 6 * 3600
-    cache_size: int = 512
+    cache_size: int = 1024
     # Image attachments cannot read Discord's viewer theme; choose the card
     # surface deliberately ("dark" is the Discord-friendly default).
     card_theme: str = "dark"
@@ -131,7 +148,7 @@ class DictionaryConfig:
             text_triggers=_bool(env.get("DICTIONARY_TEXT_TRIGGERS"), True),
             timeout=max(2.0, _float(env.get("DICTIONARY_TIMEOUT"), 8.0)),
             cache_ttl=max(60, _int(env.get("DICTIONARY_CACHE_TTL"), 6 * 3600)),
-            cache_size=max(16, _int(env.get("DICTIONARY_CACHE_SIZE"), 512)),
+            cache_size=max(16, _int(env.get("DICTIONARY_CACHE_SIZE"), 1024)),
             card_theme=card_theme if card_theme in {"dark", "light"} else "dark",
             prefer_native_audio=_bool(env.get("PRONUNCIATION_PREFER_NATIVE"), True),
             voice_playback=_bool(env.get("PRONUNCIATION_VOICE_PLAYBACK"), False),
@@ -139,6 +156,210 @@ class DictionaryConfig:
             speech_api_key=env.get("SPEECH_API_KEY", "").strip(),
             speech_model=env.get("SPEECH_MODEL", "").strip(),
             speech_voice=env.get("SPEECH_VOICE", "").strip(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ElevenLabsConfig:
+    """The owner's ElevenLabs voice — used for *every* spoken word.
+
+    ``ELEVENLABS_VOICE_ID`` is the custom (cloned) male voice that speaks both
+    Hindi and English. The default model is ``eleven_flash_v2_5``: the fastest
+    multilingual model ElevenLabs ships, so a reply starts speaking in well
+    under a second whenever the key is valid.
+
+    The key travels only in the ``xi-api-key`` header. It is never logged,
+    never echoed in a Discord message and never written to disk.
+    """
+
+    api_key: str = ""
+    voice_id: str = ""
+    # eleven_flash_v2_5 = fastest multilingual (Hindi + English). Override with
+    # eleven_turbo_v2_5 (slightly better quality) or eleven_multilingual_v2.
+    model: str = "eleven_flash_v2_5"
+    # 128 kbps 44.1 kHz MP3 by default — noticeably cleaner than the 64 kbps
+    # web voices and still tiny for a sentence of speech.
+    output_format: str = "mp3_44100_128"
+    # Voice shaping. Natural, expressive and close to the captured voice.
+    stability: float = 0.45
+    similarity_boost: float = 0.85
+    style: float = 0.15
+    speed: float = 1.0
+    # Optional ISO-639-1 hint ("hi" / "en"). Blank = let the model detect it,
+    # which is what makes Hinglish sentences come out right.
+    language_code: str = ""
+    # Speak dictionary headwords with this voice even when a human recording
+    # exists (the owner asked for *their* voice everywhere). Set false to let
+    # native dictionary recordings win.
+    pronunciation_first: bool = True
+    # Per-request deadline for one synthesis call.
+    timeout: float = 25.0
+
+    @property
+    def configured(self) -> bool:
+        return bool(self.api_key.strip() and self.voice_id.strip())
+
+    @property
+    def masked_key(self) -> str:
+        key = self.api_key.strip()
+        if len(key) <= 8:
+            return "…" if key else ""
+        return f"{key[:2]}…{key[-2:]}"
+
+    @classmethod
+    def from_env(cls, env) -> "ElevenLabsConfig":
+        model = str(env.get("ELEVENLABS_MODEL", "") or "").strip() or "eleven_flash_v2_5"
+        output_format = (
+            str(env.get("ELEVENLABS_OUTPUT_FORMAT", "") or "").strip()
+            or "mp3_44100_128"
+        )
+        return cls(
+            api_key=env.get("ELEVENLABS_API_KEY", "").strip(),
+            voice_id=env.get("ELEVENLABS_VOICE_ID", "").strip(),
+            model=model,
+            output_format=output_format,
+            stability=min(1.0, max(0.0, _float(env.get("ELEVENLABS_STABILITY"), 0.45))),
+            similarity_boost=min(
+                1.0, max(0.0, _float(env.get("ELEVENLABS_SIMILARITY"), 0.85))
+            ),
+            style=min(1.0, max(0.0, _float(env.get("ELEVENLABS_STYLE"), 0.15))),
+            speed=min(1.2, max(0.7, _float(env.get("ELEVENLABS_SPEED"), 1.0))),
+            language_code=str(env.get("ELEVENLABS_LANGUAGE", "") or "").strip().lower(),
+            pronunciation_first=_bool(
+                env.get("ELEVENLABS_PRONUNCIATION_FIRST"), True
+            ),
+            timeout=max(5.0, _float(env.get("ELEVENLABS_TIMEOUT"), 25.0)),
+        )
+
+
+# Fastest-first Gemini cascade used for spoken "Hey Paradise" answers. The
+# first *available* model that returns an answer wins; a missing/quota-blocked
+# model is skipped automatically, so the bot never stalls on one model.
+DEFAULT_GEMINI_CHAIN: tuple[str, ...] = (
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class WakeConfig:
+    """The "Hey Paradise …" voice-chat assistant (see commands/wake.py).
+
+    Someone types ``Hey Paradise <question>`` in a voice channel's text chat;
+    Paradise answers in that same chat *and* speaks the answer in the channel
+    with the owner's ElevenLabs voice.
+    """
+
+    enabled: bool = True
+    # Only react inside voice-channel text chats (the "VC chat").
+    vc_only: bool = True
+    # Fastest-first model cascade. Blank falls back to DEFAULT_GEMINI_CHAIN.
+    models: tuple[str, ...] = DEFAULT_GEMINI_CHAIN
+    # Answer budget for the spoken/typed reply.
+    max_answer_chars: int = 700
+    # What is actually spoken aloud (keeps a long answer from monologuing).
+    speech_max_chars: int = 600
+    # Reuse the same text chat as the reply target; speak when connected.
+    speak: bool = True
+    # Auto-connect to the asker's voice channel when Paradise is elsewhere.
+    connect_if_needed: bool = True
+    user_cooldown: float = 4.0
+    channel_cooldown: float = 2.0
+
+    @classmethod
+    def from_env(cls, env) -> "WakeConfig":
+        return cls(
+            enabled=_bool(env.get("WAKE_WORD_ENABLED"), True),
+            vc_only=_bool(env.get("WAKE_WORD_VC_ONLY"), True),
+            models=_csv(env.get("GEMINI_MODEL_CHAIN"), DEFAULT_GEMINI_CHAIN),
+            max_answer_chars=max(
+                80, min(1500, _int(env.get("WAKE_WORD_MAX_CHARS"), 700))
+            ),
+            speech_max_chars=max(
+                80, min(1200, _int(env.get("WAKE_WORD_SPEECH_CHARS"), 600))
+            ),
+            speak=_bool(env.get("WAKE_WORD_SPEAK"), True),
+            connect_if_needed=_bool(env.get("WAKE_WORD_CONNECT"), True),
+            user_cooldown=max(0.0, _float(env.get("WAKE_WORD_USER_COOLDOWN"), 4.0)),
+            channel_cooldown=max(
+                0.0, _float(env.get("WAKE_WORD_CHANNEL_COOLDOWN"), 2.0)
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class VoicePresenceConfig:
+    """Automatic voice-channel presence (see commands/voice_presence.py)."""
+
+    enabled: bool = True
+    # Paradise joins silently: no text in the channel, nothing spoken.
+    announce: bool = False
+    # Seconds between crowd-following scans. Lower = snappier joins.
+    follow_interval: float = 20.0
+
+    @classmethod
+    def from_env(cls, env) -> "VoicePresenceConfig":
+        return cls(
+            enabled=_bool(env.get("VOICE_PRESENCE_ENABLED"), True),
+            announce=_bool(env.get("VOICE_ARRIVAL_ANNOUNCE"), False),
+            follow_interval=max(
+                5.0, min(300.0, _float(env.get("VOICE_PRESENCE_INTERVAL"), 20.0))
+            ),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class AutoUpdateConfig:
+    """Pull the latest files from GitHub on start-up and while online."""
+
+    enabled: bool = True
+    repository: str = "STUP1DLADKAA/ParadiseBOT"
+    branch: str = "main"
+    # Seconds between background checks while the bot is online (0 = never).
+    interval: float = 1800.0
+    check_on_start: bool = True
+    # False = report an available update without touching any file.
+    apply: bool = True
+    # Exit after applying a start-up update so the process manager restarts
+    # cleanly on the new code (running a half-old, half-new Python process is
+    # never safe). Set false to keep running the already-imported code.
+    restart_after_update: bool = True
+    # Directory holding the applied-commit state file.
+    state_dir: str = ""
+    timeout: float = 45.0
+    # Deadline for the connect-time check (a slow GitHub must not stall boot).
+    startup_timeout: float = 20.0
+    # Optional GitHub token (raises the API rate limit for public repos and
+    # is required to read a private one). Never logged.
+    token: str = ""
+    # Extra paths that must never be overwritten (comma separated, relative).
+    protected: tuple[str, ...] = ()
+
+    @classmethod
+    def from_env(cls, env) -> "AutoUpdateConfig":
+        repo = (
+            str(env.get("AUTO_UPDATE_REPO", "") or "").strip()
+            or "STUP1DLADKAA/ParadiseBOT"
+        )
+        return cls(
+            enabled=_bool(env.get("AUTO_UPDATE_ENABLED"), True),
+            repository=repo,
+            branch=str(env.get("AUTO_UPDATE_BRANCH", "") or "").strip() or "main",
+            interval=max(
+                0.0, _float(env.get("AUTO_UPDATE_INTERVAL"), 1800.0)
+            ),
+            check_on_start=_bool(env.get("AUTO_UPDATE_ON_START"), True),
+            apply=_bool(env.get("AUTO_UPDATE_APPLY"), True),
+            restart_after_update=_bool(env.get("AUTO_UPDATE_RESTART"), True),
+            state_dir=str(env.get("AUTO_UPDATE_STATE_DIR", "") or "").strip(),
+            timeout=max(10.0, _float(env.get("AUTO_UPDATE_TIMEOUT"), 45.0)),
+            startup_timeout=max(
+                5.0, _float(env.get("AUTO_UPDATE_STARTUP_TIMEOUT"), 20.0)
+            ),
+            token=str(env.get("GITHUB_TOKEN", "") or "").strip(),
+            protected=_csv(env.get("AUTO_UPDATE_PROTECTED"), ()),
         )
 
 
@@ -254,30 +475,36 @@ class VoiceClipConfig:
     # Maximum distinct active speaker streams retained per voice connection.
     max_active_speakers: int = 32
     # Maximum memory (bytes) consumed by buffered Opus frames per guild.
-    max_buffer_bytes: int = 24 * 1024 * 1024
+    # The host is no longer resource-starved, so the rolling window is kept in
+    # a generous 48 MiB budget per guild.
+    max_buffer_bytes: int = 48 * 1024 * 1024
     # Concurrent active export jobs and bounded waiting queue capacity.
-    max_concurrent_exports: int = 1
-    max_queued_exports: int = 2
+    max_concurrent_exports: int = 2
+    max_queued_exports: int = 4
     # Per-export deadline covering decode, mix and FFmpeg encode (seconds).
-    export_timeout_seconds: float = 30.0
+    export_timeout_seconds: float = 45.0
     # Safe Discord DM upload cap (~9.5 MiB, well under the 10 MiB default limit).
     max_file_bytes: int = 9_961_472
     # Upper bound on temporary output bytes across in-flight exports.
-    max_temp_disk_bytes: int = 32 * 1024 * 1024
-    # AAC-LC bitrate (kbps) at 48 kHz mono.
-    bitrate_kbps: int = 96
+    max_temp_disk_bytes: int = 64 * 1024 * 1024
+    # AAC-LC bitrate (kbps) at 48 kHz mono. 192 kbps is transparent for
+    # speech and still far below Discord's upload cap for a 3-minute clip.
+    bitrate_kbps: int = 192
+    # Mastering chain applied while encoding the mixed clip (empty = default).
+    audio_filter: str = ""
     # Consent policy: "notice" (transparent channel notice + instant opt-out)
     # or "opt_in" (captures only speakers who explicitly click Allow Recording).
     consent_mode: str = "notice"
     # Post a recording & consent notice in the voice channel text chat.
-    notice_enabled: bool = True
+    # Off by default: Paradise joins voice channels silently.
+    notice_enabled: bool = False
 
     @classmethod
     def from_env(cls, env) -> "VoiceClipConfig":
         raw_mode = str(env.get("VOICE_CLIP_CONSENT_MODE", "notice") or "notice").strip().lower()
         consent_mode = raw_mode if raw_mode in {"notice", "opt_in"} else "notice"
-        buffer_mb = max(2, min(128, _int(env.get("VOICE_CLIP_MAX_BUFFER_MB"), 24)))
-        temp_mb = max(4, min(256, _int(env.get("VOICE_CLIP_MAX_TEMP_MB"), 32)))
+        buffer_mb = max(2, min(256, _int(env.get("VOICE_CLIP_MAX_BUFFER_MB"), 48)))
+        temp_mb = max(4, min(512, _int(env.get("VOICE_CLIP_MAX_TEMP_MB"), 64)))
         return cls(
             enabled=_bool(env.get("VOICE_CLIP_ENABLED"), True),
             max_buffer_seconds=max(
@@ -288,13 +515,13 @@ class VoiceClipConfig:
             ),
             max_buffer_bytes=buffer_mb * 1024 * 1024,
             max_concurrent_exports=max(
-                1, min(4, _int(env.get("VOICE_CLIP_MAX_CONCURRENT_EXPORTS"), 1))
+                1, min(8, _int(env.get("VOICE_CLIP_MAX_CONCURRENT_EXPORTS"), 2))
             ),
             max_queued_exports=max(
-                0, min(8, _int(env.get("VOICE_CLIP_MAX_QUEUED_EXPORTS"), 2))
+                0, min(16, _int(env.get("VOICE_CLIP_MAX_QUEUED_EXPORTS"), 4))
             ),
             export_timeout_seconds=max(
-                5.0, min(120.0, _float(env.get("VOICE_CLIP_EXPORT_TIMEOUT"), 30.0))
+                5.0, min(180.0, _float(env.get("VOICE_CLIP_EXPORT_TIMEOUT"), 45.0))
             ),
             max_file_bytes=max(
                 262_144,
@@ -302,10 +529,11 @@ class VoiceClipConfig:
             ),
             max_temp_disk_bytes=temp_mb * 1024 * 1024,
             bitrate_kbps=max(
-                48, min(192, _int(env.get("VOICE_CLIP_BITRATE_KBPS"), 96))
+                64, min(320, _int(env.get("VOICE_CLIP_BITRATE_KBPS"), 192))
             ),
+            audio_filter=str(env.get("VOICE_CLIP_AUDIO_FILTER", "") or "").strip(),
             consent_mode=consent_mode,
-            notice_enabled=_bool(env.get("VOICE_CLIP_NOTICE_ENABLED"), True),
+            notice_enabled=_bool(env.get("VOICE_CLIP_NOTICE_ENABLED"), False),
         )
 
 
@@ -424,6 +652,19 @@ class Config:
     # Dictionary lookups, cards and pronunciation.
     dictionary: DictionaryConfig = DictionaryConfig()
 
+    # The owner's ElevenLabs voice — used for pronunciation and every spoken
+    # voice-channel reply. Entirely optional.
+    elevenlabs: ElevenLabsConfig = ElevenLabsConfig()
+
+    # "Hey Paradise <question>" in voice-chat (typed answer + spoken answer).
+    wake: WakeConfig = WakeConfig()
+
+    # Automatic voice-channel presence (silent by default).
+    voice_presence: VoicePresenceConfig = VoicePresenceConfig()
+
+    # Pull the latest files from GitHub on start-up / while online.
+    autoupdate: AutoUpdateConfig = AutoUpdateConfig()
+
     # Voice activity tracking and statistics.
     voice: VoiceConfig = VoiceConfig()
 
@@ -435,6 +676,9 @@ class Config:
 
     # Web image search for mention requests ("show me a picture of …").
     image_search: ImageSearchConfig = ImageSearchConfig()
+
+    # Where preloaded speech clips are cached on disk (default data/tts_cache).
+    tts_cache_dir: str = ""
 
     @property
     def ai_configured(self) -> bool:
@@ -453,10 +697,24 @@ class Config:
             ai_model=env.get("AI_MODEL", "").strip(),
             personality=PersonalityConfig.from_env(env),
             dictionary=DictionaryConfig.from_env(env),
+            elevenlabs=ElevenLabsConfig.from_env(env),
+            wake=WakeConfig.from_env(env),
+            voice_presence=VoicePresenceConfig.from_env(env),
+            autoupdate=AutoUpdateConfig.from_env(env),
             voice=VoiceConfig.from_env(env),
             voice_clip=VoiceClipConfig.from_env(env),
             minigames=MiniGamesConfig.from_env(env),
             image_search=ImageSearchConfig.from_env(env),
+            tts_cache_dir=(
+                str(env.get("TTS_CACHE_DIR", "") or "").strip()
+                or os.path.join(
+                    os.path.dirname(
+                        str(env.get("VOICE_DB_PATH", "") or "").strip()
+                        or os.path.join("data", "paradise.db")
+                    ),
+                    "tts_cache",
+                )
+            ),
         )
 
 

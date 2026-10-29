@@ -52,6 +52,8 @@ class VoiceClip(commands.Cog):
         self.bot.voice_clip_service = self.service  # type: ignore[attr-defined]
         self._announced_notice_channel: dict[int, int] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        # One "Discord won't send audio while deafened" explanation per guild.
+        self._deafen_notice_sent: set[int] = set()
 
     async def cog_load(self) -> None:
         self._expiry_sweep.start()
@@ -105,9 +107,19 @@ class VoiceClip(commands.Cog):
                 self.service.detach_guild(guild.id)
                 return
 
-            if getattr(after, "self_deaf", False) or getattr(after, "deaf", False):
-                # Do not retain partial audio when deafened.
+            if getattr(after, "deaf", False):
+                # Guild-forced deafen. Discord does not send audio to a
+                # server-deafened client at all, so no amount of code here can
+                # capture it — explain once and stop pretending to record.
                 self.service.detach_guild(guild.id)
+                self._explain_guild_deafen(guild)
+                return
+
+            if getattr(after, "self_deaf", False):
+                # Our own deafen flag (e.g. joined by older code). Drop buffered
+                # audio, then clear the flag so capture can resume.
+                self.service.detach_guild(guild.id)
+                self._schedule_undeafen(guild, after.channel)
                 return
 
             if before_id != after_id:
@@ -128,6 +140,47 @@ class VoiceClip(commands.Cog):
             buf = self.service.get_buffer(guild.id)
             if buf is not None and before_id is not None and buf.channel_id == before_id:
                 self.service.handle_speaker_leave(guild.id, member.id)
+
+    def _schedule_undeafen(self, guild: discord.Guild, channel) -> None:
+        """Clear a self-deafen flag so the rolling buffer can keep recording."""
+        if not self.service.enabled or channel is None:
+            return
+        task = asyncio.create_task(
+            self._undeafen(guild, channel), name=f"paradise-undeafen-{guild.id}"
+        )
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+
+    async def _undeafen(self, guild: discord.Guild, channel) -> None:
+        try:
+            await guild.change_voice_state(
+                channel=channel, self_deaf=False, self_mute=False
+            )
+            log.info(
+                "Cleared the bot's self-deafen in guild %s so clipping keeps "
+                "recording",
+                guild.id,
+            )
+        except (discord.DiscordException, asyncio.TimeoutError):
+            log.debug("Could not clear the bot's self-deafen", exc_info=True)
+
+    def _explain_guild_deafen(self, guild: discord.Guild) -> None:
+        """Log (once per guild) why clips stop when a moderator deafens the bot.
+
+        This is a Discord protocol limit, not a bug here: a server-deafened
+        voice client is never sent any audio by the gateway, and the bot
+        cannot un-deafen itself against a moderator's action.
+        """
+        if guild.id in self._deafen_notice_sent:
+            return
+        self._deafen_notice_sent.add(guild.id)
+        log.warning(
+            "Voice clipping stopped in guild %s: a moderator server-deafened "
+            "Paradise. Discord never sends audio to a server-deafened client, "
+            "so capture cannot continue until the deafen is lifted (the bot "
+            "cannot override it). Un-deafen it under Server Settings → Members.",
+            guild.id,
+        )
 
     async def _post_recording_notice(
         self,

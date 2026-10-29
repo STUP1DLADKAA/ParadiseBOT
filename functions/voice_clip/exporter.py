@@ -25,6 +25,17 @@ from .mixer import MixResult, mix_snapshot_to_pcm_f32
 
 log = logging.getLogger(__name__)
 
+# Mastering chain for the mixed clip. Voice packets arrive already compressed
+# at 48 kHz; this only removes sub-bass rumble, evens out quiet and loud
+# speakers (loudnorm, -16 LUFS — the usual podcast/speech target) and limits
+# peaks so nothing clips when Discord transcodes again on playback.
+DEFAULT_AUDIO_FILTER = (
+    "highpass=f=75,"
+    "lowpass=f=16000,"
+    "loudnorm=I=-16:TP=-1.5:LRA=11,"
+    "alimiter=limit=0.95:attack=5:release=50:level=disabled"
+)
+
 
 @dataclass(slots=True)
 class ExportedClip:
@@ -86,7 +97,8 @@ class ClipExportPipeline:
         export_timeout_seconds: float = 30.0,
         max_file_bytes: int = 9_961_472,
         max_temp_disk_bytes: int = 32 * 1024 * 1024,
-        bitrate_kbps: int = 96,
+        bitrate_kbps: int = 192,
+        audio_filter: str = "",
         ffmpeg_executable: str | None = None,
     ) -> None:
         self.max_concurrent_exports: int = max(1, int(max_concurrent_exports))
@@ -94,7 +106,8 @@ class ClipExportPipeline:
         self.export_timeout_seconds: float = max(1.0, float(export_timeout_seconds))
         self.max_file_bytes: int = max(65_536, int(max_file_bytes))
         self.max_temp_disk_bytes: int = max(262_144, int(max_temp_disk_bytes))
-        self.bitrate_kbps: int = max(48, min(192, int(bitrate_kbps)))
+        self.bitrate_kbps: int = max(64, min(320, int(bitrate_kbps)))
+        self.audio_filter: str = (audio_filter or "").strip() or DEFAULT_AUDIO_FILTER
         self._explicit_ffmpeg = ffmpeg_executable
 
         self._semaphore = asyncio.Semaphore(self.max_concurrent_exports)
@@ -259,7 +272,11 @@ class ClipExportPipeline:
         pcm_f32_bytes: bytes,
         out_path: str,
     ) -> None:
-        """Encode 48 kHz mono float32 PCM to AAC-LC in M4A with faststart."""
+        """Encode 48 kHz mono float32 PCM to AAC-LC in M4A with faststart.
+
+        Quality settings: 48 kHz, the configured (high) bitrate and a proper
+        speech mastering chain — see :data:`DEFAULT_AUDIO_FILTER`.
+        """
         cmd = [
             ffmpeg_exe,
             "-y",
@@ -275,7 +292,11 @@ class ClipExportPipeline:
             "-i",
             "pipe:0",
             "-af",
-            "alimiter=limit=0.95:attack=5:release=50:level=disabled",
+            self.audio_filter,
+            "-ar",
+            str(SAMPLE_RATE),
+            "-ac",
+            "1",
             "-c:a",
             "aac",
             "-profile:a",

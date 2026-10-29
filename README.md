@@ -2,7 +2,7 @@
 
 A small private Discord bot for a friends-only server — part search engine, part utility toolbox, with an *optional* AI reasoning layer on top.
 
-Paradise answers when addressed, quietly watches the server, and every once in a while reacts to or comments on a message — rarely enough that it feels like an Easter egg. Its presence is status-only (no activity payload); it is Online from 08:00–20:00 IST, Idle overnight, and Do Not Disturb while a mini-game is running. Discord's public bot API does not support editing an ordinary account profile note, so Paradise never claims to publish the locally rotated note pool. It is intentionally not a moderation suite, dashboard, music player, or AI wrapper.
+Paradise answers when addressed, quietly watches the server, and every once in a while reacts to or comments on a message — rarely enough that it feels like an Easter egg. It keeps itself up to date from this repository, follows the crowd into voice channels **silently**, and speaks in the owner's own ElevenLabs voice when you call it there. Its presence is status-only (no activity payload); it is Online from 08:00–20:00 IST, Idle overnight, and Do Not Disturb while a mini-game is running. Discord's public bot API does not support editing an ordinary account profile note, so Paradise never claims to publish the locally rotated note pool. It is intentionally not a moderation suite, dashboard, music player, or AI wrapper.
 
 ## Tool-first, AI-last
 
@@ -62,6 +62,11 @@ Everything lives in `.env` (never committed). See `.env.example` for all options
 | Dictionary | `DICTIONARY_TEXT_TRIGGERS`, `DICTIONARY_TIMEOUT`, `DICTIONARY_CACHE_TTL`, `DICTIONARY_CACHE_SIZE`, `DICTIONARY_CARD_THEME` | all optional — the dictionary needs no keys and works out of the box |
 | Image search | `IMAGE_SEARCH_ENABLED`, `IMAGE_SEARCH_TIMEOUT`, `IMAGE_SEARCH_CACHE_TTL`, `IMAGE_SEARCH_CACHE_SIZE`, `IMAGE_SEARCH_API_KEY`, `IMAGE_SEARCH_ENGINE_ID` | all optional — Wikipedia, Wikimedia Commons and Openverse need no keys. The Google Programmable Search pair is an optional coverage upgrade (100 free queries/day) |
 | Pronunciation | `PRONUNCIATION_PREFER_NATIVE`, `PRONUNCIATION_VOICE_PLAYBACK`, `SPEECH_BASE_URL`, `SPEECH_API_KEY`, `SPEECH_MODEL`, `SPEECH_VOICE` | optional. `SPEECH_*` adds a neural voice for words with no human recording; without it a free voice is used |
+| Your voice | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL`, `ELEVENLABS_OUTPUT_FORMAT`, `ELEVENLABS_STABILITY`, `ELEVENLABS_SIMILARITY`, `ELEVENLABS_STYLE`, `ELEVENLABS_SPEED`, `ELEVENLABS_LANGUAGE`, `ELEVENLABS_PRONUNCIATION_FIRST`, `ELEVENLABS_TIMEOUT` | optional. Your custom ElevenLabs voice (default model `eleven_flash_v2_5`) is used for **every** spoken word: dictionary pronunciation and voice-chat answers, in Hindi and English |
+| “Hey Paradise” | `WAKE_WORD_ENABLED`, `WAKE_WORD_VC_ONLY`, `GEMINI_MODEL_CHAIN`, `WAKE_WORD_MAX_CHARS`, `WAKE_WORD_SPEECH_CHARS`, `WAKE_WORD_SPEAK`, `WAKE_WORD_CONNECT`, `WAKE_WORD_USER_COOLDOWN`, `WAKE_WORD_CHANNEL_COOLDOWN` | the typed + spoken voice-chat assistant. `GEMINI_MODEL_CHAIN` is a fastest-first model cascade |
+| Voice presence | `VOICE_PRESENCE_ENABLED`, `VOICE_ARRIVAL_ANNOUNCE`, `VOICE_PRESENCE_INTERVAL` | joins are **silent** by default (`VOICE_ARRIVAL_ANNOUNCE=false`) |
+| Auto-update | `AUTO_UPDATE_ENABLED`, `AUTO_UPDATE_REPO`, `AUTO_UPDATE_BRANCH`, `AUTO_UPDATE_INTERVAL`, `AUTO_UPDATE_ON_START`, `AUTO_UPDATE_APPLY`, `AUTO_UPDATE_RESTART`, `AUTO_UPDATE_TIMEOUT`, `AUTO_UPDATE_STARTUP_TIMEOUT`, `AUTO_UPDATE_STATE_DIR`, `AUTO_UPDATE_PROTECTED`, `GITHUB_TOKEN` | pulls the latest files from GitHub on start-up and while online (see below) |
+| Voice clips | `VOICE_CLIP_*` | `/clip` capture and export. 192 kbps AAC-LC with a speech mastering chain by default, two concurrent exports, a 180-second rolling window |
 
 ## Mention me — no commands to learn
 
@@ -208,7 +213,13 @@ Paradise automatically tracks voice channel sessions with zero database spam and
 /vc stats member:@Alex
 /settimezone Asia/Kolkata
 @Paradise what time is it for Alex
+/edit user:@Alex period:Today adjustment:600     ← authorized user only
 ```
+
+`/edit` writes through a single store-level upsert (`adjust_daily_stat`), so the
+first adjustment of a day creates the row instead of silently updating nothing.
+Week and month adjustments are spread across the days and applied concurrently;
+if any day fails, nothing is reported as saved.
 
 ## Dictionary
 
@@ -223,6 +234,110 @@ what does serendipity mean?
 ```
 
 - **No API key, no external service.** Word data comes from two free, key-less sources: [dictionaryapi.dev](https://dictionaryapi.dev) (Wiktionary-backed definitions, IPA and human recordings) and [Datamuse](https://www.datamuse.com/api/) (synonyms, antonyms, related words, spelling correction). If the first is down the second still produces a usable card, clearly marked as partial.
+
+## Keeping itself up to date
+
+Paradise pulls this repository into its own checkout. On every start (and every
+`AUTO_UPDATE_INTERVAL` seconds while it stays online) it asks GitHub for the
+newest commit on `AUTO_UPDATE_BRANCH`:
+
+* **Never touched:** `.env` (and any `.env.*` except `.env.example`), `.git`,
+  `data/`, virtualenvs, caches, `*.db` / `*.sqlite` / `*.log` files, and
+  anything listed in `AUTO_UPDATE_PROTECTED`.
+* **Validated first:** the archive must contain `bot.py` + `requirements.txt`,
+  every `.py` file must compile, and path traversal is rejected — a bad
+  download changes nothing.
+* **Recoverable:** every replaced file is copied to
+  `data/autoupdate_backup/latest/` before it is overwritten.
+* The applied commit lives in `data/autoupdate_state.json`, so this costs one
+  GitHub API call per check (60/hour unauthenticated; set `GITHUB_TOKEN` to
+  raise it).
+
+The terminal says exactly what happened:
+
+```text
+✅ auto-update: already up to date (commit d38af11)          ← nothing to do, bot just runs
+
+🔄 AUTO-UPDATE APPLIED — 12 file(s) updated, 0 removed
+   repository: STUP1DLADKAA/ParadiseBOT@a1b2c3d
+   + commands/wake.py
+   RESTART Paradise to run the new code.
+```
+
+With `AUTO_UPDATE_RESTART=true` (the default) a start-up update makes the
+process exit immediately so your supervisor restarts it on the new files —
+running a half-old, half-new Python process is never safe. Set it to `false`
+to keep the bot running and restart it yourself; set `AUTO_UPDATE_APPLY=false`
+to only be told when an update exists.
+
+## Your voice — ElevenLabs
+
+Set `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` (your custom/cloned male
+voice) and Paradise speaks with **that** voice everywhere: dictionary
+pronunciation, `/define` playback, and every voice-chat answer. The default
+model is `eleven_flash_v2_5` — the fastest multilingual model, so a sentence
+starts playing in well under a second — and because it is multilingual, Hindi,
+English and Hinglish all work without configuration.
+
+```env
+ELEVENLABS_API_KEY=...          # elevenlabs.io → Settings → API keys
+ELEVENLABS_VOICE_ID=...         # Voice Lab → your voice → ID
+ELEVENLABS_MODEL=eleven_flash_v2_5
+```
+
+The key only ever travels in the `xi-api-key` header; it is never logged, never
+posted, never committed. Without the key everything still works (the dictionary
+falls back to a human recording and then a free web voice).
+
+## “Hey Paradise …” in voice chat
+
+Type the wake phrase in a voice channel's text chat and Paradise answers —
+**in the chat and out loud**, in the same voice:
+
+```text
+Hey Paradise what's the capital of Rajasthan?
+→ Jaipur is the capital of Rajasthan, in the north-west of India.
+```
+
+* Answer model: the fastest available Gemini model. `GEMINI_MODEL_CHAIN`
+  (default `gemini-2.5-flash-lite, gemini-2.0-flash-lite, gemini-2.5-flash,
+  gemini-2.0-flash`) is tried fastest-first; the first two are raced
+  concurrently and a throttled/missing model is skipped for a few minutes
+  instead of stalling. If Gemini cannot answer at all, the configured
+  OpenAI-compatible fallback is used.
+* If **every** model fails, Paradise says something rude instead — out loud,
+  from a preloaded clip (`data/tts_cache`), so the channel is never silent.
+* The typed answer and the spoken answer are the same text.
+* Recognised phrases: `hey/hi/hello/yo/ok/okay/oye/arre paradise …` or
+  `Paradise, …`. Ordinary sentences that merely contain the word never trigger
+  anything, and normal text channels are ignored unless
+  `WAKE_WORD_VC_ONLY=false`.
+* Text always works; speech needs PyNaCl + ffmpeg (both ship in
+  `requirements.txt`) and your ElevenLabs key.
+
+## Voice presence: silent joins
+
+Paradise follows the crowd into whichever accessible voice channel has the most
+humans and leaves when it empties — without posting a message or saying
+anything. That is deliberate: joins are silent, the consent notice is off
+(`VOICE_CLIP_NOTICE_ENABLED=false`), and nothing is spoken unless you ask it
+something.
+
+Set `VOICE_ARRIVAL_ANNOUNCE=true` to bring back the old random "arrival line"
+(text + heavy-male voice), which is still implemented.
+
+### Voice clips while deafened — a Discord limit
+
+`/clip` records continuously while Paradise sits in the channel. It joins
+**undeafened** on purpose, because a deafened client is never sent any audio.
+
+- If Paradise deafens itself (an old config, or an admin using the bot's own
+  toggle), it clears the flag and keeps recording.
+- If a **moderator server-deafens** it, capture stops and cannot be resumed by
+  the bot: Discord does not transmit audio to a server-deafened voice client,
+  and nothing a bot can send overrides that. Un-deafen it under *Server
+  Settings → Members*. The reason is logged once per guild and `/clip` replies
+  with a plain explanation instead of pretending.
 
 ## Architecture
 
@@ -241,6 +356,10 @@ commands/
   system.py               /help command
   assistant.py            mention router: "@Paradise <anything>" → tools first, AI last;
                           combined multi-tool replies, grounded search synthesis
+  wake.py                 "Hey Paradise <question>" in voice chat → typed + spoken answer
+                          (fastest-first Gemini cascade, rude preloaded fallback)
+  voice_presence.py       silent crowd-following: join the busiest VC, say nothing, leave
+                          when it empties (VOICE_ARRIVAL_ANNOUNCE=true restores the lines)
 functions/
   startup.py              the only command-tree writer: prune retired commands, sync the
                           current tree to the home guild on every start, verify, report
@@ -259,7 +378,11 @@ functions/
   cache.py                shared bounded TTL cache + single-flight request collapsing
   calculator.py           safe AST-whitelisted calculator (percent idioms, word operators)
   gemini.py               Gemini REST client (key in header only, masked logs, graceful
-                          invalid/quota handling, complete-output retry handling)
+                          invalid/quota handling, complete-output retry handling) +
+                          fastest-first model cascade with hedging and per-model back-off
+  tts.py                  the owner's ElevenLabs voice (fast multilingual model), with an
+                          OpenAI-compatible and a free web fallback; memory + disk cache
+  autoupdate.py           pull this repository's latest commit into the checkout, safely
   ai.py                   provider chain: Gemini → OpenAI-compatible → none; activation
                           rules, bounded context, concise direct responses
   search/                 native web search engine (DuckDuckGo, Wikipedia, caching) +
@@ -278,7 +401,8 @@ functions/
                           no activities; rotating notes stay local due Discord API limits
   minigames/              recoverable SQLite scheduler, lifecycle, four modular games,
                           UI controls and aggregate-only leaderboard
-  dictionary/             dictionary engine & card renderer
+  dictionary/             dictionary engine & card renderer (and pronunciation, which
+                          prefers the owner's ElevenLabs voice)
   recipes/                recipe engine & bundled recipe book
 assets/fonts/             bundled Inter subset for card renderers
 tests/                    comprehensive offline and feature test suites

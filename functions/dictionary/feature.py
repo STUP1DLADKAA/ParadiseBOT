@@ -16,7 +16,15 @@ from .cache import SingleFlight, TTLCache
 from .http import HttpClient
 from .models import LookupResult, WordEntry
 from .playback import PlaybackSupport, VoicePlayback, playback_support
-from .pronounce import NeuralSpeechProvider, PronunciationOutcome, PronunciationService
+from .pronounce import (
+    MAX_SPOKEN_CHARS,
+    ElevenLabsSpeechProvider,
+    NativeRecordingProvider,
+    NeuralSpeechProvider,
+    PronunciationOutcome,
+    PronunciationService,
+    WebVoiceProvider,
+)
 from .render import (
     RenderUnavailable,
     Theme,
@@ -30,17 +38,17 @@ from . import fonts
 
 log = logging.getLogger(__name__)
 
-CARD_CACHE_ITEMS = 64
+CARD_CACHE_ITEMS = 128
 CARD_CACHE_BYTES = 24 * 1024 * 1024
 CARD_TTL = 3 * 3600.0
-RENDER_CONCURRENCY = 2
+RENDER_CONCURRENCY = 4
 RENDER_TIMEOUT = 15.0
 
 
 class DictionaryFeature:
     """Data → card → audio, with every cache and deadline in one place."""
 
-    def __init__(self, config=None) -> None:
+    def __init__(self, config=None, *, elevenlabs=None) -> None:
         self.config = config
         timeout = float(getattr(config, "timeout", 8.0) or 8.0)
         self.client = HttpClient(timeout=timeout)
@@ -50,16 +58,33 @@ class DictionaryFeature:
             cache_size=int(getattr(config, "cache_size", 512) or 512),
             cache_ttl=float(getattr(config, "cache_ttl", 6 * 3600) or 6 * 3600),
         )
+        # The owner's custom ElevenLabs voice leads whenever it's configured:
+        # pronunciation should sound exactly like every other spoken word.
+        self.elevenlabs_voice = ElevenLabsSpeechProvider(
+            config=elevenlabs, max_chars=MAX_SPOKEN_CHARS
+        )
+        neural = NeuralSpeechProvider(
+            self.client,
+            base_url=getattr(config, "speech_base_url", "") or "",
+            api_key=getattr(config, "speech_api_key", "") or "",
+            model=getattr(config, "speech_model", "") or "",
+            voice=getattr(config, "speech_voice", "") or "",
+        )
+        providers = [
+            NativeRecordingProvider(self.client, timeout=timeout),
+            neural,
+            WebVoiceProvider(self.client, timeout=timeout),
+        ]
+        if self.elevenlabs_voice.available:
+            # Keep the configured voice in the chain at the position the owner
+            # asked for: first by default, or right after a human recording.
+            pron_first = bool(getattr(elevenlabs, "pronunciation_first", True))
+            providers.insert(0 if pron_first else 1, self.elevenlabs_voice)
         self.pronunciation = PronunciationService(
             self.client,
+            providers=providers,
             prefer_native=bool(getattr(config, "prefer_native_audio", True)),
-            neural=NeuralSpeechProvider(
-                self.client,
-                base_url=getattr(config, "speech_base_url", "") or "",
-                api_key=getattr(config, "speech_api_key", "") or "",
-                model=getattr(config, "speech_model", "") or "",
-                voice=getattr(config, "speech_voice", "") or "",
-            ),
+            neural=neural,
             timeout=timeout,
         )
         self.playback = VoicePlayback(
@@ -96,6 +121,7 @@ class DictionaryFeature:
             ),
             fonts.describe(),
             self.pronunciation.describe(),
+            "voice: " + self.elevenlabs_voice.describe(),
         ]
         support = self.voice_support()
         bits.append(
@@ -184,6 +210,10 @@ class DictionaryFeature:
             await self.playback.shutdown()
         except Exception:  # noqa: BLE001 - shutdown is best effort
             log.debug("Voice playback shutdown failed", exc_info=True)
+        try:
+            await self.elevenlabs_voice.close()
+        except Exception:  # noqa: BLE001 - shutdown is best effort
+            log.debug("Voice shutdown failed", exc_info=True)
         await self.service.close()
         await self.client.close()
 

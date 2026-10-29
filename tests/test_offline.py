@@ -39,7 +39,7 @@ EXPECTED_COMMANDS = {
     "ping", "coinflip", "choose",
     "remind", "poll", "afk", "translate", "settimezone", "vc", "clip",
     "minigames", "recipe",
-    "summarize", "help",
+    "summarize", "help", "edit",
 }
 
 # Everything that must never come back: the whole music/TTS stack plus
@@ -106,16 +106,23 @@ class TestCommandSet(unittest.TestCase):
         self.assertTrue(declared <= EXPECTED_COMMANDS, f"unexpected: {declared - EXPECTED_COMMANDS}")
 
     def test_no_music_or_tts_modules_left(self):
+        # A music system and third-party TTS suites stay out of this bot. The
+        # owner's own ElevenLabs voice (functions/tts.py) is intentional and
+        # explicitly allowed — it is one small client, not a TTS framework.
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         for path in (
             "commands/music.py", "commands/voice.py", "functions/music",
-            "functions/tts.py", "functions/lyrics.py", "functions/settings.py",
+            "functions/lyrics.py", "functions/settings.py",
             "lavalink",
         ):
             self.assertFalse(
                 os.path.exists(os.path.join(root, path)),
                 f"{path} should have been removed",
             )
+        self.assertTrue(
+            os.path.exists(os.path.join(root, "functions", "tts.py")),
+            "functions/tts.py is the owner's voice provider",
+        )
 
     def test_no_music_or_tts_references_in_source(self):
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -287,8 +294,13 @@ class TestConfig(unittest.TestCase):
         )
         with open(path, encoding="utf-8") as handle:
             content = handle.read().lower()
-        for needle in ("lavalink", "tts_", "music_", "lyrics", "genius"):
+        # No leftovers from the removed music/TTS suites. (The owner's own
+        # ElevenLabs voice and its TTS_CACHE_DIR are deliberate, tested
+        # elsewhere — this guards against the old framework keys returning.)
+        for needle in ("lavalink", "edge_tts", "tts_engine", "tts_voice", "music_", "lyrics", "genius"):
             self.assertNotIn(needle, content, f".env.example still mentions {needle}")
+        self.assertIn("elevenlabs_voice_id=", content)
+        self.assertIn("discord_token=", content)
 
 
 # ---------------------------------------------------------------------------
@@ -733,7 +745,7 @@ class TestWiring(unittest.TestCase):
         ):
             __import__(name)
         for gone in (
-            "functions.music", "functions.tts", "functions.lyrics",
+            "functions.music", "functions.lyrics",
             "functions.settings", "commands.music", "commands.voice",
         ):
             self.assertNotIn(gone, sys.modules, f"{gone} was imported somewhere")

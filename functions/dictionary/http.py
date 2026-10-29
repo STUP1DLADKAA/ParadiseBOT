@@ -68,7 +68,7 @@ class HttpClient:
         rate: int = 8,
         per: float = 1.0,
         user_agent: str = USER_AGENT,
-        concurrency: int = 6,
+        concurrency: int = 16,
     ) -> None:
         self.timeout = float(timeout)
         self.retries = max(0, int(retries))
@@ -92,7 +92,12 @@ class HttpClient:
                 self._session = aiohttp.ClientSession(
                     timeout=aiohttp.ClientTimeout(total=self.timeout),
                     headers={"User-Agent": self.user_agent},
-                    connector=aiohttp.TCPConnector(limit=10, ttl_dns_cache=300),
+                    # A wider pool: the box is no longer resource-starved, so
+                    # dictionary/search/weather lookups stop queueing behind
+                    # each other.
+                    connector=aiohttp.TCPConnector(
+                        limit=48, limit_per_host=12, ttl_dns_cache=300
+                    ),
                 )
         return self._session
 

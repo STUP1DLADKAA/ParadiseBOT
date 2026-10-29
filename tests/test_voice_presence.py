@@ -113,6 +113,7 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
             self.bot,
             settle_delay=0.0,
             speech_providers=[self.provider],
+            announce=True,
         )
         self._real_create_source = self.cog._create_audio_source
         # Stub out external ffmpeg spawn during fast join/move state tests
@@ -138,7 +139,7 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(set(picked[:20])), 20)
 
     async def test_default_neural_provider_uses_deep_male_onyx_voice_and_filters(self):
-        default_cog = VoicePresence(self.bot, settle_delay=0.0)
+        default_cog = VoicePresence(self.bot, settle_delay=0.0, announce=True)
         try:
             neural = default_cog._speech_providers[0]
             self.assertEqual(neural._voice, "onyx")
@@ -309,6 +310,94 @@ class TestVoicePresenceArrival(unittest.IsolatedAsyncioTestCase):
             if stdout is not None and hasattr(stdout, "close"):
                 stdout.close()
             source.cleanup()
+
+
+class TestSilentJoin(unittest.IsolatedAsyncioTestCase):
+    """Paradise joins a voice channel without saying or texting anything."""
+
+    async def asyncSetUp(self):
+        self.bot = MagicMock()
+        self.bot.user = SimpleNamespace(id=999000)
+        self.bot.guilds = []
+        self.bot.config = SimpleNamespace(
+            voice_presence=SimpleNamespace(announce=False, follow_interval=20.0),
+            voice_clip=SimpleNamespace(enabled=True),
+            dictionary=SimpleNamespace(
+                speech_base_url="", speech_api_key="", speech_model="",
+                speech_voice="", timeout=8.0,
+            ),
+        )
+        self.cog = VoicePresence(self.bot, settle_delay=0.0)
+
+    async def asyncTearDown(self):
+        await self.cog.cog_unload()
+
+    def _guild(self, *channels):
+        guild = MagicMock()
+        guild.id = 777
+        guild.afk_channel = None
+        guild.me = SimpleNamespace(id=999000, voice=SimpleNamespace(mute=False))
+        guild.voice_channels = list(channels)
+        guild.voice_client = None
+        return guild
+
+    async def test_join_is_completely_silent(self):
+        vc = _make_voice_channel(201, humans=2)
+        guild = self._guild(vc)
+
+        async def connect(**kwargs):
+            guild.voice_client = _make_fake_voice_client(vc)
+            return guild.voice_client
+
+        vc.connect = AsyncMock(side_effect=connect)
+
+        await self.cog.join_busiest(guild)
+        await asyncio.sleep(0.02)
+
+        # No text in the channel's chat, and nothing spoken.
+        vc.send.assert_not_awaited()
+        guild.voice_client.play.assert_not_called()
+
+    async def test_default_cog_has_no_arrival_providers(self):
+        self.assertEqual(self.cog._speech_providers, [])
+        self.assertFalse(self.cog.announce)
+
+    async def test_join_is_undeafened_so_clipping_can_record(self):
+        vc = _make_voice_channel(202, humans=1)
+        guild = self._guild(vc)
+
+        async def connect(**kwargs):
+            guild.voice_client = _make_fake_voice_client(vc)
+            return guild.voice_client
+
+        vc.connect = AsyncMock(side_effect=connect)
+
+        await self.cog.join_busiest(guild)
+        vc.connect.assert_awaited_once()
+        kwargs = vc.connect.await_args.kwargs
+        self.assertFalse(kwargs.get("self_deaf", False))
+        # The receive-capable client is used when clipping is enabled.
+        from functions.voice_clip import ClipVoiceClient
+
+        self.assertIs(kwargs.get("cls"), ClipVoiceClient)
+
+    async def test_moved_by_admin_stays_silent(self):
+        vc1 = _make_voice_channel(203, humans=1)
+        vc2 = _make_voice_channel(204, humans=2)
+        guild = self._guild(vc1, vc2)
+        guild.voice_client = _make_fake_voice_client(vc2)
+
+        bot_member = SimpleNamespace(id=999000, bot=True, guild=guild)
+        await self.cog.on_voice_state_update(
+            bot_member,
+            SimpleNamespace(channel=vc1),
+            SimpleNamespace(channel=vc2),
+        )
+        await asyncio.sleep(0.05)
+
+        vc1.send.assert_not_awaited()
+        vc2.send.assert_not_awaited()
+        guild.voice_client.play.assert_not_called()
 
 
 if __name__ == "__main__":

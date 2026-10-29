@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import logging
+import os
 import sys
 import time
 from collections import deque
@@ -13,6 +15,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import Config, load_config
+from functions import autoupdate
 from functions.ai import AIService
 from functions.personality import Personality
 from functions.presence import PresenceManager
@@ -33,6 +36,7 @@ EXTENSIONS = (
     "commands.system",
     "commands.assistant",
     "commands.edit",
+    "commands.wake",
 )
 
 
@@ -92,6 +96,7 @@ class ParadiseBot(commands.Bot):
             self, guild_id=PRIMARY_GUILD_ID, sync_global=False
         )
         self.commands_ready = False
+        self.autoupdate_task: asyncio.Task | None = None
         # Exactly-once guard for message dispatch (bounded, in-memory).
         self._handled: deque[int] = deque()
         self._handled_ids: set[int] = set()
@@ -102,6 +107,9 @@ class ParadiseBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         """The explicit startup flow: extensions → prune → sync → ready."""
+        workers = tune_default_executor()
+        if workers:
+            log.info("Worker threads: %d (audio, rendering, file I/O)", workers)
         await self._load_extensions()
 
         # Command synchronisation is awaited here, before the bot is
@@ -125,6 +133,12 @@ class ParadiseBot(commands.Bot):
 
         self.presence_manager.start()
 
+        # Keep the checkout fresh while online (the start-up check already
+        # ran before login; this one handles long-lived processes).
+        self.autoupdate_task = asyncio.create_task(
+            autoupdate.watch(self, self.config), name="paradise-autoupdate"
+        )
+
     async def _load_extensions(self) -> None:
         """Load every extension; one broken cog never blocks the others."""
         for extension in EXTENSIONS:
@@ -142,6 +156,13 @@ class ParadiseBot(commands.Bot):
             log.debug("AI startup validation skipped", exc_info=True)
 
     async def close(self) -> None:
+        watcher = getattr(self, "autoupdate_task", None)
+        if watcher is not None:
+            watcher.cancel()
+            try:
+                await watcher
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         clip_service = getattr(self, "voice_clip_service", None)
         if clip_service is not None:
             try:
@@ -230,6 +251,13 @@ class ParadiseBot(commands.Bot):
                 await self._assistant_failure(message)
             return
 
+        # "Hey Paradise <question>" in a voice channel: typed + spoken answer.
+        try:
+            if await self._maybe_wake(message):
+                return
+        except Exception:
+            log.exception("Wake-word handling failed")
+
         try:
             if await self._maybe_dictionary(message):
                 return
@@ -306,6 +334,15 @@ class ParadiseBot(commands.Bot):
                 log.debug("Could not post AFK notice", exc_info=True)
             return
 
+    # -- Wake word ("Hey Paradise …") ------------------------------------------
+
+    async def _maybe_wake(self, message: discord.Message) -> bool:
+        cog = self.get_cog("Wake")
+        handler = getattr(cog, "handle_message", None)
+        if handler is None:
+            return False
+        return bool(await handler(message))
+
     # -- Dictionary -----------------------------------------------------------
 
     async def _maybe_dictionary(self, message: discord.Message) -> bool:
@@ -325,6 +362,31 @@ class ParadiseBot(commands.Bot):
         return bool(await handler(message))
 
 
+def tune_default_executor(loop: asyncio.AbstractEventLoop | None = None) -> int:
+    """Use the whole box: a fat thread pool for audio/rendering work.
+
+    Opus decoding, timeline mixing, FFmpeg pipes and Pillow card rendering all
+    run in the default executor. The old low-spec sizing made those queue up
+    behind each other; this sizes the pool to the machine (8–32 workers).
+
+    Must run inside the *running* loop (``setup_hook``): ``Client.run`` creates
+    its own loop, so configuring one beforehand would be thrown away.
+    """
+    try:
+        target = loop or asyncio.get_running_loop()
+        cpu = os.cpu_count() or 4
+        workers = max(8, min(32, cpu * 4))
+        target.set_default_executor(
+            concurrent.futures.ThreadPoolExecutor(
+                max_workers=workers, thread_name_prefix="paradise-worker"
+            )
+        )
+        return workers
+    except Exception:  # noqa: BLE001 - tuning is optional
+        log.debug("Could not tune the default executor", exc_info=True)
+        return 0
+
+
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
@@ -340,6 +402,24 @@ def main() -> int:
             file=sys.stderr,
         )
         return 1
+
+    # Pull the latest files from GitHub *before* anything imports the cogs.
+    try:
+        update = asyncio.run(autoupdate.run_startup_check(config))
+    except Exception:  # noqa: BLE001 - updating must never block start-up
+        log.debug("Auto-update start-up check failed", exc_info=True)
+        update = None
+    if (
+        update is not None
+        and update.applied
+        and bool(getattr(config.autoupdate, "restart_after_update", True))
+    ):
+        print(
+            "Paradise updated itself and will exit now so the new files are "
+            "loaded cleanly. Start it again (or let your supervisor restart it).",
+            file=sys.stderr,
+        )
+        return 0
 
     bot = ParadiseBot(config)
     try:
