@@ -42,7 +42,9 @@ import discord
 
 log = logging.getLogger(__name__)
 
-#: Paradise's home server. Commands are published here instantly on boot.
+#: Fallback home server used by this repository's demo deployment. Configure
+#: your own with ``DISCORD_GUILD_ID``; leave it unset to publish commands
+#: globally (Discord can take up to an hour to propagate those).
 PRIMARY_GUILD_ID = 1180538130009432126
 
 #: Public slash commands that were retired in favour of natural mentions.
@@ -88,8 +90,9 @@ class SyncReport:
         if self.skipped:
             return "command sync already completed this session"
         state = "ok" if self.guild_ok else "FAILED"
+        target = f"guild {self.guild_id}" if self.guild_id else "global commands"
         return (
-            f"guild {self.guild_id}: {state} "
+            f"{target}: {state} "
             f"({len(self.guild_commands)} commands"
             f"{', pruned ' + ', '.join(self.pruned) if self.pruned else ''})"
         )
@@ -110,10 +113,14 @@ class CommandSynchronizer:
         *,
         guild_id: int = PRIMARY_GUILD_ID,
         retired: frozenset[str] = RETIRED_COMMANDS,
-        sync_global: bool = False,
+        sync_global: bool | None = None,
     ) -> None:
         self.bot = bot
-        self.guild_id = int(guild_id)
+        self.guild_id = max(0, int(guild_id or 0))
+        # Without a home guild there is nothing to publish to, so fall back to
+        # global registration instead of silently syncing nowhere.
+        if sync_global is None:
+            sync_global = not self.guild_id
         self.retired = frozenset(retired)
         self.sync_global = bool(sync_global)
         self._done = False
@@ -159,7 +166,13 @@ class CommandSynchronizer:
 
             report = SyncReport(guild_id=self.guild_id)
             report.pruned = self.prune()
-            await self._sync_guild(report)
+            if self.guild_id:
+                await self._sync_guild(report)
+            elif not self.sync_global:
+                report.errors.append("no home guild configured")
+            else:
+                # Global-only deployment: a guild sync would do nothing.
+                report.guild_ok = True
             # Global sync is disabled by default — commands live only in the
             # home guild to avoid duplicates and propagation delays. If you
             # explicitly need global registration, set sync_global=True.

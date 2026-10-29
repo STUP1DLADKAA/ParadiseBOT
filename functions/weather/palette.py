@@ -162,9 +162,9 @@ def compute_phase(weather: WeatherData) -> Phase:
         sunrise, sunset = 6 * 60 + 15, 18 * 60 + 15
 
     # Twilight windows either side of sunrise/sunset (civil-ish, stylised).
+    # Only the outer edges shape the palette ramp; the inner ones are the
+    # geometric midpoints of those ramps and need no separate constant.
     dawn_start = sunrise - 70
-    dawn_end = sunrise + 35
-    dusk_start = sunset - 35
     dusk_end = sunset + 70
     solar_noon = (sunrise + sunset) / 2
     # Midnight is the midpoint of the night span (sunset -> next sunrise).

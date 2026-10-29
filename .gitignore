@@ -1,6 +1,43 @@
+# ── Secrets ────────────────────────────────────────────────────────────────
 .env
+.env.*
+!.env.example
+
+# ── Local runtime state (never commit: it is the bot's memory) ─────────────
+data/
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.log
+
+# ── Python ────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
 .venv/
 venv/
-data/
+env/
+.python-version
+
+# ── Tooling caches ────────────────────────────────────────────────────────
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# ── Generated benchmark output (results/*.json that ARE tracked are the
+#    recorded baselines; the CI smoke run writes ci.json) ─────────────────
+benchmarks/results/ci.json
+
+# ── Editors / OS ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db

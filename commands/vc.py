@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import io
 import logging
-from typing import Literal
-
 import discord
 from discord import app_commands
 from discord.ext import commands
@@ -13,7 +11,9 @@ from discord.ext import commands
 from config import VoiceConfig
 from functions.helpers import Colour
 from functions.voice import (
+    IMAGE_PAGE_SIZE,
     LeaderboardImageRenderer,
+    leaderboard_subtitle,
     LeaderboardView,
     VoiceDatabase,
     VoicePeriod,
@@ -198,12 +198,19 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
         )
 
         if image:
+            total_pages = max(1, (len(members) + IMAGE_PAGE_SIZE - 1) // IMAGE_PAGE_SIZE)
             image_bytes = await self.renderer.render_leaderboard(
                 guild_name=interaction.guild.name,
                 period=selected_period,
                 members=members,
                 page=1,
-                page_size=10,
+                page_size=IMAGE_PAGE_SIZE,
+                subtitle_override=(
+                    f"Server: {interaction.guild.name}   ·   "
+                    + leaderboard_subtitle(
+                        members, page=1, total_pages=total_pages
+                    )
+                ),
             )
             file = discord.File(io.BytesIO(image_bytes), filename="voice_leaderboard.png")
             embed = discord.Embed(
@@ -211,7 +218,6 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
                 colour=Colour.ACCENT,
             )
             embed.set_image(url="attachment://voice_leaderboard.png")
-            total_pages = max(1, (len(members) + 9) // 10)
             embed.set_footer(text=f"Server: {interaction.guild.name} • Page 1 of {total_pages}")
             msg = await interaction.followup.send(embed=embed, file=file, view=view)
             view.message = msg

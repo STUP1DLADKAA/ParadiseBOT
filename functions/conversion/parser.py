@@ -5,8 +5,6 @@ from __future__ import annotations
 import re
 
 from functions.helpers import ParadiseError
-from .currency import resolve_currency
-from .units import TEMP_UNITS, resolve_unit
 
 
 def parse_fraction_or_float(val_str: str) -> float:

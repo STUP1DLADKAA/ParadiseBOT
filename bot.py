@@ -5,7 +5,6 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import logging
-import os
 import sys
 import time
 from collections import deque
@@ -15,7 +14,7 @@ from discord import app_commands
 from discord.ext import commands
 
 from config import Config, load_config
-from functions import autoupdate
+from functions import autoupdate, perf
 from functions.ai import AIService
 from functions.personality import Personality
 from functions.presence import PresenceManager
@@ -93,7 +92,12 @@ class ParadiseBot(commands.Bot):
         # Commands are registered ONLY in the home guild (instant, no duplicates)
         # — global sync is disabled to prevent double-registration.
         self.synchronizer = CommandSynchronizer(
-            self, guild_id=PRIMARY_GUILD_ID, sync_global=False
+            self,
+            # Discord propagates guild commands instantly; global ones can take
+            # an hour. Set DISCORD_GUILD_ID for instant registration, or leave
+            # it blank to publish globally.
+            guild_id=config.guild_id or PRIMARY_GUILD_ID,
+            sync_global=not config.guild_id,
         )
         self.commands_ready = False
         self.autoupdate_task: asyncio.Task | None = None
@@ -127,6 +131,13 @@ class ParadiseBot(commands.Bot):
             log.warning("Command sync issue — %s", problem)
 
         log.info("AI provider: %s", self.ai.describe())
+
+        # Warm fonts, card backdrops and the render pool while Discord is
+        # still connecting, so the first `/vc leaderboard` is not the slow one.
+        self.loop.create_task(
+            perf.prewarm(enabled=bool(getattr(self.config, "prewarm", True))),
+            name="paradise-prewarm",
+        )
         # Validate the Gemini key (if any) in the background — validation is
         # never fatal: an unreachable network simply skips it.
         self.loop.create_task(self._validate_ai())
@@ -177,6 +188,11 @@ class ParadiseBot(commands.Bot):
             await self.ai.close()
         except Exception:
             log.debug("Shutdown step failed", exc_info=True)
+        try:
+            await perf.close_shared_sessions()
+            await perf.shutdown_render_pool()
+        except Exception:
+            log.debug("Shared-session shutdown failed", exc_info=True)
         await super().close()
 
     async def on_ready(self) -> None:
@@ -368,17 +384,16 @@ class ParadiseBot(commands.Bot):
 def tune_default_executor(loop: asyncio.AbstractEventLoop | None = None) -> int:
     """Use the whole box: a fat thread pool for audio/rendering work.
 
-    Opus decoding, timeline mixing, FFmpeg pipes and Pillow card rendering all
-    run in the default executor. The old low-spec sizing made those queue up
-    behind each other; this sizes the pool to the machine (8–32 workers).
+    Opus decoding, timeline mixing, FFmpeg pipes, Supabase calls and file I/O
+    all run in the default executor. Sizing is centralised in
+    :mod:`functions.perf` so the bot, the benchmarks and the tests agree.
 
     Must run inside the *running* loop (``setup_hook``): ``Client.run`` creates
     its own loop, so configuring one beforehand would be thrown away.
     """
     try:
         target = loop or asyncio.get_running_loop()
-        cpu = os.cpu_count() or 4
-        workers = max(8, min(32, cpu * 4))
+        workers = perf.auto_workers()
         target.set_default_executor(
             concurrent.futures.ThreadPoolExecutor(
                 max_workers=workers, thread_name_prefix="paradise-worker"

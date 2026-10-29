@@ -29,6 +29,9 @@ from .tracker import (
     VoiceTracker,
 )
 from .ui import (
+    IMAGE_PAGE_SIZE,
+    TEXT_PAGE_SIZE,
+    leaderboard_subtitle,
     LeaderboardView,
     build_leaderboard_text_embed,
     build_user_stats_embed,
@@ -57,6 +60,9 @@ __all__ = [
     "LeaderboardImageRenderer",
     "LeaderboardView",
     "build_leaderboard_text_embed",
+    "IMAGE_PAGE_SIZE",
+    "TEXT_PAGE_SIZE",
+    "leaderboard_subtitle",
     "build_user_stats_embed",
     "format_duration",
     "format_duration_diff",

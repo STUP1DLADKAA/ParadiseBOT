@@ -10,7 +10,7 @@ fake client that emulates the PostgreSQL functions, and the real VoiceTracker.
 No network, no credentials, no production data.
 
 Usage:
-    python3 tools/repro_incident.py
+    python3 tools/repro/repro_incident.py
 """
 
 from __future__ import annotations
@@ -19,10 +19,10 @@ import asyncio
 import sys
 import tempfile
 import types
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from pathlib import Path
 
-REPO = Path(__file__).resolve().parents[1]
+REPO = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO))
 sys.path.insert(0, str(REPO / "tests"))
 
@@ -186,7 +186,7 @@ async def scenario_continuous(label="Issue A/B: continuous session 07:00 -> 15:0
             print(f"  {wall} IST | shown={hr(shown):>8} | committed={hr(daily):>8} "
                   f"| active_started_at={started} |{flag}")
     print()
-    print(f"  EXPECTED after 8h30m connected: 8h30m")
+    print("  EXPECTED after 8h30m connected: 8h30m")
     print(f"  REGRESSIONS OBSERVED: {regressions if regressions else 'none'}")
     return regressions
 

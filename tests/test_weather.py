@@ -115,14 +115,14 @@ class TestWeatherProvider(unittest.IsolatedAsyncioTestCase):
             await self.service.get_weather("")
 
     async def test_curated_city_lookup_falls_back_without_network(self):
-        with patch("functions.weather.provider.aiohttp.ClientSession", return_value=_FailingSession()):
+        with patch("functions.weather.provider._session", lambda *a, **k: _FailingSession()):
             loc = await self.service._resolve_location("Tokyo")
         self.assertIsNotNone(loc)
         self.assertEqual(loc.name, "Tokyo")
         self.assertEqual(loc.country, "Japan")
 
     async def test_fuzzy_city_resolution_is_offline(self):
-        with patch("functions.weather.provider.aiohttp.ClientSession", return_value=_FailingSession()):
+        with patch("functions.weather.provider._session", lambda *a, **k: _FailingSession()):
             loc_delhi = await self.service._resolve_location("Delhy")
             loc_tokyo = await self.service._resolve_location("Tokio")
             loc_mumbai = await self.service._resolve_location("Mumba")
@@ -149,7 +149,7 @@ class TestWeatherProvider(unittest.IsolatedAsyncioTestCase):
         location = LocationInfo(
             name="Delhi", latitude=28.61, country="India", timezone="Asia/Kolkata"
         )
-        with patch("functions.weather.provider.aiohttp.ClientSession", return_value=_FailingSession()):
+        with patch("functions.weather.provider._session", lambda *a, **k: _FailingSession()):
             weather = await self.service._fetch_weather_data(location)
         self.assertEqual(weather.condition, "Partly cloudy")
         self.assertEqual(weather.weather_code, 2)

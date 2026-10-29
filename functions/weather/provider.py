@@ -9,8 +9,9 @@ from datetime import datetime, timezone
 from typing import Any, Protocol
 from zoneinfo import ZoneInfo
 
-import aiohttp
 from rapidfuzz import process, fuzz
+
+from functions.perf import shared_session as _shared_session
 
 from functions.helpers import ParadiseError
 from .models import LocationInfo, WeatherData
@@ -113,6 +114,15 @@ def _degrees_to_cardinal(deg: int | float) -> str:
     return dirs[ix]
 
 
+def _session(timeout: float):
+    """The pooled session used for every weather request.
+
+    One function so the offline tests can substitute an unreachable session
+    and exercise the real fallback code path.
+    """
+    return _shared_session("weather", timeout=timeout)
+
+
 class WeatherProvider(Protocol):
     """Protocol for weather service providers."""
 
@@ -126,6 +136,11 @@ class OpenMeteoWeatherService:
     def __init__(self, cache_ttl: int = 600) -> None:
         self.cache_ttl = cache_ttl
         self._cache: OrderedDict[str, tuple[float, WeatherData]] = OrderedDict()
+        # Geocoding results are stable for a session; remembering them makes
+        # every repeat lookup ("weather in delhi" ten times a day) a cache hit
+        # instead of another round trip.
+        self._places: OrderedDict[str, tuple[float, LocationInfo]] = OrderedDict()
+        self._places_ttl = max(3600.0, float(cache_ttl) * 6)
 
     async def get_weather(self, query: str) -> WeatherData:
         query = query.strip()
@@ -159,14 +174,32 @@ class OpenMeteoWeatherService:
 
     async def _resolve_location(self, query: str) -> LocationInfo | None:
         """Resolve location using geocoding API or offline fuzzy city database."""
+        now = time.monotonic()
+        remembered = self._places.get(query)
+        if remembered is not None:
+            stamped, place = remembered
+            if now - stamped < self._places_ttl:
+                self._places.move_to_end(query)
+                return place
+            self._places.pop(query, None)
+
+        place = await self._geocode(query)
+        if place is not None:
+            self._places[query] = (now, place)
+            self._places.move_to_end(query)
+            while len(self._places) > _WEATHER_CACHE_MAX_ITEMS:
+                self._places.popitem(last=False)
+        return place
+
+    async def _geocode(self, query: str) -> LocationInfo | None:
+        """One geocoding round trip, with the offline city table as fallback."""
         # First try Open-Meteo Geocoding API if available
         try:
             url = "https://geocoding-api.open-meteo.com/v1/search"
             params = {"name": query, "count": "5", "language": "en", "format": "json"}
             headers = {"User-Agent": USER_AGENT}
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=5)
-            ) as session:
+            session = _session(5.0)
+            if True:  # keep the existing indentation/shape of the block
                 async with session.get(url, params=params, headers=headers) as resp:
                     if resp.status == 200:
                         res = await resp.json(content_type=None)
@@ -220,9 +253,8 @@ class OpenMeteoWeatherService:
         }
         headers = {"User-Agent": USER_AGENT}
         try:
-            async with aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=6)
-            ) as session:
+            session = _session(6.0)
+            if True:  # pooled: no TLS handshake per weather card
                 async with session.get(url, params=params, headers=headers) as response:
                     if response.status != 200:
                         log.warning("Open-Meteo returned HTTP %s for a weather request", response.status)

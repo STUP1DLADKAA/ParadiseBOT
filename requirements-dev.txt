@@ -1,0 +1,6 @@
+# Development and CI dependencies. The bot itself only needs requirements.txt.
+-r requirements.txt
+
+pytest>=8.0,<10.0        # test suite (python -m pytest -q)
+pyflakes>=3.0,<4.0       # fast undefined-name / unused-import check
+ruff>=0.6,<1.0           # optional linter/formatter (config in pyproject.toml)

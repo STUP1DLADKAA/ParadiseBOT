@@ -1,8 +1,8 @@
 # ParadiseBOT on Supabase — voice activity setup
 
-The `/vc` leaderboard, `/vc stats`, and the daily DM reports are backed by the
-**Supabase PostgreSQL database** (project **“Paradise”**, ref
-`gxcjtbiyamyyxokgehpe`, region `ap-south-1`). SQLite remains only for user
+The `/vc` leaderboard, `/vc stats`, and the daily DM reports are backed by a
+**Supabase PostgreSQL database** (any project works; pick the region closest to
+your members — this bot was developed against `ap-south-1`, Mumbai). SQLite remains only for user
 settings (timezones, DM preferences) and as a bounded, temporary fallback
 queue while Supabase is unreachable.
 
@@ -13,7 +13,7 @@ queue while Supabase is unreachable.
 
 ## 1. Apply the schema (one-time, ~3 minutes)
 
-1. Open the Supabase Dashboard → your **Paradise** project.
+1. Open the Supabase Dashboard → your project.
 2. Go to **SQL Editor** → **New query**.
 3. For a new database, run [`migrations/001_voice_activity.sql`](migrations/001_voice_activity.sql) first.
 4. Run [`migrations/002_voice_ist_calendar.sql`](migrations/002_voice_ist_calendar.sql) second.
@@ -105,7 +105,7 @@ In the Dashboard go to **Project Settings → API**:
 Copy `.env.example` to `.env` if you haven't, then fill in:
 
 ```env
-SUPABASE_URL=https://gxcjtbiyamyyxokgehpe.supabase.co
+SUPABASE_URL=https://<your-project-ref>.supabase.co
 SUPABASE_SECRET_KEY=sb_secret_…        # your real secret key
 
 VOICE_HEARTBEAT_INTERVAL=20            # seconds; 15–30 recommended
@@ -271,8 +271,8 @@ cd supabase && npm install --no-save --package-lock=false @electric-sql/pglite &
 `tests/test_voice_migration.py` exercise the Python store, the tracker's
 checkpoint/recovery behaviour and the migrator offline against an in-memory
 fake of the Supabase client that mirrors these exact semantics.
-`tools/repro_*.py` reproduce each reported incident end to end, and
-`tools/fuzz_voice.py` randomises joins, restarts, outages, guild changes and
+`tools/repro/` reproduces each reported incident end to end, and
+`tools/repro/fuzz_voice.py` randomises joins, restarts, outages, guild changes and
 Dashboard edits to assert that credited time never decreases and is never
 counted twice.
 

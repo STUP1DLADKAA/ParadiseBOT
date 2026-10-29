@@ -1,0 +1,39 @@
+name: Feature request
+description: Suggest a capability or an improvement
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Paradise deliberately stays small: no dashboard, no moderation suite, no
+        music player. Tool-first answers and drawn cards are the theme — ideas
+        that fit that shape are much more likely to land.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation, not the implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What would you like to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+    validations:
+      required: false
+  - type: dropdown
+    id: keys
+    attributes:
+      label: Would this need a new API key or paid service?
+      options:
+        - "No — it can work key-less"
+        - "Yes, but it is optional with a fallback"
+        - "Yes, and it is required"
+    validations:
+      required: true

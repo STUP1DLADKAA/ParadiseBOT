@@ -1,0 +1,71 @@
+name: Bug report
+description: Something behaved differently from what the docs say
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the report. Please do **not** paste tokens, API keys or `.env`
+        contents — redact them. Security issues belong in SECURITY.md, not here.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: The command or message, the reply, and what you expected instead.
+      placeholder: |
+        `@Paradise weather in Delhi` replied "…" but I expected a weather card.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Start the bot with …
+        2. Type …
+        3. See …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Version / commit
+      description: Output of `git rev-parse --short HEAD`
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Which part?
+      multiple: true
+      options:
+        - Mention assistant / router
+        - Dictionary
+        - Weather
+        - Search
+        - Conversions / calculator / time
+        - Voice leaderboard (/vc)
+        - Voice clips (/clip)
+        - Wake word / speech
+        - Mini-games
+        - Auto-update
+        - Cards / rendering
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact tokens, keys, user IDs and server names.
+      render: text
+    validations:
+      required: false
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I removed every token, key, user ID and server name from this report.
+          required: true
+        - label: I searched existing issues for the same problem.
+          required: true

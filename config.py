@@ -36,6 +36,22 @@ def _chance(raw: str | None, default: float) -> float:
     return value if 0.0 <= value <= 1.0 else default
 
 
+def _ids(raw: str | None) -> tuple[int, ...]:
+    """A comma/space separated list of Discord IDs; anything invalid is ignored."""
+    text = str(raw or "").strip()
+    if not text:
+        return ()
+    out: list[int] = []
+    for chunk in text.replace(";", ",").replace(" ", ",").split(","):
+        value = chunk.strip().strip("<>@!")
+        if not value.isdigit():
+            continue
+        number = int(value)
+        if number and number not in out:
+            out.append(number)
+    return tuple(out)
+
+
 def _csv(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
     """A comma/space separated list of identifiers, de-duplicated in order."""
     text = str(raw or "").strip()
@@ -363,7 +379,9 @@ class AutoUpdateConfig:
         )
 
 
-DEFAULT_VOICE_ALERT_CHANNEL_ID = 1507796401122181352
+#: Where deafen warnings and the midnight leaderboard are posted. 0 (the
+#: default) disables those alerts until you set ``VOICE_ALERT_CHANNEL_ID``.
+DEFAULT_VOICE_ALERT_CHANNEL_ID = 0
 DEFAULT_DEAF_WARNING_SECONDS = 30.0
 
 
@@ -386,7 +404,7 @@ class VoiceConfig:
     alert_channel_id: int = DEFAULT_VOICE_ALERT_CHANNEL_ID
     deaf_warning_seconds: float = DEFAULT_DEAF_WARNING_SECONDS
 
-    # Supabase project ("Paradise", ref gxcjtbiyamyyxokgehpe, ap-south-1).
+    # Supabase project (the deployment this bot grew up in: ap-south-1).
     # SUPABASE_SECRET_KEY must be the server-side SECRET key (service_role),
     # NOT the public/anon key. Create the schema first by running
     # supabase/migrations/001_voice_activity.sql then 002_voice_ist_calendar.sql
@@ -680,6 +698,21 @@ class Config:
     # Where preloaded speech clips are cached on disk (default data/tts_cache).
     tts_cache_dir: str = ""
 
+    # Warm fonts, card backdrops and the render pool at start-up so the first
+    # command is as fast as the thousandth. Costs one short burst of CPU.
+    prewarm: bool = True
+
+    # Home guild for instant slash-command publishing. 0 means "no home guild"
+    # — commands are then registered globally, which Discord can take up to an
+    # hour to propagate. Set ``DISCORD_GUILD_ID`` for instant registration.
+    guild_id: int = 0
+
+    # Operator-only features (/edit, /clip, the deafened-VC exemption). These
+    # are Discord user IDs, not secrets: configure your own in .env.
+    edit_user_ids: tuple[int, ...] = ()
+    clip_user_ids: tuple[int, ...] = ()
+    deaf_exempt_user_ids: tuple[int, ...] = ()
+
     @property
     def ai_configured(self) -> bool:
         # Gemini is the primary provider; an OpenAI-compatible endpoint is a
@@ -705,6 +738,11 @@ class Config:
             voice_clip=VoiceClipConfig.from_env(env),
             minigames=MiniGamesConfig.from_env(env),
             image_search=ImageSearchConfig.from_env(env),
+            prewarm=_bool(env.get("PREWARM_ON_START"), True),
+            guild_id=max(0, _int(env.get("DISCORD_GUILD_ID"), 0)),
+            edit_user_ids=_ids(env.get("EDIT_ALLOWED_USER_IDS")),
+            clip_user_ids=_ids(env.get("CLIP_ALLOWED_USER_IDS")),
+            deaf_exempt_user_ids=_ids(env.get("VOICE_DEAF_EXEMPT_USER_IDS")),
             tts_cache_dir=(
                 str(env.get("TTS_CACHE_DIR", "") or "").strip()
                 or os.path.join(

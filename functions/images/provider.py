@@ -34,10 +34,17 @@ from urllib.parse import urlparse
 
 import aiohttp
 
+from functions.perf import shared_session
+
 from functions.cache import SingleFlight, TTLCache
 from .models import ImageResponse, ImageResult
 
 log = logging.getLogger(__name__)
+
+# How long the preferred image source gets before the next one is started as
+# well. Small enough to hide a slow provider, large enough not to fan out on
+# every ordinary lookup.
+HEDGE_DELAY = 0.35
 
 USER_AGENT = (
     "ParadiseBot/1.0 (+https://github.com/STUP1DLADKAA/ParadiseBOT) image-search"
@@ -115,6 +122,19 @@ def _looks_like_image(url: str, mime: str) -> bool:
         return True
     path = urlparse(url).path.lower()
     return path.endswith(_IMAGE_EXTENSIONS)
+
+
+def _session(timeout: float) -> aiohttp.ClientSession:
+    """The pooled HTTP session used for image lookups.
+
+    A single place to swap sessions is also what the offline tests patch, so
+    the behaviour under test is the real code path.
+    """
+    return shared_session(
+        "images",
+        timeout=timeout,
+        headers={"User-Agent": USER_AGENT},
+    )
 
 
 class ImageSearchService:
@@ -214,36 +234,70 @@ class ImageSearchService:
         seen: set[str] = set()
         used: list[str] = []
 
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        async with aiohttp.ClientSession(
-            timeout=timeout, headers={"User-Agent": USER_AGENT}
-        ) as session:
+        def _merge(name: str, found: list[ImageResult]) -> None:
+            """Add a provider's results, de-duplicated and capped."""
+            added = False
+            for item in found:
+                if len(collected) >= limit:
+                    break
+                fingerprint = item.image_url.rstrip("/").casefold()
+                if fingerprint in seen:
+                    continue
+                seen.add(fingerprint)
+                collected.append(item)
+                added = True
+            if added and name not in used:
+                used.append(name)
+
+        session = _session(self.timeout)
+        pending: dict[asyncio.Task, str] = {}
+
+        def _harvest(task: asyncio.Task) -> None:
+            name = pending.pop(task)
+            if task.cancelled():
+                return
+            try:
+                found = task.result()
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+                log.debug("Image provider %s unreachable", name)
+                return
+            except Exception:  # noqa: BLE001 - one bad provider never wins
+                log.debug("Image provider %s failed", name, exc_info=True)
+                return
+            _merge(name, list(found or []))
+
+        # Hedged, priority-ordered fetch: the preferred source is asked first
+        # and gets a short head start. Only when it is slow or comes back thin
+        # is the next source started — in parallel with whatever is still
+        # running — so an ordinary lookup is one request and a bad day never
+        # means waiting for every provider in turn.
+        try:
             for name, provider in providers:
                 if len(collected) >= limit:
                     break
-                try:
-                    found = await provider(session, query, limit)
-                except asyncio.CancelledError:
-                    raise
-                except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-                    log.debug("Image provider %s unreachable", name)
-                    continue
-                except Exception:  # noqa: BLE001 - one bad provider never wins
-                    log.debug("Image provider %s failed", name, exc_info=True)
-                    continue
+                pending[asyncio.ensure_future(provider(session, query, limit))] = name
+                done, _ = await asyncio.wait(
+                    set(pending), timeout=HEDGE_DELAY, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in done:
+                    _harvest(task)
 
-                for item in found:
-                    fingerprint = item.image_url.rstrip("/").casefold()
-                    if fingerprint in seen:
-                        continue
-                    seen.add(fingerprint)
-                    collected.append(item)
-                    if len(collected) >= limit:
-                        break
-                if found:
-                    used.append(name)
+            # Give anything still in flight one more short grace period, in
+            # priority order — but never wait on a straggler once the answer is
+            # already rich enough. The rest is cancelled below.
+            for task in list(pending):
+                if len(collected) >= limit:
+                    break
+                if not task.done():
+                    await asyncio.wait({task}, timeout=HEDGE_DELAY)
+                if task.done():
+                    _harvest(task)
+        finally:
+            for task in pending:
+                if not task.done():
+                    task.cancel()
 
-            usable = await self._keep_embeddable(session, collected, limit)
+        usable = await self._keep_embeddable(session, collected, limit)
 
         response = ImageResponse(
             query=query, results=usable, provider="+".join(used) if used else ""

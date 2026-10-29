@@ -167,10 +167,8 @@ class FakeSession:
 
 
 def use_session(session):
-    """Patch the service's aiohttp session factory with *session*."""
-    return patch.object(
-        provider_module.aiohttp, "ClientSession", lambda *a, **k: session
-    )
+    """Patch the service's pooled-session factory with *session*."""
+    return patch.object(provider_module, "_session", lambda *a, **k: session)
 
 
 def make_service(**config):
@@ -560,6 +558,58 @@ class TestImageEmbeds(unittest.TestCase):
         )
         embeds = build_image_embeds(response, 1)
         self.assertEqual(len(embeds), 1)
+
+
+class TestHedgedProviders(unittest.IsolatedAsyncioTestCase):
+    """A slow provider must not serialise the whole lookup.
+
+    The preferred source gets a short head start; if it stalls, the next one
+    is started in parallel. These tests pin that behaviour without relying on
+    wall-clock timing: the hedge delay is patched to zero.
+    """
+
+    async def asyncSetUp(self):
+        self._delay = provider_module.HEDGE_DELAY
+
+    async def asyncTearDown(self):
+        provider_module.HEDGE_DELAY = self._delay
+
+    def _hedge(self) -> None:
+        # A tiny head start instead of the production 0.35s: the fakes resolve
+        # immediately, so one event-loop turn is all the winner needs.
+        provider_module.HEDGE_DELAY = 0.01
+
+    async def test_a_stalled_provider_does_not_block_a_working_one(self):
+        release = asyncio.Event()
+
+        class StallingSession(FakeSession):
+            async def _get(self, url):  # type: ignore[override]
+                if "wikipedia.org" in url:
+                    await release.wait()
+                return await super()._get(url)
+
+        self._hedge()
+        session = StallingSession({"api.openverse.org": OPENVERSE_PAYLOAD})
+        service = make_service()
+        try:
+            with use_session(session):
+                response = await asyncio.wait_for(
+                    service.search("red panda cub", limit=1), timeout=2.0
+                )
+        finally:
+            release.set()
+        self.assertTrue(response.has_results)
+        self.assertEqual(response.best.provider, "Openverse")
+
+    async def test_the_preferred_provider_wins_when_it_is_fast(self):
+        self._hedge()
+        session = FakeSession(
+            {"en.wikipedia.org": WIKI_PAYLOAD, "api.openverse.org": OPENVERSE_PAYLOAD}
+        )
+        service = make_service()
+        with use_session(session):
+            response = await service.search("red panda", limit=1)
+        self.assertEqual(response.best.provider, "Wikipedia")
 
 
 if __name__ == "__main__":  # pragma: no cover

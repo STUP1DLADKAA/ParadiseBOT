@@ -8,7 +8,7 @@ from typing import Sequence
 
 import discord
 
-from functions.helpers import Colour, shorten
+from functions.helpers import Colour
 from .models import LeaderboardMember, VoicePeriod, format_duration
 from .render import LeaderboardImageRenderer
 from .store import VoiceStoreError, VoiceStoreUnavailable
@@ -16,6 +16,32 @@ from .store import VoiceStoreError, VoiceStoreUnavailable
 log = logging.getLogger(__name__)
 
 RANK_MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+
+# The image card fits ten podium rows comfortably on a 1080p screen, and the
+# text embed stays at ten so both views page identically.
+IMAGE_PAGE_SIZE = 10
+TEXT_PAGE_SIZE = 10
+
+
+def leaderboard_subtitle(
+    members: Sequence[LeaderboardMember],
+    *,
+    page: int,
+    total_pages: int,
+    live: int | None = None,
+) -> str:
+    """The one-line context under the card title: scale, paging, who's live."""
+    people = len(members)
+    tracked = f"{people} member{'' if people == 1 else 's'} tracked"
+    parts = [tracked]
+    if live is None:
+        live = sum(1 for m in members if m.is_active_now)
+    if live:
+        parts.append(f"{live} in voice right now")
+    if total_pages > 1:
+        parts.append(f"page {page} of {total_pages}")
+    return "   ·   ".join(parts)
 
 
 def build_leaderboard_text_embed(
@@ -134,7 +160,7 @@ class LeaderboardView(discord.ui.View):
         self.period = initial_period
         self.as_image = as_image
         self.page = 1
-        self.page_size = 10
+        self.page_size = IMAGE_PAGE_SIZE
         self.message: discord.Message | None = None
         self._update_controls()
 
@@ -191,6 +217,12 @@ class LeaderboardView(discord.ui.View):
                 members=members,
                 page=self.page,
                 page_size=self.page_size,
+                subtitle_override=(
+                    f"Server: {self.guild.name}   ·   "
+                    + leaderboard_subtitle(
+                        members, page=self.page, total_pages=total_pages
+                    )
+                ),
             )
             file = discord.File(io.BytesIO(image_bytes), filename="voice_leaderboard.png")
             embed = discord.Embed(

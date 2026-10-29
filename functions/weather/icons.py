@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import math
 
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw
 
 from .palette import mix
 
