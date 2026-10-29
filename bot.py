@@ -85,7 +85,11 @@ class ParadiseBot(commands.Bot):
         self._afk_notice_last: dict[tuple[int, int], float] = {}
         self._ready_logged = False
         # The single owner of every command-tree write (see functions/startup).
-        self.synchronizer = CommandSynchronizer(self, guild_id=PRIMARY_GUILD_ID)
+        # Commands are registered ONLY in the home guild (instant, no duplicates)
+        # — global sync is disabled to prevent double-registration.
+        self.synchronizer = CommandSynchronizer(
+            self, guild_id=PRIMARY_GUILD_ID, sync_global=False
+        )
         self.commands_ready = False
         # Exactly-once guard for message dispatch (bounded, in-memory).
         self._handled: deque[int] = deque()

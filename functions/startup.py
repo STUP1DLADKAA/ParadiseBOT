@@ -9,13 +9,16 @@ current tree to its home guild on every start:
           ↓
     prune retired public commands
           ↓
-    copy the tree to guild 1180538130009432126 and sync it   (instant)
+    clear the guild tree, copy global commands in, sync guild 1180538130009432126  (instant)
           ↓
     verify what Discord accepted
           ↓
-    best-effort global sync (so other servers converge too)
-          ↓
     bot ready
+
+Commands are registered ONLY in the home guild. Global sync is disabled
+by default to prevent duplicate commands (global + guild) and to ensure
+instant propagation. If you need commands in other servers, enable
+``sync_global=True`` — but be aware of the propagation delay.
 
 Properties this module guarantees:
 
@@ -93,7 +96,13 @@ class SyncReport:
 
 
 class CommandSynchronizer:
-    """Owns every command-tree write that happens at startup."""
+    """Owns every command-tree write that happens at startup.
+
+    Commands are published ONLY to the home guild (instant propagation,
+    no duplicates). Global sync is intentionally disabled — it causes
+    commands to appear twice during propagation and can take up to an
+    hour to converge.
+    """
 
     def __init__(
         self,
@@ -101,7 +110,7 @@ class CommandSynchronizer:
         *,
         guild_id: int = PRIMARY_GUILD_ID,
         retired: frozenset[str] = RETIRED_COMMANDS,
-        sync_global: bool = True,
+        sync_global: bool = False,
     ) -> None:
         self.bot = bot
         self.guild_id = int(guild_id)
@@ -151,6 +160,9 @@ class CommandSynchronizer:
             report = SyncReport(guild_id=self.guild_id)
             report.pruned = self.prune()
             await self._sync_guild(report)
+            # Global sync is disabled by default — commands live only in the
+            # home guild to avoid duplicates and propagation delays. If you
+            # explicitly need global registration, set sync_global=True.
             if self.sync_global:
                 await self._sync_global(report)
             if report.guild_ok:

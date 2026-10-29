@@ -17,7 +17,7 @@ OPUS_SILENCE: bytes = b"\xf8\xff\xfe"
 MAX_OPUS_PACKET_BYTES: int = 1500
 PACKET_OVERHEAD_BYTES: int = 64
 
-UNAUTHORIZED_CLIP_MESSAGE: str = "You do not have permission to use this command."
+UNAUTHORIZED_CLIP_MESSAGE: str = "something went wrong trying to process that clip. try again in a moment."
 
 
 class ClipError(ParadiseError):
