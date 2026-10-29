@@ -22,6 +22,10 @@ All notable changes to Paradise are recorded here. The format follows
   a real empty state, and a 45-second render cache with single-flight dedupe.
 - `tools/make_assets.py` regenerates the README images from the renderer itself.
 - `functions/voice/ui.py::leaderboard_subtitle` for the card's context line.
+- `docs/setup.md` (detailed setup guide) and `docs/performance.md`
+  (card-rendering and HTTP measurements).
+- `tests/conftest.py`: the suite is now provably offline — avatars are drawn,
+  never fetched.
 
 ### Changed
 - `tools/` reproducers moved to `tools/repro/`; engineering write-ups moved to

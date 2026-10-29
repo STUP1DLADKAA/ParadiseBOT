@@ -160,6 +160,60 @@ it off reproduces the old behaviour, including its cost.
 * `VoicePresence.join_busiest` still evaluates every voice channel every 30 s and
   on each human join; it is unrelated to time accounting and was left untouched.
 
+
+## Card rendering
+
+The leaderboard card is drawn at 2× supersampling and down-sampled with LANCZOS.
+Measured with `LeaderboardImageRenderer._draw_canvas` on a 1000×1312 card
+(12 members, podium + nine rows), on a deliberately small 2-core container —
+a normal host is proportionally faster:
+
+| Case | Time |
+| --- | --- |
+| First render in a fresh process (fonts + backdrop built on the fly) | ~404 ms |
+| After `perf.prewarm()` (fonts, backdrops and ramps cached) | ~285 ms |
+| Repeat request inside the 45 s TTL cache | ~0.07 ms |
+
+What made the difference, in order of impact:
+
+1. **PNG encoding** — `optimize=True` cost ~220 ms of the original ~1 s frame
+   for a few percent of file size. Now `compress_level=6`: visually identical,
+   about four times faster.
+2. **Cached backdrops** — the gradient is built once per canvas size at design
+   resolution and scaled up, instead of being repainted per render.
+3. **Cached masks, ramps and fallback avatars** — every `ImageDraw` helper is
+   `lru_cache`d; a row redraws no geometry it has already drawn.
+4. **A dedicated render pool** — drawing runs on `functions.perf.image_executor`
+   so a card never queues behind audio decoding or a Supabase call, and the
+   event loop keeps ticking (asserted in `tests/test_voice_render.py`).
+5. **Result cache + single-flight** — paging back and forth, or two people
+   asking for the same board, costs one render.
+
+Reproduce:
+
+```python
+from functions.voice.render import LeaderboardImageRenderer, prewarm
+from functions.voice.models import LeaderboardMember, VoicePeriod
+
+# build a board, then:
+prewarm()
+renderer = LeaderboardImageRenderer()   # scale=2 by default
+```
+
+## Outbound HTTP
+
+Every service used to open its own `aiohttp.ClientSession` per call, which
+meant a fresh TCP + TLS handshake for each lookup. `functions/perf.py` now keeps
+one pooled session per purpose (`search`, `weather`, `images`, `avatars`, …)
+with a 600 s DNS cache and up to 256 connections. Three consequences:
+
+* repeat lookups skip the handshake entirely;
+* image search is *hedged* — the preferred provider gets a 350 ms head start,
+  then the next one starts in parallel, so a slow source no longer serialises
+  the query (still one request in the common case);
+* weather remembers resolved cities, so "weather in delhi" costs one round trip
+  per hour, not one per message.
+
 ## Review agent
 
 `tools/review_agent.py` reviews a diff (not the repository) for the failure modes
