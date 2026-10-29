@@ -198,11 +198,12 @@ class AutoUpdater:
                 )
 
             if not self.apply:
-                return UpdateResult(
-                    "available",
-                    commit=latest,
-                    message=f"a newer revision is available ({latest[:7]})",
+                message = (
+                    f"a newer revision is available ({latest[:7]})"
+                    if current
+                    else f"no local baseline yet — latest is {latest[:7]}"
                 )
+                return UpdateResult("available", commit=latest, message=message)
 
             try:
                 changed, removed = await self._apply_commit(latest, state)
@@ -219,15 +220,13 @@ class AutoUpdater:
                 # The checkout already matched (first run, or an update that
                 # only touched protected files). Record the baseline and do
                 # NOT ask for a restart.
-                self._write_state(
-                    {
-                        "commit": latest,
-                        "applied_at": stamp,
-                        "files": [],
-                        "pending_restart": False,
-                        "repository": self.repository,
-                        "branch": self.branch,
-                    }
+                self._update_state(
+                    commit=latest,
+                    applied_at=stamp,
+                    files=[],
+                    pending_restart=False,
+                    repository=self.repository,
+                    branch=self.branch,
                 )
                 return UpdateResult(
                     "up-to-date",
