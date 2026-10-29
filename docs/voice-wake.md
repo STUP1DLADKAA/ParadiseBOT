@@ -24,11 +24,30 @@ weights are on disk:
 
 ```bash
 python -m pip install -r requirements-local-stt.txt   # once, ~250 MB of wheels
-python bot.py                                         # first utterance downloads
-                                                      # the model (75 MB for "small")
+python bot.py                                         # start-up fetches the model
 ```
 
-That is the whole setup. `VOICE_WAKE_STT=auto` (the default) means *local
+That is the whole setup: `pip` brings the *engine*, and the bot brings the
+weights. No requirements file can ship them — they are 75 MB of data, not a
+package — so the first start-up downloads them once, in the background, while
+Discord is still connecting:
+
+```
+On-device model: whisper small: on disk · /root/.cache/huggingface/hub/models--Systran--faster-whisper-small/snapshots/…
+```
+
+By the time anyone says "hey paradise" the files are already there, and they
+are never fetched again. To do it before the bot ever starts — for an image, or
+a slow link — use the same logic from the command line:
+
+```bash
+python tools/fetch_whisper_model.py small --dir /opt/whisper   # fetch now
+python tools/fetch_whisper_model.py small --check              # is it here?
+```
+
+Start-up is never held hostage to the download: it runs on the Whisper worker
+thread, a failure is a log line rather than a crash, and `/voicewake download`
+retries on demand. `VOICE_WAKE_STT=auto` (the default) means *local
 first*; `VOICE_WAKE_STT=local` means **local only** — the cloud providers are
 then never constructed, so a bug could not reach them.
 
@@ -37,11 +56,12 @@ then never constructed, so a bug could not reach them.
 | Model | `small` — the smallest size that is good at Hindi/Hinglish (`VOICE_WAKE_STT_MODEL`) |
 | Speed | int8 on CPU; roughly 0.5–1.5× real time for a 3–5 s sentence on a normal VPS |
 | Memory | ~600 MB while loaded, freed after 15 minutes of silence (`VOICE_WAKE_STT_UNLOAD_AFTER`) |
-| Network | none, ever, after the first download |
+| Network | none, ever, after the one-time download (at start-up) |
 | Cost | nothing |
 
-The model is loaded on a background thread the first time somebody speaks, so
-start-up stays instant and the event loop is never blocked. Loading and
+The weights are fetched by a background task at start-up (`VOICE_WAKE_STT_PRELOAD`,
+on by default), and loaded into memory on a background thread the first time
+somebody speaks, so start-up stays instant and the event loop is never blocked. Loading and
 inference both run on a dedicated one-thread executor: music, cards and
 heartbeats keep running while Whisper works.
 
@@ -128,7 +148,19 @@ VOICE_WAKE_STT_OFFLINE=true      # never touch the network, even on a typo
 ```
 
 `VOICE_WAKE_STT_OFFLINE=false` with an *empty* `MODEL_DIR` restores the default:
-download into the Hugging Face cache on first use.
+download into the Hugging Face cache on the first start-up.
+
+An image can carry the weights instead of fetching them at run time:
+
+```bash
+docker build --build-arg WHISPER_MODEL=small -t paradisebot .
+docker run … -e VOICE_WAKE_STT_MODEL_DIR=/opt/whisper \
+             -e VOICE_WAKE_STT_OFFLINE=true paradisebot
+```
+
+Without that build argument the container keeps the model on its `/app/data`
+volume (`HF_HOME`), so a restart or a re-created container does not fetch it
+again.
 
 ### The cloud fallback (optional)
 
@@ -150,6 +182,7 @@ VOICE_WAKE_STT=auto              # local → elevenlabs → gemini (default)
 | `VOICE_WAKE_STT_THREADS` | `0` | CPU threads for inference; 0 = let CTranslate2 decide |
 | `VOICE_WAKE_STT_MODEL_DIR` | — | where the weights live / download to |
 | `VOICE_WAKE_STT_OFFLINE` | `false` | never touch the network |
+| `VOICE_WAKE_STT_PRELOAD` | `true` | fetch the weights at start-up, not on the first utterance |
 | `VOICE_WAKE_STT_UNLOAD_AFTER` | `900` | seconds of silence before the weights leave RAM; 0 = keep |
 | `VOICE_WAKE_LANGUAGE` | — | ISO-639-1 hint (`hi`, `en`); blank auto-detects |
 | `VOICE_WAKE_THRESHOLD` | `0.012` | how loud a frame must be to count as voice (~-38 dBFS) |
@@ -173,6 +206,8 @@ closes a sentence after that much quiet.
 * `local whisper (not installed)` → run `pip install -r requirements-local-stt.txt`;
 * `local whisper small (… , loaded)` and an empty last transcript → the audio is
   below `VOICE_WAKE_THRESHOLD`; lower it to `0.006`;
+* `not downloaded yet` / `download failed — …` in the `model —` line → run
+  `/voicewake download`, or `python tools/fetch_whisper_model.py`;
 * `could not be loaded … not on this machine yet` → the one-time download has
   never succeeded; run once with internet, or set `VOICE_WAKE_STT_MODEL_DIR`.
 
@@ -181,6 +216,10 @@ phrase is what decides. `/voicewake status` shows the last transcript — if it
 reads "he paradise" instead of "hey paradise" that is already handled; if it
 reads something unrelated, the utterance is being cut, so raise
 `VOICE_WAKE_SILENCE_MS`.
+
+**The first start-up is quiet for a minute.** That is the one-time download;
+`/voicewake status` shows `model — whisper small: on disk · …` when it is done.
+Set `VOICE_WAKE_STT_PRELOAD=false` to move it to first use instead.
 
 **It is slow on my VPS.** Use `VOICE_WAKE_STT_MODEL=base` (English-heavy
 servers) or `tiny`, and set `VOICE_WAKE_STT_THREADS` to the number of real

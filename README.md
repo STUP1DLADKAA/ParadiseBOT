@@ -178,6 +178,7 @@ python bot.py
 
 # optional: hear the wake word out loud, transcribed on this machine
 python -m pip install -r requirements-local-stt.txt
+#   (the 75 MB model downloads itself on the next start-up; no other step)
 ```
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
@@ -211,7 +212,7 @@ unless stopped.
 | Instant slash commands | `DISCORD_GUILD_ID` | commands register globally (slow propagation) |
 | Voice leaderboards | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` + [4 SQL migrations](supabase/README.md) | `/vc` explains what to set up; nothing else breaks |
 | Music | nothing beyond `pip install -r requirements.txt` and FFmpeg | `/music play` says what is missing |
-| Spoken wake word (on-device) | `pip install -r requirements-local-stt.txt` — no key at all | typed "Hey Paradise" still works; `/voicewake status` explains how to install it |
+| Spoken wake word (on-device) | `pip install -r requirements-local-stt.txt` — no key at all; the model downloads itself at start-up | typed "Hey Paradise" still works; `/voicewake status` names the missing piece |
 | Spoken wake word (cloud fallback) | `VOICE_WAKE_STT=elevenlabs` + `ELEVENLABS_API_KEY`, or `gemini` + `GEMINI_API_KEY` | on-device recognition is used instead — no audio leaves the bot |
 | AI answers | `GEMINI_API_KEY` (or `AI_BASE_URL`/`AI_MODEL`) | tool/mention replies still work, no free-form reasoning |
 | Spoken answers in your voice | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | free fallback voice, or text only |

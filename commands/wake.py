@@ -71,6 +71,12 @@ from functions.voice_wake import (
     SpokenRequest,
     SpokenWakeListener,
 )
+from functions.voice_wake.local_stt import (
+    STATUS_DOWNLOADED,
+    STATUS_NOT_INSTALLED,
+    STATUS_OFFLINE,
+    STATUS_READY,
+)
 
 log = logging.getLogger(__name__)
 
@@ -152,6 +158,9 @@ class Wake(commands.Cog):
             raw_wake if isinstance(raw_wake, VoiceWakeConfig) else VoiceWakeConfig()
         )
         self.listener: SpokenWakeListener | None = None
+        #: The on-device engine, when it is part of the chain (for /voicewake).
+        self.local_stt: LocalWhisperTranscriber | None = None
+        self._prepare_task: asyncio.Task | None = None
         self._announced: set[int] = set()
         self._paused_guilds: set[int] = set()
         log.info("Wake word ready — %s", self.speech.describe())
@@ -173,6 +182,7 @@ class Wake(commands.Cog):
             self._preload_refusal(), name="paradise-wake-preload"
         )
         self._start_listener()
+        self._prepare_local_model()
 
     def _start_listener(self) -> None:
         """Attach the spoken wake word to the voice receiver, if enabled."""
@@ -217,6 +227,49 @@ class Wake(commands.Cog):
         # and needs a running loop, which the cog load already has).
         asyncio.create_task(self.listener.start(), name="paradise-spoken-wake-start")
 
+    # ------------------------------------------------------------------
+    # Model files: fetch them now, not on the first utterance
+    # ------------------------------------------------------------------
+
+    def _prepare_local_model(self) -> None:
+        """Download the on-device weights at start-up, in the background.
+
+        ``pip install -r requirements-local-stt.txt`` installs the *engine*;
+        the weights are data and have to be fetched once. Doing it now means
+        "hey paradise" works the first time it is said, instead of waiting for
+        a 75 MB download, and it means an operator sees the outcome in the log
+        at boot rather than the first time somebody speaks.
+        """
+        local = self.local_stt
+        if local is None or not self.voice_wake.listening:
+            return
+        if not getattr(self.voice_wake, "stt_preload", True):
+            log.info("On-device model: start-up download disabled (VOICE_WAKE_STT_PRELOAD=false)")
+            return
+        self._prepare_task = asyncio.create_task(
+            self._prepare_local_model_now(local), name="paradise-whisper-fetch"
+        )
+
+    async def _prepare_local_model_now(
+        self, local: LocalWhisperTranscriber | None = None
+    ) -> str:
+        local = local or self.local_stt
+        if local is None:
+            return STATUS_NOT_INSTALLED
+        status = await local.prepare()
+        if status in {STATUS_READY, STATUS_DOWNLOADED}:
+            log.info("On-device model: %s", local.describe_model())
+        elif status == STATUS_NOT_INSTALLED:
+            log.info(
+                "On-device model: not installed — run `%s` to enable the local wake word",
+                INSTALL_HINT,
+            )
+        elif status == STATUS_OFFLINE:
+            log.warning("On-device model: %s", local.describe_model())
+        else:
+            log.warning("On-device model: %s", local.describe_model())
+        return status
+
     def _stt_providers(self, choice: str) -> list:
         """Build the transcription chain for ``VOICE_WAKE_STT``.
 
@@ -230,17 +283,17 @@ class Wake(commands.Cog):
         wake = self.voice_wake
         providers: list = []
         if choice in {"auto", "local"}:
-            providers.append(
-                LocalWhisperTranscriber(
-                    model=getattr(wake, "stt_model", "small"),
-                    device=getattr(wake, "stt_device", "cpu"),
-                    compute_type=getattr(wake, "stt_compute", "int8"),
-                    threads=getattr(wake, "stt_threads", 0),
-                    model_dir=getattr(wake, "stt_model_dir", ""),
-                    offline=getattr(wake, "stt_offline", False),
-                    unload_after=getattr(wake, "stt_unload_after", 900.0),
-                )
+            local = LocalWhisperTranscriber(
+                model=getattr(wake, "stt_model", "small"),
+                device=getattr(wake, "stt_device", "cpu"),
+                compute_type=getattr(wake, "stt_compute", "int8"),
+                threads=getattr(wake, "stt_threads", 0),
+                model_dir=getattr(wake, "stt_model_dir", ""),
+                offline=getattr(wake, "stt_offline", False),
+                unload_after=getattr(wake, "stt_unload_after", 900.0),
             )
+            self.local_stt = local
+            providers.append(local)
         if choice in {"auto", "elevenlabs"}:
             providers.append(ElevenLabsTranscriber(eleven_key, timeout=25.0))
         if choice in {"auto", "gemini"}:
@@ -258,6 +311,9 @@ class Wake(commands.Cog):
         if self._preload_task is not None:
             self._preload_task.cancel()
             self._preload_task = None
+        if self._prepare_task is not None:
+            self._prepare_task.cancel()
+            self._prepare_task = None
         for task in list(self._workers.values()):
             task.cancel()
         if self._workers:
@@ -878,6 +934,8 @@ class Wake(commands.Cog):
         if listener is not None:
             stats = listener.stats
             lines.append(f"`{listener.describe()}`")
+        if self.local_stt is not None:
+            lines.append(f"model — `{self.local_stt.describe_model()}`")
             lines.append(
                 f"utterances: {stats.segments} · transcribed: {stats.transcripts} · "
                 f"answered: {stats.triggers}"
@@ -924,6 +982,44 @@ class Wake(commands.Cog):
             return
         await interaction.response.send_message(
             "listening again — say **hey paradise** and ask.", ephemeral=True
+        )
+
+    @voicewake.command(
+        name="download",
+        description="Fetch the on-device model now (it is also fetched at start-up)",
+    )
+    async def voicewake_download(self, interaction: discord.Interaction) -> None:
+        local = self.local_stt
+        if local is None:
+            await interaction.response.send_message(
+                "the spoken wake word is off here, or it is using a cloud provider "
+                "(`VOICE_WAKE_STT`).",
+                ephemeral=True,
+            )
+            return
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if getattr(self.voice_wake, "stt_offline", False):
+            await interaction.followup.send(
+                "`VOICE_WAKE_STT_OFFLINE=true` — nothing will be downloaded. "
+                "Point `VOICE_WAKE_STT_MODEL_DIR` at a model directory instead.",
+                ephemeral=True,
+            )
+            return
+        before = local.prepare_status
+        status = await self._prepare_local_model_now(local)
+        if status in {STATUS_READY, STATUS_DOWNLOADED}:
+            line = (
+                "downloaded — say **hey paradise** and ask."
+                if before not in {STATUS_READY, STATUS_DOWNLOADED}
+                and status == STATUS_DOWNLOADED
+                else "already here — say **hey paradise** and ask."
+            )
+            await interaction.followup.send(
+                f"{line}\n`{local.describe_model()}`", ephemeral=True
+            )
+            return
+        await interaction.followup.send(
+            f"not ready yet — `{local.describe_model()}`", ephemeral=True
         )
 
     @voicewake.command(name="notice", description="Post the listening notice again")

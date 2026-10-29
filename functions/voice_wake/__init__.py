@@ -22,7 +22,11 @@ Pieces:
 """
 
 from .listener import ListenerStats, SpokenRequest, SpokenWakeListener
-from .local_stt import INSTALL_HINT, LocalWhisperTranscriber
+from .local_stt import (
+    INSTALL_HINT,
+    LocalWhisperTranscriber,
+    download_model_files,
+)
 from .phrases import WakeMatch, find_wake, normalise
 from .segmenter import Segment, SpeechSegmenter, frame_rms
 from .stt import (
@@ -38,6 +42,7 @@ __all__ = [
     "ElevenLabsTranscriber",
     "INSTALL_HINT",
     "LocalWhisperTranscriber",
+    "download_model_files",
     "GeminiTranscriber",
     "ListenerStats",
     "Segment",
