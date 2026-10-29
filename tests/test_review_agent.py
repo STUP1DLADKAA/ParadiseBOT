@@ -48,11 +48,11 @@ class TestPlaceholderDetection(unittest.TestCase):
     # Credential-shaped strings are assembled at runtime: a literal that looks
     # like a real Discord token trips GitHub's own push protection, which is a
     # good reason not to have one in a public repository.
-    FAKE_DISCORD_TOKEN = ".".join(["M" + "T" * 23, "GaBcDe", "a" * 27])
+    FAKE_DISCORD_TOKEN = ".".join(["M" + "T" * 23, "GaBcDe", "a" * 27])  # review-agent: allow-secret-fixture
     REAL_VALUES = [
-        'SUPABASE_SECRET_KEY = "sb_secret_abcdefghijklmnop"',
-        f"DISCORD_TOKEN={FAKE_DISCORD_TOKEN}",
-        "GEMINI_API_KEY=" + "AIza" + "SyD-" + "abcdefghijklmnopqrstuvwxyz12345",
+        'SUPABASE_SECRET_KEY = "sb_secret_abcdefghijklmnop"',  # review-agent: allow-secret-fixture
+        f"DISCORD_TOKEN={FAKE_DISCORD_TOKEN}",  # review-agent: allow-secret-fixture
+        "GEMINI_API_KEY=" + "AIza" + "SyD-" + "abcdefghijklmnopqrstuvwxyz12345",  # review-agent: allow-secret-fixture
     ]
 
     def test_documentation_shapes_are_recognised(self):
@@ -78,7 +78,8 @@ class TestSecretRule(unittest.TestCase):
 
     def test_a_quoted_credential_in_code_still_blocks(self):
         report = review_line(
-            "functions/example.py", 'SUPABASE_SECRET_KEY = "sb_secret_abcdefghijklmnop"'
+            "functions/example.py",
+            'SUPABASE_SECRET_KEY = "sb_secret_abcdefghijklmnop"',  # review-agent: allow-secret-fixture
         )
         findings = [f for f in report.findings if f.rule == "SEC001"]
         self.assertEqual(len(findings), 1)
@@ -89,6 +90,14 @@ class TestSecretRule(unittest.TestCase):
         token = TestPlaceholderDetection.FAKE_DISCORD_TOKEN
         report = review_line("bot.py", f'TOKEN = "{token}"')
         self.assertTrue([f for f in report.findings if f.rule == "SEC001"])
+
+    def test_the_fixture_marker_is_explicit(self):
+        """A marker lets a *test* carry a credential-shaped string on purpose."""
+        report = review_line(
+            "tests/test_thing.py",
+            'KEY = "sb_secret_abcdefghijklmnop"  # review-agent: allow-secret-fixture',
+        )
+        self.assertFalse([f for f in report.findings if f.rule == "SEC001"])
 
     def test_env_example_is_always_exempt(self):
         report = review_line(".env.example", "DISCORD_TOKEN=")

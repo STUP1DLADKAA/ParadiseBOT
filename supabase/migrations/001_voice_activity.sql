@@ -1,7 +1,7 @@
 -- ============================================================================
 -- ParadiseBot — Voice Activity schema migration 001 (Supabase / PostgreSQL)
 -- ============================================================================
--- Project : any Supabase project (developed against ap-south-1)
+-- Project : "Paradise" (ref: gxcjtbiyamyyxokgehpe, region: ap-south-1)
 -- Applies : ONE TIME, manually, in the Supabase Dashboard → SQL Editor.
 -- Version : 1  (reported to the bot by public.voice_schema_version())
 --

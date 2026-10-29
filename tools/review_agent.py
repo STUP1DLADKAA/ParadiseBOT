@@ -190,6 +190,11 @@ PLACEHOLDER_VALUE = re.compile(
     """,
 )
 
+#: An explicit, greppable opt-out for a *test fixture* that has to look like a
+#: credential. It is deliberately verbose so it stands out in review, and it is
+#: only ever appropriate inside tests/.
+SECRET_FIXTURE_MARKER = "review-agent: allow-secret-fixture"
+
 SECRET_PATTERNS = (
     (re.compile(r"sb_secret_[A-Za-z0-9_\-]{10,}"), "Supabase secret key"),
     (re.compile(r"sbp_[A-Za-z0-9]{20,}"), "Supabase personal token"),
@@ -388,7 +393,13 @@ def review_file(diff: FileDiff, report: ReviewReport) -> None:
 
         # --- secrets ---------------------------------------------------
         for pattern, label in SECRET_PATTERNS:
-            if pattern.search(text) and ".env.example" not in path and not _is_placeholder(text):
+            allowed_fixture = SECRET_FIXTURE_MARKER in text
+            if (
+                pattern.search(text)
+                and ".env.example" not in path
+                and not allowed_fixture
+                and not _is_placeholder(text)
+            ):
                 report.add(
                     Finding(
                         BLOCKING,
