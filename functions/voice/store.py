@@ -230,6 +230,24 @@ class VoiceStore(ABC):
         target_date: date | None = None,
     ) -> dict[str, int]: ...
 
+    async def adjust_daily_stat(
+        self,
+        guild_id: int,
+        user_id: int,
+        day: date,
+        delta_seconds: int,
+    ) -> int | None:
+        """Add ``delta_seconds`` to one (guild, user, day) total.
+
+        This is the only write path behind ``/edit``. Implementations must
+        clamp at zero, create the row when it does not exist yet, and return
+        the resulting total (or ``None`` when the write could not be made).
+
+        The default implementation refuses politely so a store that has no
+        daily-aggregate concept can never crash the command.
+        """
+        return None
+
     @abstractmethod
     async def get_daily_server_total(self, guild_id: int, date_str: str) -> int: ...
 

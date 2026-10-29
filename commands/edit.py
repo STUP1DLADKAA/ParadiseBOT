@@ -10,6 +10,7 @@ Unauthorized users receive a vague technical error message.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import date, timedelta
 
@@ -20,6 +21,7 @@ from discord.ext import commands
 from config import VoiceConfig
 from functions.helpers import Colour
 from functions.voice.models import VoicePeriod
+from functions.voice.store import VoiceStoreUnavailable
 
 log = logging.getLogger(__name__)
 
@@ -102,78 +104,35 @@ class EditVoiceData(commands.Cog):
         store,
         guild_id: int,
         user_id: int,
-        date: date,
+        day: date,
         delta_seconds: int,
     ) -> bool:
-        """Update a daily stat for a specific date.
+        """Add ``delta_seconds`` to one day's voice total.
 
-        Args:
-            store: The voice store
-            guild_id: The guild ID
-            user_id: The user ID
-            date: The date to update
-            delta_seconds: The amount to add (positive) or subtract (negative)
-
-        Returns:
-            True if successful, False otherwise
+        The write itself belongs to the store (Supabase in production): a
+        single upsert that creates the row when it doesn't exist. The command
+        never touches a query builder directly — that indirection is what
+        broke ``/edit`` with ``'coroutine' object has no attribute 'execute'``.
         """
         try:
-            # Get the specific user's daily record
-            records = await store.get_daily_guild_user_records(date.isoformat())
-            current_value = 0
-            for record in records:
-                if record.guild_id == guild_id and record.user_id == user_id:
-                    current_value = record.duration_seconds
-                    break
-
-            # Calculate new value (cannot go below 0)
-            new_value = max(0, current_value + delta_seconds)
-
-            # Use the Supabase client directly to update the table
-            if hasattr(store, "_execute") and hasattr(store, "_ensure_client"):
-                client = await store._ensure_client()
-
-                # Access the voice_daily_stats table and update the row
-                result = await store._execute(
-                    "edit daily stat",
-                    lambda c: c.table("voice_daily_stats")
-                    .update({"duration_seconds": new_value, "updated_at": "now()"})
-                    .eq("guild_id", guild_id)
-                    .eq("user_id", user_id)
-                    .eq("date", date.isoformat())
-                    .execute(),
-                )
-
-                # Check if the update was successful
-                if hasattr(result, "data") and result.data:
-                    return True
-                elif hasattr(result, "count") and result.count > 0:
-                    return True
-                else:
-                    # If no rows were updated, the row might not exist
-                    # Try inserting a new row
-                    insert_result = await store._execute(
-                        "insert daily stat",
-                        lambda c: c.table("voice_daily_stats")
-                        .insert({
-                            "guild_id": guild_id,
-                            "user_id": user_id,
-                            "date": date.isoformat(),
-                            "duration_seconds": new_value,
-                        })
-                        .execute(),
-                    )
-                    if hasattr(insert_result, "data") and insert_result.data:
-                        return True
-                    return False
-            else:
-                log.warning(
-                    "Cannot edit daily stat: store doesn't support direct table access"
-                )
-                return False
-        except Exception as e:
-            log.exception(f"Failed to update daily stat: {e}")
+            result = await store.adjust_daily_stat(
+                guild_id, user_id, day, int(delta_seconds)
+            )
+        except VoiceStoreUnavailable as err:
+            log.warning("Voice database unavailable for /edit: %s", err)
             return False
+        except Exception:  # noqa: BLE001 - one failed day must not kill the command
+            log.exception("Failed to update daily stat for %s on %s", user_id, day)
+            return False
+        if result is None:
+            log.warning(
+                "Store refused the daily stat update (guild=%s user=%s date=%s)",
+                guild_id,
+                user_id,
+                day,
+            )
+            return False
+        return True
 
     async def _apply_time_adjustment(
         self,
@@ -218,55 +177,53 @@ class EditVoiceData(commands.Cog):
                     return True, f"✅ Yesterday's voice time adjusted by {_format_adjustment(delta_seconds)}"
                 return False, "Failed to update yesterday's stats"
 
-            elif period == VoicePeriod.WEEK:
-                # Week = last 7 days including today
+            elif period in (VoicePeriod.WEEK, VoicePeriod.MONTH):
+                days = 7 if period == VoicePeriod.WEEK else 30
                 today = date.today()
-                total_delta = 0
-                for i in range(7):
-                    day = today - timedelta(days=i)
-                    # Distribute the delta across 7 days proportionally
-                    day_delta = delta_seconds // 7
-                    remainder = delta_seconds % 7 if i == 0 else 0
-                    if day_delta != 0 or remainder != 0:
-                        success = await self._update_daily_stat(
-                            store, guild_id, user_id, day, day_delta + remainder
-                        )
-                        if success:
-                            total_delta += day_delta + remainder
-                if total_delta == delta_seconds:
-                    return True, f"✅ This week's voice time adjusted by {_format_adjustment(delta_seconds)}"
-                return False, "Failed to update week's stats"
+                # Spread the adjustment evenly; the remainder goes on today so
+                # the total written always equals the requested delta.
+                per_day, remainder = divmod(delta_seconds, days)
+                plan: list[tuple[date, int]] = []
+                for offset in range(days):
+                    amount = per_day + (remainder if offset == 0 else 0)
+                    if amount == 0:
+                        continue
+                    plan.append((today - timedelta(days=offset), amount))
+                if not plan:
+                    return True, f"✅ {period.label}'s voice time adjusted by 0s"
 
-            elif period == VoicePeriod.MONTH:
-                # Month = last 30 days including today
-                today = date.today()
-                total_delta = 0
-                for i in range(30):
-                    day = today - timedelta(days=i)
-                    day_delta = delta_seconds // 30
-                    remainder = delta_seconds % 30 if i == 0 else 0
-                    if day_delta != 0 or remainder != 0:
-                        success = await self._update_daily_stat(
-                            store, guild_id, user_id, day, day_delta + remainder
-                        )
-                        if success:
-                            total_delta += day_delta + remainder
-                if total_delta == delta_seconds:
-                    return True, f"✅ This month's voice time adjusted by {_format_adjustment(delta_seconds)}"
-                return False, "Failed to update month's stats"
+                results = await asyncio.gather(
+                    *(
+                        self._update_daily_stat(store, guild_id, user_id, day, amount)
+                        for day, amount in plan
+                    ),
+                    return_exceptions=False,
+                )
+                applied = sum(
+                    amount for (_, amount), ok in zip(plan, results) if ok
+                )
+                if applied != delta_seconds:
+                    return (
+                        False,
+                        "Some of that adjustment could not be saved — the voice "
+                        "database rejected part of it. Nothing else was changed.",
+                    )
+                return True, (
+                    f"✅ {period.label}'s voice time adjusted by "
+                    f"{_format_adjustment(delta_seconds)}"
+                )
 
             elif period == VoicePeriod.ALL_TIME:
-                # All time is trickier - we can't easily distribute across all days
-                # For now, we'll add a note that this requires manual DB edit
-                # Or we could add a large delta to today and let the system handle it
-                # Better approach: record it in a way that affects all_time
-                # Since all_time is the sum of all daily stats, we need to add
-                # the delta to a specific day (e.g., today)
+                # All-time is the sum of every daily row, so the delta is
+                # booked on today (and shows up in every window that includes it).
                 success = await self._update_daily_stat(
                     store, guild_id, user_id, date.today(), delta_seconds
                 )
                 if success:
-                    return True, f"✅ All time voice time adjusted by {_format_adjustment(delta_seconds)} (added to today)"
+                    return True, (
+                        f"✅ All time voice time adjusted by "
+                        f"{_format_adjustment(delta_seconds)} (booked on today)"
+                    )
                 return False, "Failed to update all time stats"
 
             return False, "Unknown period"
@@ -377,11 +334,11 @@ class EditVoiceData(commands.Cog):
             embed.add_field(
                 name="New Breakdown",
                 value=(
-                    f"📅 Today: {_format_seconds(new_breakdown['today'])}s\n"
-                    f"⏪ Yesterday: {_format_seconds(new_breakdown['yesterday'])}s\n"
-                    f"📊 This Week: {_format_seconds(new_breakdown['week'])}s\n"
-                    f"🗓️ This Month: {_format_seconds(new_breakdown['month'])}s\n"
-                    f"👑 All Time: {_format_seconds(new_breakdown['all_time'])}s"
+                    f"📅 Today: {_format_seconds(new_breakdown['today'])}\n"
+                    f"⏪ Yesterday: {_format_seconds(new_breakdown['yesterday'])}\n"
+                    f"📊 This Week: {_format_seconds(new_breakdown['week'])}\n"
+                    f"🗓️ This Month: {_format_seconds(new_breakdown['month'])}\n"
+                    f"👑 All Time: {_format_seconds(new_breakdown['all_time'])}"
                 ),
                 inline=False,
             )
@@ -390,13 +347,12 @@ class EditVoiceData(commands.Cog):
             old_value = current_breakdown[period]
             new_value = new_breakdown[period]
             diff = new_value - old_value
-            diff_sign = "+" if diff > 0 else ""
             embed.add_field(
                 name="Period Change",
                 value=(
-                    f"Before: {_format_seconds(old_value)}s\n"
-                    f"After: {_format_seconds(new_value)}s\n"
-                    f"Change: {diff_sign}{diff}s"
+                    f"Before: {_format_seconds(old_value)}\n"
+                    f"After: {_format_seconds(new_value)}\n"
+                    f"Change: {_format_adjustment(diff)}"
                 ),
                 inline=False,
             )

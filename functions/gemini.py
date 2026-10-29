@@ -85,6 +85,9 @@ class GeminiService:
         self.validated: bool | None = None
         self.disabled_reason = ""
         self._failure_until = 0.0
+        # Per-model back-off: a model that answered 404/429/5xx is skipped for
+        # a while, so the cascade never waits on a model that just failed.
+        self._model_skip_until: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Configuration surface
@@ -158,6 +161,97 @@ class GeminiService:
     # Generation
     # ------------------------------------------------------------------
 
+    async def generate_chain(
+        self,
+        prompt: str,
+        *,
+        models: tuple[str, ...] | list[str] = (),
+        system: str = "",
+        max_tokens: int = 500,
+        temperature: float = 0.7,
+        hedge: bool = True,
+    ) -> str:
+        """Answer with the fastest model that works, then fall back down a chain.
+
+        The chain is tried fastest-first. When ``hedge`` is set the first two
+        *available* models are raced concurrently and the first complete answer
+        wins — the extra request is cheap and it makes a cold start noticeably
+        snappier. A model that fails is skipped for a few minutes
+        (:attr:`_model_skip_until`) so later calls don't pay the penalty again.
+        """
+        chain = [str(model).strip() for model in models if str(model).strip()]
+        if self.model not in chain:
+            chain.append(self.model)
+        now = time.monotonic()
+        usable = [
+            model
+            for model in chain
+            if self._model_skip_until.get(model, 0.0) <= now
+        ] or chain
+        if not usable:
+            raise ParadiseError("no Gemini model is available right now")
+
+        errors: list[str] = []
+
+        async def attempt(model: str) -> str:
+            return await self.generate(
+                prompt,
+                system=system,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                model=model,
+            )
+
+        # Race the two fastest candidates first.
+        if hedge and len(usable) > 1:
+            tasks = {
+                asyncio.create_task(attempt(model), name=f"gemini-hedge-{model}"): model
+                for model in usable[:2]
+            }
+            pending = set(tasks)
+            try:
+                while pending:
+                    done, pending = await asyncio.wait(
+                        pending, return_when=asyncio.FIRST_COMPLETED
+                    )
+                    for task in done:
+                        model = tasks[task]
+                        try:
+                            answer = task.result()
+                        except Exception as error:  # noqa: BLE001
+                            self._skip_model(model)
+                            errors.append(f"{model}: {error.__class__.__name__}")
+                            continue
+                        for other in pending:
+                            other.cancel()
+                        if pending:
+                            await asyncio.gather(*pending, return_exceptions=True)
+                        return answer
+                remaining = usable[2:]
+            except asyncio.CancelledError:
+                for task in tasks:
+                    task.cancel()
+                raise
+        else:
+            remaining = usable
+
+        for model in remaining:
+            try:
+                return await attempt(model)
+            except asyncio.CancelledError:
+                raise
+            except Exception as error:  # noqa: BLE001 - try the next model
+                self._skip_model(model)
+                errors.append(f"{model}: {error.__class__.__name__}")
+                continue
+
+        log.warning("Every Gemini model failed (%s)", "; ".join(errors[:4]))
+        raise ParadiseError("every Gemini model is unavailable right now")
+
+    def _skip_model(self, model: str, seconds: float = _FAILURE_COOLDOWN) -> None:
+        """Stop asking a model that just failed for a bounded while."""
+        self._model_skip_until[model] = time.monotonic() + seconds
+
     async def generate(
         self,
         prompt: str,
@@ -165,10 +259,15 @@ class GeminiService:
         system: str = "",
         max_tokens: int = 500,
         temperature: float = 0.7,
+        model: str = "",
     ) -> str:
         """Generate a complete answer, retrying once after ``MAX_TOKENS``."""
         text, truncated = await self._generate_once(
-            prompt, system=system, max_tokens=max_tokens, temperature=temperature
+            prompt,
+            system=system,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            model=model,
         )
         if not truncated:
             return text
@@ -183,6 +282,7 @@ class GeminiService:
                 system=system,
                 max_tokens=retry_budget,
                 temperature=temperature,
+                model=model,
             )
         except ParadiseError:
             raise ParadiseError("I couldn't finish that answer cleanly. try again.") from None
@@ -197,6 +297,7 @@ class GeminiService:
         system: str,
         max_tokens: int,
         temperature: float,
+        model: str = "",
     ) -> tuple[str, bool]:
         if not self.configured:
             raise ParadiseError("Gemini isn't configured on this bot.")
@@ -208,6 +309,7 @@ class GeminiService:
         if time.monotonic() < self._failure_until:
             raise ParadiseError("Gemini is cooling down for a minute — try again soon.")
 
+        target = model or self.model
         payload: dict = {
             "contents": [{"role": "user", "parts": [{"text": prompt}]}],
             "generationConfig": {
@@ -220,11 +322,13 @@ class GeminiService:
 
         try:
             session = await self._get_session()
-            url = f"{API_BASE}/models/{self.model}:generateContent"
+            url = f"{API_BASE}/models/{target}:generateContent"
             async with session.post(url, headers=self._headers(), json=payload) as response:
                 if response.status != 200:
                     body = await response.text()
-                    self._handle_error_status(response.status, body, context="generate")
+                    self._handle_error_status(
+                        response.status, body, context="generate", model=target
+                    )
                 data = await response.json(content_type=None)
         except ParadiseError:
             raise
@@ -304,15 +408,17 @@ class GeminiService:
         if self._owns_session and self._session is not None and not self._session.closed:
             await self._session.close()
 
-    def _handle_error_status(self, status: int, body: str, *, context: str) -> None:
+    def _handle_error_status(
+        self, status: int, body: str, *, context: str, model: str = ""
+    ) -> None:
         """Map API errors to friendly errors; disable on key problems."""
         safe_body = body[:200].replace(self._config.api_key, "") if self.configured else ""
+        target = model or self.model
         if status in (400,):
             # Most commonly an unknown model name — not a key problem.
-            log.warning("Gemini %s rejected request (model=%s): %s", context, self.model, safe_body)
+            log.warning("Gemini %s rejected request (model=%s): %s", context, target, safe_body)
             raise ParadiseError(
-                f"Gemini rejected the request — the configured model "
-                f"`{self.model}` may be wrong."
+                f"Gemini rejected the request — the model `{target}` may be wrong."
             )
         if status in (401, 403):
             self.disabled_reason = "API key rejected"
@@ -326,12 +432,12 @@ class GeminiService:
                 "the Gemini API key was rejected — AI features are off until "
                 "it's fixed, everything else still works."
             )
-        if status == 404:
-            log.warning("Gemini %s: model %s not found (404)", context, self.model)
-            raise ParadiseError(
-                f"the configured Gemini model `{self.model}` doesn't exist."
-            )
+        if status in (404,):
+            log.warning("Gemini %s: model %s not found (404)", context, target)
+            self._skip_model(target, _QUOTA_COOLDOWN)
+            raise ParadiseError(f"the Gemini model `{target}` doesn't exist.")
         if status in (429, 503):
+            self._skip_model(target, _QUOTA_COOLDOWN)
             self._failure_until = time.monotonic() + _QUOTA_COOLDOWN
             log.warning("Gemini %s rate-limited/overloaded (%s)", context, status)
             raise ParadiseError("Gemini is busy (quota/overload) — try again in a few minutes.")

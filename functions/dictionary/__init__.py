@@ -45,6 +45,7 @@ from .normalize import (
 )
 from .playback import PlaybackSupport, PlaybackUnavailable, VoicePlayback, playback_support
 from .pronounce import (
+    ElevenLabsSpeechProvider,
     NativeRecordingProvider,
     NeuralSpeechProvider,
     PronunciationError,
@@ -79,6 +80,7 @@ __all__ = [
     "DatamuseProvider",
     "DictionaryFeature",
     "DictionaryService",
+    "ElevenLabsSpeechProvider",
     "Enrichment",
     "FreeDictionaryProvider",
     "FuzzyMatch",

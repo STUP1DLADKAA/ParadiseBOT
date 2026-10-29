@@ -352,6 +352,47 @@ class AIService:
         self._remember_exchange(message.channel.id, answer)
         return answer.strip() or "I don't have a useful answer for that yet."
 
+    async def answer_quick(
+        self,
+        prompt: str,
+        *,
+        models: tuple[str, ...] | list[str] = (),
+        system: str = "",
+        max_tokens: int = 320,
+    ) -> str:
+        """One short answer, fastest-first, across every configured model.
+
+        This is the path behind “Hey Paradise …” in voice chat, where latency
+        is user-visible. Gemini models are raced/tried in the configured
+        fastest-first order (:meth:`GeminiService.generate_chain`); if Gemini
+        cannot answer at all, the OpenAI-compatible provider is used before
+        giving up. It never streams a half answer and never invents facts.
+        """
+        if not self.available:
+            raise ParadiseError(FALLBACK_UNAVAILABLE)
+
+        if self.gemini.available:
+            try:
+                return await self.gemini.generate_chain(
+                    prompt,
+                    models=models,
+                    system=system or SYSTEM_PROMPT,
+                    max_tokens=max_tokens,
+                    temperature=0.6,
+                )
+            except ParadiseError as error:
+                if not (self.config.ai_base_url and self.config.ai_model):
+                    raise
+                log.info("Gemini cascade failed (%s) — using the fallback provider", error)
+
+        return await self._chat_openai(
+            [
+                {"role": "system", "content": system or SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=max_tokens,
+        )
+
     async def reason(
         self, question: str, facts: list[str] | str, *, max_tokens: int = 500
     ) -> str:

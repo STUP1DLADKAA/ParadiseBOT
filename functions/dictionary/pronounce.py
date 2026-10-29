@@ -215,6 +215,65 @@ class NeuralSpeechProvider:
         )
 
 
+class ElevenLabsSpeechProvider:
+    """The owner's ElevenLabs voice — the same voice the VC replies use.
+
+    Optional: skipped entirely when ``ELEVENLABS_API_KEY`` or
+    ``ELEVENLABS_VOICE_ID`` is missing. The voice itself (and its full request
+    plumbing, caching and model fallbacks) lives in ``functions.tts`` so the
+    dictionary and the voice channel always sound identical.
+    """
+
+    name = "elevenlabs"
+
+    def __init__(
+        self,
+        client: HttpClient | None = None,
+        *,
+        voice=None,
+        config=None,
+        max_chars: int = MAX_SPOKEN_CHARS,
+    ) -> None:
+        if voice is None:
+            from functions.tts import ElevenLabsVoice
+
+            voice = ElevenLabsVoice(config)
+        self._voice = voice
+        self._max_chars = max_chars
+
+    @property
+    def available(self) -> bool:
+        return bool(getattr(self._voice, "available", False))
+
+    def describe(self) -> str:
+        describer = getattr(self._voice, "describe", None)
+        if describer is None:
+            return "custom voice" if self.available else "not configured"
+        return describer()
+
+    async def speak(self, request: SpeechRequest) -> Clip | None:
+        if not self.available:
+            return None
+        text = speakable(request.word, max_chars=self._max_chars)
+        if not text:
+            return None
+        clip = await self._voice.speak(text, language=request.language or "en")
+        if clip is None or not getattr(clip, "data", b""):
+            return None
+        return Clip(
+            data=clip.data,
+            extension=getattr(clip, "extension", "mp3") or "mp3",
+            provider=self.name,
+            region=request.region,
+            detail=getattr(clip, "detail", "") or "elevenlabs voice",
+        )
+
+    async def close(self) -> None:
+        closer = getattr(self._voice, "close", None)
+        if closer is not None:
+            await closer()
+
+
 class WebVoiceProvider:
     """Free, key-less neural web voice. The always-there fallback."""
 

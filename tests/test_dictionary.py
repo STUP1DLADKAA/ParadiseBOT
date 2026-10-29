@@ -1944,7 +1944,7 @@ class TestConfigPlumbing(unittest.TestCase):
             {"DICTIONARY_TIMEOUT": "soon", "DICTIONARY_CACHE_SIZE": "lots"}
         )
         self.assertEqual(settings.timeout, 8.0)
-        self.assertEqual(settings.cache_size, 512)
+        self.assertEqual(settings.cache_size, 1024)
 
     def test_absurd_env_values_are_clamped(self):
         settings = DictionaryConfig.from_env(

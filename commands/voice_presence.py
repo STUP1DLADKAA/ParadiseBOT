@@ -1,4 +1,11 @@
-"""Keep Paradise in the busiest accessible human voice channel and announce arrival."""
+"""Keep Paradise in the busiest accessible human human voice channel.
+
+Paradise joins **silently**: no message in the channel's text chat and nothing
+spoken. It simply moves to whichever accessible channel has the most humans,
+stays there, and leaves when the channel empties. Set
+``VOICE_ARRIVAL_ANNOUNCE=true`` to restore the old spoken "arrival line"
+behaviour (the lines and the heavy-male voice filters are still here).
+"""
 
 from __future__ import annotations
 
@@ -11,7 +18,7 @@ from collections import OrderedDict, deque
 import discord
 from discord.ext import commands, tasks
 
-from config import DictionaryConfig, VoiceClipConfig
+from config import DictionaryConfig
 from functions.dictionary.http import HttpClient, HttpError
 from functions.dictionary.models import Clip, SpeechRequest
 from functions.dictionary.playback import (
@@ -131,11 +138,24 @@ class VoicePresence(commands.Cog):
         *,
         settle_delay: float = SETTLE_DELAY_SECONDS,
         speech_providers: list | None = None,
+        announce: bool | None = None,
+        follow_interval: float | None = None,
     ) -> None:
         self.bot = bot
         self.settle_delay = max(0.0, float(settle_delay))
+        presence_cfg = getattr(getattr(bot, "config", None), "voice_presence", None)
+        # Silent by default: joining a voice channel says nothing, anywhere.
+        if announce is None:
+            announce = bool(getattr(presence_cfg, "announce", False))
+        self.announce = bool(announce)
+        if follow_interval is None:
+            follow_interval = float(getattr(presence_cfg, "follow_interval", 30.0) or 30.0)
+        self.follow_interval = max(5.0, float(follow_interval))
         self._http = HttpClient()
-        if speech_providers is None:
+        if speech_providers is None and not self.announce:
+            # Nothing is ever spoken on join, so don't build TTS providers.
+            self._speech_providers = []
+        elif speech_providers is None:
             raw_cfg = getattr(getattr(bot, "config", None), "dictionary", None)
             dict_cfg = (
                 raw_cfg if isinstance(raw_cfg, DictionaryConfig) else DictionaryConfig()
@@ -169,7 +189,13 @@ class VoicePresence(commands.Cog):
         self._tasks: set[asyncio.Task] = set()
 
     async def cog_load(self) -> None:
+        try:
+            self.follow_crowd.change_interval(seconds=self.follow_interval)
+        except Exception:  # noqa: BLE001 - interval tuning is optional
+            log.debug("Could not set the crowd-follow interval", exc_info=True)
         self.follow_crowd.start()
+        if not self.announce:
+            log.info("Voice presence: joining voice channels silently")
 
     async def cog_unload(self) -> None:
         self.follow_crowd.cancel()
@@ -274,11 +300,11 @@ class VoicePresence(commands.Cog):
                     or getattr(client.channel, "id", None) != channel.id
                 ):
                     return
-                await self._announce_unlocked(guild, channel)
+                await self._on_joined(guild, channel)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
-            log.warning("Could not announce bot VC arrival in %s", channel.id, exc_info=True)
+            log.warning("Could not track bot VC arrival in %s", channel.id, exc_info=True)
 
     async def _wait_for_voice_ready(self, guild: discord.Guild, channel_id: int) -> None:
         loop = asyncio.get_running_loop()
@@ -347,21 +373,75 @@ class VoicePresence(commands.Cog):
                     return
                 await client.move_to(target)
             else:
-                clip_cfg = getattr(getattr(self.bot, "config", None), "voice_clip", None)
-                if isinstance(clip_cfg, VoiceClipConfig) and clip_cfg.enabled:
-                    await target.connect(
-                        timeout=CONNECT_TIMEOUT,
-                        self_deaf=False,
-                        cls=ClipVoiceClient,
-                    )
-                else:
-                    await target.connect(timeout=CONNECT_TIMEOUT, self_deaf=True)
+                await target.connect(
+                    timeout=CONNECT_TIMEOUT,
+                    # Never join deafened: a deafened client receives no audio
+                    # at all, which would silently disable voice clipping.
+                    self_deaf=False,
+                    cls=self._voice_client_class(),
+                )
 
-            await self._announce_unlocked(guild, target)
+            await self._on_joined(guild, target)
+
+    def _voice_client_class(self):
+        """The receive-capable client when clipping is on, else the default."""
+        clip_cfg = getattr(getattr(self.bot, "config", None), "voice_clip", None)
+        if bool(getattr(clip_cfg, "enabled", False)):
+            return ClipVoiceClient
+        return discord.VoiceClient
+
+    async def ensure_connected(
+        self,
+        guild: discord.Guild,
+        channel: discord.VoiceChannel | discord.StageChannel,
+    ) -> discord.VoiceClient | None:
+        """Make sure Paradise is in ``channel`` — silently, never announcing.
+
+        Used by the wake-word replies ("Hey Paradise …" spoken in that VC).
+        Returns the connected client, or ``None`` when it cannot join.
+        """
+        async with self._guild_lock(guild.id):
+            client = guild.voice_client
+            if client is not None and client.is_connected():
+                if getattr(client.channel, "id", None) != getattr(channel, "id", None):
+                    if client.is_playing():
+                        return client
+                    await client.move_to(channel)
+                return client
+
+            me = getattr(guild, "me", None)
+            if me is not None and hasattr(channel, "permissions_for"):
+                perms = channel.permissions_for(me)
+                if not getattr(perms, "view_channel", True) or not getattr(
+                    perms, "connect", True
+                ):
+                    return None
+            try:
+                return await channel.connect(
+                    timeout=CONNECT_TIMEOUT,
+                    self_deaf=False,
+                    cls=self._voice_client_class(),
+                )
+            except (asyncio.TimeoutError, discord.DiscordException):
+                log.warning("Could not join %s", getattr(channel, "id", "?"), exc_info=True)
+                return None
 
     # ------------------------------------------------------------------
-    # VC arrival text + heavy-male voice announcement (identical line!)
+    # Arrival handling: silent by default, funny lines when opted in
     # ------------------------------------------------------------------
+
+    async def _on_joined(
+        self,
+        guild: discord.Guild,
+        channel: discord.VoiceChannel | discord.StageChannel,
+    ) -> None:
+        """Post-join hook. Says nothing unless ``VOICE_ARRIVAL_ANNOUNCE`` is on."""
+        if not self.announce:
+            # Nothing in the text chat, nothing spoken: a silent join.
+            self._last_announced_channel[guild.id] = getattr(channel, "id", 0)
+            log.debug("Joined %s silently", getattr(channel, "id", "?"))
+            return
+        await self._announce_unlocked(guild, channel)
 
     async def _announce_unlocked(
         self,
