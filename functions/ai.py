@@ -375,8 +375,8 @@ class AIService:
     ) -> str:
         """One short answer, fastest-first, across every configured model.
 
-        This is the path behind “Hey Paradise …” in voice chat, where latency
-        is user-visible. Gemini models are raced/tried in the configured
+        This is the path behind an @Paradise mention, where latency is
+        user-visible. Gemini models are raced/tried in the configured
         fastest-first order (:meth:`GeminiService.generate_chain`); if Gemini
         cannot answer at all, the OpenAI-compatible provider is used before
         giving up. It never streams a half answer and never invents facts.

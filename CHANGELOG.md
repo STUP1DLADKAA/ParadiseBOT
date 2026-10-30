@@ -30,14 +30,25 @@ All notable changes to Paradise are recorded here. The format follows
 - `/meme [topic]`, `/gif <query>`, `/roast [member]`, and `@Paradise roast me`
   routed through the mention assistant (a new `roast` route kind, so it never
   costs a model call).
-- Spoken "hey paradise" with no question is answered with one of eight
-  acknowledgements instead of the same line every time.
 - `PERSONALITY_AMBIENT_REACTION_CHANCE`, `PERSONALITY_GIF_CHANCE`,
   `PERSONALITY_ONLINE_MEME_CHANCE`, `PERSONALITY_ROAST_CHANCE`,
   `PERSONALITY_ROAST_INTENSITY`, `PERSONALITY_ROAST_USER_COOLDOWN`,
   `MEME_SOURCES`, `MEME_TIMEOUT`, `TENOR_API_KEY`, `GIPHY_API_KEY`.
 
 ### Changed
+- **The bot is lighter and faster to run.** With speech recognition gone, there
+  is no model in memory, no per-utterance recognition on the CPU and no worker
+  thread for it; the receive path only decrypts and buffers. One export runs at
+  a time (a 60-second clip encodes in about a second, so the two-deep queue is
+  invisible), the per-guild buffer ceiling dropped 48 → 32 MiB, and a bot with
+  `VOICE_CLIP_ENABLED=false` connects with a plain voice client and decrypts
+  nothing at all.
+- **`/clip` sound is clearer at the same size.** The mastering chain is
+  `highpass=f=70,lowpass=f=18500,alimiter=…`: the old 16 kHz cut was a telephone
+  master that dulled sibilance, and 18.5 kHz keeps the top of the speech band
+  while staying under Nyquist. 128 kbps AAC-LC mono at 48 kHz is untouched — a
+  minute is ~950 KB, a full three-minute window ~2.8 MB, one encode, no
+  resample, `+faststart` so Discord can start playing immediately.
 - The AI persona is allowed to be funny on purpose: banter and roasts are
   explicitly in the system prompt, with the same hard limits as the roast book
   (no identity attacks, no slurs, no pile-ons, and jokes off entirely when
@@ -46,36 +57,7 @@ All notable changes to Paradise are recorded here. The format follows
   0.045 → 0.10, quip 0.035 → 0.12, global cooldown 45 s → 10 s, channel cooldown
   120 s → 35 s, humour cooldown 150 s → 45 s, reply cooldown 600 s → 150 s.
 
-- **The wake word can be spoken.** Paradise listens to the voice channel it is
-  already in, waits for an utterance to end, transcribes it once
-  (on-device Whisper, with Scribe/Gemini as an opt-in fallback), and only then checks for
-  "hey paradise" — English, Hinglish and Devanagari, including the usual
-  speech-to-text mis-hearings ("he paradise", "pair of dice", "अरे पैराडाइज़").
-  Transcribed on-device by default (see above).
-  `functions/voice_wake/`, `requirements-local-stt.txt`,
-  `/voicewake status|stop|start|notice|download`,
-  [docs/voice-wake.md](docs/voice-wake.md).
-- **The Whisper model downloads itself.** `pip` installs the engine; the 75 MB
-  of weights are fetched once at start-up, on the Whisper worker thread, so the
-  first "hey paradise" is not also the first download. `/voicewake status` shows
-  the model line, `/voicewake download` retries on demand, and
-  `python tools/fetch_whisper_model.py small --dir /opt/whisper` does the same
-  fetch before the bot runs (Docker: `--build-arg WHISPER_MODEL=small`).
-  `VOICE_WAKE_STT_PRELOAD=false` restores download-on-first-use. Container
-  images keep the weights on the `/app/data` volume (`HF_HOME`), so a rebuilt
-  container does not fetch them again.
-- Per-utterance endpointing: energy-based VAD, 100 ms pre-roll, 700 ms silence
-  to close, 12 s hard cap, and down-mixing to 16 kHz mono before recognition.
-- 22 `VOICE_WAKE_*` settings, a receive-tap hook on the voice receiver
-  (`VoiceClipService.add_tap`) so other features can observe audio safely, and
-  68 new tests including real Opus, real RTP-decryption and real Whisper paths.
-
 ### Changed
-- The voice receiver now runs when **either** the clip buffer or the spoken wake
-  word needs it (`VoiceClipService.receiving_wanted`), so `VOICE_CLIP_ENABLED`
-  can stay off.
-- The channel is told once, on first join, that Paradise is listening; anyone
-  who opted out of voice capture is dropped before the listener sees a packet.
 - **The `/vc` leaderboard is a page now, not a poster.** White cards on a light
   grey page, one accent per period, a 44 px period title, one grouped list
   instead of a box per person, hairline separators, real (drawn) shadows and
@@ -88,31 +70,26 @@ All notable changes to Paradise are recorded here. The format follows
   channel post uses the same framing.
 - `/vc stats` groups its numbers the way a settings screen would; leaderboard
   paging is a quiet "page 2 of 3" in the footer only.
-- **Speech recognition now runs on the bot's own CPU.** The wake word is
-  transcribed by faster-whisper inside the process — no API key, no upload,
-  works offline once the weights are downloaded — so `VOICE_WAKE_STT=auto`
-  never touches ElevenLabs or Gemini while the local engine is installed.
-  `pip install -r requirements-local-stt.txt` enables it (the Docker image does
-  it by default); `VOICE_WAKE_STT=local` forbids the cloud entirely. Loading and
-  inference run on a dedicated one-thread executor, the model is freed after 15
-  minutes of silence, and a missing dependency, a failed download or a stuck
-  decode is reported in plain words instead of going silent.
-  New keys: `VOICE_WAKE_STT_MODEL`, `_DEVICE`, `_COMPUTE`, `_THREADS`,
-  `_MODEL_DIR`, `_OFFLINE`, `_UNLOAD_AFTER`. [docs/voice-wake.md](docs/voice-wake.md).
-
 ### Removed
+- **The "hey paradise" assistant, and everything that spoke.** `commands/wake.py`,
+  `functions/voice_wake/` (listener, endpointing, local Whisper, cloud
+  recognition, cue), `docs/voice-wake.md`, `requirements-local-stt.txt`,
+  `tools/fetch_whisper_model.py`, both `WakeConfig` and `VoiceWakeConfig`, all
+  22 `VOICE_WAKE_*` and 8 `WAKE_WORD_*` settings, the `/voicewake` command and
+  the `Dockerfile` speech-recognition stage are gone. The bot no longer
+  transcribes anything, no longer speaks in a voice channel, and has no wake
+  word — type at it instead. This also removes a 75 MB model download, the CPU
+  cost of recognising every utterance, and the dedicated worker thread that
+  carried it.
+- **The receive-tap hook.** `VoiceClipService.add_tap` / `remove_tap` existed
+  only for the spoken wake word. The receiver now does exactly one thing with a
+  packet — decrypt and buffer it — so the UDP reader thread has one less fan-out
+  per packet.
 - **Music, entirely.** `commands/music.py`, `functions/music/`,
   `docs/music.md`, `tests/test_music.py`, every `MUSIC_*` setting, the
-  `yt-dlp` dependency, the `/cmd` panel and the "play …" branches of the voice
-  wake cog are all deleted. Wake-word replies are plain chat + speech again.
+  `yt-dlp` dependency and the `/cmd` panel are all deleted.
 
 ### Fixed
-- **The wake word went deaf while `/clip` was recording.** The receive router
-  only notified the listeners *after* appending the packet to the clip buffer,
-  so anything that made the buffer unhappy silenced wake recognition too. The
-  tap now runs first, and `commands/wake.py` re-binds it whenever the voice
-  service object is replaced and restarts a listener that has died (checked
-  every 30 s), so recording can never take listening down with it.
 - **Clipped speech had a jitter.** Frames used to be placed on the wall clock
   they *arrived* at; a few milliseconds of network wobble made one frame overlap
   the next and the next leave a hole, which is heard as a flutter. Frames are
@@ -130,25 +107,10 @@ All notable changes to Paradise are recorded here. The format follows
   [docs/engineering/voice-accounting-incident.md §K](docs/engineering/voice-accounting-incident.md).
 
 ### Added
-- **A chime the moment "hey paradise" is recognised.** Two generated notes
-  (880 Hz then a fifth above) are encoded to raw PCM in-process and played
-  through `discord.PCMAudio` — no FFmpeg, no audio file in the repository —
-  before the model is asked anything, so the thinking pause never reads as
-  being ignored. `VOICE_WAKE_CUE=false` turns it off; it never interrupts
-  something that is already playing.
 - `functions/voice_clip/mixer.py::apply_static_gain`: one constant gain per
   clip, levelled to −20 dBFS RMS with the loudest sample under the ceiling.
-- `/voicewake status` now reports the receiver itself: packets received,
-  packets recorded, frames listened to, and plain-word advice when a counter
-  is stuck at zero.
 
 ### Changed
-- **"Hey Paradise" now answers in far more situations.** `WAKE_WORD_VC_ONLY`
-  used to mean "only in a voice channel's text chat"; sitting in a voice
-  channel now counts as well, so typing in `#general` while in the VC is
-  answered *and* spoken in the channel. Every ignored wake phrase is logged
-  at INFO, and a missing ElevenLabs key is reported at start-up instead of
-  silently producing text-only replies.
 - **`/clip` records everyone, silently.** Consent prompts, the channel notice,
   the opt-out list and `VOICE_CLIP_CONSENT_MODE` / `VOICE_CLIP_NOTICE_ENABLED`
   are gone; every human in the channel is captured, and the debug panel shows

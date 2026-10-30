@@ -19,6 +19,7 @@ from functions.voice_clip import (
     ClipError,
     MAX_CLIP_DURATION,
     MIN_CLIP_DURATION,
+    NoUsableAudioError,
     UNAUTHORIZED_CLIP_MESSAGE,
     VoiceClipService,
     authorize_clip_user,
@@ -65,6 +66,31 @@ class VoiceClip(commands.Cog):
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
         await self.service.shutdown()
+
+    def _log_receiver_state(self, guild: discord.Guild | None) -> None:
+        """Say *why* a clip came back empty instead of leaving a silent failure.
+
+        The counters are integers only — never audio. If nothing ever decrypted
+        the bot is muted, deafened or not really connected; if packets arrived
+        but none were buffered, the failure is in the decoder or depacketiser.
+        """
+        guild_id = getattr(guild, "id", None)
+        if guild_id is None:
+            return
+        try:
+            stats = self.service.receiver_stats(int(guild_id))
+        except Exception:  # noqa: BLE001
+            log.debug("Could not read receiver statistics", exc_info=True)
+            return
+        log.info(
+            "Empty /clip in guild %s — received=%s buffered=%s transport_errors=%s "
+            "dave_errors=%s",
+            guild_id,
+            stats.get("received"),
+            stats.get("buffered"),
+            stats.get("transport_errors"),
+            stats.get("dave_errors"),
+        )
 
     @tasks.loop(seconds=15.0)
     async def _expiry_sweep(self) -> None:
@@ -224,6 +250,8 @@ class VoiceClip(commands.Cog):
                 duration=valid_duration,
             )
         except ClipError as err:
+            if isinstance(err, NoUsableAudioError):
+                self._log_receiver_state(interaction.guild)
             await _send_ephemeral(interaction, f"⚠️ {err}")
             return
         except Exception:  # noqa: BLE001

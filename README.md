@@ -28,7 +28,7 @@ only ever the *last* resort.
 **1. How this codebase was built.** Paradise was written by its owner working
 *with* AI assistants — architecture, module code, tests and documentation have
 all had AI involvement. Every change was reviewed, run and tested before it
-landed (`845` offline tests, a static review agent and CI gate the merge), but
+landed (1,000+ offline tests, a static review agent and CI gate the merge), but
 you should treat the code the way you would treat any contributor's: read it
 before you trust it. Sections that were AI-assisted are not individually marked
 because, after this much iteration, the distinction is no longer meaningful.
@@ -41,8 +41,6 @@ cannot answer:
 | Where | What it is | Key required |
 | --- | --- | --- |
 | `@Paradise <complex question>` | Gemini reasoning (or an OpenAI-compatible fallback) | optional |
-| `Hey Paradise …` in voice chat | fastest-first Gemini cascade, then spoken aloud | optional |
-| `Hey Paradise …` **spoken** in the channel | **on-device** Whisper (faster-whisper, this CPU, no upload) → Gemini answer → your voice | optional |
 | `/summarize` | Gemini summary of pasted text | optional |
 | Personality & banter | canned reactions, replies, stickers, roasts, rendered memes and keyless internet memes — **no model** for any of it | never |
 
@@ -53,18 +51,13 @@ search returns *real* photos from Wikipedia/Wikimedia/Openverse instead of
 made-up ones.
 
 **4. What leaves the machine.** One thing: a question, sent to Gemini when it
-actually needs a model. Recognition of the **spoken** wake word runs on this
-machine — faster-whisper on this CPU, inside the bot, with no key and no
-upload — so your voice never leaves it. Cards, voice tracking, the dictionary
-and every deterministic tool run locally too. Nothing about your
-voice is stored: the buffers are in memory, bounded, and dropped after
-transcription. Cloud recognition exists as a fallback for hosts that cannot run
-Whisper, and is never chosen while the local engine is installed.
-[Full privacy notes](docs/voice-wake.md#privacy-honestly).
+actually needs a model. The bot does not listen to your voice: the only audio
+it touches is the `/clip` buffer, which lives in memory, is bounded, and is
+exported only when an operator asks for it. Cards, voice tracking, the
+dictionary and every deterministic tool run locally too.
 
 With **no API key at all** the bot is fully functional: only free-form
-conversation, `/summarize`, the spoken answers and the spoken wake word are
-unavailable.
+conversation, `/summarize` and the AI-shaped answers are unavailable.
 
 ---
 
@@ -75,9 +68,7 @@ unavailable.
 | **Mention-first interface** | `@Paradise 100 USD to INR`, `@Paradise weather in Delhi`, `@Paradise define ephemeral` — no slash commands to memorise. A deterministic router picks the right native tool; two requests in one sentence run concurrently. |
 | **Voice leaderboards** | Supabase-backed tracking with crash-safe checkpoints, IST calendar windows and a daily DM that reads like a note from a person. The card is a rendered page — a podium, then one grouped list, in white on light grey with a single accent per period. |
 | **Cards, drawn in code** | Dictionary, weather, recipe, mini-game and leaderboard visuals are Pillow-rendered at 2× supersampling — deterministic, cacheable, never generated. The leaderboard's contrast ratios are asserted in the test suite, not eyeballed. |
-| **Your own voice** | Optional ElevenLabs voice for every spoken word, with an OpenAI-compatible and a free web fallback. Hindi, English and Hinglish. |
-| **"Hey Paradise"** | Type the phrase in a voice channel's text chat, **or just say it out loud**: answered in the chat *and* spoken in the channel, in the same voice. Spoken requests are transcribed **on the bot's own CPU** (faster-whisper, no key, nothing uploaded) once the sentence has ended. [Details](docs/voice-wake.md). |
-| **A chime when it hears you** | The instant "hey paradise" is recognised, a two-note chime plays in the channel — before the model is asked anything, so a pause never looks like being ignored. |
+| **Pronunciation** | Optional ElevenLabs voice for dictionary words, with an OpenAI-compatible and a free web fallback. Hindi, English and Hinglish. |
 | **It actually talks back** | Reactions, one-liners, stickers, roasts, reaction GIFs and memes pulled from real Reddit communities — no API key needed. Say "roast me", type something cocky, or just be funny near it. [How it works](docs/humour.md). |
 | **Silent presence** | Follows the crowd into the busiest voice channel and says nothing when it arrives. |
 | **Mini-games** | A recoverable SQLite scheduler, four modular games, aggregate-only leaderboard. |
@@ -127,9 +118,9 @@ lookup is reported honestly instead of being guessed.
 
 ## Quick start
 
-**Requirements:** Python 3.11+, a Discord bot token, and ~150 MB of disk for
-dependencies (+250 MB if you also install on-device speech recognition).
-Linux, macOS and Windows all work.
+**Requirements:** Python 3.11+ and a Discord bot token. About 150 MB of disk
+for dependencies, and no speech-recognition weights to download — the bot
+transcribes nothing. Linux, macOS and Windows all work.
 
 ```bash
 git clone https://github.com/STUP1DLADKAA/ParadiseBOT.git
@@ -138,10 +129,6 @@ cd ParadiseBOT
 python -m pip install -r requirements.txt
 cp .env.example .env          # then fill in DISCORD_TOKEN
 python bot.py
-
-# optional: hear the wake word out loud, transcribed on this machine
-python -m pip install -r requirements-local-stt.txt
-#   (the 75 MB model downloads itself on the next start-up; no other step)
 ```
 
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
@@ -174,10 +161,8 @@ unless stopped.
 | The bot works at all | `DISCORD_TOKEN` | refuses to start with a clear message |
 | Instant slash commands | `DISCORD_GUILD_ID` | commands register globally (slow propagation) |
 | Voice leaderboards | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` + [4 SQL migrations](supabase/README.md) | `/vc` explains what to set up; nothing else breaks |
-| Spoken wake word (on-device) | `pip install -r requirements-local-stt.txt` — no key at all; the model downloads itself at start-up | typed "Hey Paradise" still works; `/voicewake status` names the missing piece |
-| Spoken wake word (cloud fallback) | `VOICE_WAKE_STT=elevenlabs` + `ELEVENLABS_API_KEY`, or `gemini` + `GEMINI_API_KEY` | on-device recognition is used instead — no audio leaves the bot |
 | AI answers | `GEMINI_API_KEY` (or `AI_BASE_URL`/`AI_MODEL`) | tool/mention replies still work, no free-form reasoning |
-| Spoken answers in your voice | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | free fallback voice, or text only |
+| Word pronunciation in your voice | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | a free fallback voice, or text only |
 | Weather alerts & midnight board | `VOICE_ALERT_CHANNEL_ID` | those two posts are skipped |
 
 Every option, with defaults and clamps, lives in [`.env.example`](.env.example).
@@ -193,7 +178,6 @@ ParadiseBOT/
 ├── commands/                  slash commands and cogs
 │   ├── assistant.py           mention router: "@Paradise <anything>" → tools first, AI last
 │   ├── vc.py                  /vc leaderboard · /vc stats · /vc dmreports
-│   ├── wake.py                "Hey Paradise …" — typed, spoken aloud, answered in voice
 │   ├── voice_presence.py      silent crowd-following into voice channels
 │   ├── clip.py                rolling voice-clip capture and export
 │   ├── dictionary.py          chat triggers, cards, playback buttons
@@ -213,7 +197,6 @@ ParadiseBOT/
 │   ├── voice_clip/            Opus decoding, rolling buffer, mixer, AAC export
 │   ├── minigames/             recoverable scheduler + four games
 │   ├── recipes/               recipe engine and bundled recipe book
-│   ├── voice_wake/            endpointing, wake-phrase matching, on-device whisper
 │   ├── tts.py                 ElevenLabs → OpenAI-compatible → free voice
 │   ├── gemini.py · ai.py      model cascade, provider chain, activation rules
 │   ├── perf.py                shared HTTP pools, render pool, start-up prewarm
@@ -265,11 +248,10 @@ A trimmed view — see [`.env.example`](.env.example) for all ~120 settings.
 | Discord | `DISCORD_TOKEN`, `DISCORD_GUILD_ID` | token required; guild ID makes commands instant |
 | Operator access | `EDIT_ALLOWED_USER_IDS`, `CLIP_ALLOWED_USER_IDS`, `VOICE_DEAF_EXEMPT_USER_IDS` | comma-separated Discord user IDs |
 | Voice data | `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `VOICE_*` | service-role key only, server-side |
-| AI | `GEMINI_API_KEY`, `GEMINI_MODEL`, `GEMINI_MODEL_CHAIN`, `AI_BASE_URL`, `AI_MODEL` | all optional |
-| Your voice | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL` | default `eleven_flash_v2_5` |
-| Wake word | `WAKE_WORD_*` | typed + spoken answers in voice chat |
+| AI | `GEMINI_API_KEY`, `GEMINI_MODEL`, `AI_BASE_URL`, `AI_MODEL` | all optional |
+| Your voice | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL` | default `eleven_flash_v2_5`; word pronunciation only |
 | Presence | `VOICE_PRESENCE_ENABLED`, `VOICE_ARRIVAL_ANNOUNCE` | silent joins by default |
-| Clips | `VOICE_CLIP_*` | 192 kbps AAC, mastering chain, 180 s window |
+| Clips | `VOICE_CLIP_*` | 128 kbps AAC-LC at 48 kHz, one static gain, 180 s window |
 | Self-update | `AUTO_UPDATE_*` | validated pull from GitHub; `AUTO_UPDATE_APPLY=false` to only be notified |
 | Performance | `PREWARM_ON_START` | warm fonts and card backdrops at boot |
 
@@ -277,6 +259,11 @@ A trimmed view — see [`.env.example`](.env.example) for all ~120 settings.
 the machine (`8–32` workers, up to `256` connections, one pooled session per
 service). Cards render at 2× supersampling, and identical renders inside a
 45-second window are served from cache. See [docs/performance.md](docs/performance.md).
+
+Nothing is transcribed. There is no speech model in memory and no recognition
+running on the CPU — the only audio work is the `/clip` buffer, which stores
+Opus packets as they arrive and does its decoding once, at export time, in a
+single FFmpeg pass. A 60-second clip encodes in about a second.
 
 ---
 

@@ -14,6 +14,7 @@ import sys
 import unittest
 from collections import deque
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import AsyncMock
 
 import discord
@@ -38,6 +39,7 @@ from functions.meme_feed import (  # noqa: E402
     parse_meme,
     parse_tenor,
 )
+from functions import personality as personality_module  # noqa: E402
 from functions.personality import AMBIENT_REACTIONS, Personality  # noqa: E402
 from functions.roasts import (  # noqa: E402
     INTENSITIES,
@@ -410,17 +412,26 @@ class TestLouderPersonality(unittest.IsolatedAsyncioTestCase):
         first = _make_msg("honestly i think cereal is technically cold soup")
         await personality.handle(first)
         first.reply.assert_awaited_once()
+        self.assertEqual(personality._last_action_by_channel[10], "meme")
 
-        # Same channel, cooldowns open, but the last action was a meme, so the
-        # meme weight is penalised and the roll lands nowhere.
-        second = _make_msg("another extremely normal sentence about lunch")
-        await personality.handle(second)
-        second.reply.assert_not_called()
+        # The repeat is *penalised*, so a coin flip now usually lands nowhere:
+        # same channel, cooldowns open, but the meme weight is a quarter.
+        self.assertEqual(
+            personality._weigh("meme", 10, 1.0), personality.REPEAT_PENALTY
+        )
+        self.assertEqual(personality._weigh("meme", 99, 1.0), 1.0)
+        self.assertEqual(personality._weigh("roast", 10, 1.0), 1.0)
 
-        # A different channel is unaffected.
-        third = _make_msg("a third normal sentence about the weather", channel_id=99)
-        await personality.handle(third)
-        third.reply.assert_awaited_once()
+        with mock.patch.object(personality_module.random, "random", return_value=0.9):
+            second = _make_msg("another extremely normal sentence about lunch")
+            await personality.handle(second)
+            second.reply.assert_not_called()
+
+        # A different channel is unaffected by that channel's history.
+        with mock.patch.object(personality_module.random, "random", return_value=0.5):
+            third = _make_msg("a third normal sentence about the weather", channel_id=99)
+            await personality.handle(third)
+            third.reply.assert_awaited_once()
 
     async def test_the_opt_out_survives_an_invitation(self):
         personality = _personality(roast_chance=1.0, roast_user_cooldown=0)

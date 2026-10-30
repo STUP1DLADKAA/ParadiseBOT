@@ -1,8 +1,8 @@
 # Setup guide
 
 The README gets you running in five minutes. This page is the detail behind the
-optional parts: voice data, the owner's voice, the wake word, silent presence,
-clips, self-update and the operator commands.
+optional parts: voice data, the owner's voice, silent presence, clips,
+self-update and the operator commands.
 
 Everything here is optional except the Discord token.
 
@@ -22,7 +22,7 @@ Everything here is optional except the Discord token.
    | Send Messages, Embed Links, Attach Files | replies and cards |
    | Read Message History | mention context, AFK detection |
    | Add Reactions | personality |
-   | Connect, Speak | voice presence, wake word, pronunciation |
+   | Connect, Speak | voice presence, pronunciation playback |
    | Use Voice Activity | receiving audio for `/clip` |
 
 4. Copy the token into `.env` as `DISCORD_TOKEN`.
@@ -103,53 +103,7 @@ ELEVENLABS_MODEL=eleven_flash_v2_5
 
 ---
 
-## 4. "Hey Paradise …" in voice chat
-
-Type the phrase in a voice channel's text chat:
-
-```text
-Hey Paradise what's the capital of Rajasthan?
-→ Jaipur is the capital of Rajasthan, in the north-west of India.   (and spoken aloud)
-```
-
-* The answer model is the fastest one with capacity:
-  `GEMINI_MODEL_CHAIN` (default `gemini-2.5-flash-lite, gemini-2.0-flash-lite,
-  gemini-2.5-flash, gemini-2.0-flash`) is tried fastest-first, the first two are
-  hedged, and a throttled model is skipped for a few minutes.
-* If every model fails, Paradise says something rude instead — from a clip
-  preloaded at start-up, so the channel is never silent.
-* Recognised phrases: `hey/hi/hello/yo/ok/okay/oye/arre paradise …` or
-  `Paradise, …`. Ordinary sentences containing the word never trigger anything.
-* Only voice-channel text chats are watched (`WAKE_WORD_VC_ONLY=true`); normal
-  channels are ignored.
-* Text always works. Speech needs PyNaCl + ffmpeg (both in `requirements.txt`).
-
-### Saying it out loud — transcribed on your own CPU
-
-The wake word also works when **spoken** in the channel, and the recognition
-runs inside the bot (faster-whisper, no key, no upload):
-
-```bash
-python -m pip install -r requirements-local-stt.txt   # once, ~250 MB
-```
-
-* The model itself (75 MB for `small`) is downloaded once **at start-up**, in
-  the background — `pip` installs the engine, not the weights — and after that
-  it is fully offline. `python tools/fetch_whisper_model.py small --dir …` does
-  the same fetch before the bot runs (useful when building an image), and
-  `/voicewake download` retries on demand. `VOICE_WAKE_STT_MODEL_DIR` points at
-  weights you already have, `VOICE_WAKE_STT_OFFLINE=true` forbids the network,
-  and `VOICE_WAKE_STT_PRELOAD=false` moves the fetch back to first use.
-* `VOICE_WAKE_STT=local` guarantees no audio ever leaves the machine; `auto`
-  (the default) tries the local engine first and only falls back to
-  `ELEVENLABS_API_KEY`/`GEMINI_API_KEY` recognition when Whisper is not
-  installed.
-* It joins undeafened because a deafened client receives no audio at all.
-* Full guide: [docs/voice-wake.md](voice-wake.md).
-
----
-
-## 5. Voice presence: silent joins
+## 4. Voice presence: silent joins
 
 Paradise follows the crowd into whichever accessible voice channel has the most
 humans and leaves when it empties — without posting anything or speaking.
@@ -174,26 +128,37 @@ humans and leaves when it empties — without posting anything or speaking.
 
 ---
 
-## 6. Voice clips (`/clip`)
+## 5. Voice clips (`/clip`)
 
 ```env
 VOICE_CLIP_ENABLED=true
 CLIP_ALLOWED_USER_IDS=123456789012345678   # who may request/receive clips
 VOICE_CLIP_MAX_SECONDS=180                 # rolling window (clamped to 180)
-VOICE_CLIP_BITRATE_KBPS=192                # 64–320
+VOICE_CLIP_BITRATE_KBPS=128                # 64–320
 ```
 
 * Audio is decoded from Discord's Opus stream, kept in a bounded in-memory ring
-  buffer, mixed per speaker and exported once as 48 kHz mono AAC-LC.
-* Default mastering chain: `highpass=f=75,lowpass=f=16000,
-  loudnorm=I=-16:TP=-1.5:LRA=11,alimiter=…` — override with
-  `VOICE_CLIP_AUDIO_FILTER`.
+  buffer, mixed per speaker and exported **once** as 48 kHz mono AAC-LC. There
+  is no resample (Discord voice is mono 48 kHz) and no second lossy step.
+* Quality comes from doing very little: the level is set with one constant gain
+  per clip, then `highpass=f=70,lowpass=f=18500,alimiter=…` and nothing else.
+  There is deliberately no `loudnorm`: a single-pass loudness normaliser rides
+  the gain up and down between sentences, which is audible as a wobble on a
+  short clip. Override the chain with `VOICE_CLIP_AUDIO_FILTER`.
+* 128 kbps mono is transparent for speech and small: a minute is ~950 KB, the
+  full three-minute window ~2.8 MB. `+faststart` puts the index at the front so
+  Discord can play the attachment before the download finishes.
+* One export at a time, two queued. A 60-second clip encodes in about a second,
+  so nobody waits, and the box never runs two FFmpeg encoders at once.
 * The file is DM'd to the authorized operator only. It is never uploaded
   anywhere else, and the buffer is purged the moment recording stops.
+* Nothing else in the bot listens to voice. The receive path exists solely to
+  feed this buffer; with `VOICE_CLIP_ENABLED=false` the bot connects with a
+  plain (non-receiving) voice client and decrypts nothing at all.
 
 ---
 
-## 7. Operator commands
+## 6. Operator commands
 
 ```env
 EDIT_ALLOWED_USER_IDS=123456789012345678     # /edit
@@ -210,7 +175,7 @@ hint that the command exists.
 
 ---
 
-## 8. Self-update from GitHub
+## 7. Self-update from GitHub
 
 On boot (and every `AUTO_UPDATE_INTERVAL` seconds while online) Paradise asks
 GitHub for the newest commit on `AUTO_UPDATE_BRANCH`:
@@ -244,13 +209,13 @@ Terminal output:
 
 🔄 AUTO-UPDATE APPLIED — 12 file(s) updated, 0 removed
    repository: STUP1DLADKAA/ParadiseBOT@a1b2c3d
-   + commands/wake.py
+   + commands/banter.py
    RESTART Paradise to run the new code.
 ```
 
 ---
 
-## 9. Performance
+## 8. Performance
 
 Paradise sizes its own pools at boot:
 
@@ -266,7 +231,7 @@ bot then warms lazily on first use.
 
 ---
 
-## 10. Troubleshooting
+## 9. Troubleshooting
 
 | Symptom | Cause / fix |
 | --- | --- |
@@ -275,7 +240,6 @@ bot then warms lazily on first use.
 | `/vc` says it isn't configured | `SUPABASE_URL` / `SUPABASE_SECRET_KEY` missing, or the migrations were not applied |
 | Leaderboard shows `User 123…` | Server Members Intent is off in the Developer Portal |
 | No sound from `/clip` capture | another admin server-deafened the bot (see §5) |
-| Wake word answers but says nothing | PyNaCl/ffmpeg missing, or no speech provider configured |
 | `auto-update: skipped (crash loop guard)` | the previous three starts never reached Discord — fix the error, then delete `data/autoupdate_state.json` |
 | Cards look pixelated | the bundled fonts are missing from `assets/fonts/` |
 

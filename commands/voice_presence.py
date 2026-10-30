@@ -384,17 +384,14 @@ class VoicePresence(commands.Cog):
             await self._on_joined(guild, target)
 
     def _voice_client_class(self):
-        """The receive-capable client when anything needs to hear the channel.
+        """The receive-capable client only when the clip buffer needs audio.
 
-        That is the clip buffer *or* the spoken wake word: both are fed by the
-        same receiver, so connecting with the plain client would make the wake
-        word silently deaf.
+        With ``VOICE_CLIP_ENABLED=false`` the plain client is used: nothing
+        decrypts, nothing buffers, and the bot stays as light as a music-free
+        voice client can be.
         """
         clip_cfg = getattr(getattr(self.bot, "config", None), "voice_clip", None)
-        wake_cfg = getattr(getattr(self.bot, "config", None), "voice_wake", None)
-        if bool(getattr(clip_cfg, "enabled", False)) or bool(
-            getattr(wake_cfg, "listening", False)
-        ):
+        if bool(getattr(clip_cfg, "enabled", False)):
             return ClipVoiceClient
         return discord.VoiceClient
 
@@ -405,7 +402,6 @@ class VoicePresence(commands.Cog):
     ) -> discord.VoiceClient | None:
         """Make sure Paradise is in ``channel`` — silently, never announcing.
 
-        Used by the wake-word replies ("Hey Paradise …" spoken in that VC).
         Returns the connected client, or ``None`` when it cannot join.
         """
         async with self._guild_lock(guild.id):

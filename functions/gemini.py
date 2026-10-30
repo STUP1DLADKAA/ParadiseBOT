@@ -371,46 +371,6 @@ class GeminiService:
             raise ParadiseError("Gemini answered with nothing useful. try again.")
         return text, self._finish_reason(data) in {"max_tokens", "length"}
 
-    async def transcribe_audio(
-        self,
-        audio: bytes,
-        *,
-        prompt: str,
-        mime: str = "audio/wav",
-        model: str = "",
-        max_tokens: int = 256,
-        max_bytes: int = 8 * 1024 * 1024,
-    ) -> str:
-        """Ask Gemini to transcribe a short recording (inline, base64).
-
-        Used by the spoken wake word: the same API key that answers questions
-        also hears them, so no third subscription is needed. The audio is
-        sent as ``inline_data`` — a few hundred kilobytes for a sentence —
-        which keeps the request a single round trip.
-        """
-        import base64
-
-        if not audio:
-            return ""
-        if len(audio) > max_bytes:
-            raise ParadiseError("that recording is too long to transcribe.")
-        parts = [
-            {"text": prompt},
-            {
-                "inline_data": {
-                    "mime_type": mime,
-                    "data": base64.b64encode(audio).decode("ascii"),
-                }
-            },
-        ]
-        text, _ = await self._post_parts(
-            parts,
-            max_tokens=max_tokens,
-            temperature=0.0,
-            model=model,
-        )
-        return text
-
     async def reason(self, question: str, facts: list[str] | str, *, max_tokens: int = 500) -> str:
         """Grounded reasoning: answer *question* strictly from *facts*.
 
