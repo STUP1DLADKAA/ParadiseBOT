@@ -102,10 +102,6 @@ class VoiceClipService:
         self._lock = threading.Lock()
         self._buffers: dict[int, RollingAudioBuffer] = {}
         self._routers: dict[int, VoiceReceiveRouter] = {}
-        #: Observers of accepted packets (the spoken wake word listens here).
-        #: Shared list, read on the UDP thread, guarded by ``_lock`` on write.
-        self._taps: list = []
-
         self.exporter = ClipExportPipeline(
             max_concurrent_exports=self.config.max_concurrent_exports,
             max_queued_exports=self.config.max_queued_exports,
@@ -124,36 +120,12 @@ class VoiceClipService:
     def receiving_wanted(self) -> bool:
         """Should voice connections use the receive-capable client?
 
-        The receiver is what makes a spoken wake word possible, so it is
-        needed when *either* the clip buffer or voice listening is on.
+        The receiver exists for exactly one reason now: feeding the rolling
+        clip buffer. With ``VOICE_CLIP_ENABLED=false`` there is nothing to
+        receive, so the bot connects with the plain client and pays for no
+        decryption at all.
         """
-        wake = getattr(getattr(self.bot, "config", None), "voice_wake", None)
-        return bool(self.config.enabled or getattr(wake, "listening", False))
-
-    # ------------------------------------------------------------------
-    # Packet taps (spoken wake word)
-    # ------------------------------------------------------------------
-
-    def add_tap(self, tap) -> None:
-        """Register an observer called with ``(guild_id, user_id, packet)``."""
-        with self._lock:
-            if tap not in self._taps:
-                self._taps.append(tap)
-
-    def remove_tap(self, tap) -> None:
-        with self._lock:
-            try:
-                self._taps.remove(tap)
-            except ValueError:
-                pass
-
-    def _fan_out(self, guild_id: int, user_id: int, packet) -> None:
-        taps = list(self._taps)
-        for tap in taps:
-            try:
-                tap(guild_id, user_id, packet)
-            except Exception:  # noqa: BLE001 - an observer must not break audio
-                log.debug("voice clip tap failed", exc_info=True)
+        return bool(self.config.enabled)
 
     # ------------------------------------------------------------------
     # Buffer & Receiver Attachment
@@ -211,18 +183,12 @@ class VoiceClipService:
             old_router = self._routers.pop(gid, None)
             if old_router is not None:
                 old_router.reset()
-            gid_for_tap = gid
-
-            def tap(user_id: int, packet, _gid: int = gid_for_tap) -> None:
-                self._fan_out(_gid, user_id, packet)
-
             router = VoiceReceiveRouter(
                 guild_id=gid,
                 buffer=buf,
                 is_bot_user=_is_bot,
                 dave_state_getter=_dave_state,
                 clock=self._clock,
-                taps=[tap],
             )
             self._routers[gid] = router
         return router
@@ -252,11 +218,11 @@ class VoiceClipService:
     def receiver_stats(self, guild_id: int) -> dict[str, int]:
         """Packets the receiver has seen for ``guild_id`` (never audio).
 
-        ``received`` counts every UDP frame that decrypted; ``heard`` counts the
-        ones that were handed to listeners. Zero ``received`` with the bot in a
-        channel means Discord is not sending anything at all — muted, deafened
-        or not actually connected — which is worth being able to see from
-        ``/voicewake status`` instead of guessing.
+        ``received`` counts every UDP frame that decrypted and ``buffered`` the
+        ones that made it into the rolling buffer. Zero ``received`` with the
+        bot in a channel means Discord is not sending anything at all — muted,
+        deafened or not actually connected — which the ``/clip`` debug panel
+        shows instead of leaving people to guess.
         """
         with self._lock:
             router = self._routers.get(int(guild_id))

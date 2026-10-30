@@ -285,7 +285,7 @@ class AutoUpdateTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(
                 updater._is_protected(PurePosixPath(protected)), protected
             )
-        for allowed in ("bot.py", "commands/wake.py", ".env.example", "README.md"):
+        for allowed in ("bot.py", "commands/banter.py", ".env.example", "README.md"):
             self.assertFalse(updater._is_protected(PurePosixPath(allowed)), allowed)
 
     def test_extra_protected_paths_from_config(self):

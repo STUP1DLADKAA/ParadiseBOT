@@ -32,7 +32,6 @@ HELP_BLURBS = {
     "minigames": "automated Paradise games and leaderboard",
     "recipe": "recipes from ingredients you have",
     "summarize": "recap recent chat in this channel",
-    "voicewake": "spoken wake word status, pause and resume",
     "help": "this list",
 }
 
@@ -40,7 +39,6 @@ HELP_GROUPS = {
     "🎲 fun": ("ping", "coinflip", "choose", "roast", "meme", "gif"),
     "🧰 useful": ("remind", "poll", "afk", "translate", "settimezone", "recipe"),
     "🎙️ voice": ("vc", "clip", "edit"),
-    "🎙 listening": ("voicewake",),
     "🎲 community": ("minigames",),
     "🤖 ai": ("summarize",),
 }

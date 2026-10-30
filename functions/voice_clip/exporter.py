@@ -28,11 +28,22 @@ log = logging.getLogger(__name__)
 # Mastering chain for the mixed clip. The *level* is set in numpy, with one
 # constant gain per clip (:func:`functions.voice_clip.mixer.apply_static_gain`)
 # — a single-pass ``loudnorm`` instead rides the gain up and down between
-# sentences, which is audible as a wobble on a short clip. FFmpeg only removes
-# sub-bass rumble and the top octave, and catches any last transient.
+# sentences, which is audible as a wobble on a short clip.
+#
+# What is left is deliberately minimal, because every stage here is a stage
+# between the speaker's mouth and the file:
+#   * highpass 70 Hz — removes desk rumble and the sub-bass thump Discord's
+#     Opus stream carries; nothing speech lives down there.
+#   * lowpass 18.5 kHz — keeps the top of the speech band intact (sibilance,
+#     the "air" that makes a voice sound present) while staying well under
+#     Nyquist for 48 kHz, so nothing aliases. A 16 kHz cut is a telephone
+#     master; it is audible as dullness on a good pair of headphones.
+#   * alimiter 0.95 — catches the last inter-sample transient. It is an
+#     emergency brake, not a level control: the level is already set once,
+#     statically, in numpy.
 DEFAULT_AUDIO_FILTER = (
-    "highpass=f=75,"
-    "lowpass=f=16000,"
+    "highpass=f=70,"
+    "lowpass=f=18500,"
     "alimiter=limit=0.95:attack=5:release=50:level=disabled"
 )
 
@@ -274,8 +285,16 @@ class ClipExportPipeline:
     ) -> None:
         """Encode 48 kHz mono float32 PCM to AAC-LC in M4A with faststart.
 
-        Quality settings: 48 kHz, the configured (high) bitrate and a proper
-        speech mastering chain — see :data:`DEFAULT_AUDIO_FILTER`.
+        One pass, no intermediate files: float32 PCM arrives on stdin and the
+        finished M4A lands in a temp directory. The clip is decoded once
+        (Opus → PCM), mixed once, encoded once — the only lossy step after
+        Discord's own Opus is this one encode, at a bitrate chosen to make it
+        transparent for speech.
+
+        48 kHz mono is the source's own format (Discord voice is mono), so
+        there is no resample and no fake stereo. ``+faststart`` moves the
+        moov atom to the front, so Discord can start playing the attachment
+        before the download finishes.
         """
         cmd = [
             ffmpeg_exe,

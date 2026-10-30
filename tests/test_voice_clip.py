@@ -914,6 +914,73 @@ class TestStaticLevelling(unittest.TestCase):
         self.assertIn("alimiter", DEFAULT_AUDIO_FILTER)
 
 
+class TestReceiverDiagnostics(unittest.TestCase):
+    def test_receiver_stats_are_counters_and_never_audio(self):
+        service = VoiceClipService(
+            SimpleNamespace(user=SimpleNamespace(id=1)), VoiceClipConfig()
+        )
+        self.assertEqual(
+            service.receiver_stats(4242),
+            {
+                "received": 0,
+                "buffered": 0,
+                "transport_errors": 0,
+                "dave_errors": 0,
+            },
+        )
+
+
+class TestExportQuality(unittest.TestCase):
+    """The export chain is the whole product: clear, small, one pass."""
+
+    def test_the_mastering_chain_keeps_the_speech_band(self):
+        import re
+
+        from functions.voice_clip.exporter import DEFAULT_AUDIO_FILTER
+
+        self.assertNotIn("loudnorm", DEFAULT_AUDIO_FILTER)
+        lowpass = re.search(r"lowpass=f=(\d+)", DEFAULT_AUDIO_FILTER)
+        highpass = re.search(r"highpass=f=(\d+)", DEFAULT_AUDIO_FILTER)
+        self.assertIsNotNone(lowpass)
+        self.assertIsNotNone(highpass)
+        # A 16 kHz cut is a telephone master: dull on good headphones.
+        self.assertGreaterEqual(int(lowpass.group(1)), 18000)
+        # Nothing below ~80 Hz in a voice is speech; it is rumble.
+        self.assertLessEqual(int(highpass.group(1)), 80)
+        # …and the cut must stay under Nyquist for the 48 kHz stream.
+        self.assertLess(int(lowpass.group(1)), SAMPLE_RATE // 2)
+
+    def test_the_level_is_set_once_not_ridden(self):
+        """No dynamic normaliser anywhere in the chain — that is the wobble."""
+        from functions.voice_clip.exporter import DEFAULT_AUDIO_FILTER
+        from functions.voice_clip.mixer import apply_static_gain
+
+        self.assertNotIn("dynaudnorm", DEFAULT_AUDIO_FILTER)
+        self.assertNotIn("loudnorm", DEFAULT_AUDIO_FILTER)
+        self.assertTrue(callable(apply_static_gain))
+
+    def test_the_bitrate_is_a_speech_bitrate_and_is_clamped(self):
+        from functions.voice_clip.exporter import ClipExportPipeline
+
+        self.assertEqual(ClipExportPipeline().bitrate_kbps, 128)
+        self.assertEqual(ClipExportPipeline(bitrate_kbps=1).bitrate_kbps, 64)
+        self.assertEqual(ClipExportPipeline(bitrate_kbps=9999).bitrate_kbps, 320)
+
+    def test_the_receiver_no_longer_carries_observers(self):
+        """The wake word is gone, so nothing may slow the packet path down."""
+        from functions.voice_clip.service import VoiceClipService
+
+        service = VoiceClipService(SimpleNamespace(user=SimpleNamespace(id=1)), VoiceClipConfig())
+        for removed in ("add_tap", "remove_tap", "_fan_out", "_taps"):
+            self.assertFalse(hasattr(service, removed), removed)
+        # Receiving is needed exactly when clipping is on — nothing else.
+        self.assertTrue(service.receiving_wanted)
+        disabled = VoiceClipService(
+            SimpleNamespace(user=SimpleNamespace(id=1)), VoiceClipConfig(enabled=False)
+        )
+        self.assertFalse(disabled.receiving_wanted)
+
+
 # ===========================================================================
 # 4. Lifecycle, Capture, Concurrency & Failure Recovery
 # ===========================================================================

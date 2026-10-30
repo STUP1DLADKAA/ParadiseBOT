@@ -39,7 +39,7 @@ EXPECTED_COMMANDS = {
     "ping", "coinflip", "choose", "roast", "meme", "gif",
     "remind", "poll", "afk", "translate", "settimezone", "vc", "clip",
     "minigames", "recipe",
-    "summarize", "help", "edit", "voicewake",
+    "summarize", "help", "edit",
 }
 
 # Names that must never come back at the top level.
@@ -52,6 +52,8 @@ REMOVED_COMMANDS = {
     "join", "leave", "lyrics", "status",
     # tts / voice
     "say",
+    # the "hey paradise" assistant and its spoken wake word are gone
+    "voicewake", "wake",
     # misc removals
     "8ball", "settings", "truth", "dare", "serverinfo", "userinfo", "vibe", "roll",
     # retired in favour of natural mentions (the capabilities remain)
@@ -749,7 +751,52 @@ class TestWiring(unittest.TestCase):
     def test_the_music_extension_is_not_loaded(self):
         self.assertNotIn("commands.music", EXTENSIONS)
         self.assertNotIn("commands.voice", EXTENSIONS)
-        self.assertIn("commands.wake", EXTENSIONS)
+        self.assertIn("commands.banter", EXTENSIONS)
+
+    def test_the_wake_word_is_gone_and_stays_gone(self):
+        """No cog, no engine, no recogniser, no settings, no model download."""
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for path in (
+            "commands/wake.py",
+            "functions/voice_wake",
+            "docs/voice-wake.md",
+            "tests/test_voice_wake.py",
+            "tests/test_wake.py",
+            "requirements-local-stt.txt",
+            "tools/fetch_whisper_model.py",
+        ):
+            self.assertFalse(
+                os.path.exists(os.path.join(root, path)), f"{path} should be gone"
+            )
+        self.assertNotIn("commands.wake", EXTENSIONS)
+        config = Config.from_env({})
+        self.assertFalse(hasattr(config, "voice_wake"))
+        self.assertFalse(hasattr(config, "wake"))
+
+    def test_no_wake_settings_are_left_in_the_template(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, ".env.example"), encoding="utf-8") as handle:
+            content = handle.read()
+        for needle in ("VOICE_WAKE_", "WAKE_WORD_", "INSTALL_LOCAL_STT", "WHISPER"):
+            self.assertNotIn(needle, content, f".env.example still mentions {needle}")
+
+    def test_nothing_still_imports_the_wake_stack(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        offenders = []
+        for base, _dirs, files in os.walk(root):
+            if any(part in base for part in (".git", "__pycache__", "data")):
+                continue
+            for name in files:
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(base, name)
+                with open(path, encoding="utf-8", errors="ignore") as handle:
+                    text = handle.read()
+                if name == os.path.basename(__file__):
+                    continue  # this test names the removed modules on purpose
+                if "voice_wake" in text or "commands.wake" in text:
+                    offenders.append(os.path.relpath(path, root))
+        self.assertEqual(offenders, [], f"still importing the wake stack: {offenders}")
 
     def test_dictionary_extension_is_loaded(self):
         self.assertIn("commands.dictionary", EXTENSIONS)

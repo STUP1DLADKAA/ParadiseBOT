@@ -20,7 +20,7 @@ from discord.voice_state import VoiceConnectionState
 import nacl.secret
 from nacl.exceptions import CryptoError
 
-from .buffer import BufferedAudioPacket, RollingAudioBuffer
+from .buffer import RollingAudioBuffer
 from .constants import MAX_OPUS_PACKET_BYTES, OPUS_SILENCE
 
 log = logging.getLogger(__name__)
@@ -192,16 +192,9 @@ class VoiceReceiveRouter:
         is_bot_user: Callable[[int], bool] | None = None,
         dave_state_getter: Callable[[], tuple[davey.DaveSession | None, int]] | None = None,
         clock: Callable[[], float] = time.monotonic,
-        taps: list[Callable[[int, "BufferedAudioPacket"], None]] | None = None,
     ) -> None:
         self.guild_id = int(guild_id)
         self.buffer = buffer
-        # Optional observers (the spoken wake word). They are called with the
-        # *accepted* packet on the UDP reader thread, so they must be cheap and
-        # must never raise — see ``_notify_taps``.
-        self._taps: list[Callable[[int, "BufferedAudioPacket"], None]] = (
-            taps if taps is not None else []
-        )
         self._is_bot_user = is_bot_user or (lambda _uid: False)
         self._dave_state_getter = dave_state_getter or (lambda: (None, 0))
         self._clock = clock
@@ -338,12 +331,6 @@ class VoiceReceiveRouter:
         if opus_bytes is None:
             return
 
-        # Observers (the spoken wake word) get the packet *first*, before the
-        # clip buffer has any say. The buffer can refuse a packet — it is full,
-        # it was just cleared, a speaker was evicted — and when it did, the wake
-        # word used to go deaf with it. Listening must not depend on recording.
-        self._notify_taps(user_id, opus_bytes, parsed, arrival_mono)
-
         if self.buffer.append_packet(
             user_id=user_id,
             opus_data=opus_bytes,
@@ -353,25 +340,6 @@ class VoiceReceiveRouter:
             mono_time=arrival_mono,
         ):
             self.packets_buffered += 1
-
-    def _notify_taps(self, user_id: int, opus_bytes: bytes, parsed, arrival_mono: float) -> None:
-        """Hand the accepted packet to every observer, never failing the reader."""
-        if not self._taps:
-            return
-        packet = BufferedAudioPacket(
-            mono_time=arrival_mono,
-            rtp_timestamp=parsed.rtp_timestamp,
-            sequence=parsed.sequence,
-            ssrc=parsed.ssrc,
-            stream_epoch=self.buffer.epoch_for(user_id),
-            opus_data=opus_bytes,
-            is_silence=opus_bytes == OPUS_SILENCE,
-        )
-        for tap in list(self._taps):
-            try:
-                tap(user_id, packet)
-            except Exception:  # noqa: BLE001 - an observer must not break audio
-                log.debug("voice tap failed", exc_info=True)
 
     def _stage_unknown_ssrc_unlocked(
         self,
@@ -466,9 +434,8 @@ class ClipVoiceClient(discord.VoiceClient):
         guild = getattr(self.channel, "guild", None)
         if service is None or guild is None or channel_id is None:
             return
-        # ``receiving_wanted`` is true when the clip buffer *or* the spoken
-        # wake word needs the receiver; ``enabled`` alone would make the
-        # wake word deaf on a bot with clipping turned off.
+        # ``receiving_wanted`` is the clip buffer's answer (and nothing else
+        # needs audio any more). False means this client decrypts nothing.
         if not getattr(service, "receiving_wanted", service.enabled):
             return
         self._receive_router = service.attach_voice_client(

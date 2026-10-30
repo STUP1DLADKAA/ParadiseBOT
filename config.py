@@ -55,18 +55,6 @@ def _roast_intensity(raw: str | None) -> str:
     return value if value in {"mild", "spicy", "nuclear"} else "spicy"
 
 
-def _stt_model(raw: str | None) -> str:
-    """A Whisper size ("small", "large-v3-turbo") or a path to a model dir.
-
-    Kept forgiving on purpose: CTranslate2 also accepts the output directory of
-    its own converter, so anything path-shaped is passed through untouched.
-    """
-    value = "".join(
-        ch for ch in str(raw or "").strip() if ch.isalnum() or ch in "-._/:\\ "
-    ).strip()
-    return value or "small"
-
-
 def _ids(raw: str | None) -> tuple[int, ...]:
     """A comma/space separated list of Discord IDs; anything invalid is ignored."""
     text = str(raw or "").strip()
@@ -316,63 +304,6 @@ class ElevenLabsConfig:
         )
 
 
-# Fastest-first Gemini cascade used for spoken "Hey Paradise" answers. The
-# first *available* model that returns an answer wins; a missing/quota-blocked
-# model is skipped automatically, so the bot never stalls on one model.
-DEFAULT_GEMINI_CHAIN: tuple[str, ...] = (
-    "gemini-2.5-flash-lite",
-    "gemini-2.0-flash-lite",
-    "gemini-2.5-flash",
-    "gemini-2.0-flash",
-)
-
-
-@dataclass(frozen=True, slots=True)
-class WakeConfig:
-    """The "Hey Paradise …" voice-chat assistant (see commands/wake.py).
-
-    Someone types ``Hey Paradise <question>`` in a voice channel's text chat;
-    Paradise answers in that same chat *and* speaks the answer in the channel
-    with the owner's ElevenLabs voice.
-    """
-
-    enabled: bool = True
-    # Only react inside voice-channel text chats (the "VC chat").
-    vc_only: bool = True
-    # Fastest-first model cascade. Blank falls back to DEFAULT_GEMINI_CHAIN.
-    models: tuple[str, ...] = DEFAULT_GEMINI_CHAIN
-    # Answer budget for the spoken/typed reply.
-    max_answer_chars: int = 700
-    # What is actually spoken aloud (keeps a long answer from monologuing).
-    speech_max_chars: int = 600
-    # Reuse the same text chat as the reply target; speak when connected.
-    speak: bool = True
-    # Auto-connect to the asker's voice channel when Paradise is elsewhere.
-    connect_if_needed: bool = True
-    user_cooldown: float = 4.0
-    channel_cooldown: float = 2.0
-
-    @classmethod
-    def from_env(cls, env) -> "WakeConfig":
-        return cls(
-            enabled=_bool(env.get("WAKE_WORD_ENABLED"), True),
-            vc_only=_bool(env.get("WAKE_WORD_VC_ONLY"), True),
-            models=_csv(env.get("GEMINI_MODEL_CHAIN"), DEFAULT_GEMINI_CHAIN),
-            max_answer_chars=max(
-                80, min(1500, _int(env.get("WAKE_WORD_MAX_CHARS"), 700))
-            ),
-            speech_max_chars=max(
-                80, min(1200, _int(env.get("WAKE_WORD_SPEECH_CHARS"), 600))
-            ),
-            speak=_bool(env.get("WAKE_WORD_SPEAK"), True),
-            connect_if_needed=_bool(env.get("WAKE_WORD_CONNECT"), True),
-            user_cooldown=max(0.0, _float(env.get("WAKE_WORD_USER_COOLDOWN"), 4.0)),
-            channel_cooldown=max(
-                0.0, _float(env.get("WAKE_WORD_CHANNEL_COOLDOWN"), 2.0)
-            ),
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class VoicePresenceConfig:
     """Automatic voice-channel presence (see commands/voice_presence.py)."""
@@ -564,13 +495,16 @@ class VoiceClipConfig:
     max_buffer_seconds: int = 180
     # Maximum distinct active speaker streams retained per voice connection.
     max_active_speakers: int = 32
-    # Maximum memory (bytes) consumed by buffered Opus frames per guild.
-    # The host is no longer resource-starved, so the rolling window is kept in
-    # a generous 48 MiB budget per guild.
-    max_buffer_bytes: int = 48 * 1024 * 1024
+    # Maximum memory (bytes) consumed by buffered Opus frames per guild. Three
+    # minutes of speech from a dozen people is a few MiB; this is a ceiling,
+    # not an allocation, and it is released the moment recording stops.
+    max_buffer_bytes: int = 32 * 1024 * 1024
     # Concurrent active export jobs and bounded waiting queue capacity.
-    max_concurrent_exports: int = 2
-    max_queued_exports: int = 4
+    # One at a time: an export is a short FFmpeg burst on the whole core, and a
+    # 60-second clip finishes in about a second, so a queue of two never makes
+    # anybody wait — while the box never sees two encoders at once.
+    max_concurrent_exports: int = 1
+    max_queued_exports: int = 2
     # Per-export deadline covering decode, mix and FFmpeg encode (seconds).
     export_timeout_seconds: float = 45.0
     # Safe Discord DM upload cap (~9.5 MiB, well under the 10 MiB default limit).
@@ -585,7 +519,7 @@ class VoiceClipConfig:
 
     @classmethod
     def from_env(cls, env) -> "VoiceClipConfig":
-        buffer_mb = max(2, min(256, _int(env.get("VOICE_CLIP_MAX_BUFFER_MB"), 48)))
+        buffer_mb = max(2, min(256, _int(env.get("VOICE_CLIP_MAX_BUFFER_MB"), 32)))
         temp_mb = max(4, min(512, _int(env.get("VOICE_CLIP_MAX_TEMP_MB"), 64)))
         return cls(
             enabled=_bool(env.get("VOICE_CLIP_ENABLED"), True),
@@ -597,10 +531,10 @@ class VoiceClipConfig:
             ),
             max_buffer_bytes=buffer_mb * 1024 * 1024,
             max_concurrent_exports=max(
-                1, min(8, _int(env.get("VOICE_CLIP_MAX_CONCURRENT_EXPORTS"), 2))
+                1, min(8, _int(env.get("VOICE_CLIP_MAX_CONCURRENT_EXPORTS"), 1))
             ),
             max_queued_exports=max(
-                0, min(16, _int(env.get("VOICE_CLIP_MAX_QUEUED_EXPORTS"), 4))
+                0, min(16, _int(env.get("VOICE_CLIP_MAX_QUEUED_EXPORTS"), 2))
             ),
             export_timeout_seconds=max(
                 5.0, min(180.0, _float(env.get("VOICE_CLIP_EXPORT_TIMEOUT"), 45.0))
@@ -713,130 +647,6 @@ class GeminiConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class VoiceWakeConfig:
-    """The wake word spoken out loud in a voice channel (functions/voice_wake).
-
-    Paradise listens to the channel it is already sitting in, waits for an
-    utterance to *finish*, transcribes it once, and only then decides whether
-    it was addressed — "hey paradise …" in English, Hinglish or Hindi.
-
-    Recognition runs **on this machine** by default: faster-whisper, in this
-    process, on this CPU, with no key and no upload (``functions/voice_wake/
-    local_stt.py``). The cloud providers still exist for machines that cannot
-    run Whisper, and ``VOICE_WAKE_STT=local`` forbids them outright.
-
-    Because a local transcription is never uploaded, nothing leaves the bot.
-    Capture is unconditional — every human in the channel is heard, with no
-    opt-out to guard — and ``VOICE_WAKE_ANNOUNCE`` controls the one-time notice.
-    Turn it off with ``VOICE_WAKE_ENABLED=false`` and everything else keeps
-    working.
-    """
-
-    enabled: bool = True
-    #: "auto" (local whisper, then ElevenLabs Scribe, then Gemini), "local",
-    #: "elevenlabs", "gemini" or "off".
-    stt: str = "auto"
-    #: Whisper size for the local engine: tiny, base, small, medium, large-v3…
-    stt_model: str = "small"
-    #: torch-free CTranslate2 device: "cpu" (default) or "cuda".
-    stt_device: str = "cpu"
-    #: CTranslate2 precision: int8 (fast, default), int8_float32 or float32.
-    stt_compute: str = "int8"
-    #: CPU threads for inference; 0 lets CTranslate2 pick.
-    stt_threads: int = 0
-    #: Directory holding the model weights (downloads there on first run).
-    stt_model_dir: str = ""
-    #: Never touch the network: only use weights that are already on disk.
-    stt_offline: bool = False
-    #: Fetch the weights at start-up (once) instead of on the first utterance.
-    stt_preload: bool = True
-    #: Drop the weights from RAM after this much silence; 0 keeps them loaded.
-    stt_unload_after: float = 900.0
-    #: ISO-639-1 hint for the transcriber; blank lets it detect.
-    language: str = ""
-    #: Framed speech detection: a 20 ms frame above this fraction of full
-    #: scale counts as voice. ~0.012 is -38 dBFS.
-    energy_threshold: float = 0.012
-    #: How much voice must be heard before recording starts.
-    onset_ms: int = 60
-    #: Quiet gap that closes an utterance.
-    silence_ms: int = 700
-    #: Anything shorter than this is a door slam, not a sentence.
-    min_seconds: float = 0.6
-    #: Hard cap on one utterance (protects memory and the API bill).
-    max_seconds: float = 12.0
-    #: Per-user gap between two accepted requests.
-    cooldown: float = 3.0
-    #: Guild-wide ceiling, asked per minute, whatever the crowd size.
-    max_per_minute: int = 8
-    #: After a bare "hey paradise", how long the question may follow.
-    follow_up_seconds: float = 6.0
-    #: Speakers tracked at once.
-    max_speakers: int = 32
-    #: Post a one-time "listening for 'Hey Paradise'" notice in the channel.
-    announce: bool = True
-    #: Post the answer in the voice channel's text chat as well as speaking it.
-    post_text: bool = True
-    #: Say "haan?" when only the wake word was heard.
-    acknowledge: bool = True
-    #: Play a short chime the instant the phrase is recognised, so nobody has
-    #: to wonder whether they were heard while the answer is being built.
-    cue: bool = True
-
-    @property
-    def listening(self) -> bool:
-        return bool(self.enabled and self.stt != "off")
-
-    @classmethod
-    def from_env(cls, env) -> "VoiceWakeConfig":
-        stt = str(env.get("VOICE_WAKE_STT", "auto") or "auto").strip().lower()
-        if stt not in {"auto", "local", "elevenlabs", "gemini", "off"}:
-            stt = "auto"
-        return cls(
-            enabled=_bool(env.get("VOICE_WAKE_ENABLED"), True),
-            stt=stt,
-            stt_model=_stt_model(env.get("VOICE_WAKE_STT_MODEL")),
-            stt_device=str(env.get("VOICE_WAKE_STT_DEVICE", "cpu") or "cpu")
-            .strip()
-            .lower(),
-            stt_compute=str(env.get("VOICE_WAKE_STT_COMPUTE", "int8") or "int8")
-            .strip()
-            .lower(),
-            stt_threads=max(0, min(64, _int(env.get("VOICE_WAKE_STT_THREADS"), 0))),
-            stt_model_dir=str(env.get("VOICE_WAKE_STT_MODEL_DIR", "") or "").strip(),
-            stt_offline=_bool(env.get("VOICE_WAKE_STT_OFFLINE"), False),
-            stt_preload=_bool(env.get("VOICE_WAKE_STT_PRELOAD"), True),
-            stt_unload_after=max(
-                0.0, min(86_400.0, _float(env.get("VOICE_WAKE_STT_UNLOAD_AFTER"), 900.0))
-            ),
-            language=str(env.get("VOICE_WAKE_LANGUAGE", "") or "").strip().lower()[:5],
-            energy_threshold=max(
-                0.0005, min(0.2, _float(env.get("VOICE_WAKE_THRESHOLD"), 0.012))
-            ),
-            onset_ms=max(20, min(400, _int(env.get("VOICE_WAKE_ONSET_MS"), 60))),
-            silence_ms=max(200, min(3000, _int(env.get("VOICE_WAKE_SILENCE_MS"), 700))),
-            min_seconds=max(
-                0.2, min(5.0, _float(env.get("VOICE_WAKE_MIN_SECONDS"), 0.6))
-            ),
-            max_seconds=max(
-                2.0, min(30.0, _float(env.get("VOICE_WAKE_MAX_SECONDS"), 12.0))
-            ),
-            cooldown=max(0.0, min(60.0, _float(env.get("VOICE_WAKE_COOLDOWN"), 3.0))),
-            max_per_minute=max(
-                1, min(60, _int(env.get("VOICE_WAKE_MAX_PER_MINUTE"), 8))
-            ),
-            follow_up_seconds=max(
-                2.0, min(30.0, _float(env.get("VOICE_WAKE_FOLLOWUP_SECONDS"), 6.0))
-            ),
-            max_speakers=max(1, min(128, _int(env.get("VOICE_WAKE_MAX_SPEAKERS"), 32))),
-            announce=_bool(env.get("VOICE_WAKE_ANNOUNCE"), True),
-            post_text=_bool(env.get("VOICE_WAKE_POST_TEXT"), True),
-            acknowledge=_bool(env.get("VOICE_WAKE_ACKNOWLEDGE"), True),
-            cue=_bool(env.get("VOICE_WAKE_CUE"), True),
-        )
-
-
-@dataclass(frozen=True, slots=True)
 class Config:
     """Everything Paradise reads from the environment."""
 
@@ -856,12 +666,9 @@ class Config:
     # Dictionary lookups, cards and pronunciation.
     dictionary: DictionaryConfig = DictionaryConfig()
 
-    # The owner's ElevenLabs voice — used for pronunciation and every spoken
-    # voice-channel reply. Entirely optional.
+    # The owner's ElevenLabs voice — used to pronounce words in the dictionary.
+    # Entirely optional; nothing else speaks.
     elevenlabs: ElevenLabsConfig = ElevenLabsConfig()
-
-    # "Hey Paradise <question>" in voice-chat (typed answer + spoken answer).
-    wake: WakeConfig = WakeConfig()
 
     # Automatic voice-channel presence (silent by default).
     voice_presence: VoicePresenceConfig = VoicePresenceConfig()
@@ -877,9 +684,6 @@ class Config:
 
     # Automated mini-game destination; scheduler settings are persisted in SQLite.
     minigames: MiniGamesConfig = MiniGamesConfig()
-
-    # The wake word spoken out loud in a voice channel.
-    voice_wake: VoiceWakeConfig = VoiceWakeConfig()
 
     # Web image search for mention requests ("show me a picture of …").
     image_search: ImageSearchConfig = ImageSearchConfig()
@@ -920,8 +724,6 @@ class Config:
             personality=PersonalityConfig.from_env(env),
             dictionary=DictionaryConfig.from_env(env),
             elevenlabs=ElevenLabsConfig.from_env(env),
-            wake=WakeConfig.from_env(env),
-            voice_wake=VoiceWakeConfig.from_env(env),
             voice_presence=VoicePresenceConfig.from_env(env),
             autoupdate=AutoUpdateConfig.from_env(env),
             voice=VoiceConfig.from_env(env),

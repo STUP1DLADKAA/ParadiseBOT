@@ -36,7 +36,6 @@ EXTENSIONS = (
     "commands.system",
     "commands.assistant",
     "commands.edit",
-    "commands.wake",
 )
 
 
@@ -303,13 +302,6 @@ class ParadiseBot(commands.Bot):
                 await self._assistant_failure(message)
             return
 
-        # "Hey Paradise <question>" in a voice channel: typed + spoken answer.
-        try:
-            if await self._maybe_wake(message):
-                return
-        except Exception:
-            log.exception("Wake-word handling failed")
-
         try:
             if await self._maybe_dictionary(message):
                 return
@@ -385,15 +377,6 @@ class ParadiseBot(commands.Bot):
             except (discord.DiscordException, asyncio.TimeoutError):
                 log.debug("Could not post AFK notice", exc_info=True)
             return
-
-    # -- Wake word ("Hey Paradise …") ------------------------------------------
-
-    async def _maybe_wake(self, message: discord.Message) -> bool:
-        cog = self.get_cog("Wake")
-        handler = getattr(cog, "handle_message", None)
-        if handler is None:
-            return False
-        return bool(await handler(message))
 
     # -- Dictionary -----------------------------------------------------------
 
