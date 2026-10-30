@@ -18,6 +18,9 @@ HELP_BLURBS = {
     "ping": "am I alive (with the real latency)",
     "coinflip": "a very serious coin toss",
     "choose": "decisions, outsourced",
+    "roast": "get roasted (or roast a friend)",
+    "meme": "a random meme from the internet",
+    "gif": "a reaction gif",
     "remind": "nudge you later in this channel",
     "poll": "reaction poll",
     "afk": "temporary AFK status",
@@ -34,7 +37,7 @@ HELP_BLURBS = {
 }
 
 HELP_GROUPS = {
-    "🎲 fun": ("ping", "coinflip", "choose"),
+    "🎲 fun": ("ping", "coinflip", "choose", "roast", "meme", "gif"),
     "🧰 useful": ("remind", "poll", "afk", "translate", "settimezone", "recipe"),
     "🎙️ voice": ("vc", "clip", "edit"),
     "🎙 listening": ("voicewake",),
@@ -52,6 +55,7 @@ MENTION_CAPABILITIES = (
     ("define", "@Paradise define ephemeral"),
     ("images", "@Paradise show me pictures of a red panda"),
     ("maths", "@Paradise what is 15% of 920"),
+    ("roasts", "@Paradise roast me"),
 )
 
 
@@ -96,7 +100,7 @@ class System(commands.Cog):
             if group == "🤖 ai":
                 value += "\nmention me to talk naturally (needs an AI key set by the owner)."
             embed.add_field(name=group, value=value, inline=False)
-        embed.set_footer(text="quiet by design · it watches, occasionally comments")
+        embed.set_footer(text="it reads everything · it comments constantly")
         await interaction.response.send_message(embed=embed)
 
 

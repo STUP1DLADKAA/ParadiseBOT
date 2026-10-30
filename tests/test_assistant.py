@@ -177,6 +177,38 @@ def mention(text: str) -> FakeMessage:
 
 
 class TestAssistantDispatch(unittest.IsolatedAsyncioTestCase):
+    async def test_roast_me_roasts_the_asker(self):
+        assistant, _ = make_assistant()
+        message = mention("roast me")
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        text = message.replies[0]["content"]
+        self.assertIn("roasting myself", text)
+        self.assertIn("Tester", text)
+
+    async def test_roast_a_mentioned_member(self):
+        assistant, _ = make_assistant()
+        message = mention("roast <@555>")
+        message.guild = SimpleNamespace(
+            id=1,
+            me=SimpleNamespace(),
+            get_member=lambda member_id: SimpleNamespace(
+                id=member_id, display_name="Rohan", name="Rohan"
+            )
+            if member_id == 555
+            else None,
+        )
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        self.assertIn("Rohan", message.replies[0]["content"])
+
+    async def test_roast_a_named_target(self):
+        assistant, _ = make_assistant()
+        message = mention("roast the guy who lost")
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        self.assertIn("guy who lost", message.replies[0]["content"])
+
     async def test_unaddressed_messages_ignored(self):
         assistant, _ = make_assistant()
         handled = await assistant.handle_message(FakeMessage("25% of 800", addressed=False))

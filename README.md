@@ -44,7 +44,7 @@ cannot answer:
 | `Hey Paradise …` in voice chat | fastest-first Gemini cascade, then spoken aloud | optional |
 | `Hey Paradise …` **spoken** in the channel | **on-device** Whisper (faster-whisper, this CPU, no upload) → Gemini answer → your voice | optional |
 | `/summarize` | Gemini summary of pasted text | optional |
-| Passive personality | rare canned reactions/replies — **no model**, just local templates | never |
+| Personality & banter | canned reactions, replies, stickers, roasts, rendered memes and keyless internet memes — **no model** for any of it | never |
 
 **3. What is *not* AI.** Every image the bot produces — leaderboard cards,
 dictionary cards, weather cards, recipe cards — is drawn programmatically with
@@ -78,6 +78,7 @@ unavailable.
 | **Your own voice** | Optional ElevenLabs voice for every spoken word, with an OpenAI-compatible and a free web fallback. Hindi, English and Hinglish. |
 | **"Hey Paradise"** | Type the phrase in a voice channel's text chat, **or just say it out loud**: answered in the chat *and* spoken in the channel, in the same voice. Spoken requests are transcribed **on the bot's own CPU** (faster-whisper, no key, nothing uploaded) once the sentence has ended. [Details](docs/voice-wake.md). |
 | **A chime when it hears you** | The instant "hey paradise" is recognised, a two-note chime plays in the channel — before the model is asked anything, so a pause never looks like being ignored. |
+| **It actually talks back** | Reactions, one-liners, stickers, roasts, reaction GIFs and memes pulled from real Reddit communities — no API key needed. Say "roast me", type something cocky, or just be funny near it. [How it works](docs/humour.md). |
 | **Silent presence** | Follows the crowd into the busiest voice channel and says nothing when it arrives. |
 | **Mini-games** | A recoverable SQLite scheduler, four modular games, aggregate-only leaderboard. |
 | **Self-updating** | Pulls the latest revision from GitHub on start-up and while online — validated, backed up, crash-loop guarded, and it never touches `.env` or `data/`. |
@@ -218,13 +219,14 @@ ParadiseBOT/
 │   ├── perf.py                shared HTTP pools, render pool, start-up prewarm
 │   ├── autoupdate.py          validated, crash-loop-guarded self-update
 │   ├── startup.py             the single owner of command-tree writes
-│   └── cache.py · helpers.py · personality.py · presence.py · translate.py
+│   ├── personality.py · roasts.py · memes.py · meme_feed.py
+│   └── cache.py · helpers.py · presence.py · translate.py
 ├── assets/                    bundled fonts (OFL), README images
 ├── benchmarks/                offline voice-pipeline harness + recorded results
 ├── docs/                      setup guides and engineering write-ups
 │   └── engineering/           incident report and optimisation report
 ├── supabase/                  SQL migrations, local validator, schema docs
-├── tests/                     845 offline tests — no network, no credentials
+├── tests/                     1,050 offline tests — no network, no credentials
 ├── tools/                     review agent, asset generator
 │   └── repro/                 incident reproducers and the invariant fuzzer
 ├── .env.example · requirements.txt · pyproject.toml · LICENSE

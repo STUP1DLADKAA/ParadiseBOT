@@ -46,6 +46,7 @@ from __future__ import annotations
 import asyncio
 import io
 import logging
+import random
 import re
 import time
 
@@ -79,6 +80,19 @@ from functions.voice_wake.local_stt import (
 )
 
 log = logging.getLogger(__name__)
+
+#: Said out loud when only "hey paradise" was heard. Short, and spoken in the
+#: same voice as everything else, so it should sound like a person, not a menu.
+ACKNOWLEDGEMENTS: tuple[str, ...] = (
+    "haan? bolo.",
+    "haan haan, sun raha hoon.",
+    "bol, kya hua?",
+    "heh? kya keh rahe ho?",
+    "haan? poora bol.",
+    "sun raha hoon, bolo.",
+    "haan? main yahin hoon.",
+    "bata, kya chahiye?",
+)
 
 MAX_PLAY_SECONDS = 45.0
 MAX_QUEUE = 4
@@ -495,7 +509,7 @@ class Wake(commands.Cog):
         if channel is None:
             return
         try:
-            clip = await self.speech.synthesize("haan? bolo.")
+            clip = await self.speech.synthesize(random.choice(ACKNOWLEDGEMENTS))
         except Exception:  # noqa: BLE001 - an acknowledgement is optional
             log.debug("Could not synthesise the acknowledgement", exc_info=True)
             return

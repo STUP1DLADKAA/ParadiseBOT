@@ -31,6 +31,7 @@ import logging
 import re
 import time
 from datetime import datetime
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import discord
@@ -47,9 +48,10 @@ from functions.images import (
     NO_IMAGE_LINE, ImageSearchService, build_image_embeds,
 )
 from functions.intent import classify_request, should_classify
+from functions.roasts import build_roast, clean_name, sanitize_intensity
 from functions.router import (
     AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
-    HELP, IMAGE, PING, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
+    HELP, IMAGE, PING, ROAST, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
     Route, route_many,
 )
 from functions.search import SearchAnswerView, SearchResponse, build_answer_embed
@@ -79,6 +81,7 @@ ASK_HINT = (
     "• `@Paradise latest Minecraft news`\n"
     "• `@Paradise translate hello into Japanese`\n"
     "• `@Paradise flip a coin`  ·  `@Paradise choose pizza or burgers`\n"
+    "• `@Paradise roast me`  ·  `@Paradise meme`\n"
     "no commands to remember — just say it normally."
 )
 
@@ -210,6 +213,8 @@ class Assistant(commands.Cog):
             return True
         if kind == CHOOSE:
             return await self._choose(message, route)
+        if kind == ROAST:
+            return await self._roast(message, route)
         if kind == CALCULATE:
             return await self._calculate(message, route)
         if kind == DEFINE:
@@ -234,6 +239,45 @@ class Assistant(commands.Cog):
             # result; explicit search requests are handled by _search above.
             return await self._ai(message, text)
         return await self._ai(message, text)
+
+    async def _roast(self, message: discord.Message, route: Route) -> bool:
+        """``@Paradise roast <someone>`` — a jab, aimed at the right person."""
+        target = self._roast_target(message, route.payload or "")
+        engine = getattr(self.bot, "personality", None)
+        intensity = sanitize_intensity(getattr(engine, "roast_intensity", "spicy"))
+        line = build_roast(
+            target.name,
+            intensity=intensity,
+            recent=getattr(engine, "_recent_roasts", None),
+        )
+        if target.self_roast:
+            line = f"roasting myself, since you asked: {line}"
+        await self._quiet_reply(message, line)
+        return True
+
+    @staticmethod
+    def _roast_target(message: discord.Message, payload: str):
+        """Who the roast is for: a mentioned member, the asker, or a plain name."""
+        text = (payload or "").strip()
+        mention = re.search(r"<@!?(\d+)>", text)
+        if mention is not None and message.guild is not None:
+            member = message.guild.get_member(int(mention.group(1)))
+            if member is not None:
+                name = (
+                    getattr(member, "display_name", None)
+                    or getattr(member, "name", None)
+                    or "them"
+                )
+                return SimpleNamespace(name=clean_name(name, fallback="them"), self_roast=False)
+        lowered = text.lower()
+        if not text or lowered == "me" or lowered.startswith("me ") or lowered == "myself":
+            name = (
+                getattr(message.author, "display_name", None)
+                or getattr(message.author, "name", None)
+                or "you"
+            )
+            return SimpleNamespace(name=clean_name(name, fallback="you"), self_roast=True)
+        return SimpleNamespace(name=clean_name(text, fallback="them"), self_roast=False)
 
     # ------------------------------------------------------------------
     # Multi-tool requests ("weather in Delhi and time in Tokyo")

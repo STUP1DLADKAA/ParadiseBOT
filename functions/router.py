@@ -45,6 +45,7 @@ from functions.keywords import keyword_route
 from functions.normalize import normalize_request
 from functions.routes import (
     AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
+    ROAST,
     DETERMINISTIC_KINDS, HELP, HIGH_CONFIDENCE, IMAGE, MEDIUM_CONFIDENCE,
     PING, Route, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
 )
@@ -68,6 +69,15 @@ _PING = re.compile(
 )
 _COINFLIP = re.compile(
     r"^(?:(?:flip|toss)\s+(?:a\s+)?coin|coin ?flip|heads or tails)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_ROAST = re.compile(
+    r"^(?:roast|insult|destroy|humiliate|roast the hell out of)\s+"
+    r"(?P<target>.+?)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_ROAST_SELF = re.compile(
+    r"^(?:roast me|insult me|say something mean to me|do your worst)\s*[?!.]*$",
     re.IGNORECASE,
 )
 _CHOOSE = re.compile(
@@ -304,6 +314,15 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
         return Route(kind=PING, confidence=0.98)
     if _COINFLIP.match(cleaned):
         return Route(kind=COINFLIP, confidence=0.98)
+    if _ROAST_SELF.match(cleaned):
+        return Route(kind=ROAST, payload="me", confidence=0.97)
+    roast_match = _ROAST.match(cleaned)
+    if roast_match and len(roast_match.group("target")) <= 120:
+        return Route(
+            kind=ROAST,
+            payload=roast_match.group("target").strip(),
+            confidence=0.95,
+        )
     choose_match = _CHOOSE.match(cleaned)
     if choose_match:
         return Route(kind=CHOOSE, payload=choose_match.group("options").strip(), confidence=0.95)
@@ -534,6 +553,6 @@ def route_many(text: str) -> list[Route]:
 __all__ = [
     "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE", "DEFINE",
     "DETERMINISTIC_KINDS", "HELP", "HIGH_CONFIDENCE", "IMAGE", "MEDIUM_CONFIDENCE",
-    "PING", "Route", "SEARCH", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER",
+    "PING", "ROAST", "Route", "SEARCH", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER",
     "route_many", "route_query", "route_strict",
 ]
