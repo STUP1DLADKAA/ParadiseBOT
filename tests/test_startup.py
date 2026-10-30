@@ -79,8 +79,26 @@ class FakeTree:
         return list(self.guild_commands.get(guild.id, {}).values())
 
 
-def fake_bot(tree: FakeTree):
-    return SimpleNamespace(tree=tree)
+class FakeHTTP:
+    """Records the one REST call that clears the global command list."""
+
+    def __init__(self, *, fail: bool = False) -> None:
+        self.purges: list[tuple[int, list]] = []
+        self.fail = fail
+
+    async def bulk_upsert_global_commands(self, application_id, payload):
+        if self.fail:
+            raise discord.DiscordException("global purge boom")
+        self.purges.append((application_id, list(payload)))
+        return []
+
+
+def fake_bot(tree: FakeTree, *, http=None):
+    return SimpleNamespace(
+        tree=tree,
+        application_id=1234,
+        http=http if http is not None else FakeHTTP(),
+    )
 
 
 def run(coro):
@@ -94,6 +112,11 @@ class TestTargetGuild(unittest.TestCase):
     def test_retired_commands_listed(self):
         for name in ("search", "convert", "time", "define", "dictionary",
                      "recommend", "weather"):
+            self.assertIn(name, RETIRED_COMMANDS)
+
+    def test_the_music_commands_are_retired_too(self):
+        """A guild that still has /music from an older release must lose it."""
+        for name in ("music", "cmd", "p"):
             self.assertIn(name, RETIRED_COMMANDS)
 
 
@@ -168,12 +191,33 @@ class TestSynchronizer(unittest.TestCase):
         self.assertEqual(len(names), len(set(names)))
         self.assertEqual(tree.cleared, [TARGET_GUILD, TARGET_GUILD])
 
-    def test_global_sync_also_runs_when_enabled(self):
+    def test_a_global_copy_is_purged_so_nothing_is_listed_twice(self):
+        """The duplicate-entry bug: global + guild copies of every command."""
+        tree = FakeTree(["ping", "help"])
+        http = FakeHTTP()
+        report = run(CommandSynchronizer(fake_bot(tree, http=http)).run())
+
+        self.assertEqual(tree.sync_calls, [TARGET_GUILD], "no global sync, ever")
+        self.assertEqual(http.purges, [(1234, [])], "the global list must be emptied")
+        self.assertTrue(report.global_purged)
+        self.assertIn("global copy cleared", report.summary())
+
+    def test_a_guild_id_always_wins_over_sync_global(self):
         tree = FakeTree(["ping"])
-        sync = CommandSynchronizer(fake_bot(tree), sync_global=True)
-        report = run(sync.run())
-        self.assertEqual(tree.sync_calls, [TARGET_GUILD, None])
-        self.assertTrue(report.global_ok)
+        http = FakeHTTP()
+        sync = CommandSynchronizer(fake_bot(tree, http=http), sync_global=True)
+        run(sync.run())
+        self.assertFalse(sync.sync_global, "guild + global is the duplicate bug")
+        self.assertEqual(tree.sync_calls, [TARGET_GUILD])
+
+    def test_the_purge_can_be_switched_off(self):
+        tree = FakeTree(["ping"])
+        http = FakeHTTP()
+        report = run(
+            CommandSynchronizer(fake_bot(tree, http=http), purge_global=False).run()
+        )
+        self.assertEqual(http.purges, [])
+        self.assertFalse(report.global_purged)
 
     def test_guild_failure_is_logged_not_fatal(self):
         tree = FakeTree(["ping"], fail_guild=True)
@@ -188,17 +232,14 @@ class TestSynchronizer(unittest.TestCase):
         run(sync.run())
         self.assertEqual(tree.sync_calls, [TARGET_GUILD, TARGET_GUILD])
 
-    def test_global_failure_does_not_break_guild_sync(self):
-        tree = FakeTree(["ping"], fail_global=True)
-        # Global sync is opt-in (production publishes to the home guild only),
-        # so this test asks for it explicitly.
-        sync = CommandSynchronizer(fake_bot(tree), sync_global=True)
-
-        report = run(sync.run())
+    def test_a_failed_purge_does_not_break_the_guild_sync(self):
+        tree = FakeTree(["ping"])
+        http = FakeHTTP(fail=True)
+        report = run(CommandSynchronizer(fake_bot(tree, http=http)).run())
 
         self.assertTrue(report.ok)
-        self.assertFalse(report.global_ok)
-        self.assertTrue(any("global" in error for error in report.errors))
+        self.assertFalse(report.global_purged)
+        self.assertEqual(report.guild_commands, ("ping",))
 
     def test_report_summary_leaks_nothing_sensitive(self):
         tree = FakeTree(["ping"])

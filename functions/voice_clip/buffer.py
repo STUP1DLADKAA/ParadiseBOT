@@ -264,18 +264,6 @@ class RollingAudioBuffer:
                 stream.stream_epoch += 1
                 stream.last_ssrc = None
 
-    def purge_speaker(self, user_id: int) -> int:
-        """Immediately remove all buffered packets for ``user_id`` (e.g. opt-out)."""
-        with self._lock:
-            stream = self._speakers.pop(user_id, None)
-            if stream is None:
-                return 0
-            removed = len(stream.packets)
-            self._total_bytes = max(0, self._total_bytes - stream.byte_size)
-            self._total_packets = max(0, self._total_packets - removed)
-            stream.packets.clear()
-            return removed
-
     def evict_expired(self) -> int:
         """Explicitly run expiry sweep against the current monotonic clock."""
         now = self._clock()

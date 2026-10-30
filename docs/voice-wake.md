@@ -11,8 +11,9 @@ you │ 🎙  "hey paradise, what's the capital of Rajasthan?"
 bot │ 🗣  "Jaipur is the capital of Rajasthan."
 ```
 
-If a song is playing, see [music](music.md): the song ducks to 15 % for the
-length of the answer and comes back up.
+The instant the phrase is recognised, a two-note chime plays in the channel —
+before the answer is composed, so the pause while the model thinks never looks
+like being ignored (`VOICE_WAKE_CUE=false` turns it off).
 
 ## On-device by default
 
@@ -62,7 +63,7 @@ then never constructed, so a bug could not reach them.
 The weights are fetched by a background task at start-up (`VOICE_WAKE_STT_PRELOAD`,
 on by default), and loaded into memory on a background thread the first time
 somebody speaks, so start-up stays instant and the event loop is never blocked. Loading and
-inference both run on a dedicated one-thread executor: music, cards and
+inference both run on a dedicated one-thread executor: cards, commands and
 heartbeats keep running while Whisper works.
 
 ### Why not something smaller?
@@ -268,7 +269,7 @@ functions/voice_wake/local_stt.py  faster-whisper on a one-thread executor
 functions/voice_wake/phrases.py    wake phrase + question
         │
         ▼
-commands/wake.py                   music first, then Gemini, then speak (ElevenLabs)
+commands/wake.py                   chime, then Gemini, then speak (ElevenLabs)
 ```
 
 Every hop except the model itself is a pure function with tests:
@@ -282,6 +283,5 @@ Whisper weights too.
 The answer still needs a brain: Gemini (or an OpenAI-compatible endpoint) writes
 it, ElevenLabs speaks it. Only the *listening* became local.
 
-Lavalink is absent for the same reason as in [music](music.md#why-not-lavalink-v4):
-it owns the voice connection, and a voice connection it owns delivers no audio
-to this code.
+Nothing else owns the voice connection: Paradise connects with its own
+`ClipVoiceClient`, which is the only way this code can see RTP at all.

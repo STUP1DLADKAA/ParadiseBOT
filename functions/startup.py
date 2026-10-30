@@ -15,10 +15,12 @@ current tree to its home guild on every start:
           ↓
     bot ready
 
-Commands are registered ONLY in the home guild. Global sync is disabled
-by default to prevent duplicate commands (global + guild) and to ensure
-instant propagation. If you need commands in other servers, enable
-``sync_global=True`` — but be aware of the propagation delay.
+Commands are registered ONLY in the home guild — always. That is what makes
+them appear and disappear instantly, and it is the only way to guarantee a
+command is never listed twice: a global registration and a guild registration
+of the same command show up as two entries until Discord's global cache
+converges (up to an hour later). Whatever an older version published globally
+is purged on the next start, so an existing deployment heals itself.
 
 Properties this module guarantees:
 
@@ -43,8 +45,9 @@ import discord
 log = logging.getLogger(__name__)
 
 #: Fallback home server used by this repository's demo deployment. Configure
-#: your own with ``DISCORD_GUILD_ID``; leave it unset to publish commands
-#: globally (Discord can take up to an hour to propagate those).
+#: your own with ``DISCORD_GUILD_ID``. Commands are never registered globally:
+#: a global copy would be a duplicate next to the guild copy and can take an
+#: hour to disappear.
 PRIMARY_GUILD_ID = 1180538130009432126
 
 #: Public slash commands that were retired in favour of natural mentions.
@@ -59,6 +62,10 @@ RETIRED_COMMANDS = frozenset(
         "dictionary",
         "recommend",
         "weather",
+        # Deleted outright: music is gone and those commands go with it.
+        "music",
+        "cmd",
+        "p",
         # Older removals, kept here so a stale guild tree is cleaned up too.
         "example",
         "trending",
@@ -79,6 +86,7 @@ class SyncReport:
     global_commands: tuple[str, ...] = ()
     guild_ok: bool = False
     global_ok: bool = False
+    global_purged: bool = False
     skipped: bool = False
     errors: list[str] = field(default_factory=list)
 
@@ -90,21 +98,23 @@ class SyncReport:
         if self.skipped:
             return "command sync already completed this session"
         state = "ok" if self.guild_ok else "FAILED"
-        target = f"guild {self.guild_id}" if self.guild_id else "global commands"
+        purged = ", global copy cleared" if self.global_purged else ""
         return (
-            f"{target}: {state} "
+            f"guild {self.guild_id}: {state} "
             f"({len(self.guild_commands)} commands"
-            f"{', pruned ' + ', '.join(self.pruned) if self.pruned else ''})"
+            f"{', pruned ' + ', '.join(self.pruned) if self.pruned else ''}"
+            f"{purged})"
         )
 
 
 class CommandSynchronizer:
     """Owns every command-tree write that happens at startup.
 
-    Commands are published ONLY to the home guild (instant propagation,
-    no duplicates). Global sync is intentionally disabled — it causes
-    commands to appear twice during propagation and can take up to an
-    hour to converge.
+    Commands are published ONLY to the home guild (instant propagation, never
+    listed twice) and any global copy left behind by an older release is
+    removed. ``sync_global`` is kept as an explicit escape hatch for a bot with
+    no home server at all; it must never be combined with a guild id, because
+    that is exactly how the duplicate entries happened.
     """
 
     def __init__(
@@ -113,16 +123,16 @@ class CommandSynchronizer:
         *,
         guild_id: int = PRIMARY_GUILD_ID,
         retired: frozenset[str] = RETIRED_COMMANDS,
-        sync_global: bool | None = None,
+        sync_global: bool = False,
+        purge_global: bool = True,
     ) -> None:
         self.bot = bot
         self.guild_id = max(0, int(guild_id or 0))
-        # Without a home guild there is nothing to publish to, so fall back to
-        # global registration instead of silently syncing nowhere.
-        if sync_global is None:
-            sync_global = not self.guild_id
         self.retired = frozenset(retired)
-        self.sync_global = bool(sync_global)
+        # A guild copy and a global copy of the same command is a duplicate:
+        # one or the other, decided here and nowhere else.
+        self.sync_global = bool(sync_global) and not self.guild_id
+        self.purge_global = bool(purge_global) and bool(self.guild_id)
         self._done = False
         self._lock = asyncio.Lock()
         self.last_report: SyncReport | None = None
@@ -168,16 +178,15 @@ class CommandSynchronizer:
             report.pruned = self.prune()
             if self.guild_id:
                 await self._sync_guild(report)
-            elif not self.sync_global:
-                report.errors.append("no home guild configured")
-            else:
-                # Global-only deployment: a guild sync would do nothing.
+                if self.purge_global:
+                    await self._purge_global(report)
+            elif self.sync_global:
+                # No home server at all: global registration is the only
+                # option, and there is no guild copy to duplicate it.
                 report.guild_ok = True
-            # Global sync is disabled by default — commands live only in the
-            # home guild to avoid duplicates and propagation delays. If you
-            # explicitly need global registration, set sync_global=True.
-            if self.sync_global:
                 await self._sync_global(report)
+            else:
+                report.errors.append("no home guild configured")
             if report.guild_ok:
                 self._done = True
             self.last_report = report
@@ -221,6 +230,33 @@ class CommandSynchronizer:
         report.guild_commands = names
         report.guild_ok = True
         self._verify(report, names)
+
+    async def _purge_global(self, report: SyncReport) -> None:
+        """Delete the global command list, so nothing is listed twice.
+
+        Uses the REST endpoint directly instead of ``tree.sync()``: clearing the
+        in-memory tree would also empty ``/help`` (it lists the live tree) and
+        break any later ``copy_global_to``.
+        """
+        http = getattr(self.bot, "http", None)
+        application_id = getattr(self.bot, "application_id", None)
+        upsert = getattr(http, "bulk_upsert_global_commands", None)
+        if upsert is None or not application_id:
+            log.debug("Global command purge unavailable on this client")
+            return
+        try:
+            await asyncio.wait_for(
+                upsert(application_id, []), timeout=_SYNC_TIMEOUT
+            )
+        except (discord.DiscordException, asyncio.TimeoutError, OSError) as error:
+            # Cosmetic only: the guild tree is already authoritative.
+            log.info("Could not clear the global command list (%s)", type(error).__name__)
+            return
+        except Exception as error:  # noqa: BLE001 - never block startup
+            log.debug("Global command purge failed: %s", type(error).__name__)
+            return
+        report.global_purged = True
+        log.info("Cleared the global command list (commands live in guild %s)", self.guild_id)
 
     async def _sync_global(self, report: SyncReport) -> None:
         try:

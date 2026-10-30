@@ -497,7 +497,11 @@ class VoiceConfig:
 
 @dataclass(frozen=True, slots=True)
 class VoiceClipConfig:
-    """Bounded rolling voice-clip buffer and export resource limits (/clip)."""
+    """Bounded rolling voice-clip buffer and export resource limits (/clip).
+
+    This deployment is a private one: **every** speaker in the channel is
+    captured, with no opt-in, no opt-out and no notice posted in the channel.
+    """
 
     enabled: bool = True
     # Hard-capped at 180 seconds per product requirement.
@@ -517,22 +521,14 @@ class VoiceClipConfig:
     max_file_bytes: int = 9_961_472
     # Upper bound on temporary output bytes across in-flight exports.
     max_temp_disk_bytes: int = 64 * 1024 * 1024
-    # AAC-LC bitrate (kbps) at 48 kHz mono. 192 kbps is transparent for
-    # speech and still far below Discord's upload cap for a 3-minute clip.
-    bitrate_kbps: int = 192
+    # AAC-LC bitrate (kbps) at 48 kHz mono. 128 kbps is clear speech and about
+    # a third smaller than 192 — a 3-minute clip is ~3 MB instead of ~4.5 MB.
+    bitrate_kbps: int = 128
     # Mastering chain applied while encoding the mixed clip (empty = default).
     audio_filter: str = ""
-    # Consent policy: "notice" (transparent channel notice + instant opt-out)
-    # or "opt_in" (captures only speakers who explicitly click Allow Recording).
-    consent_mode: str = "notice"
-    # Post a recording & consent notice in the voice channel text chat.
-    # Off by default: Paradise joins voice channels silently.
-    notice_enabled: bool = False
 
     @classmethod
     def from_env(cls, env) -> "VoiceClipConfig":
-        raw_mode = str(env.get("VOICE_CLIP_CONSENT_MODE", "notice") or "notice").strip().lower()
-        consent_mode = raw_mode if raw_mode in {"notice", "opt_in"} else "notice"
         buffer_mb = max(2, min(256, _int(env.get("VOICE_CLIP_MAX_BUFFER_MB"), 48)))
         temp_mb = max(4, min(512, _int(env.get("VOICE_CLIP_MAX_TEMP_MB"), 64)))
         return cls(
@@ -559,11 +555,9 @@ class VoiceClipConfig:
             ),
             max_temp_disk_bytes=temp_mb * 1024 * 1024,
             bitrate_kbps=max(
-                64, min(320, _int(env.get("VOICE_CLIP_BITRATE_KBPS"), 192))
+                64, min(320, _int(env.get("VOICE_CLIP_BITRATE_KBPS"), 128))
             ),
             audio_filter=str(env.get("VOICE_CLIP_AUDIO_FILTER", "") or "").strip(),
-            consent_mode=consent_mode,
-            notice_enabled=_bool(env.get("VOICE_CLIP_NOTICE_ENABLED"), False),
         )
 
 
@@ -675,10 +669,11 @@ class VoiceWakeConfig:
     local_stt.py``). The cloud providers still exist for machines that cannot
     run Whisper, and ``VOICE_WAKE_STT=local`` forbids them outright.
 
-    Because a local transcription is never uploaded, nothing leaves the bot;
-    the channel is still told once that Paradise is listening and the existing
-    per-user voice-capture opt-out is still honoured. Turn it off with
-    ``VOICE_WAKE_ENABLED=false`` and everything else keeps working.
+    Because a local transcription is never uploaded, nothing leaves the bot.
+    Capture is unconditional — every human in the channel is heard, with no
+    opt-out to guard — and ``VOICE_WAKE_ANNOUNCE`` controls the one-time notice.
+    Turn it off with ``VOICE_WAKE_ENABLED=false`` and everything else keeps
+    working.
     """
 
     enabled: bool = True
@@ -728,6 +723,9 @@ class VoiceWakeConfig:
     post_text: bool = True
     #: Say "haan?" when only the wake word was heard.
     acknowledge: bool = True
+    #: Play a short chime the instant the phrase is recognised, so nobody has
+    #: to wonder whether they were heard while the answer is being built.
+    cue: bool = True
 
     @property
     def listening(self) -> bool:
@@ -778,85 +776,7 @@ class VoiceWakeConfig:
             announce=_bool(env.get("VOICE_WAKE_ANNOUNCE"), True),
             post_text=_bool(env.get("VOICE_WAKE_POST_TEXT"), True),
             acknowledge=_bool(env.get("VOICE_WAKE_ACKNOWLEDGE"), True),
-        )
-
-
-@dataclass(frozen=True, slots=True)
-class MusicConfig:
-    """In-process music with spoken answers mixed over it (commands/music.py).
-
-    Paradise is its own music bot: yt-dlp searches, FFmpeg decodes, and a
-    numpy mixer ducks the song to ``duck_volume`` whenever the ElevenLabs
-    voice says something. See ``functions/music/__init__.py`` for why Lavalink
-    is not used (it owns the voice connection, so there would be no audio left
-    to duck and nothing to mix the answer into).
-    """
-
-    enabled: bool = True
-    # Playback level for music alone (0.0–2.0). The spoken voice is always 1.0.
-    volume: float = 0.5
-    # What the song drops to while Paradise talks. 0.15 = 15 %.
-    duck_volume: float = 0.15
-    # Length of the fade down/up, in milliseconds (a hard step clicks).
-    fade_ms: int = 240
-    # How many songs may wait in the queue.
-    max_queue: int = 50
-    # How many search hits to enqueue for a text query (1 = play the top hit).
-    search_results: int = 1
-    # Source used for text queries: ytsearch (YouTube) or scsearch (SoundCloud).
-    search_source: str = "ytsearch"
-    # Refuse tracks longer than this many seconds (0 = no limit).
-    max_track_seconds: int = 0
-    # Seconds to wait for a search/resolve before giving up.
-    search_timeout: float = 25.0
-    # Netscape cookies.txt for yt-dlp, when YouTube demands sign-in.
-    cookies_file: str = ""
-    # Optional HTTP(S) proxy for yt-dlp only. Never logged.
-    proxy: str = ""
-    # Leave the channel after this many idle seconds (0 = stay put).
-    idle_disconnect: float = 300.0
-    # "!" in front of play/skip/stop also works as a plain text command.
-    prefix: str = "!"
-    text_commands: bool = True
-    # Post the control panel automatically when a song starts.
-    auto_panel: bool = False
-
-    @property
-    def duck_label(self) -> str:
-        return f"{round(self.duck_volume * 100)}%"
-
-    @classmethod
-    def from_env(cls, env) -> "MusicConfig":
-        source = str(env.get("MUSIC_SEARCH_SOURCE", "ytsearch") or "").strip().lower()
-        if source not in {"ytsearch", "scsearch"}:
-            source = "ytsearch"
-        prefix = str(env.get("MUSIC_PREFIX", "!") or "").strip() or "!"
-        return cls(
-            enabled=_bool(env.get("MUSIC_ENABLED"), True),
-            volume=max(0.0, min(2.0, _float(env.get("MUSIC_VOLUME"), 0.5))),
-            duck_volume=max(
-                0.0, min(1.0, _float(env.get("MUSIC_DUCK_VOLUME"), 0.15))
-            ),
-            fade_ms=max(0, min(2000, _int(env.get("MUSIC_FADE_MS"), 240))),
-            max_queue=max(1, min(500, _int(env.get("MUSIC_MAX_QUEUE"), 50))),
-            search_results=max(
-                1, min(10, _int(env.get("MUSIC_SEARCH_RESULTS"), 1))
-            ),
-            search_source=source,
-            max_track_seconds=max(
-                0, _int(env.get("MUSIC_MAX_TRACK_SECONDS"), 0)
-            ),
-            search_timeout=max(
-                5.0, min(120.0, _float(env.get("MUSIC_SEARCH_TIMEOUT"), 25.0))
-            ),
-            cookies_file=str(env.get("MUSIC_COOKIES_FILE", "") or "").strip(),
-            proxy=str(env.get("MUSIC_PROXY", "") or "").strip(),
-            idle_disconnect=max(
-                0.0, min(86400.0, _float(env.get("MUSIC_IDLE_DISCONNECT"), 300.0))
-            ),
-            prefix=prefix[:3],
-            text_commands=_bool(env.get("MUSIC_TEXT_COMMANDS"), True),
-            auto_panel=_bool(env.get("MUSIC_AUTO_PANEL"), False),
+            cue=_bool(env.get("VOICE_WAKE_CUE"), True),
         )
 
 
@@ -902,9 +822,6 @@ class Config:
     # Automated mini-game destination; scheduler settings are persisted in SQLite.
     minigames: MiniGamesConfig = MiniGamesConfig()
 
-    # Music: yt-dlp search, FFmpeg decode, ducking mixer (commands/music.py).
-    music: MusicConfig = MusicConfig()
-
     # The wake word spoken out loud in a voice channel.
     voice_wake: VoiceWakeConfig = VoiceWakeConfig()
 
@@ -918,9 +835,9 @@ class Config:
     # command is as fast as the thousandth. Costs one short burst of CPU.
     prewarm: bool = True
 
-    # Home guild for instant slash-command publishing. 0 means "no home guild"
-    # — commands are then registered globally, which Discord can take up to an
-    # hour to propagate. Set ``DISCORD_GUILD_ID`` for instant registration.
+    # Home guild for slash commands. They are *only* ever registered here:
+    # Discord publishes guild commands instantly, and a global copy would be a
+    # duplicate entry until its cache expired. Set ``DISCORD_GUILD_ID``.
     guild_id: int = 0
 
     # Operator-only features (/edit, /clip, the deafened-VC exemption). These
@@ -948,7 +865,6 @@ class Config:
             dictionary=DictionaryConfig.from_env(env),
             elevenlabs=ElevenLabsConfig.from_env(env),
             wake=WakeConfig.from_env(env),
-            music=MusicConfig.from_env(env),
             voice_wake=VoiceWakeConfig.from_env(env),
             voice_presence=VoicePresenceConfig.from_env(env),
             autoupdate=AutoUpdateConfig.from_env(env),

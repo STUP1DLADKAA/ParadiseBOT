@@ -1,4 +1,9 @@
-"""Authorized /clip slash command and voice recording lifecycle cog."""
+"""`/clip` — save the last N seconds of the voice channel and DM it to you.
+
+Capture is silent and unconditional: no notice is posted, nobody is asked for
+permission, and everyone in the channel is included. This is a private
+deployment; the only gate is on who may *request* a clip.
+"""
 
 from __future__ import annotations
 
@@ -12,20 +17,15 @@ from discord.ext import commands, tasks
 from config import VoiceClipConfig
 from functions.voice_clip import (
     ClipError,
-    ClipVoiceClient,
     MAX_CLIP_DURATION,
     MIN_CLIP_DURATION,
-    RecordingConsentView,
     UNAUTHORIZED_CLIP_MESSAGE,
     VoiceClipService,
     authorize_clip_user,
-    build_recording_notice_text,
     validate_clip_duration,
 )
 
 log = logging.getLogger(__name__)
-
-NOTICE_SETTLE_SECONDS: float = 0.6
 
 
 async def _send_ephemeral(interaction: discord.Interaction, content: str) -> None:
@@ -50,7 +50,6 @@ class VoiceClip(commands.Cog):
         cfg = raw_cfg if isinstance(raw_cfg, VoiceClipConfig) else VoiceClipConfig()
         self.service = VoiceClipService(bot, cfg)
         self.bot.voice_clip_service = self.service  # type: ignore[attr-defined]
-        self._announced_notice_channel: dict[int, int] = {}
         self._tasks: set[asyncio.Task[None]] = set()
         # One "Discord won't send audio while deafened" explanation per guild.
         self._deafen_notice_sent: set[int] = set()
@@ -103,7 +102,6 @@ class VoiceClip(commands.Cog):
         # 1. Paradise itself joined, moved, deafened, or left a voice channel.
         if self.bot.user is not None and member.id == self.bot.user.id:
             if after.channel is None:
-                self._announced_notice_channel.pop(guild.id, None)
                 self.service.detach_guild(guild.id)
                 return
 
@@ -126,13 +124,6 @@ class VoiceClip(commands.Cog):
                 buf = self.service.get_buffer(guild.id)
                 if buf is not None and buf.channel_id != after_id:
                     buf.start_session(after.channel.id)
-                if self.service.enabled and self.service.config.notice_enabled:
-                    task = asyncio.create_task(
-                        self._post_recording_notice(guild, after.channel),
-                        name=f"paradise-clip-notice-{guild.id}",
-                    )
-                    self._tasks.add(task)
-                    task.add_done_callback(self._tasks.discard)
             return
 
         # 2. A human speaker left or moved out of the currently recorded channel.
@@ -181,45 +172,6 @@ class VoiceClip(commands.Cog):
             "cannot override it). Un-deafen it under Server Settings → Members.",
             guild.id,
         )
-
-    async def _post_recording_notice(
-        self,
-        guild: discord.Guild,
-        channel: discord.VoiceChannel | discord.StageChannel,
-    ) -> None:
-        try:
-            await asyncio.sleep(NOTICE_SETTLE_SECONDS)
-            vc = getattr(guild, "voice_client", None)
-            if (
-                vc is None
-                or not isinstance(vc, ClipVoiceClient)
-                or not vc.is_connected()
-                or getattr(vc.channel, "id", None) != channel.id
-            ):
-                return
-            if self._announced_notice_channel.get(guild.id) == channel.id:
-                return
-            self._announced_notice_channel[guild.id] = channel.id
-
-            notice = build_recording_notice_text(
-                max_seconds=self.service.config.max_buffer_seconds,
-                consent_mode=self.service.config.consent_mode,
-            )
-            view = RecordingConsentView(self.service.consent, guild.id)
-            await channel.send(
-                notice,
-                view=view,
-                delete_after=3600,
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-        except asyncio.CancelledError:
-            raise
-        except discord.DiscordException:
-            log.debug(
-                "Could not post recording transparency notice in channel %s",
-                getattr(channel, "id", None),
-                exc_info=True,
-            )
 
     # ------------------------------------------------------------------
     # /clip duration:<seconds>

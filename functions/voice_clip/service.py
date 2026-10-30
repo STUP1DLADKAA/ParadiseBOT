@@ -15,7 +15,6 @@ import discord
 from config import VoiceClipConfig
 
 from .buffer import ClipIntervalSnapshot, RollingAudioBuffer
-from .consent import ConsentManager
 from .constants import (
     AUTHORIZED_CLIP_USER_ID,
     ClipAuthorizationError,
@@ -83,7 +82,12 @@ def format_clip_dm_text(
 
 
 class VoiceClipService:
-    """Coordinates per-guild rolling voice buffers, consent, export and DM delivery."""
+    """Coordinates per-guild rolling voice buffers, export and DM delivery.
+
+    Capture is unconditional by design: this is a private deployment, so every
+    human speaker in the channel is buffered. There is no opt-in, no opt-out
+    and no notice posted in the channel.
+    """
 
     def __init__(
         self,
@@ -102,10 +106,6 @@ class VoiceClipService:
         #: Shared list, read on the UDP thread, guarded by ``_lock`` on write.
         self._taps: list = []
 
-        self.consent = ConsentManager(
-            mode=self.config.consent_mode,
-            on_revoke=self.purge_user_audio,
-        )
         self.exporter = ClipExportPipeline(
             max_concurrent_exports=self.config.max_concurrent_exports,
             max_queued_exports=self.config.max_queued_exports,
@@ -219,7 +219,6 @@ class VoiceClipService:
             router = VoiceReceiveRouter(
                 guild_id=gid,
                 buffer=buf,
-                consent=self.consent,
                 is_bot_user=_is_bot,
                 dave_state_getter=_dave_state,
                 clock=self._clock,
@@ -250,12 +249,25 @@ class VoiceClipService:
         elif buf is not None:
             buf.mark_speaker_discontinuity(int(user_id))
 
-    def purge_user_audio(self, guild_id: int, user_id: int) -> int:
-        """Purge all buffered audio for ``user_id`` (invoked on opt-out)."""
-        buf = self.get_buffer(guild_id)
-        if buf is None:
-            return 0
-        return buf.purge_speaker(int(user_id))
+    def receiver_stats(self, guild_id: int) -> dict[str, int]:
+        """Packets the receiver has seen for ``guild_id`` (never audio).
+
+        ``received`` counts every UDP frame that decrypted; ``heard`` counts the
+        ones that were handed to listeners. Zero ``received`` with the bot in a
+        channel means Discord is not sending anything at all — muted, deafened
+        or not actually connected — which is worth being able to see from
+        ``/voicewake status`` instead of guessing.
+        """
+        with self._lock:
+            router = self._routers.get(int(guild_id))
+        if router is None:
+            return {"received": 0, "buffered": 0, "transport_errors": 0, "dave_errors": 0}
+        return {
+            "received": int(router.packets_received),
+            "buffered": int(router.packets_buffered),
+            "transport_errors": int(router.transport_errors),
+            "dave_errors": int(router.dave_errors),
+        }
 
     def evict_all_expired(self) -> int:
         with self._lock:
@@ -474,5 +486,4 @@ class VoiceClipService:
             router.reset()
         for buf in buffers:
             buf.clear()
-        self.consent.clear_all()
         await self.exporter.shutdown()

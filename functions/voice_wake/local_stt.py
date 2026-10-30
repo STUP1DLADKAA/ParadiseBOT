@@ -31,8 +31,8 @@ the network even if the model is missing, and ``VOICE_WAKE_STT_PRELOAD=false``
 to keep start-up silent and only download on first use.
 
 Nothing here blocks the event loop: loading and inference both run on a
-dedicated one-thread executor, so Whisper never delays music, cards or gateway
-heartbeats. The model is dropped again after ``VOICE_WAKE_STT_UNLOAD_AFTER``
+dedicated one-thread executor, so Whisper never delays cards, commands or
+gateway heartbeats. The model is dropped again after ``VOICE_WAKE_STT_UNLOAD_AFTER``
 seconds of silence (15 minutes by default), so an idle bot keeps its RAM.
 """
 
