@@ -9,8 +9,9 @@ This package makes the same thing work when you simply **say it out loud**:
     bot │ 🗣 "Jaipur is the capital of Rajasthan."
 
 Nothing is uploaded until something that sounds like speech has *ended*, and
-each utterance is transcribed exactly once. A user who opted out of voice
-capture never reaches this code at all — the receiver drops them first.
+each utterance is transcribed exactly once. Every human speaker in the channel
+is heard: the receiver hands packets to the listener before the clip buffer has
+any say, so recording and listening cannot break each other.
 
 Pieces:
 
@@ -19,8 +20,10 @@ Pieces:
 ``stt``        WAV → text (local whisper, then ElevenLabs Scribe, then Gemini)
 ``local_stt``  the on-device engine: faster-whisper on this CPU, no network
 ``listener``   the tap, the rate limits and the callback into the bot
+``cue``        the short chime that says "I heard you" before the answer
 """
 
+from .cue import build_cue_pcm
 from .listener import ListenerStats, SpokenRequest, SpokenWakeListener
 from .local_stt import (
     INSTALL_HINT,
@@ -52,6 +55,7 @@ __all__ = [
     "SpokenRequest",
     "SpokenWakeListener",
     "WakeMatch",
+    "build_cue_pcm",
     "find_wake",
     "frame_rms",
     "normalise",

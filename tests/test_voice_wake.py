@@ -557,7 +557,6 @@ class TestReceiverTap(unittest.TestCase):
 
     def test_tap_receives_the_buffered_packet(self):
         from functions.voice_clip.buffer import RollingAudioBuffer
-        from functions.voice_clip.consent import ConsentManager
         from functions.voice_clip.receiver import VoiceReceiveRouter
 
         buffer = RollingAudioBuffer(guild_id=1)
@@ -566,7 +565,6 @@ class TestReceiverTap(unittest.TestCase):
         router = VoiceReceiveRouter(
             guild_id=1,
             buffer=buffer,
-            consent=ConsentManager(mode="notice"),
             taps=[lambda user_id, packet: seen.append((user_id, packet))],
         )
         secret = bytes(range(32))
@@ -584,7 +582,6 @@ class TestReceiverTap(unittest.TestCase):
 
     def test_a_breaking_observer_does_not_break_audio(self):
         from functions.voice_clip.buffer import RollingAudioBuffer
-        from functions.voice_clip.consent import ConsentManager
         from functions.voice_clip.receiver import VoiceReceiveRouter
 
         buffer = RollingAudioBuffer(guild_id=1)
@@ -597,7 +594,6 @@ class TestReceiverTap(unittest.TestCase):
         router = VoiceReceiveRouter(
             guild_id=1,
             buffer=buffer,
-            consent=ConsentManager(mode="notice"),
             taps=[explode, lambda user_id, packet: called.append(user_id)],
         )
         secret = bytes(range(32))
@@ -608,28 +604,32 @@ class TestReceiverTap(unittest.TestCase):
         self.assertEqual(called, [1001])
         self.assertEqual(router.packets_buffered, 1)
 
-    def test_a_muted_opt_out_user_never_reaches_the_tap(self):
+    def test_every_speaker_reaches_the_tap_even_when_the_buffer_says_no(self):
+        """Listening must not depend on recording.
+
+        The tap used to fire only for packets the clip buffer *accepted*, so a
+        full buffer, a just-cleared guild or a refused speaker made the wake
+        word deaf while /clip kept working. The observer is now called before
+        the buffer is asked anything.
+        """
         from functions.voice_clip.buffer import RollingAudioBuffer
-        from functions.voice_clip.consent import ConsentManager
         from functions.voice_clip.receiver import VoiceReceiveRouter
 
         buffer = RollingAudioBuffer(guild_id=1)
-        buffer.start_session(channel_id=2)
-        consent = ConsentManager(mode="notice")
-        consent.revoke_user(1, 1001)
+        # Recording is NOT active: append_packet() will refuse every packet.
         seen = []
         router = VoiceReceiveRouter(
             guild_id=1,
             buffer=buffer,
-            consent=consent,
             taps=[lambda user_id, packet: seen.append(user_id)],
         )
         secret = bytes(range(32))
         router.configure_transport("aead_xchacha20_poly1305_rtpsize", secret, own_ssrc=555)
         router.register_ssrc(user_id=1001, ssrc=111)
         router.handle_udp_packet(self._datagram(secret, 111, 1, b"\xf8\xff\xfe"))
-        self.assertEqual(seen, [])
 
+        self.assertEqual(seen, [1001])
+        self.assertEqual(router.packets_buffered, 0, "the buffer still refused it")
 
 # ---------------------------------------------------------------------------
 # Config plumbing
@@ -710,10 +710,6 @@ class CogTest(unittest.IsolatedAsyncioTestCase):
             answer_quick=AsyncMock(return_value="Jaipur is the capital."),
             gemini=gemini,
         )
-        self.music_answers: list[str] = []
-        music = SimpleNamespace(
-            handle_spoken_request=self._music_answer,
-        )
         import discord
 
         self.channel = MagicMock(spec=discord.VoiceChannel)
@@ -733,7 +729,8 @@ class CogTest(unittest.IsolatedAsyncioTestCase):
             guilds=[],
             config=config,
             voice_clip_service=self.service,
-            get_cog=lambda name: music if name == "Music" else None,
+            # There is no music cog any more: every question is a question.
+            get_cog=lambda name: None,
             get_guild=lambda gid: self.guild if gid == 5 else None,
         )
         self.cog = Wake(self.bot)
@@ -745,10 +742,6 @@ class CogTest(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.cog.cog_unload()
-
-    async def _music_answer(self, *, guild, member, channel, text):
-        self.music_answers.append(text)
-        return "playing **Billie Jean**." if text.startswith("play") else None
 
     async def _post_text(self, channel, text):
         self.posted.append(text)
@@ -776,7 +769,8 @@ class CogTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.posted, ["Jaipur is the capital."])
         self.assertEqual(self.spoken, ["Jaipur is the capital."])
 
-    async def test_a_spoken_music_request_never_reaches_gemini(self):
+    async def test_a_play_request_is_now_just_a_question(self):
+        """Music is gone: "play billie jean" goes to the model like anything else."""
         from functions.voice_wake import SpokenRequest, WakeMatch
 
         await self.cog._on_spoken_request(
@@ -788,9 +782,74 @@ class CogTest(unittest.IsolatedAsyncioTestCase):
                 match=WakeMatch(True, "play billie jean"),
             )
         )
-        self.assertEqual(self.music_answers, ["play billie jean"])
-        self.ai.answer_quick.assert_not_awaited()
-        self.assertEqual(self.spoken, ["playing **Billie Jean**."])
+        self.ai.answer_quick.assert_awaited_once()
+        self.assertEqual(self.spoken, ["Jaipur is the capital."])
+
+    async def test_the_chime_plays_the_moment_the_phrase_lands(self):
+        played = []
+
+        class Voice:
+            channel = self.channel
+
+            def is_connected(self):
+                return True
+
+            def is_playing(self):
+                return False
+
+            def play(self, source, after=None):
+                played.append(source)
+
+        self.guild.voice_client = Voice()
+        await self.cog._on_spoken_request(
+            __import__("functions.voice_wake", fromlist=["SpokenRequest"]).SpokenRequest(
+                guild_id=5,
+                user_id=7,
+                question="hi",
+                transcript="hey paradise hi",
+                match=__import__("functions.voice_wake", fromlist=["WakeMatch"]).WakeMatch(
+                    True, "hi"
+                ),
+            )
+        )
+        self.assertEqual(len(played), 1)
+        # …and the answer still went out afterwards.
+        self.assertEqual(self.posted, ["Jaipur is the capital."])
+
+    async def test_the_chime_can_be_switched_off(self):
+        played = []
+
+        class Voice:
+            def is_connected(self):
+                return True
+
+            def is_playing(self):
+                return False
+
+            def play(self, source, after=None):
+                played.append(source)
+
+        self.guild.voice_client = Voice()
+        self.cog.voice_wake = VoiceWakeConfig(cue=False)
+        await self.cog._play_heard_cue(5)
+        self.assertEqual(played, [])
+
+    async def test_the_chime_never_interrupts_something_already_playing(self):
+        played = []
+
+        class Voice:
+            def is_connected(self):
+                return True
+
+            def is_playing(self):
+                return True
+
+            def play(self, source, after=None):
+                played.append(source)
+
+        self.guild.voice_client = Voice()
+        await self.cog._play_heard_cue(5)
+        self.assertEqual(played, [])
 
     async def test_paused_guilds_drop_packets_before_the_listener(self):
         self.cog._paused_guilds.add(5)
@@ -1358,6 +1417,118 @@ class TestModelFiles(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("on disk", result.stdout)
+
+
+class TestHeardCue(unittest.TestCase):
+    """The chime that says "I heard you" — generated, not shipped."""
+
+    def pcm(self, **kwargs):
+        from functions.voice_wake.cue import build_cue_pcm
+
+        return build_cue_pcm(**kwargs)
+
+    def test_it_is_the_format_pcmaudio_wants(self):
+        import numpy as np
+
+        raw = self.pcm()
+        samples = np.frombuffer(raw, dtype="<i2")
+        # 48 kHz stereo, 16-bit: two samples per frame, ~0.42 s long.
+        self.assertEqual(samples.size % 2, 0)
+        frames = samples.size // 2
+        self.assertAlmostEqual(frames / 48000.0, 0.42, delta=0.05)
+
+    def test_both_channels_are_identical(self):
+        import numpy as np
+
+        samples = np.frombuffer(self.pcm(), dtype="<i2")
+        left, right = samples[0::2], samples[1::2]
+        self.assertTrue(bool(np.array_equal(left, right)))
+
+    def test_it_is_audible_but_never_harsh(self):
+        import numpy as np
+
+        samples = np.frombuffer(self.pcm(), dtype="<i2").astype(np.float32) / 32768.0
+        peak = float(np.max(np.abs(samples)))
+        self.assertGreater(peak, 0.10, "nobody would hear that")
+        self.assertLess(peak, 0.35, "that is a notification, not a chime")
+
+    def test_it_starts_and_ends_at_zero(self):
+        """A tone that begins mid-cycle clicks. The fade prevents that."""
+        import numpy as np
+
+        samples = np.frombuffer(self.pcm(), dtype="<i2").astype(np.float32) / 32768.0
+        left = samples[0::2]
+        self.assertLess(abs(float(left[0])), 1e-4)
+        self.assertLess(abs(float(left[-1])), 1e-3)
+
+    def test_two_notes_a_fifth_apart(self):
+        import numpy as np
+
+        from functions.voice_wake.cue import NOTE_HIGH, NOTE_LOW
+
+        samples = np.frombuffer(self.pcm(), dtype="<i2").astype(np.float32) / 32768.0
+        left = samples[0::2]
+        split = int(left.size * 0.6)
+        for window, expected in ((left[: split - 200], NOTE_LOW), (left[split:], NOTE_HIGH)):
+            spectrum = np.abs(np.fft.rfft(window * np.hanning(window.size)))
+            peak_hz = float(np.argmax(spectrum)) * 48000.0 / window.size
+            self.assertAlmostEqual(peak_hz, expected, delta=25.0)
+
+
+class TestTapSurvivesTheReceiver(unittest.TestCase):
+    """The wake word must not go deaf when the service object is replaced."""
+
+    def test_rebinding_moves_the_tap_to_the_new_service(self):
+        from commands.wake import Wake
+
+        class Service:
+            def __init__(self):
+                self.taps = []
+
+            def add_tap(self, tap):
+                self.taps.append(tap)
+
+            def remove_tap(self, tap):
+                if tap in self.taps:
+                    self.taps.remove(tap)
+
+        bot = SimpleNamespace(
+            user=SimpleNamespace(id=1),
+            ai=SimpleNamespace(gemini=SimpleNamespace(available=False)),
+            guilds=[],
+            config=Config(wake=WakeConfig(speak=False), voice_wake=VoiceWakeConfig()),
+            voice_clip_service=Service(),
+            get_cog=lambda name: None,
+            get_guild=lambda gid: None,
+        )
+        cog = Wake(bot)
+        first = bot.voice_clip_service
+        self.assertTrue(cog._bind_tap(first))
+        self.assertEqual(len(first.taps), 1)
+
+        # A reload swaps the service object: the old list is thrown away.
+        second = Service()
+        self.assertTrue(cog._bind_tap(second))
+        self.assertEqual(first.taps, [], "the old receiver kept the tap")
+        self.assertEqual(len(second.taps), 1)
+
+        # Binding the same object twice must not duplicate the tap.
+        cog._bind_tap(second)
+        self.assertEqual(len(second.taps), 1)
+
+    def test_a_missing_receiver_is_not_fatal(self):
+        from commands.wake import Wake
+
+        bot = SimpleNamespace(
+            user=SimpleNamespace(id=1),
+            ai=SimpleNamespace(gemini=SimpleNamespace(available=False)),
+            guilds=[],
+            config=Config(wake=WakeConfig(speak=False), voice_wake=VoiceWakeConfig()),
+            get_cog=lambda name: None,
+            get_guild=lambda gid: None,
+        )
+        cog = Wake(bot)
+        self.assertFalse(cog._bind_tap(None))
 
 
 class TestPrepareAtStartup(unittest.IsolatedAsyncioTestCase):

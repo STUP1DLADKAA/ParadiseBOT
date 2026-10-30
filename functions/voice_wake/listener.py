@@ -133,6 +133,17 @@ class SpokenWakeListener:
     def available(self) -> bool:
         return self.stt.available
 
+    @property
+    def alive(self) -> bool:
+        """Is the drain task still running?
+
+        It is not allowed to die — ``_run`` catches everything — but a task can
+        still be cancelled by a reload or an unlucky shutdown, and a listener
+        that is silently gone looks exactly like a bot that cannot hear.
+        """
+        return self._task is not None and not self._task.done()
+
+
     def describe(self) -> str:
         return f"{self.stt.describe()} · threshold {self.config.energy_threshold:.3f}"
 

@@ -16,10 +16,17 @@ from .opus_codec import SpeakerOpusDecoder
 MAX_CONCEALED_LOSS_FRAMES: int = 5
 # Talkspurt break threshold when RTP vs monotonic arrival diverges (> 200 ms)
 # or when sequence/RTP jumps exceed 0.5 s.
-TALKSPURT_DRIFT_SECONDS: float = 0.20
+# A pause longer than this in the arrival clock means the speaker actually
+# stopped talking (rather than the network being 20 ms late), so the timeline
+# re-anchors on the clock instead of running on.
+TALKSPURT_PAUSE_SECONDS: float = 0.60
 MAX_CONTIGUOUS_FRAME_GAP: int = 25
 # Anti-clipping ceiling (-0.72 dBFS) and smooth envelope parameters.
 LIMITER_CEILING: float = 0.92
+# Speech is levelled to this RMS with one *static* gain. A dynamic normaliser
+# (loudnorm in single-pass mode) rides the gain up and down between sentences,
+# which is audible as a wobble on a short clip — the "jitter" people hear.
+TARGET_RMS_DBFS: float = -20.0
 LIMITER_BLOCK_SAMPLES: int = 480  # 10 ms @ 48 kHz
 SILENCE_PEAK_THRESHOLD: float = 1e-4
 
@@ -104,6 +111,101 @@ def _add_frame(mix: np.ndarray, offset: int, frame: np.ndarray) -> int:
     return offset + frame.size
 
 
+def _frame_step_samples(ordered: list[BufferedAudioPacket], index: int) -> int:
+    """How many samples one packet of this stream covers.
+
+    Discord normally sends 20 ms frames, but some clients send 60 ms ones. The
+    sender's own RTP timestamps say which: look at the next packet of the same
+    stream when it is the next sequence number, then at the previous one, and
+    fall back to :data:`FRAME_SAMPLES` when neither is usable.
+    """
+    packet = ordered[index]
+    candidates: list[int] = []
+    if index + 1 < len(ordered):
+        nxt = ordered[index + 1]
+        if nxt.stream_epoch == packet.stream_epoch and nxt.ssrc == packet.ssrc:
+            delta = ((nxt.sequence - packet.sequence + 32768) % 65536) - 32768
+            if delta == 1:
+                candidates.append((nxt.rtp_timestamp - packet.rtp_timestamp) & 0xFFFFFFFF)
+    if index > 0:
+        prev = ordered[index - 1]
+        if prev.stream_epoch == packet.stream_epoch and prev.ssrc == packet.ssrc:
+            delta = ((packet.sequence - prev.sequence + 32768) % 65536) - 32768
+            if delta == 1:
+                candidates.append((packet.rtp_timestamp - prev.rtp_timestamp) & 0xFFFFFFFF)
+    for candidate in candidates:
+        # 2.5 ms … 120 ms: anything else is a clock jump, not a frame size.
+        if 120 <= candidate <= 5760:
+            return candidate
+    return FRAME_SAMPLES
+
+
+def plan_speaker_timeline(
+    packets: tuple[BufferedAudioPacket, ...],
+    window_start_mono: float,
+) -> list[tuple[int, int, BufferedAudioPacket]]:
+    """Lay one speaker's packets out on a continuous sample timeline.
+
+    Returns ``(start_sample, missing_frames, packet)`` per packet, where
+    ``missing_frames`` packets were lost between it and the previous one and
+    must be concealed.
+
+    The rule that removes the stutter: inside a talkspurt every frame is placed
+    exactly where the previous one ended. Placing each frame at its *arrival*
+    time instead — which is what this used to do — lets a 5 ms network wobble,
+    or a burst of three packets arriving together, overlap one frame with the
+    next and cut a hole before the one after it. That is audible as a flutter,
+    even though not a single packet was lost. RTP gives us the real answer:
+    consecutive sequence numbers are consecutive frames of a known length.
+
+    A genuine pause (a sequence reset, a long gap, or more than
+    :data:`TALKSPURT_PAUSE_SECONDS` between arrivals) re-anchors on the clock,
+    but never backwards.
+    """
+    ordered = _order_and_deduplicate(packets)
+    plan: list[tuple[int, int, BufferedAudioPacket]] = []
+    cursor: int | None = None
+    previous: BufferedAudioPacket | None = None
+
+    for index, packet in enumerate(ordered):
+        step = _frame_step_samples(ordered, index)
+        arrival_sample = max(
+            0, int(round((packet.mono_time - window_start_mono) * SAMPLE_RATE))
+        )
+        new_stream = (
+            previous is None
+            or packet.stream_epoch != previous.stream_epoch
+            or packet.ssrc != previous.ssrc
+        )
+        if new_stream:
+            start = arrival_sample
+            missing = 0
+            cursor = start
+        else:
+            assert previous is not None and cursor is not None
+            seq_delta = ((packet.sequence - previous.sequence + 32768) % 65536) - 32768
+            rtp_delta = (packet.rtp_timestamp - previous.rtp_timestamp) & 0xFFFFFFFF
+            pause = packet.mono_time - previous.mono_time
+            if (
+                seq_delta <= 0
+                or seq_delta > MAX_CONTIGUOUS_FRAME_GAP
+                or pause > TALKSPURT_PAUSE_SECONDS
+            ):
+                start = max(cursor, arrival_sample)
+                missing = 0
+                cursor = start
+            else:
+                # Frames the sender emitted but the network ate.
+                missing = max(0, min(seq_delta - 1, int(rtp_delta // step) - 1))
+                missing = min(missing, MAX_CONCEALED_LOSS_FRAMES)
+                start = cursor
+        plan.append((start, missing, packet))
+        cursor = start + (missing + 1) * step
+        previous = packet
+
+    return plan
+
+
 def _render_speaker_into_mix(
     mix: np.ndarray,
     speaker: SpeakerIntervalPackets,
@@ -126,98 +228,76 @@ def _render_speaker_into_mix(
         last_warmup_epoch = wpkt.stream_epoch
         last_warmup_ssrc = wpkt.ssrc
 
-    packets = _order_and_deduplicate(speaker.packets)
-    if not packets:
+    if not speaker.packets:
         return 0, decoder.decode_errors
 
-    in_talkspurt = False
-    anchor_sample = 0
-    anchor_rtp = 0
-    prev_seq = 0
-    prev_rtp = 0
-    prev_epoch = -1
-    prev_ssrc = -1
-    last_end_sample = 0
+    previous_epoch: int | None = None
+    previous_ssrc: int | None = None
+    written_until: int | None = None
+    for start_sample, missing, packet in plan_speaker_timeline(
+        speaker.packets, window_start_mono
+    ):
+        # A new stream (they reconnected, Discord moved their SSRC) needs a
+        # fresh codec: reusing the old one decodes the first frame as garbage.
+        if (
+            previous_epoch is not None
+            and (packet.stream_epoch != previous_epoch or packet.ssrc != previous_ssrc)
+        ):
+            decoder.reset()
+        previous_epoch = packet.stream_epoch
+        previous_ssrc = packet.ssrc
 
-    for pkt in packets:
-        mono_offset_sec = pkt.mono_time - window_start_mono
-        mono_sample = int(round(mono_offset_sec * SAMPLE_RATE))
+        # Never write over audio that is already there. The planned position is
+        # nominal (it assumes the sender's frame size), while a decoded frame
+        # is the ground truth; when they disagree the frame that exists wins.
+        cursor = start_sample if written_until is None else max(written_until, start_sample)
+        if missing and not packet.is_silence:
+            for lost in range(missing):
+                # The frame right before a received packet can be rebuilt from
+                # its in-band FEC; the rest are extrapolated.
+                frame = (
+                    decoder.decode_fec(packet.opus_data)
+                    if lost == missing - 1
+                    else decoder.decode_plc()
+                )
+                cursor = _add_frame(mix, cursor, frame)
+                concealed += 1
 
-        start_new_spurt = not in_talkspurt
-        seq_delta = 0
-        rtp_delta = 0
-
-        if in_talkspurt:
-            if pkt.stream_epoch != prev_epoch or pkt.ssrc != prev_ssrc:
-                decoder.reset()
-                start_new_spurt = True
-            else:
-                seq_delta = ((pkt.sequence - prev_seq + 32768) % 65536) - 32768
-                rtp_delta = (pkt.rtp_timestamp - prev_rtp) & 0xFFFFFFFF
-                if (
-                    seq_delta <= 0
-                    or seq_delta > MAX_CONTIGUOUS_FRAME_GAP
-                    or rtp_delta == 0
-                    or rtp_delta > MAX_CONTIGUOUS_FRAME_GAP * FRAME_SAMPLES
-                ):
-                    start_new_spurt = True
-                else:
-                    projected_sample = anchor_sample + (
-                        (pkt.rtp_timestamp - anchor_rtp) & 0xFFFFFFFF
-                    )
-                    projected_sec = projected_sample / SAMPLE_RATE
-                    if abs(projected_sec - mono_offset_sec) > TALKSPURT_DRIFT_SECONDS:
-                        start_new_spurt = True
-
-        if start_new_spurt:
-            target_sample = max(0, mono_sample)
-            # Prevent slight arrival jitter from overlapping the speaker's own tail.
-            if in_talkspurt and pkt.stream_epoch == prev_epoch and target_sample < last_end_sample:
-                if last_end_sample - target_sample <= FRAME_SAMPLES * 2:
-                    target_sample = last_end_sample
-            anchor_sample = target_sample
-            anchor_rtp = pkt.rtp_timestamp
-            in_talkspurt = True
-        else:
-            target_sample = anchor_sample + (
-                (pkt.rtp_timestamp - anchor_rtp) & 0xFFFFFFFF
-            )
-            # Conceal short packet drops inside an active talkspurt without shifting
-            # subsequent packets on the timeline.
-            expected_frames_between = max(
-                0,
-                min(seq_delta - 1, int(round(rtp_delta / FRAME_SAMPLES)) - 1),
-            )
-            if expected_frames_between > 0 and not pkt.is_silence:
-                to_conceal = min(expected_frames_between, MAX_CONCEALED_LOSS_FRAMES)
-                conceal_cursor = last_end_sample
-                for loss_idx in range(to_conceal):
-                    is_last_before_pkt = (
-                        loss_idx == to_conceal - 1
-                        and to_conceal == expected_frames_between
-                    )
-                    plc_frame = (
-                        decoder.decode_fec(pkt.opus_data)
-                        if is_last_before_pkt
-                        else decoder.decode_plc()
-                    )
-                    if conceal_cursor + plc_frame.size <= target_sample + FRAME_SAMPLES // 2:
-                        conceal_cursor = _add_frame(mix, conceal_cursor, plc_frame)
-                        concealed += 1
-
-        decoded = decoder.decode_packet(pkt.opus_data)
+        decoded = decoder.decode_packet(packet.opus_data)
         if decoded is None:
-            # Malformed Opus packet: substitute PLC/silence of 20ms so timing never shifts.
+            # Malformed Opus: substitute PLC of the same length so timing never
+            # shifts and the next packet still lands on the grid.
             decoded = decoder.decode_plc()
             concealed += 1
-
-        last_end_sample = _add_frame(mix, target_sample, decoded)
-        prev_seq = pkt.sequence
-        prev_rtp = pkt.rtp_timestamp
-        prev_epoch = pkt.stream_epoch
-        prev_ssrc = pkt.ssrc
+        written_until = _add_frame(mix, cursor, decoded)
 
     return concealed, decoder.decode_errors
+
+
+def apply_static_gain(
+    samples: np.ndarray,
+    *,
+    target_rms_dbfs: float = TARGET_RMS_DBFS,
+    peak_ceiling: float = LIMITER_CEILING,
+) -> float:
+    """Level the whole clip with one constant gain; return the gain applied.
+
+    Constant, not adaptive: every part of the clip is scaled by the same
+    factor, so a pause stays as quiet relative to speech as it really was and
+    the level never breathes. The gain is capped so the loudest sample lands
+    under ``peak_ceiling`` — no pre-limiter clipping, no pumping.
+    """
+    if samples.size == 0:
+        return 1.0
+    rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float32))))
+    peak = float(np.max(np.abs(samples)))
+    if rms <= 1e-7 or peak <= 1e-7:
+        return 1.0
+    gain = float(10.0 ** (target_rms_dbfs / 20.0) / rms)
+    if gain * peak > peak_ceiling:
+        gain = peak_ceiling / peak
+    samples *= np.float32(gain)
+    return gain
 
 
 def apply_smooth_peak_limiter(
@@ -306,6 +386,7 @@ def mix_snapshot_to_pcm_f32(snapshot: ClipIntervalSnapshot) -> MixResult:
         total_concealed += concealed
         total_decode_errors += dec_err
 
+    apply_static_gain(mix)
     peak_before, peak_after = apply_smooth_peak_limiter(mix)
     if peak_after < SILENCE_PEAK_THRESHOLD:
         raise NoUsableAudioError(
@@ -322,3 +403,13 @@ def mix_snapshot_to_pcm_f32(snapshot: ClipIntervalSnapshot) -> MixResult:
         concealed_frames=total_concealed,
         decode_errors=total_decode_errors,
     )
+
+
+__all__ = [
+    "MAX_CONCEALED_LOSS_FRAMES",
+    "MixResult",
+    "apply_smooth_peak_limiter",
+    "apply_static_gain",
+    "mix_snapshot_to_pcm_f32",
+    "plan_speaker_timeline",
+]

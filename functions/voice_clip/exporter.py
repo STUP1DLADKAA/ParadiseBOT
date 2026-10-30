@@ -25,14 +25,14 @@ from .mixer import MixResult, mix_snapshot_to_pcm_f32
 
 log = logging.getLogger(__name__)
 
-# Mastering chain for the mixed clip. Voice packets arrive already compressed
-# at 48 kHz; this only removes sub-bass rumble, evens out quiet and loud
-# speakers (loudnorm, -16 LUFS — the usual podcast/speech target) and limits
-# peaks so nothing clips when Discord transcodes again on playback.
+# Mastering chain for the mixed clip. The *level* is set in numpy, with one
+# constant gain per clip (:func:`functions.voice_clip.mixer.apply_static_gain`)
+# — a single-pass ``loudnorm`` instead rides the gain up and down between
+# sentences, which is audible as a wobble on a short clip. FFmpeg only removes
+# sub-bass rumble and the top octave, and catches any last transient.
 DEFAULT_AUDIO_FILTER = (
     "highpass=f=75,"
     "lowpass=f=16000,"
-    "loudnorm=I=-16:TP=-1.5:LRA=11,"
     "alimiter=limit=0.95:attack=5:release=50:level=disabled"
 )
 
@@ -97,7 +97,7 @@ class ClipExportPipeline:
         export_timeout_seconds: float = 30.0,
         max_file_bytes: int = 9_961_472,
         max_temp_disk_bytes: int = 32 * 1024 * 1024,
-        bitrate_kbps: int = 192,
+        bitrate_kbps: int = 128,
         audio_filter: str = "",
         ffmpeg_executable: str | None = None,
     ) -> None:

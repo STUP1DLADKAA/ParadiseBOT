@@ -21,7 +21,6 @@ import nacl.secret
 from nacl.exceptions import CryptoError
 
 from .buffer import BufferedAudioPacket, RollingAudioBuffer
-from .consent import ConsentManager
 from .constants import MAX_OPUS_PACKET_BYTES, OPUS_SILENCE
 
 log = logging.getLogger(__name__)
@@ -190,7 +189,6 @@ class VoiceReceiveRouter:
         *,
         guild_id: int,
         buffer: RollingAudioBuffer,
-        consent: ConsentManager,
         is_bot_user: Callable[[int], bool] | None = None,
         dave_state_getter: Callable[[], tuple[davey.DaveSession | None, int]] | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -198,7 +196,6 @@ class VoiceReceiveRouter:
     ) -> None:
         self.guild_id = int(guild_id)
         self.buffer = buffer
-        self.consent = consent
         # Optional observers (the spoken wake word). They are called with the
         # *accepted* packet on the UDP reader thread, so they must be cheap and
         # must never raise — see ``_notify_taps``.
@@ -267,7 +264,7 @@ class VoiceReceiveRouter:
 
         if not staged_frames:
             return
-        if self._is_bot_user(uid) or not self.consent.can_record(self.guild_id, uid):
+        if self._is_bot_user(uid):
             return
 
         for frame in staged_frames:
@@ -336,12 +333,16 @@ class VoiceReceiveRouter:
 
         if self._is_bot_user(user_id):
             return
-        if not self.consent.can_record(self.guild_id, user_id):
-            return
 
         opus_bytes = self._unwrap_dave(user_id, parsed.payload)
         if opus_bytes is None:
             return
+
+        # Observers (the spoken wake word) get the packet *first*, before the
+        # clip buffer has any say. The buffer can refuse a packet — it is full,
+        # it was just cleared, a speaker was evicted — and when it did, the wake
+        # word used to go deaf with it. Listening must not depend on recording.
+        self._notify_taps(user_id, opus_bytes, parsed, arrival_mono)
 
         if self.buffer.append_packet(
             user_id=user_id,
@@ -352,7 +353,6 @@ class VoiceReceiveRouter:
             mono_time=arrival_mono,
         ):
             self.packets_buffered += 1
-            self._notify_taps(user_id, opus_bytes, parsed, arrival_mono)
 
     def _notify_taps(self, user_id: int, opus_bytes: bytes, parsed, arrival_mono: float) -> None:
         """Hand the accepted packet to every observer, never failing the reader."""

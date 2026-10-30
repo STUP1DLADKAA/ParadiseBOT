@@ -39,12 +39,11 @@ from functions.voice_clip import (  # noqa: E402
     ClipUnavailableError,
     ClipValidationError,
     ClipVoiceClient,
-    ConsentManager,
     MAX_CLIP_DURATION,
     MIN_CLIP_DURATION,
     NoUsableAudioError,
     OPUS_SILENCE,
-    RecordingConsentView,
+    BufferedAudioPacket,
     RollingAudioBuffer,
     SAMPLE_RATE,
     TransportDecryptor,
@@ -53,6 +52,7 @@ from functions.voice_clip import (  # noqa: E402
     authorize_clip_user,
     ensure_opus_loaded,
     mix_snapshot_to_pcm_f32,
+    plan_speaker_timeline,
     validate_clip_duration,
 )
 
@@ -67,20 +67,25 @@ def _encode_opus_tone(
     duration_sec: float,
     *,
     amplitude: float = 0.35,
+    frame_samples: int = 960,
 ) -> list[bytes]:
-    """Encode a clean 48 kHz sine signal into real 20 ms Discord Opus packets."""
+    """Encode a clean 48 kHz sine signal into real Discord Opus packets.
+
+    ``frame_samples`` is 960 for the usual 20 ms frame, 2880 for the 60 ms
+    frames some clients send.
+    """
     assert ensure_opus_loaded(), "libopus must be loadable for Opus fixture encoding"
     encoder = discord.opus.Encoder()
-    n_frames = max(1, int(round(duration_sec / 0.02)))
+    n_frames = max(1, int(round(duration_sec * SAMPLE_RATE / frame_samples)))
     packets: list[bytes] = []
     sample_cursor = 0
     for _ in range(n_frames):
-        idx = np.arange(sample_cursor, sample_cursor + 960, dtype=np.float64)
+        idx = np.arange(sample_cursor, sample_cursor + frame_samples, dtype=np.float64)
         mono = (amplitude * 32767.0) * np.sin(2.0 * math.pi * freq_hz * idx / SAMPLE_RATE)
         s16 = np.clip(mono, -32768, 32767).astype(np.int16)
         stereo = np.column_stack((s16, s16)).reshape(-1)
-        packets.append(encoder.encode(stereo.tobytes(), 960))
-        sample_cursor += 960
+        packets.append(encoder.encode(stereo.tobytes(), frame_samples))
+        sample_cursor += frame_samples
     return packets
 
 
@@ -526,25 +531,29 @@ class TestAudioQualityAndMixing(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(rate, SAMPLE_RATE)
             self.assertAlmostEqual(samples.size / SAMPLE_RATE, 3.0, delta=0.10)
 
+            # Levels are normalised per clip (one static gain), so the checks
+            # below are relative to the clip's own RMS, not to raw amplitude.
+            clip_rms = float(np.sqrt(np.mean(np.square(samples))))
+
             # Segment 1 (0.35s .. 1.05s): ONLY 440 Hz should be strong
             seg_a_only = samples[int(0.35 * SAMPLE_RATE) : int(1.05 * SAMPLE_RATE)]
             p440_seg1 = _dominant_power_at_freq(seg_a_only, 440.0)
             p880_seg1 = _dominant_power_at_freq(seg_a_only, 880.0)
-            self.assertGreater(p440_seg1, 0.04)
+            self.assertGreater(p440_seg1, clip_rms * 0.04)
             self.assertLess(p880_seg1, p440_seg1 * 0.05)
 
             # Segment 2 (1.35s .. 2.05s): BOTH 440 Hz and 880 Hz overlap simultaneously
             seg_overlap = samples[int(1.35 * SAMPLE_RATE) : int(2.05 * SAMPLE_RATE)]
             p440_both = _dominant_power_at_freq(seg_overlap, 440.0)
             p880_both = _dominant_power_at_freq(seg_overlap, 880.0)
-            self.assertGreater(p440_both, 0.04)
-            self.assertGreater(p880_both, 0.04)
+            self.assertGreater(p440_both, clip_rms * 0.04)
+            self.assertGreater(p880_both, clip_rms * 0.04)
 
             # Segment 3 (2.35s .. 2.75s): ONLY 880 Hz remains after Speaker A stops
             seg_b_only = samples[int(2.35 * SAMPLE_RATE) : int(2.75 * SAMPLE_RATE)]
             p440_seg3 = _dominant_power_at_freq(seg_b_only, 440.0)
             p880_seg3 = _dominant_power_at_freq(seg_b_only, 880.0)
-            self.assertGreater(p880_seg3, 0.04)
+            self.assertGreater(p880_seg3, clip_rms * 0.04)
             self.assertLess(p440_seg3, p880_seg3 * 0.05)
         finally:
             await pipeline.shutdown()
@@ -626,11 +635,19 @@ class TestAudioQualityAndMixing(unittest.IsolatedAsyncioTestCase):
         clock.now = t0 + 2.0
 
         mix = mix_snapshot_to_pcm_f32(buf.snapshot(2))
-        self.assertGreater(mix.peak_before_limiter, 1.4)
+        # Four 0.70-amplitude speakers sum far past full scale; one static gain
+        # brings the whole clip down so the loudest sample is under the ceiling.
         self.assertLessEqual(mix.peak_after_limiter, 0.925)
-        # Quiet tail after limiter recovery retains its natural level (~0.15 peak)
-        quiet_tail_peak = float(np.max(np.abs(mix.samples[int(1.55 * SAMPLE_RATE) : int(1.95 * SAMPLE_RATE)])))
-        self.assertGreater(quiet_tail_peak, 0.10)
+        loud = float(np.max(np.abs(mix.samples[: int(0.9 * SAMPLE_RATE)])))
+        self.assertGreater(loud, 0.20, "the four-speaker part should be loud")
+        # The quiet tail keeps its *relative* level (one speaker vs four).
+        quiet_tail_peak = float(
+            np.max(np.abs(mix.samples[int(1.55 * SAMPLE_RATE) : int(1.95 * SAMPLE_RATE)]))
+        )
+        # One static gain for the whole clip: the one-speaker tail stays much
+        # quieter than the four-speaker overlap instead of being pumped up.
+        self.assertGreater(quiet_tail_peak, loud * 0.05)
+        self.assertLess(quiet_tail_peak, loud * 0.70)
 
     def test_packet_loss_and_malformed_opus_packets_do_not_corrupt_remainder(self) -> None:
         clock = _FakeClock(initial=5000.0)
@@ -658,44 +675,274 @@ class TestAudioQualityAndMixing(unittest.IsolatedAsyncioTestCase):
         mix = mix_snapshot_to_pcm_f32(buf.snapshot(2))
         self.assertAlmostEqual(mix.duration_seconds, 2.0, places=2)
         self.assertGreater(mix.concealed_frames, 5)
-        # Second half of the clip (after all drops & malformed frame) still cleanly has 600 Hz!
+        # Second half of the clip (after all drops & malformed frame) still
+        # cleanly has 600 Hz, at the normalised level.
         tail = mix.samples[int(1.0 * SAMPLE_RATE) :]
-        self.assertGreater(_dominant_power_at_freq(tail, 600.0), 0.05)
+        tail_rms = float(np.sqrt(np.mean(np.square(tail))))
+        self.assertGreater(_dominant_power_at_freq(tail, 600.0), tail_rms * 0.05)
 
 
 # ===========================================================================
-# 4. Lifecycle, Privacy, Consent, Concurrency & Failure Recovery
+# 3b. Timeline placement — the "jitter" fix
+# ===========================================================================
+
+
+def _packet(
+    *,
+    mono_time: float,
+    sequence: int,
+    rtp: int,
+    ssrc: int = 10,
+    epoch: int = 0,
+    payload: bytes = b"\xf8\xff\xfe",
+) -> BufferedAudioPacket:
+    return BufferedAudioPacket(
+        mono_time=mono_time,
+        rtp_timestamp=rtp,
+        sequence=sequence,
+        ssrc=ssrc,
+        stream_epoch=epoch,
+        opus_data=payload,
+        is_silence=payload == OPUS_SILENCE,
+    )
+
+
+class TestTimelinePlacement(unittest.TestCase):
+    """Frames must land where the sender put them, not where they arrived.
+
+    The old mixer re-anchored every voice burst on the *arrival* clock, so a
+    network wobble of a few milliseconds overlapped one frame with the next and
+    left a hole before the one after it. Nothing was lost, and it sounded like
+    a flutter anyway.
+    """
+
+    FRAME = 960
+
+    def plan(self, packets, start=0.0):
+        return plan_speaker_timeline(tuple(packets), start)
+
+    def test_jittery_arrivals_still_produce_a_contiguous_timeline(self):
+        packets = []
+        rng = np.random.default_rng(7)
+        for index in range(60):  # 1.2 s of speech
+            wobble = float(rng.uniform(-0.03, 0.03))  # ±30 ms of network wobble
+            packets.append(
+                _packet(
+                    mono_time=index * 0.02 + wobble,
+                    sequence=index,
+                    rtp=index * self.FRAME,
+                )
+            )
+
+        plan = self.plan(packets)
+        starts = [row[0] for row in plan]
+
+        # Every frame is exactly one frame after the previous one: no overlap,
+        # no hole, no matter what the network did.
+        for previous, current in zip(starts, starts[1:]):
+            self.assertEqual(current - previous, self.FRAME)
+        self.assertEqual(sum(row[1] for row in plan), 0)
+
+    def test_a_lost_frame_is_concealed_without_shifting_the_rest(self):
+        packets = [
+            _packet(mono_time=0.00, sequence=1, rtp=0),
+            _packet(mono_time=0.02, sequence=2, rtp=960),
+            # sequence 3 vanished on the wire
+            _packet(mono_time=0.06, sequence=4, rtp=3840),
+            _packet(mono_time=0.08, sequence=5, rtp=4800),
+        ]
+
+        plan = self.plan(packets)
+        self.assertEqual([row[0] for row in plan], [0, 960, 1920, 3840])
+        self.assertEqual([row[1] for row in plan], [0, 0, 1, 0])
+        # 1920 is where the missing frame is concealed; the next real frame
+        # follows it exactly, so the sentence never gains a gap.
+        self.assertEqual(plan[3][0] - (plan[2][0] + self.FRAME), self.FRAME)
+
+    def test_a_real_pause_is_honoured_and_never_rewinds(self):
+        packets = [
+            _packet(mono_time=0.00, sequence=1, rtp=0),
+            _packet(mono_time=0.02, sequence=2, rtp=960),
+            # they stopped talking for a second and started again
+            _packet(mono_time=1.20, sequence=3, rtp=1920),
+        ]
+
+        plan = self.plan(packets)
+        self.assertEqual(plan[0][0], 0)
+        self.assertEqual(plan[2][0], int(1.20 * SAMPLE_RATE))
+        self.assertGreater(plan[2][0], plan[1][0], "the second burst moved backwards")
+
+    def test_a_reconnect_starts_a_new_stream_on_its_own_clock(self):
+        packets = [
+            _packet(mono_time=0.00, sequence=50, rtp=0, ssrc=10, epoch=0),
+            _packet(mono_time=0.02, sequence=51, rtp=960, ssrc=10, epoch=0),
+            _packet(mono_time=0.50, sequence=0, rtp=0, ssrc=11, epoch=1),
+        ]
+
+        plan = self.plan(packets)
+        self.assertEqual(plan[2][0], int(0.50 * SAMPLE_RATE))
+        self.assertEqual(plan[2][1], 0)
+
+    def test_duplicate_packets_are_dropped(self):
+        packets = [
+            _packet(mono_time=0.00, sequence=7, rtp=0),
+            _packet(mono_time=0.02, sequence=8, rtp=960),
+            _packet(mono_time=0.03, sequence=8, rtp=960),  # retransmit
+        ]
+        plan = self.plan(packets)
+        self.assertEqual(len(plan), 2)
+
+    def test_the_rendered_audio_has_no_overlap_doubling(self):
+        """A steady tone must stay a steady tone, not flutter louder and quieter."""
+        clock = _FakeClock(initial=7000.0)
+        buf = RollingAudioBuffer(guild_id=1, clock=clock)
+        buf.start_session(channel_id=90)
+        t0 = clock.now
+        packets = _encode_opus_tone(440.0, 1.0, amplitude=0.3)
+        rng = np.random.default_rng(11)
+        for index, pkt in enumerate(packets):
+            buf.append_packet(
+                user_id=1,
+                opus_data=pkt,
+                rtp_timestamp=index * 960,
+                sequence=index,
+                ssrc=10,
+                mono_time=t0 + index * 0.02 + float(rng.uniform(-0.02, 0.02)),
+            )
+        clock.now = t0 + 1.05
+        mix = mix_snapshot_to_pcm_f32(buf.snapshot(1))
+
+        # Per-20ms RMS across the middle half of the clip: the short-term level
+        # of a steady tone must not jump around.
+        body = mix.samples[int(0.2 * SAMPLE_RATE) : int(0.75 * SAMPLE_RATE)]
+        frames = body[: (body.size // 960) * 960].reshape(-1, 960)
+        levels = np.sqrt(np.mean(frames**2, axis=1))
+        spread = float(levels.max() / max(1e-6, float(np.median(levels))))
+        self.assertLess(spread, 1.35, "the tone flutters — frames are overlapping")
+
+
+class TestVariableFrameSize(unittest.TestCase):
+    """Some clients send 60 ms frames. A 20 ms assumption tears those apart."""
+
+    def test_a_sixty_millisecond_stream_is_laid_out_at_sixty_milliseconds(self):
+        packets = tuple(
+            _packet(mono_time=index * 0.06, sequence=index, rtp=index * 2880)
+            for index in range(10)
+        )
+        plan = plan_speaker_timeline(packets, 0.0)
+        starts = [row[0] for row in plan]
+        for previous, current in zip(starts, starts[1:]):
+            self.assertEqual(current - previous, 2880)
+        self.assertEqual(sum(row[1] for row in plan), 0)
+
+    def test_sixty_millisecond_frames_render_without_a_hole_or_an_overlap(self):
+        clock = _FakeClock(initial=8000.0)
+        buf = RollingAudioBuffer(guild_id=1, clock=clock)
+        buf.start_session(channel_id=70)
+        t0 = clock.now
+        packets = _encode_opus_tone(440.0, 1.2, amplitude=0.3, frame_samples=2880)
+        for index, pkt in enumerate(packets):
+            buf.append_packet(
+                user_id=1,
+                opus_data=pkt,
+                rtp_timestamp=index * 2880,
+                sequence=index,
+                ssrc=10,
+                mono_time=t0 + index * 0.06,
+            )
+        clock.now = t0 + 1.2
+        mix = mix_snapshot_to_pcm_f32(buf.snapshot(2))
+
+        body = mix.samples[int(0.12 * SAMPLE_RATE) : int(1.08 * SAMPLE_RATE)]
+        frames = body[: (body.size // 960) * 960].reshape(-1, 960)
+        levels = np.sqrt(np.mean(frames**2, axis=1))
+        spread = float(levels.max() / max(1e-6, float(np.median(levels))))
+        self.assertLess(spread, 1.35, "60 ms frames overlapped — that is the flutter")
+        self.assertAlmostEqual(mix.duration_seconds, 1.2, delta=0.05)
+        # The stream reaches its own end: no trailing hole where the last frame
+        # should have been.
+        tail = mix.samples[int(1.0 * SAMPLE_RATE) : int(1.15 * SAMPLE_RATE)]
+        self.assertGreater(float(np.sqrt(np.mean(np.square(tail)))), 0.01)
+
+
+class TestStaticLevelling(unittest.TestCase):
+    """One gain per clip — the difference between levelling and pumping."""
+
+    def test_a_quiet_clip_is_brought_up_to_the_same_level(self):
+        from functions.voice_clip.mixer import TARGET_RMS_DBFS, apply_static_gain
+
+        quiet = (np.sin(np.linspace(0, 2 * np.pi * 220, SAMPLE_RATE)) * 0.02).astype(np.float32)
+        gain = apply_static_gain(quiet)
+        self.assertGreater(gain, 1.0)
+        rms = float(np.sqrt(np.mean(np.square(quiet))))
+        self.assertAlmostEqual(20 * math.log10(rms), TARGET_RMS_DBFS, delta=1.0)
+
+    def test_the_whole_clip_moves_together(self):
+        """Loud part, then a pause, then a quiet part: relative levels survive."""
+        from functions.voice_clip.mixer import apply_static_gain
+
+        loud = np.full(SAMPLE_RATE // 2, 0.5, dtype=np.float32)
+        quiet = np.full(SAMPLE_RATE // 2, 0.05, dtype=np.float32)
+        samples = np.concatenate([loud, quiet])
+        apply_static_gain(samples)
+        ratio_before, ratio_after = 10.0, float(
+            np.max(np.abs(samples[: SAMPLE_RATE // 2]))
+            / np.max(np.abs(samples[SAMPLE_RATE // 2 :]))
+        )
+        self.assertAlmostEqual(ratio_after, ratio_before, delta=0.01)
+
+    def test_a_very_loud_mix_never_leaves_the_ceiling(self):
+        from functions.voice_clip.mixer import LIMITER_CEILING, apply_static_gain
+
+        loud = np.full(SAMPLE_RATE, 3.0, dtype=np.float32)
+        apply_static_gain(loud)
+        self.assertLessEqual(float(np.max(np.abs(loud))), LIMITER_CEILING + 1e-6)
+
+    def test_silence_is_left_alone(self):
+        from functions.voice_clip.mixer import apply_static_gain
+
+        silent = np.zeros(SAMPLE_RATE, dtype=np.float32)
+        self.assertEqual(apply_static_gain(silent), 1.0)
+        self.assertFalse(bool(np.any(silent)))
+
+    def test_dynamic_loudness_normalisation_is_gone(self):
+        """FFmpeg must not ride the gain: that is what wobbles a short clip."""
+        from functions.voice_clip.exporter import DEFAULT_AUDIO_FILTER
+
+        self.assertNotIn("loudnorm", DEFAULT_AUDIO_FILTER)
+        self.assertIn("highpass", DEFAULT_AUDIO_FILTER)
+        self.assertIn("alimiter", DEFAULT_AUDIO_FILTER)
+
+
+# ===========================================================================
+# 4. Lifecycle, Capture, Concurrency & Failure Recovery
 # ===========================================================================
 
 
 class TestLifecyclePrivacyAndReliability(unittest.IsolatedAsyncioTestCase):
-    def test_consent_notice_opt_out_and_opt_in_modes_purge_immediately(self) -> None:
+    def test_every_speaker_is_captured_with_no_gate_at_all(self) -> None:
+        """Private deployment: capture is unconditional, by design.
+
+        There is no opt-in, no opt-out and no consent object any more — a
+        speaker is recorded because they are in the channel.
+        """
         clock = _FakeClock(initial=100.0)
         bot = SimpleNamespace(user=SimpleNamespace(id=999))
+        svc = VoiceClipService(bot, VoiceClipConfig(), clock=clock)  # type: ignore[arg-type]
+        self.assertFalse(hasattr(svc, "consent"), "consent gating must be gone")
 
-        # 1. Notice mode: captures until user opts out, then blocks + purges immediately
-        svc = VoiceClipService(bot, VoiceClipConfig(consent_mode="notice"), clock=clock)  # type: ignore[arg-type]
         guild, channel, vc = _make_guild_with_vc()
         svc.attach_voice_client(guild=guild, channel_id=channel.id, voice_client=vc)
         buf = svc.get_buffer(guild.id)
         assert buf is not None
         pkt = _encode_opus_tone(440.0, 0.02)[0]
-        buf.append_packet(user_id=201, opus_data=pkt, rtp_timestamp=0, sequence=1, ssrc=1)
-        buf.append_packet(user_id=202, opus_data=pkt, rtp_timestamp=0, sequence=1, ssrc=2)
-        self.assertEqual(buf.stats()["active_speakers"], 2)
-
-        svc.consent.revoke_user(guild.id, 201)
-        self.assertFalse(svc.consent.can_record(guild.id, 201))
-        self.assertTrue(svc.consent.can_record(guild.id, 202))
-        self.assertEqual(buf.stats()["active_speakers"], 1)
-
-        # 2. Opt-in mode: blocks until explicit allow_user
-        opt_in_consent = ConsentManager(mode="opt_in")
-        self.assertFalse(opt_in_consent.can_record(1, 301))
-        opt_in_consent.allow_user(1, 301)
-        self.assertTrue(opt_in_consent.can_record(1, 301))
-        opt_in_consent.revoke_user(1, 301)
-        self.assertFalse(opt_in_consent.can_record(1, 301))
+        for uid in (201, 202, 203):
+            self.assertTrue(
+                buf.append_packet(
+                    user_id=uid, opus_data=pkt, rtp_timestamp=0, sequence=1, ssrc=uid
+                )
+            )
+        self.assertEqual(buf.stats()["active_speakers"], 3)
 
     async def test_recording_continues_during_export_and_export_failures_preserve_buffer(self) -> None:
         clock = _FakeClock(initial=1000.0)
@@ -962,8 +1209,9 @@ class TestRealUDPClipVoiceClientIntegration(unittest.IsolatedAsyncioTestCase):
             samples, rate, codec_name = _decode_m4a_to_mono_f32(m4a_bytes)
             self.assertEqual(codec_name, "aac")
             self.assertEqual(rate, SAMPLE_RATE)
-            self.assertGreater(_dominant_power_at_freq(samples, 440.0), 0.03)
-            self.assertGreater(_dominant_power_at_freq(samples, 880.0), 0.03)
+            clip_rms = float(np.sqrt(np.mean(np.square(samples))))
+            self.assertGreater(_dominant_power_at_freq(samples, 440.0), clip_rms * 0.03)
+            self.assertGreater(_dominant_power_at_freq(samples, 880.0), clip_rms * 0.03)
         finally:
             vc._teardown_recording()
             vc._connection._socket_reader.stop()
@@ -1061,8 +1309,6 @@ class TestErrorHandlingAndTransportEdgeCases(unittest.IsolatedAsyncioTestCase):
         clock = _FakeClock(initial=100.0)
         buf = RollingAudioBuffer(guild_id=1, clock=clock)
         buf.start_session(channel_id=10)
-        consent = ConsentManager(mode="notice")
-
         fake_dave = MagicMock()
         fake_dave.ready = False
         fake_dave.can_passthrough = MagicMock(return_value=False)
@@ -1071,7 +1317,6 @@ class TestErrorHandlingAndTransportEdgeCases(unittest.IsolatedAsyncioTestCase):
         router = VoiceReceiveRouter(
             guild_id=1,
             buffer=buf,
-            consent=consent,
             is_bot_user=lambda uid: uid == 9999,
             dave_state_getter=lambda: (fake_dave, 1),
             clock=clock,

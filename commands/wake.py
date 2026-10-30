@@ -27,10 +27,9 @@ Design notes
   never a disconnect — the bot stays where it is.
 * Text always works. Speech is best effort: no key, no PyNaCl or no ffmpeg
   simply means the answer is typed only.
-* **Music first.** "Hey Paradise play billie jean" is not a question, so it
-  goes to the music cog before Gemini sees it. When a song is already
-  playing, the spoken answer is *mixed into the same audio source* and the
-  song drops to 15 % until the sentence ends (:mod:`functions.music`).
+* **Hear it, then answer.** A short chime plays the moment the phrase is
+  recognised, so a person speaking knows Paradise heard them before it spends
+  a second thinking (``VOICE_WAKE_CUE``).
 * Every ignore reason is logged at INFO. Silence with no log line is the one
   failure mode that is impossible to debug from the outside.
 * **It can also hear you.** With ``VOICE_WAKE_ENABLED`` (the default) the
@@ -52,7 +51,7 @@ import time
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from config import VoiceWakeConfig, WakeConfig
 from functions.dictionary.playback import (
@@ -71,6 +70,7 @@ from functions.voice_wake import (
     SpokenRequest,
     SpokenWakeListener,
 )
+from functions.voice_wake.cue import build_cue_pcm
 from functions.voice_wake.local_stt import (
     STATUS_DOWNLOADED,
     STATUS_NOT_INSTALLED,
@@ -161,6 +161,8 @@ class Wake(commands.Cog):
         #: The on-device engine, when it is part of the chain (for /voicewake).
         self.local_stt: LocalWhisperTranscriber | None = None
         self._prepare_task: asyncio.Task | None = None
+        #: The service object whose tap list currently holds ``_on_voice_packet``.
+        self._tap_service: object | None = None
         self._announced: set[int] = set()
         self._paused_guilds: set[int] = set()
         log.info("Wake word ready — %s", self.speech.describe())
@@ -183,12 +185,13 @@ class Wake(commands.Cog):
         )
         self._start_listener()
         self._prepare_local_model()
+        self._watchdog.start()
 
-    def _start_listener(self) -> None:
+    def _start_listener(self) -> bool:
         """Attach the spoken wake word to the voice receiver, if enabled."""
         if not self.voice_wake.listening:
             log.info("Spoken wake word disabled (VOICE_WAKE_ENABLED=false)")
-            return
+            return False
 
         chain = SpeechToTextChain(*self._stt_providers(self.voice_wake.stt))
         if not chain.available:
@@ -205,7 +208,7 @@ class Wake(commands.Cog):
                     "`%s`, or set ELEVENLABS_API_KEY / GEMINI_API_KEY.",
                     INSTALL_HINT,
                 )
-            return
+            return False
 
         self.listener = SpokenWakeListener(
             stt=chain,
@@ -213,19 +216,77 @@ class Wake(commands.Cog):
             on_request=self._on_spoken_request,
             on_wake_only=self._on_spoken_wake_only,
         )
-        service = getattr(self.bot, "voice_clip_service", None)
-        add_tap = getattr(service, "add_tap", None)
-        if add_tap is None:
+        if not self._bind_tap(getattr(self.bot, "voice_clip_service", None)):
+            # The receiver is not up *yet*. The watchdog retries every few
+            # seconds: giving up here used to mean a wake word that stayed
+            # deaf for the whole session while /clip kept working.
             log.warning(
-                "Spoken wake word idle: the voice receiver is not running "
-                "(the VoiceClip cog has to load before Wake)."
+                "Spoken wake word waiting for the voice receiver to come up"
             )
-            self.listener = None
-            return
-        add_tap(self._on_voice_packet)
         # The listener task is created on first audio (start() is idempotent
         # and needs a running loop, which the cog load already has).
-        asyncio.create_task(self.listener.start(), name="paradise-spoken-wake-start")
+        if not self.listener.alive:
+            asyncio.create_task(self.listener.start(), name="paradise-spoken-wake-start")
+        return True
+
+    def _bind_tap(self, service) -> bool:
+        """Point the receiver's packet tap at this cog, exactly once.
+
+        A reload or a reconnect can replace ``bot.voice_clip_service`` — the
+        old object (and the tap list inside it) simply goes away, which is
+        another way the wake word went deaf while clipping kept working.
+        """
+        add_tap = getattr(service, "add_tap", None)
+        if add_tap is None:
+            return False
+        if self._tap_service is service:
+            return True
+        if self._tap_service is not None:
+            remove = getattr(self._tap_service, "remove_tap", None)
+            if remove is not None:
+                try:
+                    remove(self._on_voice_packet)
+                except Exception:  # noqa: BLE001 - the old service may be gone
+                    log.debug("Could not detach from the old receiver", exc_info=True)
+        try:
+            add_tap(self._on_voice_packet)
+        except Exception:  # noqa: BLE001
+            log.debug("Could not attach the wake tap", exc_info=True)
+            return False
+        self._tap_service = service
+        log.info("Spoken wake word attached to the voice receiver")
+        return True
+
+    @tasks.loop(seconds=30.0)
+    async def _watchdog(self) -> None:
+        """Keep the two things that can silently break alive.
+
+        1. the tap must be on the *current* receiver object;
+        2. the drain task must still be running.
+        """
+        if not self.voice_wake.listening:
+            return
+        service = getattr(self.bot, "voice_clip_service", None)
+        self._bind_tap(service)
+        listener = self.listener
+        if listener is None:
+            if not self._start_listener():
+                return
+            listener = self.listener
+        if listener is not None and not listener.alive:
+            log.warning("Spoken wake listener had stopped; restarting it")
+            await listener.start()
+
+    @_watchdog.before_loop
+    async def _before_watchdog(self) -> None:
+        waiter = getattr(self.bot, "wait_until_ready", None)
+        if waiter is None:
+            return
+        try:
+            await waiter()
+        except (RuntimeError, AttributeError):
+            if self._watchdog.is_running():
+                self._watchdog.cancel()
 
     # ------------------------------------------------------------------
     # Model files: fetch them now, not on the first utterance
@@ -308,6 +369,8 @@ class Wake(commands.Cog):
         listener.tap(guild_id, user_id, packet)
 
     async def cog_unload(self) -> None:
+        if self._watchdog.is_running():
+            self._watchdog.cancel()
         if self._preload_task is not None:
             self._preload_task.cancel()
             self._preload_task = None
@@ -409,23 +472,6 @@ class Wake(commands.Cog):
         )
         self._touch(message)
 
-        # Music requests are commands, not questions: they never reach Gemini.
-        music = self.bot.get_cog("Music") if hasattr(self.bot, "get_cog") else None
-        handler = getattr(music, "handle_voice_request", None)
-        if handler is not None:
-            try:
-                music_answer = await handler(message, question)
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - never lose the answer
-                log.exception("Music request failed")
-                music_answer = None
-            if music_answer:
-                await self._reply_text(message, music_answer)
-                if self.config.speak:
-                    await self._speak(message, music_answer, failed=False)
-                return True
-
         answer, failed = await self._answer(message, question)
         await self._reply_text(message, answer)
         if self.config.speak:
@@ -438,6 +484,7 @@ class Wake(commands.Cog):
 
     async def _on_spoken_wake_only(self, guild_id: int, user_id: int) -> None:
         """Only the wake word was heard: say "haan?" and wait for the question."""
+        await self._play_heard_cue(guild_id)
         if not self.voice_wake.acknowledge:
             return
         guild = self.bot.get_guild(guild_id) if hasattr(self.bot, "get_guild") else None
@@ -460,11 +507,12 @@ class Wake(commands.Cog):
         guild = self.bot.get_guild(request.guild_id) if hasattr(self.bot, "get_guild") else None
         if guild is None:
             return
+        # Chime first: thinking takes a second, and silence looks like a bug.
+        await self._play_heard_cue(request.guild_id)
         member = guild.get_member(request.user_id)
         channel = self._bot_voice_channel(guild)
         asker = getattr(member, "display_name", "") or "someone"
 
-        # Music first: "play billie jean" is a command, not a question.
         answer, failed = await self._answer_spoken(guild, member, channel, request.question, asker)
         if channel is not None and self.voice_wake.post_text:
             await self._post_text(channel, answer)
@@ -479,21 +527,7 @@ class Wake(commands.Cog):
         question: str,
         asker: str,
     ) -> tuple[str, bool]:
-        """Music → Gemini → refusal, exactly like the typed path."""
-        music = self.bot.get_cog("Music") if hasattr(self.bot, "get_cog") else None
-        handler = getattr(music, "handle_spoken_request", None)
-        if handler is not None and channel is not None:
-            try:
-                music_answer = await handler(
-                    guild=guild, member=member, channel=channel, text=question
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:  # noqa: BLE001 - never lose the answer
-                log.exception("Spoken music request failed")
-                music_answer = None
-            if music_answer:
-                return music_answer, False
+        """Gemini → refusal. One path, typed or spoken."""
         return await self._answer_text(guild, asker, question)
 
     @staticmethod
@@ -504,6 +538,33 @@ class Wake(commands.Cog):
             return channel
         return None
 
+    async def _play_heard_cue(self, guild_id: int) -> None:
+        """Play the short "heard you" chime into the channel Paradise is in.
+
+        It is a *cue*, not a reply: it never queues behind speech, never
+        interrupts one, and a machine that cannot do voice simply skips it.
+        """
+        if not getattr(self.voice_wake, "cue", True):
+            return
+        guild = self.bot.get_guild(guild_id) if hasattr(self.bot, "get_guild") else None
+        client = getattr(guild, "voice_client", None) if guild is not None else None
+        if client is None:
+            return
+        connected = getattr(client, "is_connected", None)
+        if callable(connected) and not connected():
+            return
+        play = getattr(client, "play", None)
+        pcm_audio = getattr(discord, "PCMAudio", None)
+        if play is None or pcm_audio is None:
+            return
+        busy = getattr(client, "is_playing", None)
+        if callable(busy) and busy():
+            return
+        try:
+            play(pcm_audio(io.BytesIO(build_cue_pcm())))
+        except Exception:  # noqa: BLE001 - a missing chime is not an error
+            log.debug("Could not play the heard-you chime", exc_info=True)
+
     async def _post_text(self, channel, text: str) -> None:
         sender = getattr(channel, "send", None)
         if sender is None:
@@ -512,6 +573,23 @@ class Wake(commands.Cog):
             await sender(text, allowed_mentions=discord.AllowedMentions.none())
         except discord.DiscordException:
             log.debug("Could not post the spoken answer", exc_info=True)
+
+    def _receiver_stats(self, guild_id: int) -> dict[str, int] | None:
+        service = getattr(self.bot, "voice_clip_service", None)
+        reader = getattr(service, "receiver_stats", None)
+        if reader is None:
+            return None
+        try:
+            return reader(guild_id)
+        except Exception:  # noqa: BLE001 - diagnostics must never raise
+            log.debug("Could not read receiver stats", exc_info=True)
+            return None
+
+    @staticmethod
+    def _heard_frames(listener) -> int:
+        if listener is None:
+            return 0
+        return int(getattr(getattr(listener, "stats", None), "frames", 0) or 0)
 
     def _transcription_is_local(self) -> bool:
         """True when the active chain can recognise speech without a network."""
@@ -623,16 +701,8 @@ class Wake(commands.Cog):
     async def _speak(self, message: discord.Message, answer: str, *, failed: bool) -> None:
         if not playback_support():
             return
-        # Music playing? The channel is the one the song is in, and the asker
-        # does not have to be sitting in it.
-        music_player = self._music_player(getattr(message.guild, "id", 0))
-        music_active = bool(
-            music_player is not None
-            and getattr(music_player, "playing_music", False)
-            and getattr(getattr(music_player, "voice", None), "is_connected", lambda: False)()
-        )
         channel = self._voice_channel_for(message)
-        if channel is None and not music_active:
+        if channel is None:
             return
         await self._speak_text(
             message.guild,
@@ -676,56 +746,13 @@ class Wake(commands.Cog):
         await self._speak_clip(guild, member, channel, clip, failed=failed)
 
     async def _speak_clip(self, guild, member, channel, clip: SpeechClip, *, failed: bool) -> None:
-        """Play a ready clip: mixed over music when a song is playing."""
+        """Play a ready clip into *channel*."""
         if channel is None or clip is None or not clip.data:
             return
-
-        # A song is playing: mix the answer into it (the song ducks to 15 %
-        # and lifts back up when the sentence ends) instead of stopping it.
-        if await self._speak_over_music(guild, clip):
-            return
-
         client = await self._ensure_voice_client(guild, channel)
         if client is None:
             return
         await self._enqueue(guild.id, clip)
-
-    def _music_player(self, guild_id: int):
-        music = self.bot.get_cog("Music") if hasattr(self.bot, "get_cog") else None
-        service = getattr(music, "service", None)
-        existing = getattr(service, "existing", None)
-        if existing is None:
-            return None
-        return existing(guild_id)
-
-    async def _speak_over_music(self, guild, clip: SpeechClip) -> bool:
-        """Duck the song and speak over it. True when the answer was handed over."""
-        player = self._music_player(getattr(guild, "id", 0))
-        if player is None or not getattr(player, "playing_music", False):
-            return False
-        voice = getattr(player, "voice", None)
-        if voice is None or not voice.is_connected():
-            return False
-        try:
-            from functions.music.decoder import decode_to_pcm
-
-            loop = asyncio.get_running_loop()
-            pcm = await loop.run_in_executor(None, decode_to_pcm, clip.data)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # noqa: BLE001 - fall back to the plain path
-            log.debug("Could not decode speech for mixing", exc_info=True)
-            return False
-        if not pcm:
-            return False
-        try:
-            mixed = await player.speak(pcm)
-        except Exception:  # noqa: BLE001
-            log.debug("Could not mix speech over the music", exc_info=True)
-            return False
-        if mixed:
-            log.info("Spoke over the music in guild %s (ducked)", getattr(guild, "id", "?"))
-        return mixed
 
     def _voice_channel_for(
         self, message: discord.Message
@@ -913,6 +940,7 @@ class Wake(commands.Cog):
         guild_id = getattr(interaction, "guild_id", 0) or 0
         listener = self.listener
         lines: list[str] = []
+
         if not self.voice_wake.listening:
             lines.append("**off** — `VOICE_WAKE_ENABLED=false` in `.env`.")
         elif listener is None:
@@ -929,28 +957,57 @@ class Wake(commands.Cog):
                 )
         elif guild_id in self._paused_guilds:
             lines.append("**paused here** — `/voicewake start` to resume.")
+        elif not listener.alive:
+            lines.append("**restarting** — the listening task stopped; it is being brought back.")
         else:
             lines.append("**listening** for “hey paradise” in this channel.")
+
         if listener is not None:
-            stats = listener.stats
             lines.append(f"`{listener.describe()}`")
-        if self.local_stt is not None:
-            lines.append(f"model — `{self.local_stt.describe_model()}`")
+            stats = listener.stats
             lines.append(
                 f"utterances: {stats.segments} · transcribed: {stats.transcripts} · "
                 f"answered: {stats.triggers}"
             )
             if stats.last_transcript:
-                lines.append(f"last heard: “{discord.utils.escape_markdown(stats.last_transcript[:180])}”")
+                lines.append(
+                    f"last heard: “{discord.utils.escape_markdown(stats.last_transcript[:180])}”"
+                )
+            if stats.last_error:
+                lines.append(f"-# last error: `{discord.utils.escape_markdown(stats.last_error)}`")
+
+        if self.local_stt is not None:
+            lines.append(f"model — `{self.local_stt.describe_model()}`")
+
+        # Is any audio actually arriving? This is the difference between "I
+        # cannot hear you" and "I heard you and did not answer".
+        receiver = self._receiver_stats(guild_id)
+        if receiver is not None:
+            lines.append(
+                f"audio: {receiver['received']} packets received · "
+                f"{receiver['buffered']} recorded · "
+                f"{self._heard_frames(listener)} frames listened to"
+            )
+            if receiver["received"] == 0:
+                lines.append(
+                    "-# nothing is reaching me: check that i am in the channel, "
+                    "not muted, and not server-deafened (Discord sends no audio to "
+                    "a deafened client)."
+                )
+            elif receiver["transport_errors"] or receiver["dave_errors"]:
+                lines.append(
+                    f"-# undecryptable packets: {receiver['transport_errors']} "
+                    f"transport, {receiver['dave_errors']} end-to-end encrypted"
+                )
+
         if listener is not None and self._transcription_is_local():
             lines.append(
                 "transcription runs **on this machine** — no audio is uploaded — "
-                "and only after an utterance ends; `/clip` opt-out is honoured."
+                "and only after an utterance ends."
             )
         else:
-            lines.append(
-                "audio is only sent after an utterance ends; `/clip` opt-out is honoured."
-            )
+            lines.append("audio is only sent after an utterance ends.")
+
         embed = discord.Embed(
             title="🎙 Spoken wake word",
             description="\n".join(lines),

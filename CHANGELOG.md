@@ -61,7 +61,24 @@ All notable changes to Paradise are recorded here. The format follows
   New keys: `VOICE_WAKE_STT_MODEL`, `_DEVICE`, `_COMPUTE`, `_THREADS`,
   `_MODEL_DIR`, `_OFFLINE`, `_UNLOAD_AFTER`. [docs/voice-wake.md](docs/voice-wake.md).
 
+### Removed
+- **Music, entirely.** `commands/music.py`, `functions/music/`,
+  `docs/music.md`, `tests/test_music.py`, every `MUSIC_*` setting, the
+  `yt-dlp` dependency, the `/cmd` panel and the "play …" branches of the voice
+  wake cog are all deleted. Wake-word replies are plain chat + speech again.
+
 ### Fixed
+- **The wake word went deaf while `/clip` was recording.** The receive router
+  only notified the listeners *after* appending the packet to the clip buffer,
+  so anything that made the buffer unhappy silenced wake recognition too. The
+  tap now runs first, and `commands/wake.py` re-binds it whenever the voice
+  service object is replaced and restarts a listener that has died (checked
+  every 30 s), so recording can never take listening down with it.
+- **Clipped speech had a jitter.** Frames used to be placed on the wall clock
+  they *arrived* at; a few milliseconds of network wobble made one frame overlap
+  the next and the next leave a hole, which is heard as a flutter. Frames are
+  now placed on the sender's own RTP clock, re-anchored only on a stream change,
+  a sequence reset, a real silence gap or a long arrival pause.
 - **A long stay in a voice channel was credited a few minutes short.** 24 hours
   in a channel landed in the database as ~23 h 51 m. The checkpoint credited a
   whole number of seconds and then moved its cursor to the requested instant,
@@ -74,17 +91,17 @@ All notable changes to Paradise are recorded here. The format follows
   [docs/engineering/voice-accounting-incident.md §K](docs/engineering/voice-accounting-incident.md).
 
 ### Added
-- **Music, in-process.** `/music …`, `!p`-style text commands, a `/cmd` button
-  panel, and voice requests in English, Hinglish and Devanagari
-  ("Hey Paradise play billie jean", "billie jean baja do", "अगला गाना लगाओ").
-  yt-dlp searches, FFmpeg decodes to 48 kHz stereo PCM, and a numpy mixer
-  plays it through one `discord.AudioSource` per guild
-  (`functions/music/`, `commands/music.py`, [docs/music.md](docs/music.md)).
-- **Ducking.** When Paradise answers while a song is playing, the music gain
-  ramps 1.0 → 0.15 → 1.0 around the sentence, so the answer is always
-  intelligible and the song never stops. Verified on a real FFmpeg stream
-  (`tests/test_music.py::test_ducking_on_a_real_stream`: 0.150 and 1.000).
-- `MUSIC_*` settings (15 keys), `yt-dlp` in `requirements.txt`, 71 new tests.
+- **A chime the moment "hey paradise" is recognised.** Two generated notes
+  (880 Hz then a fifth above) are encoded to raw PCM in-process and played
+  through `discord.PCMAudio` — no FFmpeg, no audio file in the repository —
+  before the model is asked anything, so the thinking pause never reads as
+  being ignored. `VOICE_WAKE_CUE=false` turns it off; it never interrupts
+  something that is already playing.
+- `functions/voice_clip/mixer.py::apply_static_gain`: one constant gain per
+  clip, levelled to −20 dBFS RMS with the loudest sample under the ceiling.
+- `/voicewake status` now reports the receiver itself: packets received,
+  packets recorded, frames listened to, and plain-word advice when a counter
+  is stuck at zero.
 
 ### Changed
 - **"Hey Paradise" now answers in far more situations.** `WAKE_WORD_VC_ONLY`
@@ -93,8 +110,19 @@ All notable changes to Paradise are recorded here. The format follows
   answered *and* spoken in the channel. Every ignored wake phrase is logged
   at INFO, and a missing ElevenLabs key is reported at start-up instead of
   silently producing text-only replies.
-- Wake-word answers are mixed into a playing song instead of waiting for it
-  to end.
+- **`/clip` records everyone, silently.** Consent prompts, the channel notice,
+  the opt-out list and `VOICE_CLIP_CONSENT_MODE` / `VOICE_CLIP_NOTICE_ENABLED`
+  are gone; every human in the channel is captured, and the debug panel shows
+  no per-speaker state to switch off.
+- **Level differences are preserved.** The clip is levelled once, with a single
+  gain, so a pause stays as quiet relative to speech as it really was; the
+  dynamic `loudnorm` pass that rode the gain between sentences is gone from the
+  FFmpeg chain.
+- **Clips are smaller and still clear.** Default bitrate 192 → 128 kbps AAC-LC
+  at 48 kHz mono: a three-minute clip is ~3 MB instead of ~4.5 MB.
+- **Every slash command is guild-only.** `DISCORD_GUILD_ID` is now required in
+  practice: commands are published to that guild alone and the global list is
+  purged on start, so edits appear instantly and no command is listed twice.
 
 ### Added
 - `DISCORD_GUILD_ID`: publish slash commands instantly to a chosen guild;

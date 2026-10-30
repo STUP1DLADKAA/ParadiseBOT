@@ -6,7 +6,6 @@ from .buffer import (
     RollingAudioBuffer,
     SpeakerIntervalPackets,
 )
-from .consent import ConsentManager, RecordingConsentView, build_recording_notice_text
 from .constants import (
     AUTHORIZED_CLIP_USER_ID,
     ClipAuthorizationError,
@@ -29,7 +28,13 @@ from .constants import (
     validate_clip_duration,
 )
 from .exporter import ClipExportPipeline, ExportedClip, build_clip_filename
-from .mixer import MixResult, apply_smooth_peak_limiter, mix_snapshot_to_pcm_f32
+from .mixer import (
+    MixResult,
+    apply_smooth_peak_limiter,
+    apply_static_gain,
+    mix_snapshot_to_pcm_f32,
+    plan_speaker_timeline,
+)
 from .opus_codec import SpeakerOpusDecoder, ensure_opus_loaded
 from .receiver import (
     ClipVoiceClient,
@@ -55,7 +60,6 @@ __all__ = [
     "ClipUnavailableError",
     "ClipValidationError",
     "ClipVoiceClient",
-    "ConsentManager",
     "ExportedClip",
     "MAX_CLIP_DURATION",
     "MIN_CLIP_DURATION",
@@ -63,7 +67,6 @@ __all__ = [
     "NoUsableAudioError",
     "OPUS_SILENCE",
     "ParsedRTPPacket",
-    "RecordingConsentView",
     "RollingAudioBuffer",
     "SAMPLE_RATE",
     "SpeakerIntervalPackets",
@@ -73,12 +76,13 @@ __all__ = [
     "VoiceClipService",
     "VoiceReceiveRouter",
     "apply_smooth_peak_limiter",
+    "apply_static_gain",
     "authorize_clip_user",
     "build_clip_filename",
-    "build_recording_notice_text",
     "ensure_opus_loaded",
     "format_clip_dm_text",
     "mix_snapshot_to_pcm_f32",
+    "plan_speaker_timeline",
     "require_clip_authorization",
     "validate_clip_duration",
 ]

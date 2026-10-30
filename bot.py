@@ -36,11 +36,26 @@ EXTENSIONS = (
     "commands.assistant",
     "commands.edit",
     "commands.wake",
-    "commands.music",
 )
 
 
 class ParadiseTree(app_commands.CommandTree):
+    """Every command is a **guild** command — never a DM, never global.
+
+    The context flags are set here, once, instead of on 40 decorators: a
+    command registered for DMs cannot run anyway (Paradise needs a server for
+    voice, stats and permissions), and offering it there is clutter.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self.allowed_contexts = app_commands.AppCommandContext(
+            guild=True, dm_channel=False, private_channel=False
+        )
+        self.allowed_installs = app_commands.AppInstallationType(
+            guild=True, user=False
+        )
+
     async def on_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
@@ -90,15 +105,15 @@ class ParadiseBot(commands.Bot):
         self._afk_notice_last: dict[tuple[int, int], float] = {}
         self._ready_logged = False
         # The single owner of every command-tree write (see functions/startup).
-        # Commands are registered ONLY in the home guild (instant, no duplicates)
-        # — global sync is disabled to prevent double-registration.
+        # Commands are registered ONLY in the home guild: Discord publishes
+        # guild commands instantly, and a global copy would show up as a
+        # second, identical entry for up to an hour. Whatever an older release
+        # published globally is cleared on the next start.
         self.synchronizer = CommandSynchronizer(
             self,
-            # Discord propagates guild commands instantly; global ones can take
-            # an hour. Set DISCORD_GUILD_ID for instant registration, or leave
-            # it blank to publish globally.
             guild_id=config.guild_id or PRIMARY_GUILD_ID,
-            sync_global=not config.guild_id,
+            sync_global=False,
+            purge_global=True,
         )
         self.commands_ready = False
         self.autoupdate_task: asyncio.Task | None = None
@@ -256,14 +271,6 @@ class ParadiseBot(commands.Bot):
         except Exception:
             log.exception("AFK handling failed")
 
-        # Music text commands ("!p song", "!skip", "!cmd") own the message
-        # before anything else looks at it — a prefix is an explicit command.
-        try:
-            if await self._maybe_music(message):
-                return
-        except Exception:
-            log.exception("Music command failed")
-
         # Explicit address (mention or reply): the assistant owns it.
         addressed = False
         try:
@@ -366,15 +373,6 @@ class ParadiseBot(commands.Bot):
 
     async def _maybe_wake(self, message: discord.Message) -> bool:
         cog = self.get_cog("Wake")
-        handler = getattr(cog, "handle_message", None)
-        if handler is None:
-            return False
-        return bool(await handler(message))
-
-    # -- Music (prefix commands: !p, !skip, !cmd) -------------------------------
-
-    async def _maybe_music(self, message: discord.Message) -> bool:
-        cog = self.get_cog("Music")
         handler = getattr(cog, "handle_message", None)
         if handler is None:
             return False

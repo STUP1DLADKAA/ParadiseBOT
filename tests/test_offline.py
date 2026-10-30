@@ -40,15 +40,12 @@ EXPECTED_COMMANDS = {
     "remind", "poll", "afk", "translate", "settimezone", "vc", "clip",
     "minigames", "recipe",
     "summarize", "help", "edit", "voicewake",
-    # Music lives under one group plus a panel command; the individual
-    # transports (play/skip/…) are *not* top-level commands.
-    "music", "cmd",
 }
 
-# Names that must never come back at the top level. Music now exists, but it
-# is reached through `/music <action>` and `!p`-style text commands — a dozen
-# top-level slash commands is exactly what this list keeps out.
+# Names that must never come back at the top level.
 REMOVED_COMMANDS = {
+    # music was removed entirely (commands, engine, yt-dlp dependency)
+    "music", "cmd",
     "play", "pause", "resume", "skip", "previous", "stop", "queue",
     "nowplaying", "remove", "move", "clearqueue", "shuffle", "seek",
     "forward", "backward", "loop", "autoplay", "filter", "volume",
@@ -60,6 +57,7 @@ REMOVED_COMMANDS = {
     # retired in favour of natural mentions (the capabilities remain)
     "search", "weather", "convert", "time", "define", "dictionary", "recommend",
     "example", "trending", "upcoming",
+    "p", "music", "cmd",
 }
 
 
@@ -108,15 +106,15 @@ class TestCommandSet(unittest.TestCase):
         self.assertFalse(declared & REMOVED_COMMANDS)
         self.assertTrue(declared <= EXPECTED_COMMANDS, f"unexpected: {declared - EXPECTED_COMMANDS}")
 
-    def test_music_is_present_and_self_contained(self):
-        # Music is back — but in-process (yt-dlp + FFmpeg + a numpy mixer),
-        # never a Lavalink node or a TTS framework. Those stay gone.
+    def test_music_is_gone_and_stays_gone(self):
+        # Music was removed outright: no cog, no engine, no yt-dlp dependency.
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for path in ("commands/music.py", "functions/music/player.py",
-                     "functions/music/mixer.py", "functions/music/decoder.py"):
-            self.assertTrue(
-                os.path.exists(os.path.join(root, path)), f"{path} is missing"
+        for path in ("commands/music.py", "functions/music", "docs/music.md"):
+            self.assertFalse(
+                os.path.exists(os.path.join(root, path)), f"{path} should be gone"
             )
+        with open(os.path.join(root, "requirements.txt"), encoding="utf-8") as handle:
+            self.assertNotIn("yt-dlp", handle.read())
         for path in ("commands/voice.py", "functions/lyrics.py",
                      "functions/settings.py", "lavalink", "node_modules"):
             self.assertFalse(
@@ -296,7 +294,7 @@ class TestConfig(unittest.TestCase):
         self.assertEqual(config.personality.reaction_chance, 0.045)
         self.assertEqual(config.personality.reply_chance, 0.015)
 
-    def test_template_documents_music_without_secrets(self):
+    def test_template_has_no_music_or_consent_settings(self):
         path = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env.example"
         )
@@ -307,9 +305,10 @@ class TestConfig(unittest.TestCase):
         for needle in ("lavalink_uri", "lavalink_host", "lavalink_password",
                        "edge_tts", "tts_engine", "tts_voice", "lyrics", "genius"):
             self.assertNotIn(needle, content, f".env.example still mentions {needle}")
-        # The music block must exist and default to the 15 % duck.
-        self.assertIn("music_duck_volume=0.15", content)
-        self.assertIn("music_enabled=", content)
+        # …and no music block, and no recording-consent switches.
+        self.assertNotIn("music_", content)
+        self.assertNotIn("voice_clip_consent_mode", content)
+        self.assertNotIn("voice_clip_notice_enabled", content)
         self.assertIn("elevenlabs_voice_id=", content)
         self.assertIn("discord_token=", content)
 
@@ -740,16 +739,16 @@ class TestWiring(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_music_extension_is_loaded(self):
-        self.assertIn("commands.music", EXTENSIONS)
+    def test_the_music_extension_is_not_loaded(self):
+        self.assertNotIn("commands.music", EXTENSIONS)
         self.assertNotIn("commands.voice", EXTENSIONS)
+        self.assertIn("commands.wake", EXTENSIONS)
 
     def test_dictionary_extension_is_loaded(self):
         self.assertIn("commands.dictionary", EXTENSIONS)
 
-    def test_light_modules_do_not_pull_in_music(self):
-        # The music package pulls in numpy and FFmpeg plumbing; importing the
-        # bot's core modules must not pay for it.
+    def test_light_modules_do_not_pull_in_heavy_audio(self):
+        # Importing the bot's core modules must not pay for the audio stack.
         for name in (
             "config", "functions.helpers", "functions.personality",
             "functions.presence",
