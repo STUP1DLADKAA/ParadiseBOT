@@ -36,7 +36,7 @@ from functions.personality import PATTERNS, Personality  # noqa: E402
 from functions.presence import IST, NOTES, ROTATE_SECONDS, PresenceManager  # noqa: E402
 
 EXPECTED_COMMANDS = {
-    "ping", "coinflip", "choose",
+    "ping", "coinflip", "choose", "roast", "meme", "gif",
     "remind", "poll", "afk", "translate", "settimezone", "vc", "clip",
     "minigames", "recipe",
     "summarize", "help", "edit", "voicewake",
@@ -284,15 +284,18 @@ class TestConfig(unittest.TestCase):
         config = Config.from_env({})
         self.assertFalse(config.ai_configured)
         self.assertTrue(config.personality.enabled)
-        self.assertLessEqual(config.personality.reaction_chance, 0.1)
-        self.assertLessEqual(config.personality.reply_chance, 0.05)
+        # Lively, but never a certainty: no action is ever forced.
+        self.assertLessEqual(config.personality.reaction_chance, 0.3)
+        self.assertLessEqual(config.personality.reply_chance, 0.2)
+        self.assertLessEqual(config.personality.roast_chance, 0.3)
+        self.assertEqual(config.personality.roast_intensity, "spicy")
 
     def test_bad_chances_snap_to_defaults(self):
         config = Config.from_env(
             {"PERSONALITY_REACTION_CHANCE": "5", "PERSONALITY_REPLY_CHANCE": "banana"}
         )
-        self.assertEqual(config.personality.reaction_chance, 0.045)
-        self.assertEqual(config.personality.reply_chance, 0.015)
+        self.assertEqual(config.personality.reaction_chance, 0.22)
+        self.assertEqual(config.personality.reply_chance, 0.10)
 
     def test_template_has_no_music_or_consent_settings(self):
         path = os.path.join(
@@ -515,7 +518,11 @@ def make_personality(**overrides):
         reply_chance=0.0,
         sticker_chance=0.0,
         meme_chance=0.0,
+        online_meme_chance=0.0,
+        gif_chance=0.0,
         random_quip_chance=0.0,
+        roast_chance=0.0,
+        ambient_reaction_chance=0.0,
         grammar_chance=0.0,
         global_cooldown=0,
         channel_cooldown=0,

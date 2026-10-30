@@ -24,6 +24,7 @@ log = logging.getLogger("paradise")
 
 EXTENSIONS = (
     "commands.fun",
+    "commands.banter",
     "commands.utility",
     "commands.vc",
     "commands.clip",
@@ -158,6 +159,10 @@ class ParadiseBot(commands.Bot):
         # never fatal: an unreachable network simply skips it.
         self.loop.create_task(self._validate_ai())
 
+        # Warm the meme cache so the first meme reply is instant instead of
+        # waiting for Reddit. Best effort: no internet just means an empty cache.
+        self.loop.create_task(self._warm_memes(), name="paradise-memes")
+
         self.presence_manager.start()
 
         # Keep the checkout fresh while online (the start-up check already
@@ -246,6 +251,18 @@ class ParadiseBot(commands.Bot):
                 await voice_cog.tracker.reconcile_guilds()
             except Exception:
                 log.exception("Voice startup reconciliation failed")
+
+    async def _warm_memes(self) -> None:
+        """Prefetch a couple of internet memes in the background, once."""
+        feed = getattr(getattr(self, "personality", None), "meme_feed", None)
+        prefetch = getattr(feed, "prefetch", None)
+        if prefetch is None:
+            return
+        try:
+            count = await prefetch(3)
+            log.info("Meme feed: %d meme(s) ready", count)
+        except Exception:  # noqa: BLE001 - an empty cache is not an error
+            log.debug("Meme prefetch failed", exc_info=True)
 
     # ------------------------------------------------------------------
     # Messages: AFK, AI mentions, personality

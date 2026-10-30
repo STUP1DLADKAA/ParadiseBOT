@@ -7,6 +7,45 @@ All notable changes to Paradise are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- **It talks back now.** The personality engine went from "rare and polite" to
+  actually present: more than double the chance of a reaction or a reply, an
+  ambient reaction on messages that match nothing at all, a shorter global and
+  per-channel cooldown, and eleven new conversation patterns (copium, ratio,
+  sus, based, rizz, school, gym, birthdays, boredom…). Every knob is still a
+  `PERSONALITY_*` setting. [docs/humour.md](docs/humour.md).
+- **Roasts.** A roast book with three intensities (`PERSONALITY_ROAST_INTENSITY`
+  = mild / spicy / nuclear), comebacks for cocky messages ("i'm him", "1v1 me",
+  "skill issue"), and `/roast [member]`. Aimed at what somebody said or did —
+  never at who they are — with no slurs in the book, a runtime filter, a
+  six-hour "stop roasting me" opt-out and a per-person cooldown so nobody is
+  farmed. `functions/roasts.py`.
+- **Memes from the internet.** Real posts from Reddit communities through
+  meme-api.com — no API key. HTTPS-only, CDN allow-list, image extensions only,
+  NSFW/spoiler filtering, one-line titles, a small cache, prefetch and a
+  backoff when the API is down. The locally drawn meme card remains the
+  fallback, so the feature never goes dark. `functions/meme_feed.py`.
+- **Reaction GIFs.** Tenor or Giphy with a free key (`TENOR_API_KEY` /
+  `GIPHY_API_KEY`); without one the automatic path is skipped and `/gif`
+  explains itself and sends a meme instead.
+- `/meme [topic]`, `/gif <query>`, `/roast [member]`, and `@Paradise roast me`
+  routed through the mention assistant (a new `roast` route kind, so it never
+  costs a model call).
+- Spoken "hey paradise" with no question is answered with one of eight
+  acknowledgements instead of the same line every time.
+- `PERSONALITY_AMBIENT_REACTION_CHANCE`, `PERSONALITY_GIF_CHANCE`,
+  `PERSONALITY_ONLINE_MEME_CHANCE`, `PERSONALITY_ROAST_CHANCE`,
+  `PERSONALITY_ROAST_INTENSITY`, `PERSONALITY_ROAST_USER_COOLDOWN`,
+  `MEME_SOURCES`, `MEME_TIMEOUT`, `TENOR_API_KEY`, `GIPHY_API_KEY`.
+
+### Changed
+- The AI persona is allowed to be funny on purpose: banter and roasts are
+  explicitly in the system prompt, with the same hard limits as the roast book
+  (no identity attacks, no slurs, no pile-ons, and jokes off entirely when
+  somebody sounds hurt).
+- Default personality pacing: reaction 0.045 → 0.22, reply 0.015 → 0.10, meme
+  0.045 → 0.10, quip 0.035 → 0.12, global cooldown 45 s → 10 s, channel cooldown
+  120 s → 35 s, humour cooldown 150 s → 45 s, reply cooldown 600 s → 150 s.
+
 - **The wake word can be spoken.** Paradise listens to the voice channel it is
   already in, waits for an utterance to end, transcribes it once
   (on-device Whisper, with Scribe/Gemini as an opt-in fallback), and only then checks for

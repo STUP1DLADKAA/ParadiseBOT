@@ -36,6 +36,25 @@ def _chance(raw: str | None, default: float) -> float:
     return value if 0.0 <= value <= 1.0 else default
 
 
+def _sources(raw: str | None) -> tuple[str, ...]:
+    """Comma/space separated subreddit names, validated into a safe tuple."""
+    default = ("dankmemes", "memes", "me_irl", "wholesomememes")
+    if raw is None or not str(raw).strip():
+        return default
+    names: list[str] = []
+    for chunk in str(raw).replace(",", " ").split():
+        name = "".join(ch for ch in chunk if ch.isalnum() or ch == "_")
+        if name and name.lower() not in {existing.lower() for existing in names}:
+            names.append(name)
+    return tuple(names[:12]) or default
+
+
+def _roast_intensity(raw: str | None) -> str:
+    """One of mild / spicy / nuclear; anything else is the default."""
+    value = (raw or "").strip().lower()
+    return value if value in {"mild", "spicy", "nuclear"} else "spicy"
+
+
 def _stt_model(raw: str | None) -> str:
     """A Whisper size ("small", "large-v3-turbo") or a path to a model dir.
 
@@ -83,53 +102,90 @@ def _csv(raw: str | None, default: tuple[str, ...]) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True)
 class PersonalityConfig:
-    """Tuning for Paradise's passive personality & humour (see functions/personality.py).
+    """Tuning for Paradise's passive personality (see functions/personality.py).
 
-    Controls contextual pattern reactions/replies, random sticker & meme drops,
-    unpredictable smart/stupid quips, and English-only nerd grammar corrections.
+    This is the "alive" part of the bot: reactions, replies, stickers, memes
+    from the internet, GIFs, spontaneous quips, roasts and English-only nerd
+    grammar corrections. The defaults are set for a small friends-only server
+    where the bot is meant to be one of the loudest people in the channel —
+    turn any knob down, or ``PERSONALITY_ENABLED=false`` for silence.
     """
 
     enabled: bool = True
     # Chance to add a contextual reaction to a matching message.
-    reaction_chance: float = 0.045
-    # Chance to send a short contextual reply instead (rarer; never both).
-    reply_chance: float = 0.015
+    reaction_chance: float = 0.22
+    # Chance to react to a casual message that matched no pattern at all.
+    ambient_reaction_chance: float = 0.10
+    # Chance to send a short contextual reply instead (never both).
+    reply_chance: float = 0.10
     # Chance to reply to a casual message with a random Discord/vinyl sticker.
-    sticker_chance: float = 0.045
-    # Chance to reply with a dynamically rendered meme card of the message.
-    meme_chance: float = 0.045
+    sticker_chance: float = 0.05
+    # Chance to reply with a meme — from the internet when it is reachable,
+    # rendered locally when it is not.
+    meme_chance: float = 0.10
+    # Of those meme drops, how many should try the internet first.
+    online_meme_chance: float = 0.75
+    # Chance to reply with a reaction GIF (needs TENOR_API_KEY or GIPHY_API_KEY).
+    gif_chance: float = 0.05
     # Chance to drop a spontaneous smart/stupid/unpredictable quip.
-    random_quip_chance: float = 0.035
+    random_quip_chance: float = 0.12
+    # Chance to roast whoever just spoke.
+    roast_chance: float = 0.12
+    # "mild", "spicy" or "nuclear" — see functions/roasts.py.
+    roast_intensity: str = "spicy"
+    # Seconds before the same person can be roasted again.
+    roast_user_cooldown: int = 600
     # Chance to reply in nerd voice when an English sentence has a typo/grammar slip.
     grammar_chance: float = 0.70
     # Seconds between ANY two personality actions, bot-wide.
-    global_cooldown: int = 45
+    global_cooldown: int = 10
     # Seconds between personality actions in the same channel.
-    channel_cooldown: int = 120
+    channel_cooldown: int = 35
     # Extra spacing for pattern replies in the same channel.
-    reply_channel_cooldown: int = 600
-    # Per-channel spacing for stickers, memes, and spontaneous quips.
-    humour_cooldown: int = 150
+    reply_channel_cooldown: int = 150
+    # Per-channel spacing for stickers, memes, GIFs and spontaneous quips.
+    humour_cooldown: int = 45
     # Per-channel spacing for English grammar/spelling nerd corrections.
     grammar_cooldown: int = 90
+    # Communities the keyless meme feed may pull from.
+    meme_sources: tuple[str, ...] = ("dankmemes", "memes", "me_irl", "wholesomememes")
+    # Per-request deadline for the meme/GIF APIs.
+    online_timeout: float = 6.0
+    # Optional free keys; without one, GIF replies fall back to memes.
+    tenor_api_key: str = ""
+    giphy_api_key: str = ""
 
     @classmethod
     def from_env(cls, env) -> "PersonalityConfig":
         return cls(
             enabled=_bool(env.get("PERSONALITY_ENABLED"), True),
-            reaction_chance=_chance(env.get("PERSONALITY_REACTION_CHANCE"), 0.045),
-            reply_chance=_chance(env.get("PERSONALITY_REPLY_CHANCE"), 0.015),
-            sticker_chance=_chance(env.get("PERSONALITY_STICKER_CHANCE"), 0.045),
-            meme_chance=_chance(env.get("PERSONALITY_MEME_CHANCE"), 0.045),
-            random_quip_chance=_chance(env.get("PERSONALITY_QUIP_CHANCE"), 0.035),
-            grammar_chance=_chance(env.get("PERSONALITY_GRAMMAR_CHANCE"), 0.70),
-            global_cooldown=_int(env.get("PERSONALITY_GLOBAL_COOLDOWN"), 45),
-            channel_cooldown=_int(env.get("PERSONALITY_CHANNEL_COOLDOWN"), 120),
-            reply_channel_cooldown=_int(
-                env.get("PERSONALITY_REPLY_CHANNEL_COOLDOWN"), 600
+            reaction_chance=_chance(env.get("PERSONALITY_REACTION_CHANCE"), 0.22),
+            ambient_reaction_chance=_chance(
+                env.get("PERSONALITY_AMBIENT_REACTION_CHANCE"), 0.10
             ),
-            humour_cooldown=_int(env.get("PERSONALITY_HUMOUR_COOLDOWN"), 150),
+            reply_chance=_chance(env.get("PERSONALITY_REPLY_CHANCE"), 0.10),
+            sticker_chance=_chance(env.get("PERSONALITY_STICKER_CHANCE"), 0.05),
+            meme_chance=_chance(env.get("PERSONALITY_MEME_CHANCE"), 0.10),
+            online_meme_chance=_chance(
+                env.get("PERSONALITY_ONLINE_MEME_CHANCE"), 0.75
+            ),
+            gif_chance=_chance(env.get("PERSONALITY_GIF_CHANCE"), 0.05),
+            random_quip_chance=_chance(env.get("PERSONALITY_QUIP_CHANCE"), 0.12),
+            roast_chance=_chance(env.get("PERSONALITY_ROAST_CHANCE"), 0.12),
+            roast_intensity=_roast_intensity(env.get("PERSONALITY_ROAST_INTENSITY")),
+            roast_user_cooldown=_int(env.get("PERSONALITY_ROAST_USER_COOLDOWN"), 600),
+            grammar_chance=_chance(env.get("PERSONALITY_GRAMMAR_CHANCE"), 0.70),
+            global_cooldown=_int(env.get("PERSONALITY_GLOBAL_COOLDOWN"), 10),
+            channel_cooldown=_int(env.get("PERSONALITY_CHANNEL_COOLDOWN"), 35),
+            reply_channel_cooldown=_int(
+                env.get("PERSONALITY_REPLY_CHANNEL_COOLDOWN"), 150
+            ),
+            humour_cooldown=_int(env.get("PERSONALITY_HUMOUR_COOLDOWN"), 45),
             grammar_cooldown=_int(env.get("PERSONALITY_GRAMMAR_COOLDOWN"), 90),
+            meme_sources=_sources(env.get("MEME_SOURCES")),
+            online_timeout=_float(env.get("MEME_TIMEOUT"), 6.0),
+            tenor_api_key=(env.get("TENOR_API_KEY") or "").strip(),
+            giphy_api_key=(env.get("GIPHY_API_KEY") or "").strip(),
         )
 
 

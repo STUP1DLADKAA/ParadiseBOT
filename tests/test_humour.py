@@ -183,7 +183,11 @@ class TestHumourPersonalityIntegration(unittest.IsolatedAsyncioTestCase):
             reply_chance=1.0,
             sticker_chance=1.0,
             meme_chance=1.0,
+            online_meme_chance=0.0,
+            gif_chance=0.0,
             random_quip_chance=1.0,
+            roast_chance=0.0,
+            ambient_reaction_chance=0.0,
             grammar_chance=1.0,
             global_cooldown=0,
             channel_cooldown=0,
@@ -208,7 +212,11 @@ class TestHumourPersonalityIntegration(unittest.IsolatedAsyncioTestCase):
             reply_chance=0.0,
             sticker_chance=0.0,
             meme_chance=1.0,
+            online_meme_chance=0.0,
+            gif_chance=0.0,
             random_quip_chance=0.0,
+            roast_chance=0.0,
+            ambient_reaction_chance=0.0,
             grammar_chance=0.0,
             global_cooldown=0,
             channel_cooldown=0,
@@ -232,7 +240,10 @@ class TestHumourPersonalityIntegration(unittest.IsolatedAsyncioTestCase):
             reply_chance=0.0,
             sticker_chance=1.0,
             meme_chance=0.0,
+            gif_chance=0.0,
             random_quip_chance=0.0,
+            roast_chance=0.0,
+            ambient_reaction_chance=0.0,
             grammar_chance=0.0,
             global_cooldown=0,
             channel_cooldown=0,
@@ -255,9 +266,12 @@ class TestHumourPersonalityIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(msg1.reply.call_args.kwargs["stickers"], [sticker])
 
         # Case 2: Guild has 0 stickers -> falls back cleanly to custom vinyl sticker PNG
+        # (a different channel: the engine deliberately avoids doing the same
+        # kind of thing twice in a row in one channel)
         msg2 = _make_msg(
             "another normal sentence in a stickerless server",
             author_id=43,
+            channel_id=11,
             guild_stickers=[],
         )
         await personality.handle(msg2)
@@ -273,7 +287,10 @@ class TestHumourPersonalityIntegration(unittest.IsolatedAsyncioTestCase):
             reply_chance=0.0,
             sticker_chance=0.0,
             meme_chance=0.0,
+            gif_chance=0.0,
             random_quip_chance=1.0,
+            roast_chance=0.0,
+            ambient_reaction_chance=0.0,
             grammar_chance=0.0,
             global_cooldown=0,
             channel_cooldown=0,

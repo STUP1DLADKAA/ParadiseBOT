@@ -23,6 +23,7 @@ COMMAND_HELP = "command_help"
 PING = "ping"
 COINFLIP = "coinflip"
 CHOOSE = "choose"
+ROAST = "roast"
 CALCULATE = "calculate"
 DEFINE = "define"
 CONVERT = "convert"
@@ -38,8 +39,8 @@ UNKNOWN = "unknown"
 #: Every kind the assistant knows how to dispatch.
 KINDS = frozenset(
     {
-        HELP, COMMAND_HELP, PING, COINFLIP, CHOOSE, CALCULATE, DEFINE, CONVERT,
-        IMAGE, WEATHER, TIME, DATE, TRANSLATE, SEARCH, AI, UNKNOWN,
+        HELP, COMMAND_HELP, PING, COINFLIP, CHOOSE, ROAST, CALCULATE, DEFINE,
+        CONVERT, IMAGE, WEATHER, TIME, DATE, TRANSLATE, SEARCH, AI, UNKNOWN,
     }
 )
 

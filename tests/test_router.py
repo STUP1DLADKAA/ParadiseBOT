@@ -14,7 +14,7 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from functions.router import (
-    AI, CALCULATE, CONVERT, DATE, DEFINE, HELP, IMAGE,
+    AI, CALCULATE, CONVERT, DATE, DEFINE, HELP, IMAGE, ROAST,
     SEARCH, TIME, TRANSLATE, WEATHER, route_many, route_query,
 )
 
@@ -149,6 +149,29 @@ class TestRouter(unittest.TestCase):
         self.assertEqual(route.payload, "15% of 500")
         route = self.route("define    'serendipity'  ")
         self.assertEqual(route.payload, "serendipity")
+
+
+class TestRoastRouting(unittest.TestCase):
+    """"@Paradise roast me" must reach the roast, not the language model."""
+
+    def test_roast_me(self):
+        route = route_query("roast me")
+        self.assertEqual(route.kind, ROAST)
+        self.assertEqual(route.payload, "me")
+
+    def test_roast_a_member(self):
+        route = route_query("roast <@123456789>")
+        self.assertEqual(route.kind, ROAST)
+        self.assertIn("123456789", route.payload)
+
+    def test_roast_a_named_person(self):
+        route = route_query("roast the guy who lost the 1v1")
+        self.assertEqual(route.kind, ROAST)
+        self.assertIn("guy", route.payload)
+
+    def test_ordinary_sentences_are_not_roasts(self):
+        for text in ("what's the weather in Delhi", "define roast", "tell me a joke"):
+            self.assertNotEqual(route_query(text).kind, ROAST, text)
 
 
 class TestImageRouting(unittest.TestCase):
