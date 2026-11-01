@@ -45,6 +45,17 @@ cannot answer:
 | `@Paradise summarize` (or "recap", "tl;dr", "what did i miss") | AI recap of the recent conversation — no slash command needed | optional |
 | `@Paradise meme [about X]` | a real internet meme, or a locally drawn one about X | never |
 | `@Paradise gif [of X]` / "bruh gif" | a reaction GIF — keyless by default | never |
+| `@Paradise roll 2d20+3` / `8ball` / `rps` / `pick a number between 1 and 100` | dice, magic 8-ball, rock-paper-scissors, random numbers | never |
+| `@Paradise qr code for <link>` | a real scannable QR code, rendered offline | never |
+| `@Paradise password` (or "a strong 24 character password") | cryptographically strong passwords, never stored | never |
+| `@Paradise rot13` / `caesar 3` / `base64` / `hash` / `morse` | ciphers, encoding and hashes for the devs | never |
+| `@Paradise reverse` / `mock` / `count words in` / `emojify` / `spoiler` | the text utilities | never |
+| `@Paradise days until christmas` / `how long until 25 dec 2026` | countdowns | never |
+| `@Paradise color #5865F2` | colour info card with a drawn swatch | never |
+| `@Paradise uuid` / `lorem 2` | UUIDs and lorem-ipsum filler | never |
+| `@Paradise remind me in 20 minutes to check the oven` | the /remind engine, by mention | never |
+| `@Paradise poll: pizza or burgers` | the reaction-poll engine, by mention | never |
+| `@Paradise who is @user` / `avatar` / `server info` | Discord-native info cards | never |
 | `/summarize` | AI summary of recent conversation | optional |
 | `/memory add/list/remove/clear [user]` | the lords (Stupid, Taher) teach the bot facts about a member (or the server) that surface when that person talks | optional |
 | `@Paradise roast <someone>` | an AI tease about what that person actually just said (roast-book fallback) | optional |
@@ -72,7 +83,8 @@ conversation, `/summarize` and the AI-shaped answers are unavailable.
 
 | | |
 | --- | --- |
-| **Mention-first interface** | `@Paradise 100 USD to INR`, `@Paradise weather in Delhi`, `@Paradise define ephemeral` — no slash commands to memorise. A deterministic router picks the right native tool; two requests in one sentence run concurrently. |
+| **Mention-first interface** | `@Paradise 100 USD to INR`, `@Paradise weather in Delhi`, `@Paradise roll 2d20+3` — no slash commands to memorise. A deterministic router picks the right native tool; two requests in one sentence run concurrently, and 12 AI answers can be in flight at once with a per-member fairness cap. |
+| **Multi-model brains** | List several models on one OpenAI-compatible endpoint (`AI_MODELS=fast:gpt-4o-mini,deep:gpt-4o`): fast models handle labels and quips, deep models handle real questions and recaps, and a failing model is failed over mid-flight — then Gemini, as always. |
 | **Voice leaderboards** | Supabase-backed tracking with crash-safe checkpoints, IST calendar windows and a daily DM that reads like a note from a person. The card is a rendered page — a podium, then one grouped list, in white on light grey with a single accent per period. |
 | **Cards, drawn in code** | Dictionary, weather, recipe, mini-game and leaderboard visuals are Pillow-rendered at 2× supersampling — deterministic, cacheable, never generated. The leaderboard's contrast ratios are asserted in the test suite, not eyeballed. |
 | **Pronunciation** | Optional ElevenLabs voice for dictionary words, with an OpenAI-compatible and a free web fallback. Hindi, English and Hinglish. |
@@ -81,7 +93,7 @@ conversation, `/summarize` and the AI-shaped answers are unavailable.
 | **Silent presence** | Follows the crowd into the busiest voice channel and says nothing when it arrives. |
 | **Mini-games** | A recoverable SQLite scheduler, four modular games, aggregate-only leaderboard. |
 | **Self-updating** | Pulls the latest revision from GitHub on start-up and while online — validated, backed up, crash-loop guarded, and it never touches `.env` or `data/`. |
-| **No mandatory keys** | Dictionary, conversions, calculator, weather, time, translation and image search work with zero configuration. Questions and "search …" asks need an AI key. |
+| **No mandatory keys** | Dictionary, conversions, calculator, weather, time, translation, image search and the entire free toolkit (dice, QR codes, passwords, ciphers, countdowns, reminders, polls, info cards) work with zero configuration. Questions and "search …" asks need an AI key. |
 
 ### Tool-first, AI-last
 
@@ -93,6 +105,8 @@ request normalizer (typos, slang, Hinglish, emoji, filler)
 intent router (deterministic, microseconds)
    ↓
 can a native tool answer?   calculator · define · convert · image · weather · time · translate · meme · gif · recap
+                            · dice/qr/password/rot13/base64/hash/morse/colour/countdown
+                            · reminders · polls · whois/avatar/server info
    ├── YES → specialised tool, zero AI
    └── NO
         search-shaped or factual?  → forwarded straight to the AI, no web retrieval

@@ -6,6 +6,45 @@ All notable changes to Paradise are recorded here. The format follows
 
 ## [Unreleased]
 
+### Added
+- **~24 new capabilities per plain @ping, all free and offline.** A
+  deterministic toolkit (functions/toolkit.py) answers instantly, with no
+  API key and no AI: dice (`roll 2d20+3`, `roll a d20`), magic 8-ball,
+  rock-paper-scissors, random numbers (`pick a number between 1 and 100`),
+  QR codes (rendered offline with the new `qrcode` dependency), strong
+  passwords, UUIDs, lorem-ipsum, ROT13/Caesar ciphers, base64, SHA-256/MD5
+  hashes, Morse code, reverse/mock-case/count/emojify/spoiler text tools,
+  countdowns ("days until christmas", "how long until 25 dec 2026") and
+  colour cards with a drawn swatch. All of them join the compound router
+  ("weather in Delhi and roll a d20" answers both) and the AI classifier
+  learned the labels, so loose phrasings still land on the right tool.
+- **Reminders, polls and info cards by mention.** "remind me in 20 minutes
+  to check the oven" uses the /remind engine (refactored into a shared
+  `create_reminder`), "poll: pizza or burgers" deploys the reaction poll,
+  and "who is @user" / "avatar" / "server info" post Discord-native cards.
+- **Multi-model brains (`AI_MODELS`).** Several models can share one
+  OpenAI-compatible endpoint, each tagged with a role:
+  `AI_MODELS=fast:gpt-4o-mini,deep:gpt-4o`. Fast models answer labels,
+  quips and anything latency-sensitive; deep models answer real questions
+  and recaps. A model that 429s/500s is skipped for a minute and the next
+  one answers mid-flight — then Gemini, as always. Single-model setups are
+  unchanged (`AI_MODEL` still does everything).
+
+### Changed
+- **Faster for everyone, fairer under load.** Up to 12 AI requests in
+  flight at once (up from 8), and a per-member ceiling of 2 concurrent
+  requests — one person machine-gunning questions can never starve the
+  rest of the server. Per-user AI cooldown 8 s → 6 s.
+- **Alive, but controlled.** Every ambient personality chance is lower
+  (reactions 0.22 → 0.18, memes 0.16 → 0.10, quips 0.14 → 0.08, roasts
+  0.12 → 0.08, GIFs 0.10 → 0.06, replies 0.12 → 0.08, ambient reactions
+  0.10 → 0.06), the interjection chance halved (0.08 → 0.04) with a
+  10-minute cooldown, and a new hard **ambient budget**
+  (`PERSONALITY_AMBIENT_HOURLY_CAP`, default 6) caps *unprompted* chatter
+  per channel per rolling hour. Mentions, invited roasts and grammar bait
+  are never budget-limited: Paradise still answers instantly whenever
+  someone actually talks to it.
+
 ### Removed
 - **The "chat is silent" watcher is gone.** The aliveness feature — the
   lines Paradise posted when nobody had typed for a while or everyone had

@@ -15,6 +15,9 @@ aiohttp>=3.9,<4.0
 # Dictionary cards. Without it the dictionary still works and falls back
 # to a text result instead of a rendered image.
 Pillow>=10.0,<13.0
+# Offline QR-code rendering for "@Paradise qr code for …" — pure Python,
+# pairs with Pillow above, no API and no key.
+qrcode>=8.0,<10.0
 # Fast Damerau-Levenshtein matching for typo-tolerant dictionary searches.
 # A bounded pure-Python fallback remains available for minimal installs.
 rapidfuzz>=3.0,<4.0

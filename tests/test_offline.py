@@ -296,8 +296,8 @@ class TestConfig(unittest.TestCase):
         config = Config.from_env(
             {"PERSONALITY_REACTION_CHANCE": "5", "PERSONALITY_REPLY_CHANCE": "banana"}
         )
-        self.assertEqual(config.personality.reaction_chance, 0.22)
-        self.assertEqual(config.personality.reply_chance, 0.12)
+        self.assertEqual(config.personality.reaction_chance, 0.18)
+        self.assertEqual(config.personality.reply_chance, 0.08)
 
     def test_template_has_no_music_or_consent_settings(self):
         path = os.path.join(

@@ -152,6 +152,16 @@ class FakeUtilityCog:
         self.conversion_engine = FakeConversionEngine()
         self.weather_service = FakeWeatherService()
         self.db = SimpleNamespace(get_user_timezone=lambda _id: None)
+        self.reminders = []
+        self.polls = []
+
+    async def create_reminder(self, user_id, channel_id, minutes, text):
+        self.reminders.append((user_id, channel_id, minutes, text))
+        return True, f"got it. I'll remind you in {minutes} minutes."
+
+    async def deploy_poll(self, channel, question, choices, starter):
+        self.polls.append((question, tuple(choices), starter))
+        return True
 
 
 class FakeBot:
@@ -662,6 +672,148 @@ class TestAssistantSafety(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(assistant.images.calls, [])
         self.assertEqual(ai.questions, [])
         self.assertEqual(ai.responded_to, [])
+
+
+class TestToolkitByMention(unittest.IsolatedAsyncioTestCase):
+    """@Paradise + the free toolkit: dice, qr, remind, poll, whois, avatar."""
+
+    async def test_dice_by_mention(self):
+        assistant, _ = make_assistant()
+        message = mention("roll 2d20+3")
+        self.assertTrue(await assistant.handle_message(message))
+        text = message.replies[0]["content"]
+        self.assertIn("🎲", text)
+        self.assertIn("**", text)
+
+    async def test_reverse_by_mention(self):
+        assistant, _ = make_assistant()
+        message = mention("reverse hello world")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertIn("dlrow olleh", message.replies[0]["content"])
+
+    async def test_password_by_mention_mentions_nothing(self):
+        assistant, _ = make_assistant()
+        message = mention("generate a strong 24 character password")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertIn("🔒", message.replies[0]["content"])
+
+    async def test_qr_by_mention_attaches_a_png(self):
+        assistant, _ = make_assistant()
+        message = mention("qr code for https://example.com")
+        self.assertTrue(await assistant.handle_message(message))
+        reply = message.replies[0]
+        self.assertIn("QR", reply["content"])
+        file = reply.get("file")
+        self.assertIsNotNone(file)
+        self.assertEqual(file.filename, "qr.png")
+
+    async def test_countdown_by_mention(self):
+        assistant, _ = make_assistant()
+        message = mention("days until christmas")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertIn("Christmas", message.replies[0]["content"])
+
+    async def test_remind_by_mention_uses_the_reminder_engine(self):
+        assistant, bot = make_assistant()
+        utility = bot.get_cog("Utility")
+        message = mention("remind me in 20 minutes to check the oven")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertEqual(len(utility.reminders), 1)
+        user_id, channel_id, minutes, text = utility.reminders[0]
+        self.assertEqual(minutes, 20)
+        self.assertEqual(text, "check the oven")
+        self.assertIn("remind you", message.replies[0]["content"])
+
+    async def test_remind_with_no_time_asks_for_one(self):
+        assistant, bot = make_assistant()
+        utility = bot.get_cog("Utility")
+        message = mention("remind me to stretch")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertEqual(utility.reminders, [])
+        self.assertIn("when?", message.replies[0]["content"])
+
+    async def test_poll_by_mention_deploys_the_poll(self):
+        assistant, bot = make_assistant()
+        utility = bot.get_cog("Utility")
+        message = mention("poll: pizza or burgers")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertEqual(len(utility.polls), 1)
+        question, choices, starter = utility.polls[0]
+        self.assertEqual(choices, ("pizza", "burgers"))
+        self.assertEqual(starter, "Tester")
+
+    async def test_whois_by_mention_cards_the_mentioned_member(self):
+        assistant, _ = make_assistant()
+        message = mention("who is <@77>")
+        target = SimpleNamespace(
+            id=77, bot=False, display_name="Taher",
+            created_at=__import__("datetime").datetime(2020, 1, 1),
+            joined_at=__import__("datetime").datetime(2024, 6, 1),
+            roles=[SimpleNamespace(name="@everyone"), SimpleNamespace(name="lords")],
+            display_avatar=SimpleNamespace(url="https://avatar"),
+        )
+        message.mentions = [target]
+        self.assertTrue(await assistant.handle_message(message))
+        embed = message.replies[0].get("embed")
+        self.assertIsNotNone(embed)
+        self.assertIn("Taher", embed.title)
+
+    async def test_avatar_by_mention_shows_the_asker_without_a_mention(self):
+        assistant, _ = make_assistant()
+        message = mention("avatar")
+        self.assertTrue(await assistant.handle_message(message))
+        embed = message.replies[0].get("embed")
+        self.assertIsNotNone(embed)
+
+    async def test_server_info_by_mention(self):
+        assistant, _ = make_assistant()
+        message = mention("server info")
+        message.guild = SimpleNamespace(
+            id=1,
+            me=SimpleNamespace(),
+            name="Paradise",
+            member_count=42,
+            created_at=__import__("datetime").datetime(2021, 5, 1),
+            premium_subscription_count=2,
+            owner=SimpleNamespace(display_name="Stupid"),
+            icon=None,
+        )
+        self.assertTrue(await assistant.handle_message(message))
+        embed = message.replies[0].get("embed")
+        self.assertIsNotNone(embed)
+        self.assertIn("Paradise", embed.title)
+
+    async def test_compound_dice_and_countdown(self):
+        assistant, _ = make_assistant()
+        message = mention("roll a d20 and days until christmas")
+        self.assertTrue(await assistant.handle_message(message))
+        text = message.replies[0]["content"]
+        self.assertIn("🎲", text)
+        self.assertIn("Christmas", text)
+
+    async def test_compound_weather_and_reminder(self):
+        # The reminder part sends its own message; the weather part is
+        # compacted — and the city no longer eats the reminder text.
+        assistant, bot = make_assistant()
+        utility = bot.get_cog("Utility")
+        message = mention("weather in delhi and remind me in 20 minutes to eat")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertEqual(len(utility.reminders), 1)
+        self.assertEqual(utility.reminders[0][2], 20)
+        self.assertEqual(utility.reminders[0][3], "eat")
+        # The combined reply still carries the weather part.
+        text = "\n".join(str(reply.get("content")) for reply in message.replies)
+        self.assertIn("delhi", text.lower())
+
+    async def test_compound_reminder_and_dice(self):
+        assistant, bot = make_assistant()
+        utility = bot.get_cog("Utility")
+        message = mention("remind me in 30 minutes to stretch and roll a d20")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertEqual(len(utility.reminders), 1)
+        self.assertEqual(utility.reminders[0][3], "stretch")
+        text = "\n".join(str(reply.get("content")) for reply in message.replies)
+        self.assertIn("🎲", text)
 
 
 class TestMediaAndRecapByMention(unittest.IsolatedAsyncioTestCase):

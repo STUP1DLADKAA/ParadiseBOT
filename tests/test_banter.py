@@ -700,13 +700,20 @@ class TestBanterCommands(unittest.IsolatedAsyncioTestCase):
 
 
 class TestBanterConfig(unittest.TestCase):
-    def test_defaults_are_lively(self):
+    def test_defaults_are_alive_but_controlled(self):
         cfg = Config.from_env({}).personality
-        self.assertGreaterEqual(cfg.reaction_chance, 0.2)
-        self.assertGreaterEqual(cfg.roast_chance, 0.1)
+        # Alive: it still reacts, roasts and quips unprompted…
+        self.assertGreaterEqual(cfg.reaction_chance, 0.15)
+        self.assertGreaterEqual(cfg.roast_chance, 0.05)
+        self.assertGreaterEqual(cfg.random_quip_chance, 0.05)
         self.assertLessEqual(cfg.global_cooldown, 15)
         self.assertLessEqual(cfg.channel_cooldown, 60)
         self.assertEqual(cfg.roast_intensity, "spicy")
+        # …but controlled: rare interjections, and a hard hourly ceiling on
+        # unprompted chatter so it never fills the chat for no reason.
+        self.assertLessEqual(cfg.interject_chance, 0.05)
+        self.assertGreaterEqual(cfg.interject_cooldown, 300)
+        self.assertGreaterEqual(cfg.ambient_hourly_cap, 1)
 
     def test_env_overrides_are_parsed(self):
         cfg = Config.from_env(
@@ -738,12 +745,68 @@ class TestBanterConfig(unittest.TestCase):
 
     def test_a_silly_chance_falls_back(self):
         cfg = Config.from_env({"PERSONALITY_ROAST_CHANCE": "12"}).personality
-        self.assertEqual(cfg.roast_chance, 0.12)
+        self.assertEqual(cfg.roast_chance, 0.08)  # the (calmer) default
 
 
 # ---------------------------------------------------------------------------
 # The long memory: /memory facts quoted back at the right person
 # ---------------------------------------------------------------------------
+
+
+class TestAmbientBudget(unittest.IsolatedAsyncioTestCase):
+    """Unprompted chatter is capped per hour — alive, but controlled."""
+
+    async def test_unprompted_chatter_stops_at_the_hourly_cap(self):
+        personality = _personality(
+            interject_chance=1.0,
+            interject_cooldown=0,
+            ambient_hourly_cap=2,
+        )
+        replied = 0
+        for index in range(6):
+            # Two authors alternate (a live conversation) with fresh words
+            # each time — identical posts would trip the spam guard.
+            msg = _make_msg(
+                f"so anyway chapter {index} of the saga continues",
+                author_id=42 if index % 2 == 0 else 43,
+            )
+            await personality.handle(msg)
+            replied += 1 if msg.reply.await_count else 0
+        self.assertEqual(replied, 2)  # said hello twice, then went quiet
+
+    async def test_a_cap_of_zero_disables_the_ceiling(self):
+        personality = _personality(
+            interject_chance=1.0,
+            interject_cooldown=0,
+            ambient_hourly_cap=0,
+        )
+        replied = 0
+        for index in range(4):
+            msg = _make_msg(
+                f"plot twist number {index} just dropped",
+                author_id=42 if index % 2 == 0 else 43,
+            )
+            await personality.handle(msg)
+            replied += 1 if msg.reply.await_count else 0
+        # The first message cannot interject (a conversation needs two
+        # authors first); every later one does — no ceiling in the way.
+        self.assertEqual(replied, 3)
+
+    def test_the_budget_window_is_one_hour(self):
+        personality = _personality(ambient_hourly_cap=1)
+        now = 1000.0
+        self.assertTrue(personality._ambient_budget_ok(10, now))
+        personality._record_ambient(10, now)
+        self.assertFalse(personality._ambient_budget_ok(10, now + 60))
+        # …and it re-opens after the rolling hour passes.
+        self.assertTrue(personality._ambient_budget_ok(10, now + 3601))
+        # Other channels have their own budget.
+        self.assertTrue(personality._ambient_budget_ok(11, now + 60))
+
+    def test_mentions_are_never_budget_limited(self):
+        # The budget only gates the *passive* path; nothing here is passive.
+        personality = _personality(ambient_hourly_cap=0)
+        self.assertTrue(personality._ambient_budget_ok(10, 0.0))
 
 
 class TestMemoryCallbacks(unittest.IsolatedAsyncioTestCase):

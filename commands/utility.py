@@ -149,6 +149,60 @@ class Utility(commands.Cog):
 
     # -- remind -----------------------------------------------------------
 
+    async def create_reminder(
+        self, user_id: int, channel_id: int, minutes: int, text: str
+    ) -> tuple[bool, str]:
+        """Schedule one reminder. Shared by /remind and the mention router.
+
+        Returns (okay, note) — the note is already phrased for chat.
+        """
+        text = " ".join(str(text or "").split()).strip()[:300]
+        if not text:
+            return False, "remind you *about* what?"
+        minutes = max(1, min(int(minutes), 10_080))
+        if (
+            len(self.reminders) >= self.MAX_REMINDERS
+            or self.reminder_owners[user_id] >= self.MAX_PER_USER
+        ):
+            return False, "too many reminders in the air right now. try again later."
+        self._next_reminder += 1
+        reminder_id = self._next_reminder
+        self.reminder_owners[user_id] += 1
+        task = asyncio.create_task(
+            self._deliver_reminder(reminder_id, user_id, channel_id, minutes, text),
+            name=f"reminder-{reminder_id}",
+        )
+        self.reminders[reminder_id] = task
+        due = discord.utils.utcnow() + timedelta(minutes=minutes)
+        return True, f"got it. I'll remind you here {discord.utils.format_dt(due, 'R')}."
+
+    async def deploy_poll(
+        self, channel, question: str, choices: list[str], starter: str
+    ) -> bool:
+        """Post a reaction poll. Shared by /poll and the mention router."""
+        if not isinstance(channel, discord.abc.Messageable):
+            return False
+        question = str(question or "").strip()[:200]
+        choices = [str(choice).strip()[:80] for choice in choices]
+        if not question or not 2 <= len(choices) <= 10:
+            return False
+        lines = [f"📊 **{discord.utils.escape_markdown(question)}**", ""]
+        lines.extend(
+            f"{POLL_EMOJIS[i]} {discord.utils.escape_markdown(choice)}"
+            for i, choice in enumerate(choices)
+        )
+        lines += ["", f"-# react below to vote · started by {starter}"]
+        try:
+            poll_message = await channel.send(
+                "\n".join(lines), allowed_mentions=discord.AllowedMentions.none()
+            )
+            for emoji in POLL_EMOJIS[: len(choices)]:
+                await poll_message.add_reaction(emoji)
+            return True
+        except discord.DiscordException:
+            log.warning("Poll creation failed", exc_info=True)
+            return False
+
     @app_commands.command(description="Get reminded in this channel later")
     @app_commands.describe(
         minutes="1–10,080 minutes", message="What to remind you about"
@@ -165,34 +219,11 @@ class Utility(commands.Cog):
                 "I need a channel for that.", ephemeral=True
             )
             return
-        if (
-            len(self.reminders) >= self.MAX_REMINDERS
-            or self.reminder_owners[interaction.user.id] >= self.MAX_PER_USER
-        ):
-            await interaction.response.send_message(
-                "too many reminders in the air right now. try again later.",
-                ephemeral=True,
-            )
-            return
-
-        self._next_reminder += 1
-        reminder_id = self._next_reminder
-        self.reminder_owners[interaction.user.id] += 1
-        task = asyncio.create_task(
-            self._deliver_reminder(
-                reminder_id,
-                interaction.user.id,
-                interaction.channel_id,
-                minutes,
-                message,
-            ),
-            name=f"reminder-{reminder_id}",
+        okay, note = await self.create_reminder(
+            interaction.user.id, interaction.channel_id, minutes, message
         )
-        self.reminders[reminder_id] = task
-        due = discord.utils.utcnow() + timedelta(minutes=minutes)
         await interaction.response.send_message(
-            f"got it. I'll remind you here {discord.utils.format_dt(due, 'R')}.",
-            ephemeral=True,
+            note if okay else f"• {note}", ephemeral=True
         )
 
     async def _deliver_reminder(

@@ -36,6 +36,10 @@ SEARCH = "search"
 SUMMARIZE = "summarize"
 MEME = "meme"
 GIF = "gif"
+UTILITY = "utility"    # deterministic toolkit tools (payload2 = tool key)
+REMIND = "remind"      # "remind me in 20 minutes to …"
+POLL = "poll"          # reaction polls
+INFO = "info"          # Discord-native info: whois / avatar / server
 AI = "ai"
 UNKNOWN = "unknown"
 
@@ -44,14 +48,15 @@ KINDS = frozenset(
     {
         HELP, COMMAND_HELP, PING, COINFLIP, CHOOSE, ROAST, CALCULATE, DEFINE,
         CONVERT, IMAGE, WEATHER, TIME, DATE, TRANSLATE, SEARCH, SUMMARIZE,
-        MEME, GIF, AI, UNKNOWN,
+        MEME, GIF, UTILITY, REMIND, POLL, INFO, AI, UNKNOWN,
     }
 )
 
 #: Deterministic tools: answered locally or by a dedicated provider, never
 #: by asking a language model to invent the answer.
 DETERMINISTIC_KINDS = frozenset(
-    {CALCULATE, CONVERT, WEATHER, TIME, DATE, DEFINE, TRANSLATE, IMAGE}
+    {CALCULATE, CONVERT, WEATHER, TIME, DATE, DEFINE, TRANSLATE, IMAGE,
+     MEME, GIF, UTILITY, REMIND, POLL, INFO}
 )
 
 # Confidence bands used across the routing stack.
@@ -115,6 +120,7 @@ class Route:
 __all__ = [
     "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE",
     "DEFINE", "DETERMINISTIC_KINDS", "GIF", "HELP", "HIGH_CONFIDENCE", "IMAGE",
-    "KINDS", "MEDIUM_CONFIDENCE", "MEME", "PING", "Route", "SEARCH",
-    "SUMMARIZE", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER", "clamp_confidence",
+    "INFO", "KINDS", "MEDIUM_CONFIDENCE", "MEME", "PING", "POLL", "REMIND",
+    "Route", "SEARCH", "SUMMARIZE", "TIME", "TRANSLATE", "UNKNOWN",
+    "UTILITY", "WEATHER", "clamp_confidence",
 ]

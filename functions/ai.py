@@ -90,13 +90,16 @@ FALLBACK_UNAVAILABLE = (
 _CONTEXT_MESSAGES = 32
 _CONTEXT_CHARS = 6000
 #: Same user asking again: wait this long (spam guard).
-_USER_COOLDOWN = 8.0
+_USER_COOLDOWN = 6.0
 #: Same user, same channel: belt and braces on top of the user cooldown.
 _CHANNEL_COOLDOWN = 3.0
 #: How many AI provider calls may be in flight at once. Discord dispatches
 #: every event as its own task, so several members can be mid-answer at the
 #: same time; beyond this the extra calls queue (they are never dropped).
-_MAX_CONCURRENT_CALLS = 8
+_MAX_CONCURRENT_CALLS = 12
+#: Per-user ceiling: one member machine-gunning questions can never hold
+#: more than this many of the global slots, so everyone else stays fast.
+_PER_USER_SLOTS = 2
 _FAILURE_COOLDOWN = 60.0
 #: How much of a message is kept for context (record() and replies).
 _SNIPPET_CHARS = 400
@@ -120,7 +123,11 @@ class AIService:
         # blocked by the previous asker.
         self._channel_last: dict[int, tuple[float, int]] = {}
         self._provider_slots = asyncio.Semaphore(_MAX_CONCURRENT_CALLS)
-        self._failure_until: float = 0.0
+        self._user_slots: dict[int, asyncio.Semaphore] = {}
+        # Per-model back-off: a model that just 429'd/500'd is skipped for a
+        # minute so the cascade never waits on a corpse. Maps model → monotonic
+        # deadline (see _model_for).
+        self._model_skip_until: dict[str, float] = {}
         # Gemini is the fallback reasoning provider (may be unconfigured).
         self.gemini = GeminiService(getattr(config, "gemini", None))
 
@@ -131,7 +138,10 @@ class AIService:
     @property
     def _openai_configured(self) -> bool:
         """True when the primary (OpenAI-compatible) provider is set up."""
-        return bool(self.config.ai_base_url and self.config.ai_model)
+        return bool(
+            self.config.ai_base_url
+            and (self.config.ai_model or getattr(self.config, "ai_models", None))
+        )
 
     @property
     def provider_name(self) -> str:
@@ -142,9 +152,55 @@ class AIService:
             return "gemini"
         return "none"
 
+    def _role_models(self, role: str) -> list[str]:
+        """Ordered model candidates for *role* ("fast" / "deep").
+
+        The role's own models come first, then every other configured model
+        (failover order), then the legacy single ``AI_MODEL``. Duplicates
+        keep their first position. Unset → just ``AI_MODEL``.
+        """
+        specs = list(getattr(self.config, "ai_models", None) or [])
+        role = role if role in ("fast", "deep") else "deep"
+        names: list[str] = []
+        for spec in specs:
+            if spec.role == role and spec.name not in names:
+                names.append(spec.name)
+        for spec in specs:
+            if spec.role != role and spec.name not in names:
+                names.append(spec.name)
+        default = (getattr(self.config, "ai_model", "") or "").strip()
+        if default and default not in names:
+            names.append(default)
+        return names
+
+    def _model_for(self, role: str) -> list[str]:
+        """Healthy candidates for *role*: cooled-down models move to the back."""
+        models = self._role_models(role)
+        now = time.monotonic()
+        healthy = [m for m in models if now >= self._model_skip_until.get(m, 0.0)]
+        return healthy or models[:1]
+
+    def _user_slot(self, caller_id: int | None) -> asyncio.Semaphore | None:
+        """The fairness slot for one member, or None for anonymous callers."""
+        if not caller_id:
+            return None
+        slot = self._user_slots.get(caller_id)
+        if slot is None:
+            # Bound the registry: in-flight acquisitions keep their own
+            # reference, so clearing the dict never cancels anyone.
+            if len(self._user_slots) > 512:
+                self._user_slots.clear()
+            slot = asyncio.Semaphore(_PER_USER_SLOTS)
+            self._user_slots[caller_id] = slot
+        return slot
+
     def describe(self) -> str:
         if self._openai_configured:
-            base = f"openai-compatible ({self.config.ai_model})"
+            models = ", ".join(
+                f"{spec.name} ({spec.role or 'any'})"
+                for spec in (getattr(self.config, "ai_models", None) or [])
+            ) or self.config.ai_model
+            base = f"openai-compatible ({models})"
             if self.gemini.available:
                 base += " + gemini fallback"
             return base
@@ -381,22 +437,46 @@ class AIService:
         except Exception:  # noqa: BLE001 - shutdown is best effort
             log.debug("Gemini shutdown failed", exc_info=True)
 
-    async def chat(self, messages: list[dict], *, max_tokens: int = 400) -> str:
+    async def chat(
+        self,
+        messages: list[dict],
+        *,
+        max_tokens: int = 400,
+        role: str = "deep",
+        caller_id: int | None = None,
+    ) -> str:
         """Chat completion through the best available provider.
 
-        The OpenAI-compatible endpoint is always tried first; Gemini answers
-        only when that provider is missing or currently failing. Up to
-        :data:`_MAX_CONCURRENT_CALLS` run at once (several members can be
-        mid-answer at the same time); anything beyond that waits here for a
-        slot instead of being dropped, so a busy moment queues rather than
-        silently ignoring people.
+        *role* picks the model tier — "fast" for labels and quips, "deep"
+        for long answers (see ``AI_MODELS``; a single-model setup ignores
+        it). The OpenAI-compatible endpoint is always tried first and each
+        of its configured models gets a chance before Gemini answers.
+
+        Up to :data:`_MAX_CONCURRENT_CALLS` run at once, but any one member
+        holds at most :data:`_PER_USER_SLOTS` of them, so a spammer can
+        never starve the rest of the server. Anything beyond the limits
+        waits here for a slot instead of being dropped, so a busy moment
+        queues rather than silently ignoring people.
         """
         if not self.available:
             raise ParadiseError(FALLBACK_UNAVAILABLE)
+        user_slot = self._user_slot(caller_id)
+        if user_slot is not None:
+            async with user_slot:
+                return await self._chat_global(
+                    messages, max_tokens=max_tokens, role=role
+                )
+        return await self._chat_global(messages, max_tokens=max_tokens, role=role)
+
+    async def _chat_global(
+        self, messages: list[dict], *, max_tokens: int, role: str
+    ) -> str:
         async with self._provider_slots:
             if self._openai_configured:
                 try:
-                    return await self._chat_openai(messages, max_tokens=max_tokens)
+                    return await self._chat_openai(
+                        messages, max_tokens=max_tokens, role=role
+                    )
                 except ParadiseError:
                     # An outage / cooldown on the primary must not kill the
                     # fallback provider.
@@ -426,38 +506,70 @@ class AIService:
             prompt, system=system, max_tokens=max_tokens, temperature=0.9
         )
 
-    async def _chat_openai(self, messages: list[dict], *, max_tokens: int = 400) -> str:
-        """Call an OpenAI-compatible provider, retrying once on real truncation."""
-        answer, truncated = await self._chat_openai_once(messages, max_tokens=max_tokens)
-        if not truncated:
-            return answer
+    async def _chat_openai(
+        self, messages: list[dict], *, max_tokens: int = 400, role: str = "deep"
+    ) -> str:
+        """Call the OpenAI-compatible provider, cascading across models.
 
-        # A length finish is the one case where a retry is worth the tokens:
-        # returning the partial sentence would be worse than one bounded retry.
-        retry_budget = min(max(512, int(max_tokens) * 2), 1200)
-        try:
-            retry_answer, retry_truncated = await self._chat_openai_once(
-                messages, max_tokens=retry_budget
-            )
-        except ParadiseError:
-            raise ParadiseError("I couldn't finish that answer cleanly. try again.") from None
-        if retry_truncated or not retry_answer:
-            raise ParadiseError("I couldn't finish that answer cleanly. try again.")
-        return retry_answer
+        Each healthy model for *role* gets one chance; a model that fails
+        is skipped for a minute and the next one answers. Truncation still
+        gets one bounded retry on the same model (the only case where a
+        retry is worth the tokens).
+        """
+        models = self._model_for(role)
+        if not models:
+            raise ParadiseError(FALLBACK_UNAVAILABLE)
+        last_error: ParadiseError | None = None
+        for model in models:
+            try:
+                answer, truncated = await self._chat_openai_once(
+                    messages, max_tokens=max_tokens, model=model
+                )
+                if not truncated:
+                    return answer
+                # A length finish is the one case where a retry is worth the
+                # tokens: returning the partial sentence would be worse.
+                retry_budget = min(max(512, int(max_tokens) * 2), 1200)
+                try:
+                    retry_answer, retry_truncated = await self._chat_openai_once(
+                        messages, max_tokens=retry_budget, model=model
+                    )
+                except ParadiseError:
+                    raise ParadiseError(
+                        "I couldn't finish that answer cleanly. try again."
+                    ) from None
+                if retry_truncated or not retry_answer:
+                    raise ParadiseError(
+                        "I couldn't finish that answer cleanly. try again."
+                    )
+                return retry_answer
+            except ParadiseError as error:
+                last_error = error
+                self._model_skip_until[model] = time.monotonic() + _FAILURE_COOLDOWN
+                if len(models) > 1:
+                    log.warning(
+                        "Model %s failed (%s) — trying the next model", model, error
+                    )
+                    continue
+                raise
+        raise last_error or ParadiseError("the AI isn't responding right now.")
 
     async def _chat_openai_once(
-        self, messages: list[dict], *, max_tokens: int
+        self, messages: list[dict], *, max_tokens: int, model: str = ""
     ) -> tuple[str, bool]:
         if not self._openai_configured:
             raise ParadiseError(FALLBACK_UNAVAILABLE)
-        if time.monotonic() < self._failure_until:
+        model = model or self.config.ai_model
+        if not model:
+            raise ParadiseError(FALLBACK_UNAVAILABLE)
+        if time.monotonic() < self._model_skip_until.get(model, 0.0):
             raise ParadiseError("the AI is being moody. give it a minute.")
 
         headers = {"Content-Type": "application/json"}
         if self.config.ai_api_key:
             headers["Authorization"] = f"Bearer {self.config.ai_api_key}"
         payload = {
-            "model": self.config.ai_model,
+            "model": model,
             "messages": messages,
             "max_tokens": max(128, int(max_tokens)),
             "temperature": 0.95,
@@ -487,8 +599,8 @@ class AIService:
             IndexError,
             TypeError,
         ):
-            log.warning("AI request failed", exc_info=True)
-            self._failure_until = time.monotonic() + _FAILURE_COOLDOWN
+            log.warning("AI request to %s failed", model, exc_info=True)
+            self._model_skip_until[model] = time.monotonic() + _FAILURE_COOLDOWN
             raise ParadiseError("the AI isn't responding right now.") from None
 
         try:
@@ -549,6 +661,7 @@ class AIService:
                 {"role": "user", "content": user_content},
             ],
             max_tokens=self._response_budget(question),
+            caller_id=int(getattr(message.author, "id", 0) or 0),
         )
         self._touch(message)
         self._remember_exchange(message.channel.id, answer)
@@ -602,6 +715,7 @@ class AIService:
                 {"role": "user", "content": user_content},
             ],
             max_tokens=max_tokens or self._response_budget(question),
+            caller_id=int(asker_id or 0) or None,
         )
         if channel_id:
             self._remember_exchange(channel_id, answer)
@@ -635,6 +749,7 @@ class AIService:
                             {"role": "user", "content": prompt},
                         ],
                         max_tokens=max_tokens,
+                        role="fast",
                     )
                 except ParadiseError as error:
                     if not self.gemini.available:
@@ -724,11 +839,13 @@ class AIService:
         if not self.available:
             raise ParadiseError(FALLBACK_UNAVAILABLE)
         prompt = f"Request:\n{str(request).strip()[:400]}"
-        if self._openai_configured and not self._provider_slots.locked():
+        fast_models = self._model_for("fast")
+        if self._openai_configured and fast_models and not self._provider_slots.locked():
             # Classification is a latency-sensitive nicety: when every slot is
             # busy answering real questions it skips straight to the fallback
             # (Gemini, then the deterministic route) instead of queueing
-            # behind a wall of 45-second answers.
+            # behind a wall of 45-second answers. It always runs on the
+            # *fast* tier — a big model would only make it slower.
             try:
                 answer, _truncated = await self._chat_openai_once(
                     [
@@ -736,6 +853,7 @@ class AIService:
                         {"role": "user", "content": prompt},
                     ],
                     max_tokens=max(64, int(max_tokens)),
+                    model=fast_models[0],
                 )
                 if answer:
                     return answer

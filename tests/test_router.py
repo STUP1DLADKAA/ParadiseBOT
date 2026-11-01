@@ -14,8 +14,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from functions.router import (
-    AI, CALCULATE, CONVERT, DATE, DEFINE, GIF, HELP, IMAGE, MEME, ROAST,
-    SEARCH, SUMMARIZE, TIME, TRANSLATE, WEATHER, route_many, route_query,
+    AI, CALCULATE, CHOOSE, CONVERT, DATE, DEFINE, GIF, HELP, IMAGE, INFO,
+    MEME, POLL, REMIND, ROAST, SEARCH, SUMMARIZE, TIME, TRANSLATE, UTILITY,
+    WEATHER, route_many, route_query,
 )
 
 
@@ -307,6 +308,146 @@ class TestTemperatureConversionRouting(unittest.TestCase):
             "25 celsius to fahrenheit",
         ):
             self.assertEqual(route_query(text).kind, CONVERT, text)
+
+
+class TestToolkitRouting(unittest.TestCase):
+    """The free offline lane: dice, qr, passwords, reminders, polls, info."""
+
+    def _route(self, text):
+        routes = route_many(text)
+        self.assertEqual(len(routes), 1, text)
+        return routes[0]
+
+    def test_utilities_route_with_their_tool_key(self):
+        cases = {
+            "roll 2d20+3": ("dice", "2d20+3"),
+            "roll a d20": ("dice", "d20"),
+            "8ball will she text back": ("eightball", "will she text back"),
+            "pick a number between 1 and 100": ("rng", "1 and 100"),
+            "qr code for https://example.com": ("qr", "https://example.com"),
+            "make a qr code for hello": ("qr", "hello"),
+            "rot13 hello there": ("cipher", "hello there"),
+            "caesar 3 attack": ("cipher", "3 attack"),
+            "base64 encode hello world": ("base64", "encode hello world"),
+            "base64 decode aGVsbG8=": ("base64", "decode aGVsbG8="),
+            "hash the secret phrase": ("hash", "secret phrase"),
+            "sha256 of hello": ("hash", "hello"),
+            "morse sos": ("morse", "sos"),
+            "reverse hello world": ("reverse", "hello world"),
+            "mock this is fine": ("mock", "this is fine"),
+            "count words in the quick brown fox": ("count", "the quick brown fox"),
+            "emojify paradise is lit": ("emojify", "paradise is lit"),
+            "spoiler the butler did it": ("spoiler", "the butler did it"),
+            "uuid": ("uuid", "uuid"),  # whole-sentence: the tool reads the count
+            "generate a uuid for me": ("uuid", "generate a uuid for me"),
+            "days until christmas": ("countdown", "christmas"),
+            "how long until 25 dec 2026": ("countdown", "25 dec 2026"),
+            "color #5865F2": ("color", "#5865F2"),
+            "rock paper scissors": ("rps", ""),
+            "lorem 2": ("lorem", "2"),
+        }
+        for text, (tool, args) in cases.items():
+            route = self._route(text)
+            self.assertEqual(route.kind, UTILITY, text)
+            self.assertEqual(route.payload2, tool, text)
+            self.assertEqual(route.payload, args, text)
+
+    def test_password_requests_route(self):
+        for text in ("password", "a random password please",
+                     "generate a strong 24 character password"):
+            route = self._route(text)
+            self.assertEqual(route.kind, UTILITY, text)
+            self.assertEqual(route.payload2, "password", text)
+
+    def test_dice_takes_the_choose_lane_back(self):
+        # "pick a number between 1 and 10" used to be eaten by CHOOSE.
+        route = self._route("pick a number between 1 and 10")
+        self.assertEqual(route.kind, UTILITY)
+        self.assertEqual(route.payload2, "rng")
+        # …while a real choice still chooses.
+        route = self._route("pick pizza or burgers")
+        self.assertEqual(route.kind, CHOOSE)
+
+    def test_reminders_route(self):
+        for text in (
+            "remind me in 20 minutes to take the pizza out",
+            "remind me to stretch in 2 hours",
+            "set a reminder to water the plants in 1h30m",
+        ):
+            route = self._route(text)
+            self.assertEqual(route.kind, REMIND, text)
+            self.assertTrue(route.payload, text)
+
+    def test_polls_route(self):
+        self.assertEqual(self._route("poll: pizza or burgers").kind, POLL)
+        self.assertEqual(self._route("start a poll manga vs anime").kind, POLL)
+
+    def test_info_routes(self):
+        route = self._route("who is <@123456>")
+        self.assertEqual(route.kind, INFO)
+        self.assertEqual(route.payload2, "whois")
+        route = self._route("avatar of <@123>")
+        self.assertEqual(route.payload2, "avatar")
+        route = self._route("show me <@9>'s avatar")
+        self.assertEqual(route.payload2, "avatar")
+        route = self._route("server info")
+        self.assertEqual(route.payload2, "server")
+
+    def test_toolkit_negatives_stay_questions(self):
+        # These must NOT be grabbed by the toolkit lane.
+        for text in (
+            "who is the president",
+            "i forgot my password",
+            "how do i reset my password",
+            "what is a qr code",
+            "how do i make a qr code for my wifi",
+            "define roll",
+            "define rock and roll",
+            "explain dice probability",
+        ):
+            route = self._route(text)
+            self.assertNotEqual(route.kind, UTILITY, text)
+            self.assertNotEqual(route.kind, INFO, text)
+
+    def test_toolkit_joins_compound_requests(self):
+        routes = route_many("roll a d20 and days until christmas")
+        self.assertEqual(
+            [(r.kind, r.payload2) for r in routes],
+            [(UTILITY, "dice"), (UTILITY, "countdown")],
+        )
+
+    def test_bare_dice_defaults_to_one_die(self):
+        # Bare "roll" stays conversational: "rock and roll" must never
+        # become a dice roll mid-compound.
+        for text in ("dice", "a dice"):
+            route = self._route(text)
+            self.assertEqual(route.kind, UTILITY, text)
+            self.assertEqual(route.payload2, "dice", text)
+        self.assertNotEqual(self._route("roll").kind, UTILITY)
+
+    def test_poll_is_a_word_not_a_prefix(self):
+        # "pollution in delhi" is a conversation, not a poll.
+        route = self._route("pollution in delhi")
+        self.assertNotEqual(route.kind, POLL)
+        self.assertEqual(self._route("poll pizza or burgers").kind, POLL)
+
+    def test_avatar_needs_a_target(self):
+        # "avatar the last airbender" is a show, not a request.
+        route = self._route("avatar the last airbender")
+        self.assertNotEqual(route.kind, INFO)
+        self.assertEqual(self._route("avatar").payload2, "avatar")
+        self.assertEqual(self._route("avatar of <@7>").payload2, "avatar")
+
+    def test_reminder_joins_compounds_without_eating_the_city(self):
+        routes = route_many("weather in delhi and remind me in 20 minutes to eat")
+        self.assertEqual(
+            [(r.kind, r.payload) for r in routes],
+            [(WEATHER, "delhi"), (REMIND, "me in 20 minutes to eat")],
+        )
+
+    def test_uuid_count_is_read_from_the_sentence(self):
+        self.assertEqual(self._route("uuid 5").payload2, "uuid")
+        self.assertEqual(self._route("give me 3 uuids").payload2, "uuid")
 
 
 class TestCompoundRouting(unittest.TestCase):
