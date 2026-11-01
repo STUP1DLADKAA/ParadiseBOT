@@ -32,6 +32,7 @@ HELP_BLURBS = {
     "minigames": "automated Paradise games and leaderboard",
     "recipe": "recipes from ingredients you have",
     "summarize": "recap recent chat in this channel",
+    "memory": "teach me things to remember (my lord only)",
     "help": "this list",
 }
 
@@ -40,7 +41,7 @@ HELP_GROUPS = {
     "🧰 useful": ("remind", "poll", "afk", "translate", "settimezone", "recipe"),
     "🎙️ voice": ("vc", "clip", "edit"),
     "🎲 community": ("minigames",),
-    "🤖 ai": ("summarize",),
+    "🤖 ai": ("summarize", "memory"),
 }
 
 #: Capabilities that no longer have a slash command. ``/help`` advertises

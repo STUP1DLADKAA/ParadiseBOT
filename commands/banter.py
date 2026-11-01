@@ -31,8 +31,8 @@ from functions.roasts import (
 log = logging.getLogger(__name__)
 
 _NO_GIF_KEY = (
-    "gifs aren't switched on — the owner can add a free `TENOR_API_KEY` "
-    "(or `GIPHY_API_KEY`) to `.env`. here's a meme instead:"
+    "gifs are being moody — the owner can add a free `TENOR_API_KEY` "
+    "(or `GIPHY_API_KEY`) to `.env` for the good ones. here's a meme instead:"
 )
 _GIF_EMPTY = "that search came back empty. try different words."
 _MEME_EMPTY = "couldn't reach the meme mines. try again in a minute."

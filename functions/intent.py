@@ -62,7 +62,7 @@ _UNSAFE_PAYLOAD = re.compile(
 
 # Below this, the deterministic router is admitting it guessed.
 AMBIGUOUS_CONFIDENCE = MEDIUM_CONFIDENCE
-_CLASSIFY_TIMEOUT = 10.0
+_CLASSIFY_TIMEOUT = 6.0
 _MAX_QUERY = 200
 
 _JSON_OBJECT = re.compile(r"\{.*\}", re.DOTALL)

@@ -15,6 +15,10 @@ Six complementary layers, all of them on by default in a friends-only server:
    scaled by ``PERSONALITY_ROAST_INTENSITY``, never at who somebody is, and
    never when the message looks like real distress.
 6. **Spontaneous quips**: 200-IQ over-analysis and 2-IQ soup-brain remarks.
+7. **Conversation interjections**: when two or more people are actually
+   talking, the bot occasionally drops a "hello!"-style line of its own.
+8. **The lord's presence**: when the lord and master himself speaks, a small
+   chance of a loyal (and slightly cheeky) acknowledgement.
 
 The engine is *chatty* on purpose: every message is a chance, each kind of
 action has its own chance, and only the cooldowns keep it from becoming a
@@ -45,8 +49,10 @@ from functions.memes import (
 )
 from functions.roasts import (
     build_comeback,
+    build_context_roast,
     build_reaction_line,
     build_roast,
+    clean_snippet,
     invites_roast,
     looks_sensitive,
     sanitize_intensity,
@@ -71,6 +77,40 @@ _STOP_ROAST_RE = re.compile(
     r"be nice to me|don'?t roast me|that'?s enough|please stop)\b",
     re.IGNORECASE,
 )
+
+#: How recent two messages must be for a channel to count as "a conversation
+#: is happening" (two distinct humans within this window).
+_CONVERSATION_WINDOW_SECONDS = 600.0
+#: How much of someone's last message is kept for context roasts.
+_LAST_WORDS_CHARS = 160
+
+#: Dropped into a live conversation: short, friendly, never mid-argument.
+INTERJECTION_LINES: tuple[str, ...] = (
+    "hello!",
+    "hi. don't mind me.",
+    "oh, this is getting good 👀",
+    "continue, i'm invested now",
+    "wait wait, what happened next",
+    "just passing through, carry on",
+    "i have no idea what you're on about but i agree",
+    "someone say something dumb, i'm bored",
+    "great conversation, honestly. anyway.",
+)
+
+#: Said when the lord and master himself speaks: loyalty with a wink.
+LORD_LINES: tuple[str, ...] = (
+    "my lord has spoken 👑",
+    "as my lord says.",
+    "noted, my lord. filing that under genius.",
+    "my lord, the server is in shambles without you",
+    "big words from the guy i'm legally required to worship",
+    "👑 royalty check",
+    "he's literally the founding father, show some respect (i say this with love)",
+    "my lord everyone, applause",
+)
+
+#: Cheaper than words: crown him.
+LORD_REACTIONS: tuple[str, ...] = ("👑", "🗿", "🫡")
 
 _SERIOUS_TOPIC_RE = re.compile(
     r"\b(passed away|died|funeral|hospital|cancer|suicide|self[- ]harm|depressed|grief|condolences|rest in peace)\b",
@@ -578,9 +618,16 @@ class Personality:
             timeout=float(config.online_timeout),
         )
         self.roast_intensity = sanitize_intensity(config.roast_intensity)
+        #: The lord and master (config.lord_user_id); 0 disables the layer.
+        bot_config = getattr(bot, "config", None)
+        self.lord_user_id = int(getattr(bot_config, "lord_user_id", 0) or 0)
         # Recency data (all in-memory, all bounded).
         self._channel_activity: dict[int, deque[float]] = {}
         self._last_by_author: dict[int, str] = {}
+        #: ``channel -> (author_id, when)`` — powers "two people are talking".
+        self._channel_authors: dict[int, deque[tuple[int, float]]] = {}
+        #: ``author_id -> last words`` — powers context roasts.
+        self._last_words: dict[int, str] = {}
         # Cooldown clocks (monotonic seconds).
         self._last_global: float = float("-inf")
         self._last_by_channel: dict[int, float] = {}
@@ -589,6 +636,7 @@ class Personality:
         self._last_grammar_by_channel: dict[int, float] = {}
         self._last_roast_by_user: dict[int, float] = {}
         self._last_roast_by_channel: dict[int, float] = {}
+        self._last_interject_by_channel: dict[int, float] = {}
         #: ``channel -> last action`` so the bot never does the same thing twice
         #: in a row. Two memes back to back reads as a broken bot, not a funny
         #: one, and the variety is most of the charm.
@@ -604,6 +652,8 @@ class Personality:
         self._recent_roasts: deque[str] = deque(maxlen=24)
         self._recent_comebacks: deque[str] = deque(maxlen=10)
         self._recent_openers: deque[str] = deque(maxlen=10)
+        self._recent_interjections: deque[str] = deque(maxlen=8)
+        self._recent_lord_lines: deque[str] = deque(maxlen=8)
 
     # ------------------------------------------------------------------
     # Entry point
@@ -658,6 +708,22 @@ class Personality:
 
         if not self._cooldowns_ready(channel_id, now):
             return
+
+        # 2b. The lord and master himself is speaking: once in a while, a
+        #     loyal (and slightly cheeky) acknowledgement. Loyalty comes
+        #     before everything else — but only with its own cooldown.
+        if self.lord_user_id and int(message.author.id) == self.lord_user_id:
+            if await self._maybe_acknowledge_lord(message, now):
+                return
+
+        # 2c. Two people are actually having a conversation: a small chance
+        #     to drop a "hello!"-style line and be part of it.
+        if self._conversation_active(channel_id, now) and self._interject_ready(
+            channel_id, now
+        ):
+            if random.random() < float(self.config.interject_chance):
+                if await self._send_interjection(message, now):
+                    return
 
         # 3. Contextual pattern match: one of reply / meme / GIF / sticker /
         #    roast / reaction, never two.
@@ -809,10 +875,20 @@ class Personality:
         return len(content.split()) >= 2
 
     def _track(self, message: discord.Message, now: float) -> None:
+        channel_id = message.channel.id
         activity = self._channel_activity.setdefault(
-            message.channel.id, deque(maxlen=_SPAM_MESSAGE_COUNT * 4)
+            channel_id, deque(maxlen=_SPAM_MESSAGE_COUNT * 4)
         )
         activity.append(now)
+        authors = self._channel_authors.setdefault(
+            channel_id, deque(maxlen=_SPAM_MESSAGE_COUNT * 8)
+        )
+        authors.append((int(message.author.id), now))
+        words = clean_snippet(message.content, limit=_LAST_WORDS_CHARS)
+        if words:
+            self._last_words[int(message.author.id)] = words
+            if len(self._last_words) > 500:  # bounded memory
+                self._last_words.pop(next(iter(self._last_words)))
 
     def _is_spam(self, channel_id: int, author_id: int, content: str, now: float) -> bool:
         # Same person repeating themselves — never reward copy-paste spam.
@@ -836,6 +912,19 @@ class Personality:
     def _reply_ready(self, channel_id: int, now: float) -> bool:
         last = self._last_reply_by_channel.get(channel_id, float("-inf"))
         return now - last >= self.config.reply_channel_cooldown
+
+    def _conversation_active(self, channel_id: int, now: float) -> bool:
+        """Two or more distinct humans spoke in this channel recently."""
+        authors = self._channel_authors.get(channel_id, ())
+        recent = {
+            author_id for author_id, stamp in authors
+            if now - stamp <= _CONVERSATION_WINDOW_SECONDS
+        }
+        return len(recent) >= 2
+
+    def _interject_ready(self, channel_id: int, now: float) -> bool:
+        last = self._last_interject_by_channel.get(channel_id, float("-inf"))
+        return now - last >= float(self.config.interject_cooldown)
 
     def _humour_ready(self, channel_id: int, now: float) -> bool:
         last = self._last_humour_by_channel.get(channel_id, float("-inf"))
@@ -977,15 +1066,70 @@ class Personality:
                 return False
         return True
 
-    async def _send_roast(self, message: discord.Message, now: float) -> bool:
+    async def _maybe_acknowledge_lord(
+        self, message: discord.Message, now: float
+    ) -> bool:
+        """Crown him, once in a while — with a cooldown, like everything."""
+        if random.random() >= float(self.config.lord_reply_chance):
+            return False
+        if random.random() < 0.4:
+            # Cheaper and somehow even more respectful: a crown reaction.
+            try:
+                await asyncio.wait_for(
+                    message.add_reaction(random.choice(LORD_REACTIONS)), timeout=8
+                )
+            except (discord.DiscordException, asyncio.TimeoutError):
+                log.debug("Lord reaction failed", exc_info=True)
+                return False
+            self._note_action("reaction", message.channel.id)
+            self._mark(message.channel.id, now)
+            return True
+        line = self._pick(LORD_LINES, self._recent_lord_lines)
+        if not await self._deliver_text_reply(message, line):
+            return False
+        self._note_action("reply", message.channel.id)
+        self._mark(message.channel.id, now)
+        self._last_reply_by_channel[message.channel.id] = now
+        self._prune(now)
+        return True
+
+    async def _send_interjection(self, message: discord.Message, now: float) -> bool:
+        """Say hello to a conversation in progress."""
+        line = self._pick(INTERJECTION_LINES, self._recent_interjections)
+        if not await self._deliver_text_reply(message, line):
+            return False
+        self._note_action("reply", message.channel.id)
+        self._mark(message.channel.id, now)
+        self._last_interject_by_channel[message.channel.id] = now
+        self._last_reply_by_channel[message.channel.id] = now
+        self._prune(now)
+        return True
+
+    def _roast_line_for(self, message: discord.Message) -> str:
+        """The best roast for this person: about what they *just said* when
+        we have their words (the lord gets the loyal-but-cheeky frames),
+        otherwise the classic roast book."""
         author_name = (
             getattr(message.author, "display_name", None)
             or getattr(message.author, "name", None)
             or ""
         )
-        line = build_roast(
+        snippet = self._last_words.get(int(message.author.id), "")
+        line = build_context_roast(
+            author_name,
+            snippet,
+            lord=bool(self.lord_user_id)
+            and int(message.author.id) == self.lord_user_id,
+            recent=self._recent_roasts,
+        )
+        if line is not None:
+            return line
+        return build_roast(
             author_name, intensity=self.roast_intensity, recent=self._recent_roasts
         )
+
+    async def _send_roast(self, message: discord.Message, now: float) -> bool:
+        line = self._roast_line_for(message)
         if not await self._deliver_text_reply(message, line):
             return False
         self._finish_roast(message, now)
@@ -998,16 +1142,7 @@ class Personality:
         if kind == "cocky":
             line = build_comeback(recent=self._recent_comebacks)
         else:
-            author_name = (
-                getattr(message.author, "display_name", None)
-                or getattr(message.author, "name", None)
-                or ""
-            )
-            line = build_roast(
-                author_name,
-                intensity=self.roast_intensity,
-                recent=self._recent_roasts,
-            )
+            line = self._roast_line_for(message)
         if not await self._deliver_text_reply(message, line):
             return False
         self._finish_roast(message, now)
@@ -1224,6 +1359,7 @@ class Personality:
             self._last_grammar_by_channel,
             self._last_roast_by_user,
             self._last_roast_by_channel,
+            self._last_interject_by_channel,
         ):
             stale = [key for key, value in bucket.items() if value <= cutoff]
             for key in stale:

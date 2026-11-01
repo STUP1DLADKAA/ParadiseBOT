@@ -7,6 +7,7 @@ only here. A safe template is provided in ``.env.example``.
 from __future__ import annotations
 
 import os
+import re
 from dataclasses import dataclass
 
 
@@ -38,7 +39,14 @@ def _chance(raw: str | None, default: float) -> float:
 
 def _sources(raw: str | None) -> tuple[str, ...]:
     """Comma/space separated subreddit names, validated into a safe tuple."""
-    default = ("dankmemes", "memes", "me_irl", "wholesomememes")
+    default = (
+        "dankmemes",
+        "memes",
+        "me_irl",
+        "wholesomememes",
+        "terriblefacebookmemes",
+        "historymemes",
+    )
     if raw is None or not str(raw).strip():
         return default
     names: list[str] = []
@@ -105,18 +113,18 @@ class PersonalityConfig:
     # Chance to react to a casual message that matched no pattern at all.
     ambient_reaction_chance: float = 0.10
     # Chance to send a short contextual reply instead (never both).
-    reply_chance: float = 0.10
+    reply_chance: float = 0.12
     # Chance to reply to a casual message with a random Discord/vinyl sticker.
     sticker_chance: float = 0.05
     # Chance to reply with a meme — from the internet when it is reachable,
     # rendered locally when it is not.
-    meme_chance: float = 0.10
+    meme_chance: float = 0.16
     # Of those meme drops, how many should try the internet first.
     online_meme_chance: float = 0.75
-    # Chance to reply with a reaction GIF (needs TENOR_API_KEY or GIPHY_API_KEY).
-    gif_chance: float = 0.05
+    # Chance to reply with a reaction GIF (keyless by default; keys add quality).
+    gif_chance: float = 0.10
     # Chance to drop a spontaneous smart/stupid/unpredictable quip.
-    random_quip_chance: float = 0.12
+    random_quip_chance: float = 0.14
     # Chance to roast whoever just spoke.
     roast_chance: float = 0.12
     # "mild", "spicy" or "nuclear" — see functions/roasts.py.
@@ -136,12 +144,25 @@ class PersonalityConfig:
     # Per-channel spacing for English grammar/spelling nerd corrections.
     grammar_cooldown: int = 90
     # Communities the keyless meme feed may pull from.
-    meme_sources: tuple[str, ...] = ("dankmemes", "memes", "me_irl", "wholesomememes")
+    meme_sources: tuple[str, ...] = (
+        "dankmemes",
+        "memes",
+        "me_irl",
+        "wholesomememes",
+        "terriblefacebookmemes",
+        "historymemes",
+    )
     # Per-request deadline for the meme/GIF APIs.
     online_timeout: float = 6.0
     # Optional free keys; without one, GIF replies fall back to memes.
     tenor_api_key: str = ""
     giphy_api_key: str = ""
+    # Chance to say "hello!" when two people are having a conversation.
+    interject_chance: float = 0.08
+    # Seconds before the bot may interject in the same channel again.
+    interject_cooldown: int = 240
+    # Chance the bot acknowledges its lord when he speaks (reply or 👑).
+    lord_reply_chance: float = 0.20
 
     @classmethod
     def from_env(cls, env) -> "PersonalityConfig":
@@ -151,14 +172,14 @@ class PersonalityConfig:
             ambient_reaction_chance=_chance(
                 env.get("PERSONALITY_AMBIENT_REACTION_CHANCE"), 0.10
             ),
-            reply_chance=_chance(env.get("PERSONALITY_REPLY_CHANCE"), 0.10),
+            reply_chance=_chance(env.get("PERSONALITY_REPLY_CHANCE"), 0.12),
             sticker_chance=_chance(env.get("PERSONALITY_STICKER_CHANCE"), 0.05),
-            meme_chance=_chance(env.get("PERSONALITY_MEME_CHANCE"), 0.10),
+            meme_chance=_chance(env.get("PERSONALITY_MEME_CHANCE"), 0.16),
             online_meme_chance=_chance(
                 env.get("PERSONALITY_ONLINE_MEME_CHANCE"), 0.75
             ),
-            gif_chance=_chance(env.get("PERSONALITY_GIF_CHANCE"), 0.05),
-            random_quip_chance=_chance(env.get("PERSONALITY_QUIP_CHANCE"), 0.12),
+            gif_chance=_chance(env.get("PERSONALITY_GIF_CHANCE"), 0.10),
+            random_quip_chance=_chance(env.get("PERSONALITY_QUIP_CHANCE"), 0.14),
             roast_chance=_chance(env.get("PERSONALITY_ROAST_CHANCE"), 0.12),
             roast_intensity=_roast_intensity(env.get("PERSONALITY_ROAST_INTENSITY")),
             roast_user_cooldown=_int(env.get("PERSONALITY_ROAST_USER_COOLDOWN"), 600),
@@ -174,6 +195,11 @@ class PersonalityConfig:
             online_timeout=_float(env.get("MEME_TIMEOUT"), 6.0),
             tenor_api_key=(env.get("TENOR_API_KEY") or "").strip(),
             giphy_api_key=(env.get("GIPHY_API_KEY") or "").strip(),
+            interject_chance=_chance(env.get("PERSONALITY_INTERJECT_CHANCE"), 0.08),
+            interject_cooldown=_int(
+                env.get("PERSONALITY_INTERJECT_COOLDOWN"), 240
+            ),
+            lord_reply_chance=_chance(env.get("PERSONALITY_LORD_REPLY_CHANCE"), 0.20),
         )
 
 
@@ -647,6 +673,73 @@ class GeminiConfig:
         )
 
 
+def _quiet_hours(raw: str | None) -> tuple[int, int]:
+    """Parse ``ALIVENESS_QUIET_HOURS`` ("1-7") into an IST quiet window.
+
+    Anything unparsable falls back to the default 01:00–07:00 IST; an explicit
+    ``off``/``none``/``""`` disables quiet hours entirely (both ends -1).
+    """
+    text = (raw or "").strip().lower()
+    if text in {"off", "none", "disabled", "false", "0"}:
+        return (-1, -1)
+    match = re.match(r"^(\d{1,2})\s*[-–to ]+\s*(\d{1,2})$", (raw or "").strip())
+    if match:
+        start = max(0, min(23, int(match.group(1))))
+        end = max(0, min(24, int(match.group(2))))
+        return (start, end)
+    return (1, 7)
+
+
+@dataclass(frozen=True, slots=True)
+class AlivenessConfig:
+    """Tuning for the "is this server dead?" watcher (commands/aliveness.py).
+
+    Paradise keeps an eye on the chat: how long since the last human message,
+    who is in voice, how long they have been there and what time it is. When
+    the server goes quiet — or when everyone who was chatting has moved into
+    a voice call — it generates one short in-character line for that exact
+    situation, so the server never feels abandoned.
+    """
+
+    # Master switch for the watcher loop.
+    enabled: bool = True
+    # The channel the "still alive over here" lines are posted in.
+    channel_id: int = 1181574439893217280
+    # How often the loop wakes up and looks at the server.
+    interval: int = 150
+    # "Dead" = no human message anywhere for this many minutes.
+    dead_after: int = 25
+    # "Everyone is in VC" = the chatters went quiet this many minutes ago.
+    vc_quiet: int = 10
+    # How far back "recently chatted" is measured, in minutes.
+    recent_window: int = 120
+    # A voice call only counts as "everyone is in VC" with at least this many.
+    min_vc_group: int = 2
+    # Minimum minutes between two aliveness posts.
+    post_cooldown: int = 45
+    # IST hours during which Paradise lets a quiet server sleep (inclusive
+    # start, exclusive end, wrapping across midnight when start > end).
+    quiet_hours: tuple[int, int] = (1, 7)
+
+    @classmethod
+    def from_env(cls, env) -> "AlivenessConfig":
+        return cls(
+            enabled=_bool(env.get("ALIVENESS_ENABLED"), True),
+            channel_id=max(0, _int(env.get("ALIVENESS_CHANNEL_ID"), 1181574439893217280)),
+            interval=max(30, _int(env.get("ALIVENESS_INTERVAL_SECONDS"), 150)),
+            dead_after=max(5, _int(env.get("ALIVENESS_DEAD_AFTER_MINUTES"), 25)),
+            vc_quiet=max(2, _int(env.get("ALIVENESS_VC_QUIET_MINUTES"), 10)),
+            recent_window=max(
+                15, _int(env.get("ALIVENESS_RECENT_WINDOW_MINUTES"), 120)
+            ),
+            min_vc_group=max(2, _int(env.get("ALIVENESS_MIN_VC_GROUP"), 2)),
+            post_cooldown=max(
+                5, _int(env.get("ALIVENESS_POST_COOLDOWN_MINUTES"), 45)
+            ),
+            quiet_hours=_quiet_hours(env.get("ALIVENESS_QUIET_HOURS")),
+        )
+
+
 @dataclass(frozen=True, slots=True)
 class Config:
     """Everything Paradise reads from the environment."""
@@ -707,6 +800,24 @@ class Config:
     clip_user_ids: tuple[int, ...] = ()
     deaf_exempt_user_ids: tuple[int, ...] = ()
 
+    # The lord and master: always addressed as "my lord", still roastable, and
+    # the only user allowed to manage the bot's long-term memories.
+    lord_user_id: int = 922359954025885737
+
+    # The dead-server / everyone-in-VC watcher.
+    aliveness: AlivenessConfig = AlivenessConfig()
+
+    # Long-term memory (/memory) — a tiny SQLite database of things the lord
+    # asked Paradise to remember, folded into AI replies.
+    memory_db_path: str = ""
+    memory_max_entries: int = 200
+
+    # Request the presence (online status) intent at login. Discord must ALSO
+    # have it enabled in the developer portal — if the portal toggle is off,
+    # login fails with PrivilegedIntentsRequired, so this ships off by default
+    # and the aliveness watcher works without it.
+    presence_intent: bool = False
+
     @property
     def ai_configured(self) -> bool:
         # The OpenAI-compatible endpoint is the primary provider; Gemini is
@@ -737,6 +848,24 @@ class Config:
             edit_user_ids=_ids(env.get("EDIT_ALLOWED_USER_IDS")),
             clip_user_ids=_ids(env.get("CLIP_ALLOWED_USER_IDS")),
             deaf_exempt_user_ids=_ids(env.get("VOICE_DEAF_EXEMPT_USER_IDS")),
+            lord_user_id=max(
+                0, _int(env.get("PARADISE_LORD_USER_ID"), 922359954025885737)
+            ),
+            aliveness=AlivenessConfig.from_env(env),
+            memory_db_path=(
+                str(env.get("MEMORY_DB_PATH", "") or "").strip()
+                or os.path.join(
+                    os.path.dirname(
+                        str(env.get("VOICE_DB_PATH", "") or "").strip()
+                        or os.path.join("data", "paradise.db")
+                    ),
+                    "memory.db",
+                )
+            ),
+            memory_max_entries=max(
+                10, _int(env.get("MEMORY_MAX_ENTRIES"), 200)
+            ),
+            presence_intent=_bool(env.get("PRESENCE_INTENT_ENABLED"), False),
             tts_cache_dir=(
                 str(env.get("TTS_CACHE_DIR", "") or "").strip()
                 or os.path.join(

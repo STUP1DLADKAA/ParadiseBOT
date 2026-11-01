@@ -5,9 +5,12 @@ Two things live here:
 * :class:`MemeFeed` — actual memes from actual Reddit communities, through
   `meme-api.com`, which needs **no API key**. This is what makes "random meme
   from the internet" work on a fresh `.env`.
-* :class:`GifSearch` — reaction GIFs through Tenor or Giphy, which both need a
-  free key. Without one it simply reports unavailable and the caller falls back
-  to the rendered meme cards instead of posting a broken link.
+* :class:`GifSearch` — reaction GIFs through Tenor or Giphy when a free key
+  is configured, **and through Tenor's legacy keyless endpoint when it is
+  not** — so reaction GIFs work on a fresh ``.env`` too. The keyless endpoint
+  is best-effort: if it ever goes away, every call quietly returns ``None``
+  and the caller falls back to the rendered meme cards instead of posting a
+  broken link.
 
 Everything that comes back from the internet is *untrusted*: it is validated
 before it is ever shown. The rules are boring and deliberate:
@@ -69,6 +72,11 @@ _WHITESPACE_RE = re.compile(r"\s+")
 MEME_API_BASE = "https://meme-api.com/gimme"
 TENOR_SEARCH = "https://tenor.googleapis.com/v2/search"
 GIPHY_SEARCH = "https://api.giphy.com/v1/gifs/search"
+#: Tenor's legacy v1 endpoint still accepts the historical public demo key,
+#: which is what makes GIFs work without any configuration. If Tenor ever
+#: retires it, requests fail and callers degrade to memes — never an error.
+TENOR_KEYLESS_SEARCH = "https://gapi.tenor.com/v1/search"
+TENOR_PUBLIC_KEY = "LIVDSRZULELA"
 
 
 @dataclass(frozen=True, slots=True)
@@ -153,6 +161,44 @@ def parse_tenor(payload: object) -> OnlineMeme | None:
                     else "",
                     is_gif=True,
                 )
+    return None
+
+
+def parse_tenor_v1(payload: object) -> OnlineMeme | None:
+    """Pick one GIF out of a legacy Tenor v1 search response.
+
+    The v1 shape is ``{"results": [{"media": [{"gif": {"url": …}}]}]}`` —
+    the flat cousin of the v2 ``media_formats`` layout. Same validation
+    rules, same ``None`` on anything unexpected.
+    """
+    if not isinstance(payload, dict):
+        return None
+    results = payload.get("results")
+    if not isinstance(results, list):
+        return None
+    for entry in results:
+        if not isinstance(entry, dict):
+            continue
+        media_list = entry.get("media")
+        if not isinstance(media_list, list):
+            continue
+        for media in media_list:
+            if not isinstance(media, dict):
+                continue
+            for key in ("gif", "tinygif", "nanogif"):
+                candidate = media.get(key)
+                if isinstance(candidate, dict) and is_postable_image(
+                    candidate.get("url"), gifs_only=True
+                ):
+                    return OnlineMeme(
+                        url=candidate["url"].strip(),
+                        title=clean_title(""),
+                        source="tenor-keyless",
+                        page_url=(entry.get("itemurl") or "").strip()
+                        if isinstance(entry.get("itemurl"), str)
+                        else "",
+                        is_gif=True,
+                    )
     return None
 
 
@@ -317,8 +363,13 @@ class MemeFeed:
 
 
 class GifSearch:
-    """Reaction GIFs through Tenor or Giphy. Needs a free key; without one it
-    reports :attr:`available` as ``False`` and every call is a quiet ``None``."""
+    """Reaction GIFs through Tenor or Giphy.
+
+    Priority: a real Tenor key, then a Giphy key, then Tenor's legacy
+    **keyless** endpoint (enabled by default — set ``keyless=False`` to
+    require a real key). The keyless tier is best-effort: if the endpoint
+    dies, :meth:`search` returns ``None`` and the caller falls back to memes.
+    """
 
     def __init__(
         self,
@@ -328,11 +379,13 @@ class GifSearch:
         timeout: float = 6.0,
         rating: str = "pg-13",
         fetch_json: JsonFetcher | None = None,
+        keyless: bool = True,
     ) -> None:
         self.tenor_key = (tenor_key or "").strip()
         self.giphy_key = (giphy_key or "").strip()
         self.timeout = float(timeout)
         self.rating = rating or "pg-13"
+        self.keyless = bool(keyless)
         self._fetch_json = fetch_json or self._default_fetcher()
 
     def _default_fetcher(self) -> JsonFetcher:
@@ -349,6 +402,8 @@ class GifSearch:
             return "tenor"
         if self.giphy_key:
             return "giphy"
+        if self.keyless:
+            return "tenor-keyless"
         return ""
 
     @property
@@ -393,7 +448,25 @@ class GifSearch:
                 },
                 self.timeout,
             )
-            return parse_giphy(payload)
+            meme = parse_giphy(payload)
+            if meme is not None:
+                return meme
+        if self.keyless:
+            # Last tier, and the one a fresh deployment actually uses: the
+            # legacy public Tenor endpoint. Best effort — a dead endpoint is
+            # an ordinary `None`, and the meme fallback takes over.
+            payload = await self._search_json(
+                TENOR_KEYLESS_SEARCH,
+                {
+                    "q": text,
+                    "key": TENOR_PUBLIC_KEY,
+                    "limit": 20,
+                    "contentfilter": "high",
+                    "safesearch": "true",
+                },
+                self.timeout,
+            )
+            return parse_tenor_v1(payload)
         return None
 
 
@@ -407,4 +480,5 @@ __all__ = [
     "parse_giphy",
     "parse_meme",
     "parse_tenor",
+    "parse_tenor_v1",
 ]

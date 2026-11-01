@@ -6,7 +6,63 @@ All notable changes to Paradise are recorded here. The format follows
 
 ## [Unreleased]
 
+### Changed
+- **The persona got a rewrite: short, human, funny-not-brutal.** The system
+  prompt was rebuilt around how the bot should *talk* — 1–3 sentence replies,
+  casual-but-correct grammar, plain words, no jargon, no corporate speak — and
+  softened from "resident menace" to the server's funny friend (still cheeky,
+  still never refuses a genuine question, still loyal to the lord). It is also
+  ~70% smaller (8.4k → 2.4k characters), which makes every AI turn faster.
+- **Faster replies across the board.** Smaller response budgets (200/300/500
+  tokens by question size), a lower per-user (12 s) and per-channel (5 s) AI
+  cooldown, shorter assistant (45 s) and classifier (6 s) timeouts, and a
+  smaller `answer_quick` budget (220 tokens).
+- **Better chat context.** The AI now sees 16 recent messages (up from 8) with
+  3200 characters of channel context (up from 2400) and a 40-message rolling
+  history, plus remembered facts from `/memory` when they are relevant to the
+  question.
+- More memes (`PERSONALITY_MEME_CHANCE` 0.10 → 0.16), more GIFs
+  (`PERSONALITY_GIF_CHANCE` 0.05 → 0.10), more replies (0.10 → 0.12) and more
+  quips (0.12 → 0.14) — the bot is louder and more alive by default.
+
 ### Added
+- **Long-term memory.** `/memory add|list|remove|clear` — the lord
+  (`PARADISE_LORD_USER_ID`, default `922359954025885737`) teaches Paradise
+  facts, preferences and server lore, stored in a tiny capped SQLite database
+  (`data/memory.db`, `MEMORY_MAX_ENTRIES`). Every AI answer from then on folds
+  the relevant memories into its prompt, so replies feel like they come from
+  someone who has lived in the server. The command is the lord's alone;
+  everyone else is told the memories aren't theirs to touch.
+  `functions/memory.py`, `commands/memory.py`.
+- **The aliveness watcher.** Paradise now notices when its own server goes
+  quiet. When nobody has typed for 25 minutes (`ALIVENESS_DEAD_AFTER_MINUTES`)
+  — or when everyone who was chatting has moved into a voice call — it
+  composes one short, situation-aware line from the real signals (minutes of
+  silence, who is in VC and for how long, member count, IST time, optionally
+  online count) and posts it in the home channel. AI-written when configured,
+  canned-but-situational otherwise, always bounded by a 45-minute cooldown and
+  01:00–07:00 IST quiet hours. `functions/aliveness.py`,
+  `commands/aliveness.py`.
+- **The lord is acknowledged.** When user `922359954025885737` himself speaks,
+  a small chance (`PERSONALITY_LORD_REPLY_CHANCE`, 0.20) of a loyal,
+  slightly-cheeky line ("my lord has spoken 👑") or a crown reaction — and the
+  AI now addresses him as "my lord" whenever he asks something, while still
+  teasing him.
+- **Conversation interjections.** When two or more people are talking in a
+  channel (ten-minute window), a small chance
+  (`PERSONALITY_INTERJECT_CHANCE`, 0.08) of a "hello!"-style line of its own,
+  with its own cooldown (`PERSONALITY_INTERJECT_COOLDOWN`, 240 s).
+- **Context roasts.** When the roast target's last words are long enough, the
+  roast quotes them back at them ("bro woke up today and chose to say …
+  out loud."); roasting the lord uses loyal-but-cheeky frames instead.
+  `@Paradise roast <someone>` got the same upgrade: the AI teases the target
+  about what they actually just said, with the roast book as the fallback.
+- **Keyless reaction GIFs.** GIFs work on a fresh `.env`: Tenor's legacy
+  public endpoint is the keyless fallback tier behind the keyed Tenor/Giphy
+  tiers, and if it ever dies, every call quietly degrades to a meme.
+  `functions/meme_feed.py`.
+- Two more meme communities in the default rotation:
+  `terriblefacebookmemes`, `historymemes`.
 - **The ParadiseBOT character bible.** The AI's system prompt
   (`functions/ai.py`) is the full personality: resident menace of the server,
   chronically online, terminally sarcastic, ragebait enthusiast, toxic (but

@@ -13,9 +13,10 @@ from urllib.parse import urlparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from config import Config, GeminiConfig
-from functions.ai import AIService
+from functions.ai import AIService, SYSTEM_PROMPT, _USER_COOLDOWN, _CHANNEL_COOLDOWN
 from functions.gemini import GeminiService
 from functions.helpers import ParadiseError
+from functions.memory import MemoryStore
 
 
 # ---------------------------------------------------------------------------
@@ -388,6 +389,133 @@ class TestAIProviderChain(unittest.IsolatedAsyncioTestCase):
         out = await ai.classify("got any red panda content")
         self.assertIn("chat", out)
         self.assertIn(":generateContent", ai.gemini._session.requests[0]["url"])
+
+    def _primary_ai(self, **config_overrides):
+        config = Config(
+            gemini=GeminiConfig(api_key="supersecretkey-123"),
+            ai_base_url="http://local.test/v1",
+            ai_model="llama",
+            **config_overrides,
+        )
+        ai = self.make_ai(config)
+        ai.gemini._session = FakeSession(post_responses=[])
+        ai._session = FakeSession(post_responses=[
+            FakeResponse(200, {"choices": [{"message": {"content": "primary answer"}}]})
+        ])
+        return ai
+
+    async def test_the_system_prompt_is_short_and_light(self):
+        # Short prompt = faster replies; the persona is funny, not brutal.
+        self.assertLess(len(SYSTEM_PROMPT), 4000)
+        lowered = SYSTEM_PROMPT.lower()
+        self.assertIn("1-3 sentences", lowered)
+        self.assertIn("never refuse a genuine question", lowered)
+        self.assertIn("my lord", lowered)
+        self.assertNotIn("ragebait", lowered)
+        self.assertNotIn("unhinged", lowered)
+
+    async def test_the_lord_gets_special_treatment(self):
+        ai = self._primary_ai(lord_user_id=922359954025885737)
+        out = await ai.answer_question(
+            "what should we eat tonight",
+            asker="Stupid",
+            asker_id=922359954025885737,
+        )
+        self.assertEqual(out, "primary answer")
+        content = ai._session.requests[0]["json"]["messages"][1]["content"]
+        self.assertIn("lord and master", content)
+        self.assertIn("Stupid asks you: what should we eat tonight", content)
+
+    async def test_everyone_else_gets_no_lord_note(self):
+        ai = self._primary_ai(lord_user_id=922359954025885737)
+        await ai.answer_question("hello?", asker="Rohan", asker_id=555)
+        content = ai._session.requests[0]["json"]["messages"][1]["content"]
+        self.assertNotIn("lord and master", content)
+
+    async def test_answers_fold_in_remembered_facts(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ai = self._primary_ai()
+            ai.bot.memory = MemoryStore(Path(tmp) / "memory.db")
+            ai.bot.memory.add("Rohan only plays Valorant, badly")
+            await ai.answer_question(
+                "who plays valorant in this server", asker="Rohan"
+            )
+            content = ai._session.requests[0]["json"]["messages"][1]["content"]
+            self.assertIn("Rohan only plays Valorant, badly", content)
+            self.assertIn("remember", content)
+
+    async def test_a_broken_memory_never_breaks_the_answer(self):
+        class ExplodingStore:
+            def relevant(self, question, limit=6):
+                raise RuntimeError("database on fire")
+
+        ai = self._primary_ai()
+        ai.bot.memory = ExplodingStore()
+        out = await ai.answer_question("anything at all", asker="Rohan")
+        self.assertEqual(out, "primary answer")
+
+    async def test_tease_describes_the_target_and_their_words(self):
+        ai = self._primary_ai()
+        out = await ai.tease("Rohan", "i lost to a bot at chess", target_id=555)
+        self.assertEqual(out, "primary answer")
+        messages = ai._session.requests[0]["json"]["messages"]
+        self.assertEqual(messages[0]["content"], SYSTEM_PROMPT)
+        self.assertIn("Rohan", messages[1]["content"])
+        self.assertIn("i lost to a bot at chess", messages[1]["content"])
+        self.assertIn("LIGHT-HEARTED", messages[1]["content"])
+        self.assertNotIn("my lord", messages[1]["content"])
+
+    async def test_teasing_the_lord_stays_loyal(self):
+        ai = self._primary_ai(lord_user_id=922359954025885737)
+        await ai.tease(
+            "Stupid", "i deleted the database for fun", target_id=922359954025885737
+        )
+        content = ai._session.requests[0]["json"]["messages"][1]["content"]
+        self.assertIn("my lord", content)
+        self.assertIn("loyal", content)
+
+    async def test_tease_without_ai_raises(self):
+        ai = self.make_ai(Config())
+        with self.assertRaises(ParadiseError):
+            await ai.tease("Rohan", "anything")
+
+    async def test_improvise_answers_one_line_in_character(self):
+        ai = self._primary_ai()
+        out = await ai.improvise("the server has been dead for 40 minutes")
+        self.assertEqual(out, "primary answer")
+        messages = ai._session.requests[0]["json"]["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertEqual(messages[0]["content"], SYSTEM_PROMPT)
+        self.assertIn("dead for 40 minutes", messages[1]["content"])
+        self.assertLessEqual(
+            ai._session.requests[0]["json"]["max_tokens"], 200
+        )
+
+    async def test_improvise_without_a_prompt_raises(self):
+        ai = self._primary_ai()
+        with self.assertRaises(ParadiseError):
+            await ai.improvise("   ")
+
+    def test_response_budgets_stay_small(self):
+        # Small budgets = short replies and faster turns.
+        self.assertEqual(AIService._response_budget("hi"), 200)
+        self.assertEqual(
+            AIService._response_budget(
+                "what is the best phone to buy for my little sister this year"
+            ),
+            300,
+        )
+        self.assertEqual(
+            AIService._response_budget(
+                "explain the difference between tcp and udp for a school essay"
+            ),
+            500,
+        )
+        self.assertLess(_USER_COOLDOWN, 15)
+        self.assertLess(_CHANNEL_COOLDOWN, 8)
 
     async def test_validate_startup_skips_without_key(self):
         ai = self.make_ai(Config())

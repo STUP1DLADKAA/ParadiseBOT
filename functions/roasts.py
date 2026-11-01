@@ -180,6 +180,31 @@ SELF_ROASTS: tuple[str, ...] = (
     "the only thing i've ever carried is this server's patience.",
 )
 
+#: Roasts that quote what the target actually said — the "read the room and
+#: make fun of the same thing" tier. ``{snippet}`` carries their own words
+#: back to them; every frame keeps it playful rather than brutal.
+CONTEXT_ROAST_FRAMES: tuple[str, ...] = (
+    '"{snippet}" — and you typed that. voluntarily.',
+    'bro woke up today and chose to say "{snippet}" out loud.',
+    'everybody stop. {name} just said "{snippet}". historic day for science.',
+    '{name} really said "{snippet}" and hit enter with full confidence.',
+    '"{snippet}" is now my favourite thing {name} has ever been wrong about.',
+    'i showed "{snippet}" to a lawyer and they just sighed at {name}.',
+    '"{snippet}" — {name}, we need to talk about your thought process.',
+    'nobody asked and {name} still gave us "{snippet}". generosity, i guess.',
+)
+
+#: The same idea, aimed at the lord: loyal on the surface, teasing
+#: underneath, always affectionate. He is fair game — he wrote the rules.
+LORD_CONTEXT_FRAMES: tuple[str, ...] = (
+    'my lord just said "{snippet}". i am contractually obligated to find that funny.',
+    '"{snippet}" — treason to point it out, my lord, but that was mid.',
+    'i love my lord, i serve my lord, and my lord just said "{snippet}".',
+    'the founding father said "{snippet}" and i felt my loyalty flicker for a second.',
+    'my lord: "{snippet}". the historians will skip this part.',
+    '"{snippet}" — bold words from the guy i\u2019m legally required to worship.',
+)
+
 #: Real distress, or a topic where a joke would land badly. If any of this is
 #: in the message, the roast engine does nothing at all.
 _SENSITIVE_RE = re.compile(
@@ -303,7 +328,52 @@ def build_reaction_line(text: str, *, recent: deque[str] | None = None) -> str:
     return choice
 
 
+def clean_snippet(text: str | None, *, limit: int = 60) -> str:
+    """Quote-ready version of what someone just said.
+
+    Mentions, markdown and control noise go; the result is capped short so a
+    context roast stays a one-liner instead of reposting someone's essay.
+    """
+    snippet = re.sub(r"<@[!&]?\d+>", "", str(text or ""))
+    snippet = snippet.replace("@everyone", "").replace("@here", "")
+    snippet = re.sub(r"[*_`~|>\\]", "", snippet)
+    snippet = re.sub(r"\s+", " ", snippet).strip().strip("\"'")
+    return snippet[:limit]
+
+
+def build_context_roast(
+    name: str | None = None,
+    snippet: str | None = None,
+    *,
+    lord: bool = False,
+    recent: deque[str] | None = None,
+) -> str | None:
+    """A roast that quotes the target's own words back at them.
+
+    Returns ``None`` when there is nothing usable to quote (too short), so
+    the caller can fall back to :func:`build_roast`. When the target is the
+    lord, the loyal-but-cheeky frames are used instead — making fun of him
+    is mandatory, disrespecting him is not.
+    """
+    target = clean_name(name)
+    quote = clean_snippet(snippet)
+    if len(quote) < 12:  # "lol", "roast me", a stray emoji: nothing to work with
+        return None
+    pool = LORD_CONTEXT_FRAMES if lord else CONTEXT_ROAST_FRAMES
+    rendered = [frame.format(name=target, snippet=quote) for frame in pool]
+    rendered = [line for line in rendered if not _FORBIDDEN_RE.search(line)]
+    fresh = [line for line in rendered if line not in (recent or ())]
+    if not fresh:
+        return None
+    choice = random.choice(fresh)
+    if recent is not None:
+        recent.append(choice)
+    return choice
+
+
 __all__ = [
+    "CONTEXT_ROAST_FRAMES",
+    "LORD_CONTEXT_FRAMES",
     "COCKY_COMEBACKS",
     "DEFAULT_INTENSITY",
     "INTENSITIES",
@@ -313,10 +383,12 @@ __all__ = [
     "ROASTS",
     "SELF_ROASTS",
     "build_comeback",
+    "build_context_roast",
     "build_reaction_line",
     "build_roast",
     "build_self_roast",
     "clean_name",
+    "clean_snippet",
     "invites_roast",
     "looks_sensitive",
     "sanitize_intensity",
