@@ -1,7 +1,8 @@
 """``/memory`` — teach Paradise things it should remember.
 
-The command belongs to the lord alone (``PARADISE_LORD_USER_ID``, default
-``922359954025885737``): he adds facts, preferences and server lore, and the AI
+The command belongs to the lords alone (``PARADISE_LORD_USER_IDS``, default
+``922359954025885737`` and ``1049231767585964032`` — Stupid and Taher, equal
+in authority): they add facts, preferences and server lore, and the AI
 folds them into its answers from then on. For everyone else the command
 politely does not exist — a non-lord never learns what is stored, they just
 get told the memories are not theirs to touch.
@@ -29,6 +30,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from config import lord_ids_of
 from functions.helpers import shorten
 from functions.memory import MAX_MEMORY_CHARS, MemoryStore
 
@@ -51,7 +53,7 @@ def _clean_subject_name(user) -> str:
 
 
 class Memory(commands.GroupCog, name="memory"):
-    """The lord's memory: add, list, remove and clear remembered facts."""
+    """The lords' memory: add, list, remove and clear remembered facts."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -59,16 +61,15 @@ class Memory(commands.GroupCog, name="memory"):
 
     # -- permissions ------------------------------------------------------
 
-    def _lord_id(self) -> int:
+    def _lord_ids(self) -> tuple[int, ...]:
         config = getattr(self.bot, "config", None)
-        return int(getattr(config, "lord_user_id", 0) or 0)
+        return lord_ids_of(config)
 
     def _store(self) -> MemoryStore | None:
         return getattr(self.bot, "memory", None)
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        lord_id = self._lord_id()
-        if not lord_id or interaction.user.id != lord_id:
+        if interaction.user.id not in self._lord_ids():
             await interaction.response.send_message(DENIED_LINE, ephemeral=True)
             return False
         return True

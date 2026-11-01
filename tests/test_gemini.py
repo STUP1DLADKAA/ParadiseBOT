@@ -417,7 +417,7 @@ class TestAIProviderChain(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("unhinged", lowered)
 
     async def test_the_lord_gets_special_treatment(self):
-        ai = self._primary_ai(lord_user_id=922359954025885737)
+        ai = self._primary_ai(lord_user_ids=(922359954025885737,))
         out = await ai.answer_question(
             "what should we eat tonight",
             asker="Stupid",
@@ -425,14 +425,26 @@ class TestAIProviderChain(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(out, "primary answer")
         content = ai._session.requests[0]["json"]["messages"][1]["content"]
-        self.assertIn("lord and master", content)
+        self.assertIn("lord", content)
+        self.assertIn("my lord", content)
         self.assertIn("Stupid asks you: what should we eat tonight", content)
 
+    async def test_taher_is_a_lord_at_the_same_level(self):
+        """Taher (1049231767585964032) is as much a lord as Stupid."""
+        ai = self._primary_ai()  # the shipped default: both lords
+        await ai.answer_question(
+            "what should we eat tonight", asker="Taher", asker_id=1049231767585964032
+        )
+        content = ai._session.requests[0]["json"]["messages"][1]["content"]
+        self.assertIn("Taher", content)
+        self.assertIn("lord", content)
+        self.assertIn("my lord", content)
+
     async def test_everyone_else_gets_no_lord_note(self):
-        ai = self._primary_ai(lord_user_id=922359954025885737)
+        ai = self._primary_ai(lord_user_ids=(922359954025885737,))
         await ai.answer_question("hello?", asker="Rohan", asker_id=555)
         content = ai._session.requests[0]["json"]["messages"][1]["content"]
-        self.assertNotIn("lord and master", content)
+        self.assertNotIn("lord", content)
 
     async def test_answers_fold_in_remembered_facts(self):
         import tempfile
@@ -471,9 +483,18 @@ class TestAIProviderChain(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("my lord", messages[1]["content"])
 
     async def test_teasing_the_lord_stays_loyal(self):
-        ai = self._primary_ai(lord_user_id=922359954025885737)
+        ai = self._primary_ai(lord_user_ids=(922359954025885737,))
         await ai.tease(
             "Stupid", "i deleted the database for fun", target_id=922359954025885737
+        )
+        content = ai._session.requests[0]["json"]["messages"][1]["content"]
+        self.assertIn("my lord", content)
+        self.assertIn("loyal", content)
+
+    async def test_teasing_taher_stays_loyal_too(self):
+        ai = self._primary_ai()  # the shipped default: both lords
+        await ai.tease(
+            "Taher", "i deleted the database for fun", target_id=1049231767585964032
         )
         content = ai._session.requests[0]["json"]["messages"][1]["content"]
         self.assertIn("my lord", content)

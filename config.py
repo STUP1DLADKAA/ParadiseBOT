@@ -63,6 +63,43 @@ def _roast_intensity(raw: str | None) -> str:
     return value if value in {"mild", "spicy", "nuclear"} else "spicy"
 
 
+#: The shipped lords: Stupid (the owner) and Taher — same level of authority.
+DEFAULT_LORD_USER_IDS: tuple[int, ...] = (922359954025885737, 1049231767585964032)
+
+
+def _lord_ids_from_env(env) -> tuple[int, ...]:
+    """Parse the lord list.
+
+    ``PARADISE_LORD_USER_IDS`` (comma-separated) is the multi-lord form;
+    ``PARADISE_LORD_USER_ID`` (single) still works and is merged in. When
+    NEITHER is set, the shipped pair (Stupid and Taher) is used; when either
+    is set, the configured list replaces the shipped one — exactly how the
+    old single-id override behaved.
+    """
+    many = _ids(env.get("PARADISE_LORD_USER_IDS"))
+    one = max(0, _int(env.get("PARADISE_LORD_USER_ID"), 0))
+    if not many and not one:
+        return DEFAULT_LORD_USER_IDS
+    ids = list(many)
+    if one and one not in ids:
+        ids.append(one)
+    return tuple(ids)
+
+
+def lord_ids_of(config) -> tuple[int, ...]:
+    """Every lord id on a Config or any config-like object.
+
+    Accepts the new ``lord_user_ids`` tuple and the old single
+    ``lord_user_id`` attribute (tests and fakes use both shapes), so no
+    caller has to care which one it was handed.
+    """
+    ids = tuple(int(value) for value in (getattr(config, "lord_user_ids", ()) or ()) if value)
+    legacy = int(getattr(config, "lord_user_id", 0) or 0)
+    if legacy and legacy not in ids:
+        ids = (*ids, legacy)
+    return ids
+
+
 def _ids(raw: str | None) -> tuple[int, ...]:
     """A comma/space separated list of Discord IDs; anything invalid is ignored."""
     text = str(raw or "").strip()
@@ -811,9 +848,10 @@ class Config:
     clip_user_ids: tuple[int, ...] = ()
     deaf_exempt_user_ids: tuple[int, ...] = ()
 
-    # The lord and master: always addressed as "my lord", still roastable, and
-    # the only user allowed to manage the bot's long-term memories.
-    lord_user_id: int = 922359954025885737
+    # The lords and masters, all at the same level of authority: always
+    # addressed as "my lord", still roastable, and the only users allowed to
+    # manage the bot's long-term memories. Stupid (the owner) and Taher.
+    lord_user_ids: tuple[int, ...] = (922359954025885737, 1049231767585964032)
 
     # The dead-server / everyone-in-VC watcher.
     aliveness: AlivenessConfig = AlivenessConfig()
@@ -835,6 +873,15 @@ class Config:
     # login fails with PrivilegedIntentsRequired, so this ships off by default
     # and the aliveness watcher works without it.
     presence_intent: bool = False
+
+    @property
+    def lord_user_id(self) -> int:
+        """The first lord (legacy name; see ``lord_user_ids``)."""
+        return self.lord_user_ids[0] if self.lord_user_ids else 0
+
+    def is_lord(self, user_id: int | None) -> bool:
+        """True when ``user_id`` is one of the lords and masters."""
+        return bool(user_id) and int(user_id) in self.lord_user_ids
 
     @property
     def ai_configured(self) -> bool:
@@ -866,9 +913,7 @@ class Config:
             edit_user_ids=_ids(env.get("EDIT_ALLOWED_USER_IDS")),
             clip_user_ids=_ids(env.get("CLIP_ALLOWED_USER_IDS")),
             deaf_exempt_user_ids=_ids(env.get("VOICE_DEAF_EXEMPT_USER_IDS")),
-            lord_user_id=max(
-                0, _int(env.get("PARADISE_LORD_USER_ID"), 922359954025885737)
-            ),
+            lord_user_ids=_lord_ids_from_env(env),
             aliveness=AlivenessConfig.from_env(env),
             memory_db_path=(
                 str(env.get("MEMORY_DB_PATH", "") or "").strip()

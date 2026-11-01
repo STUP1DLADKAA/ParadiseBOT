@@ -68,16 +68,19 @@ from .ui import (
 
 log = logging.getLogger(__name__)
 
-#: Default operator exempt from the deafened-while-in-VC rule. Override with
-#: ``VOICE_DEAF_EXEMPT_USER_IDS`` (comma-separated Discord user IDs).
-DEAF_TIME_EXEMPT_USER_ID = 922359954025885737
+#: Default operators exempt from the deafened-while-in-VC rule (the lords).
+#: Override with ``VOICE_DEAF_EXEMPT_USER_IDS`` (comma-separated Discord IDs).
+DEAF_TIME_EXEMPT_USER_IDS = (
+    922359954025885737,   # Stupid
+    1049231767585964032,  # Taher
+)
 
 
 def deaf_exempt_user_ids() -> tuple[int, ...]:
     """IDs exempt from the "deafened means not credited" rule."""
     raw = (os.environ.get("VOICE_DEAF_EXEMPT_USER_IDS") or "").strip()
     if not raw:
-        return (DEAF_TIME_EXEMPT_USER_ID,)
+        return tuple(DEAF_TIME_EXEMPT_USER_IDS)
     ids: list[int] = []
     for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
         value = chunk.strip().strip("<>@!")

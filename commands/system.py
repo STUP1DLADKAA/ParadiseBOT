@@ -32,7 +32,7 @@ HELP_BLURBS = {
     "minigames": "automated Paradise games and leaderboard",
     "recipe": "recipes from ingredients you have",
     "summarize": "recap recent chat in this channel",
-    "memory": "teach me things to remember (my lord only)",
+    "memory": "teach me things to remember (my lords only)",
     "help": "this list",
 }
 

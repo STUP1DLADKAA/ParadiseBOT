@@ -7,7 +7,7 @@ from .buffer import (
     SpeakerIntervalPackets,
 )
 from .constants import (
-    AUTHORIZED_CLIP_USER_ID,
+    AUTHORIZED_CLIP_USER_IDS,
     ClipAuthorizationError,
     ClipBusyError,
     ClipDeliveryError,
@@ -45,7 +45,7 @@ from .receiver import (
 from .service import ClipDeliveryReport, VoiceClipService, format_clip_dm_text
 
 __all__ = [
-    "AUTHORIZED_CLIP_USER_ID",
+    "AUTHORIZED_CLIP_USER_IDS",
     "BufferedAudioPacket",
     "ClipAuthorizationError",
     "ClipBusyError",

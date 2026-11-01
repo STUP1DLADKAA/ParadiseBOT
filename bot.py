@@ -110,7 +110,7 @@ class ParadiseBot(commands.Bot):
         self.personality = Personality(self, config.personality)
         self.presence_manager = PresenceManager(self)
         self.ai = AIService(self, config)
-        # Long-term memory (the lord's /memory facts), folded into AI replies.
+        # Long-term memory (the lords' /memory facts), folded into AI replies.
         self.memory = MemoryStore(
             config.memory_db_path, max_entries=config.memory_max_entries
         )

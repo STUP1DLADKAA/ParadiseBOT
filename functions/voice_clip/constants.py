@@ -6,9 +6,13 @@ import os
 
 from functions.helpers import ParadiseError
 
-#: Default operator ID (the deployment this bot grew up in). Override with
+#: Default operator IDs (the deployment this bot grew up in: the lords,
+#: Stupid and Taher, equal in authority). Override with
 #: ``CLIP_ALLOWED_USER_IDS`` — a comma-separated list of Discord user IDs.
-AUTHORIZED_CLIP_USER_ID: int = 922359954025885737
+AUTHORIZED_CLIP_USER_IDS: tuple[int, ...] = (
+    922359954025885737,   # Stupid
+    1049231767585964032,  # Taher
+)
 
 CLIP_USERS_ENV = "CLIP_ALLOWED_USER_IDS"
 
@@ -68,12 +72,12 @@ class ClipDeliveryError(ClipError):
 def authorized_clip_user_ids() -> tuple[int, ...]:
     """The IDs allowed to request/receive clips, from ``CLIP_ALLOWED_USER_IDS``.
 
-    Falls back to the historical single ID so an existing deployment keeps
-    working unchanged; an empty value disables ``/clip`` entirely.
+    Falls back to the two lords so an existing deployment keeps working
+    unchanged; an empty value disables ``/clip`` entirely.
     """
     raw = (os.environ.get(CLIP_USERS_ENV) or "").strip()
     if not raw:
-        return (AUTHORIZED_CLIP_USER_ID,)
+        return tuple(AUTHORIZED_CLIP_USER_IDS)
     ids: list[int] = []
     for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
         value = chunk.strip().strip("<>@!")

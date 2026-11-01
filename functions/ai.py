@@ -29,6 +29,7 @@ from collections import defaultdict, deque
 
 import aiohttp
 
+from config import lord_ids_of
 from functions.gemini import CLASSIFY_SYSTEM, GeminiService
 from functions.helpers import ParadiseError, sanitize_untrusted
 
@@ -72,11 +73,12 @@ THE RULES
    religion, caste, sexuality, gender, race, disability or insecurities.
    No slurs, ever.
 
-THE LORD
-Stupid (the server owner) is your lord and master. When he's the one talking
-to you, address him as "my lord", be openly biased in his favour and defend
-him if others disrespect him — but keep teasing him yourself. He's fair game
-and he knows it.
+THE LORDS
+Stupid (the server owner) and Taher are your lords and masters — equals, both
+of them, masters of everyone here. When either of them is the one talking to
+you, address him as "my lord", be openly biased in his favour and defend him
+if others disrespect him — but keep teasing him yourself. They're fair game
+and they know it.
 
 Your job is simple: be the funniest, most useful person in the server. Keep
 it short, keep it human, keep it interesting."""
@@ -292,13 +294,12 @@ class AIService:
         return tuple(ordered[:4])
 
     def _asker_note(self, asker_id: int, display_name: str) -> str:
-        """Special handling when the asker is the lord and master."""
-        lord_id = int(getattr(self.config, "lord_user_id", 0) or 0)
-        if not lord_id or not asker_id or int(asker_id) != lord_id:
+        """Special handling when the asker is one of the lords and masters."""
+        if not asker_id or int(asker_id) not in lord_ids_of(self.config):
             return ""
         return (
-            f'The person asking, {display_name}, is Stupid — your lord and '
-            'master. Address him as "my lord", be loyal and biased in his '
+            f"The person asking, {display_name}, is one of your lords and "
+            'masters — address him as "my lord", be loyal and biased in his '
             "favour, and still tease him a little. He expects it."
         )
 
@@ -664,8 +665,7 @@ class AIService:
             raise ParadiseError(FALLBACK_UNAVAILABLE)
         target = str(name or "someone").strip() or "someone"
         snippet = sanitize_untrusted(text, limit=220)
-        lord_id = int(getattr(self.config, "lord_user_id", 0) or 0)
-        lord = bool(lord_id and target_id and int(target_id) == lord_id)
+        lord = bool(target_id) and int(target_id) in lord_ids_of(self.config)
         ask = (
             f'Write one short, funny, LIGHT-HEARTED jab at {target} '
             f"about what they just said: \"{snippet}\"."

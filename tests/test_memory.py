@@ -212,17 +212,20 @@ def make_interaction(user_id: int):
 
 
 class TestMemoryCommand(unittest.IsolatedAsyncioTestCase):
-    """commands/memory.py: the command is the lord's, and only his."""
+    """commands/memory.py: the command belongs to the lords (and only them)."""
 
     LORD_ID = LORD_ID
+    TAHER_ID = 1049231767585964032
     OTHER_ID = 111222333
 
-    def _cog(self, *, lord_id: int = LORD_ID):
+    def _cog(self, *, lord_ids=None):
         from commands.memory import Memory
 
+        if lord_ids is None:
+            lord_ids = (self.LORD_ID, self.TAHER_ID)
         tmp = tempfile.TemporaryDirectory()
         bot = SimpleNamespace(
-            config=SimpleNamespace(lord_user_id=lord_id),
+            config=SimpleNamespace(lord_user_ids=tuple(lord_ids)),
             memory=MemoryStore(Path(tmp.name) / "memory.db"),
         )
         cog = Memory(bot)
@@ -232,15 +235,35 @@ class TestMemoryCommand(unittest.IsolatedAsyncioTestCase):
     def tearDown(self):
         pass
 
-    async def test_only_the_lord_passes_the_interaction_check(self):
+    async def test_only_the_lords_pass_the_interaction_check(self):
         cog = self._cog()
         denied = make_interaction(self.OTHER_ID)
         self.assertFalse(await cog.interaction_check(denied))
         denied.response.send_message.assert_awaited_once()
 
-        allowed = make_interaction(self.LORD_ID)
-        self.assertTrue(await cog.interaction_check(allowed))
-        allowed.response.send_message.assert_not_awaited()
+        for lord_id in (self.LORD_ID, self.TAHER_ID):
+            allowed = make_interaction(lord_id)
+            self.assertTrue(await cog.interaction_check(allowed))
+            allowed.response.send_message.assert_not_awaited()
+
+    async def test_the_old_single_lord_config_still_gates(self):
+        """Fakes and older configs carry the single-id attribute only."""
+        cog = self._cog(lord_ids=(self.LORD_ID,))
+        self.assertTrue(await cog.interaction_check(make_interaction(self.LORD_ID)))
+        self.assertFalse(await cog.interaction_check(make_interaction(self.TAHER_ID)))
+
+    async def test_taher_can_teach_the_bot_too(self):
+        cog = self._cog()
+        interaction = make_interaction(self.TAHER_ID)
+        await cog.add.callback(cog, interaction, "taher never loses a 1v1")
+        store = cog.bot.memory
+        self.assertEqual(store.entries()[0].text, "taher never loses a 1v1")
+        listing = make_interaction(self.TAHER_ID)
+        await cog.list_memories.callback(cog, listing)
+        self.assertIn(
+            "taher never loses a 1v1",
+            listing.response.send_message.call_args.args[0],
+        )
 
     async def test_add_lists_removes_and_clears(self):
         cog = self._cog()

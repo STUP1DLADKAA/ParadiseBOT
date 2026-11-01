@@ -17,7 +17,7 @@ Six complementary layers, all of them on by default in a friends-only server:
 6. **Spontaneous quips**: 200-IQ over-analysis and 2-IQ soup-brain remarks.
 7. **Conversation interjections**: when two or more people are actually
    talking, the bot occasionally drops a "hello!"-style line of its own.
-8. **The lord's presence**: when the lord and master himself speaks, a small
+8. **The lords' presence**: when a lord and master himself speaks, a small
    chance of a loyal (and slightly cheeky) acknowledgement.
 
 The engine is *chatty* on purpose: every message is a chance, each kind of
@@ -38,7 +38,7 @@ from dataclasses import dataclass
 
 import discord
 
-from config import PersonalityConfig
+from config import PersonalityConfig, lord_ids_of
 from functions.grammar_nerd import detect_english_mistake, format_nerd_reply
 from functions.memory import clean_memory_text
 from functions.meme_feed import GifSearch, MemeFeed, OnlineMeme
@@ -98,7 +98,7 @@ INTERJECTION_LINES: tuple[str, ...] = (
     "great conversation, honestly. anyway.",
 )
 
-#: Said when the lord and master himself speaks: loyalty with a wink.
+#: Said when a lord and master himself speaks: loyalty with a wink.
 LORD_LINES: tuple[str, ...] = (
     "my lord has spoken 👑",
     "as my lord says.",
@@ -160,6 +160,21 @@ PATTERNS: tuple[Pattern, ...] = (
             "stupid has done more for this server than your entire bloodline of bad decisions.",
             "i wasn't going to interfere, but apparently we're disrespecting royalty today.",
             "first of all, stupid is innocent. second of all, i haven't investigated anything.",
+            "that's my lord you're talking about. show some institutional respect.",
+            "you can disagree with him. having a terrible opinion is your constitutional right.",
+            "say it again, but with courage this time.",
+            "the loyalty is religious and the pettiness is unlimited. choose wisely.",
+        ),
+    ),
+    _p(
+        "loyalty-taher",
+        r"\b(taher|t4her)\b",
+        reactions=("👑", "🗿", "⚔️"),
+        replies=(
+            "careful. that's taher you're talking about. he owns the room.",
+            "taher's resume in this server is longer than your attention span.",
+            "royalty walks among us and apparently we're joking about it.",
+            "taher is innocent until proven innocent.",
             "that's my lord you're talking about. show some institutional respect.",
             "you can disagree with him. having a terrible opinion is your constitutional right.",
             "say it again, but with courage this time.",
@@ -632,9 +647,10 @@ class Personality:
             timeout=float(config.online_timeout),
         )
         self.roast_intensity = sanitize_intensity(config.roast_intensity)
-        #: The lord and master (config.lord_user_id); 0 disables the layer.
+        #: The lords and masters (config.lord_user_ids — Stupid and Taher,
+        #: same level of authority); an empty list disables the layer.
         bot_config = getattr(bot, "config", None)
-        self.lord_user_id = int(getattr(bot_config, "lord_user_id", 0) or 0)
+        self.lord_user_ids: tuple[int, ...] = lord_ids_of(bot_config)
         # Recency data (all in-memory, all bounded).
         self._channel_activity: dict[int, deque[float]] = {}
         self._last_by_author: dict[int, str] = {}
@@ -728,7 +744,7 @@ class Personality:
         # 2b. The lord and master himself is speaking: once in a while, a
         #     loyal (and slightly cheeky) acknowledgement. Loyalty comes
         #     before everything else — but only with its own cooldown.
-        if self.lord_user_id and int(message.author.id) == self.lord_user_id:
+        if self._is_lord(message.author.id):
             if await self._maybe_acknowledge_lord(message, now):
                 return
 
@@ -1172,6 +1188,10 @@ class Personality:
         self._prune(now)
         return True
 
+    def _is_lord(self, user_id: int | None) -> bool:
+        """One of the lords and masters (Stupid, Taher — equals)."""
+        return bool(user_id) and int(user_id) in self.lord_user_ids
+
     def _roast_line_for(self, message: discord.Message) -> str:
         """The best roast for this person: about what they *just said* when
         we have their words (the lord gets the loyal-but-cheeky frames),
@@ -1185,8 +1205,7 @@ class Personality:
         line = build_context_roast(
             author_name,
             snippet,
-            lord=bool(self.lord_user_id)
-            and int(message.author.id) == self.lord_user_id,
+            lord=self._is_lord(message.author.id),
             recent=self._recent_roasts,
         )
         if line is not None:
