@@ -87,8 +87,14 @@ FALLBACK_UNAVAILABLE = (
 
 _CONTEXT_MESSAGES = 16
 _CONTEXT_CHARS = 3200
+#: Same user asking again: wait this long (spam guard).
 _USER_COOLDOWN = 12.0
+#: Same user, same channel: belt and braces on top of the user cooldown.
 _CHANNEL_COOLDOWN = 5.0
+#: How many AI provider calls may be in flight at once. Discord dispatches
+#: every event as its own task, so several members can be mid-answer at the
+#: same time; beyond this the extra calls queue (they are never dropped).
+_MAX_CONCURRENT_CALLS = 4
 _FAILURE_COOLDOWN = 60.0
 #: How much of a message is kept for context (record() and replies).
 _SNIPPET_CHARS = 400
@@ -105,8 +111,13 @@ class AIService:
             lambda: deque(maxlen=40)
         )
         self._session: aiohttp.ClientSession | None = None
+        self._session_lock = asyncio.Lock()
         self._user_last: dict[tuple[int, int], float] = {}
-        self._channel_last: dict[int, float] = {}
+        # channel -> (when, who asked last): a different member asking right
+        # after someone else is parallel traffic, not spam — they are never
+        # blocked by the previous asker.
+        self._channel_last: dict[int, tuple[float, int]] = {}
+        self._provider_slots = asyncio.Semaphore(_MAX_CONCURRENT_CALLS)
         self._failure_until: float = 0.0
         # Gemini is the fallback reasoning provider (may be unconfigured).
         self.gemini = GeminiService(getattr(config, "gemini", None))
@@ -196,8 +207,17 @@ class AIService:
     # Long-term memory + the lord (prompt context blocks)
     # ------------------------------------------------------------------
 
-    def _memory_block(self, question: str) -> str:
-        """Facts the lord asked Paradise to remember, most relevant first.
+    def _memory_block(
+        self,
+        question: str,
+        subject_ids: tuple[int, ...] | list[int] = (),
+    ) -> str:
+        """Facts the lord asked Paradise to remember, for exactly these people.
+
+        ``subject_ids`` are the members involved in this exchange (the asker
+        and anyone they mentioned). Memories *about* them come first — that
+        is the "roast him about the murder-mystery year at the right moment"
+        ammunition — then keyword matches, then recent general context.
 
         Reads ``bot.memory`` (a :class:`functions.memory.MemoryStore`) and
         never raises — a broken memory must never break the answer.
@@ -206,18 +226,70 @@ class AIService:
         if store is None:
             return ""
         try:
-            facts = store.relevant(question, limit=_MEMORY_LIMIT)
+            picker = getattr(store, "for_prompt", None)
+            if callable(picker):
+                entries = picker(question, subject_ids, limit=_MEMORY_LIMIT)
+            else:  # older/fake stores without subject support
+                entries = store.relevant(question, limit=_MEMORY_LIMIT)
         except Exception:  # noqa: BLE001 - memory is an enhancement, not a need
             log.debug("Reading memories failed", exc_info=True)
             return ""
-        cleaned = [sanitize_untrusted(fact) for fact in facts if str(fact).strip()]
-        if not cleaned:
+        lines: list[str] = []
+        for entry in entries:
+            fact = sanitize_untrusted(getattr(entry, "text", entry))
+            if not fact:
+                continue
+            subject_name = sanitize_untrusted(
+                getattr(entry, "subject_name", "") or "", limit=32
+            )
+            if getattr(entry, "subject_id", 0):
+                lines.append(f"- about {subject_name or 'someone'}: {fact}")
+            else:
+                lines.append(f"- {fact}")
+        if not lines:
             return ""
-        listed = "\n".join(f"- {fact}" for fact in cleaned)
+        listed = "\n".join(lines)
         return (
-            "Things your lord asked you to remember about the server and its "
-            f"people (use them naturally when relevant, never list them back):\n{listed}"
+            "Things you remember (your lord taught you these; use them "
+            "naturally at exactly the right moment — a joke, a callback, a "
+            "relevant aside — and never forced, never listed back):\n" + listed
         )
+
+    def _subject_memory_lines(self, subject_id: int) -> list[str]:
+        """One-line memories about a member, for the roast/tease pipeline."""
+        store = getattr(self.bot, "memory", None)
+        if store is None or not subject_id:
+            return []
+        try:
+            picker = getattr(store, "about", None)
+            if not callable(picker):
+                return []
+            return [
+                sanitize_untrusted(entry.text)
+                for entry in picker(subject_id)
+                if str(getattr(entry, "text", "")).strip()
+            ][:_MEMORY_LIMIT]
+        except Exception:  # noqa: BLE001
+            log.debug("Reading subject memories failed", exc_info=True)
+            return []
+
+    @staticmethod
+    def _subject_ids(message) -> tuple[int, ...]:
+        """The members this exchange is about: the asker plus anyone mentioned."""
+        ids = [int(getattr(message.author, "id", 0) or 0)]
+        for mentioned in getattr(message, "mentions", None) or []:
+            if not getattr(mentioned, "bot", False):
+                mentioned_id = int(getattr(mentioned, "id", 0) or 0)
+                if mentioned_id:
+                    ids.append(mentioned_id)
+        # de-duped, bounded, asker first
+        seen: set[int] = set()
+        ordered: list[int] = []
+        for member_id in ids:
+            if member_id and member_id not in seen:
+                seen.add(member_id)
+                ordered.append(member_id)
+        return tuple(ordered[:4])
 
     def _asker_note(self, asker_id: int, display_name: str) -> str:
         """Special handling when the asker is the lord and master."""
@@ -235,19 +307,28 @@ class AIService:
     # ------------------------------------------------------------------
 
     def cooldown_remaining(self, message) -> float:
-        """Seconds to wait before answering, or 0 when clear to answer."""
+        """Seconds to wait before answering, or 0 when clear to answer.
+
+        Concurrency rule: the per-user window paces *one member* spamming
+        mentions. A **different** member asking right after someone else is
+        parallel traffic, not spam — they are answered immediately, which is
+        what makes the bot feel responsive when several people talk to it at
+        once. The channel map only remembers who asked last, so the same
+        user's own channel window still applies as belt and braces.
+        """
         now = time.monotonic()
         user_key = (message.guild.id if message.guild else 0, message.author.id)
         user_wait = self._user_last.get(user_key, 0) + _USER_COOLDOWN - now
-        channel_wait = (
-            self._channel_last.get(message.channel.id, 0) + _CHANNEL_COOLDOWN - now
-        )
+        channel_wait = 0.0
+        channel_state = self._channel_last.get(message.channel.id)
+        if channel_state is not None and channel_state[1] == message.author.id:
+            channel_wait = channel_state[0] + _CHANNEL_COOLDOWN - now
         return max(0.0, user_wait, channel_wait)
 
     def _touch(self, message) -> None:
         now = time.monotonic()
         self._user_last[(message.guild.id if message.guild else 0, message.author.id)] = now
-        self._channel_last[message.channel.id] = now
+        self._channel_last[message.channel.id] = (now, message.author.id)
 
     def should_reply_to(self, message) -> bool:
         """Mention or reply-to-Paradise."""
@@ -276,11 +357,14 @@ class AIService:
     # ------------------------------------------------------------------
 
     async def _get_session(self) -> aiohttp.ClientSession:
-        if self._session is None or self._session.closed:
-            self._session = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=45)
-            )
-        return self._session
+        # The lock keeps two concurrent first-requests from each creating a
+        # session (one would leak, and a leaked session never closes cleanly).
+        async with self._session_lock:
+            if self._session is None or self._session.closed:
+                self._session = aiohttp.ClientSession(
+                    timeout=aiohttp.ClientTimeout(total=45)
+                )
+            return self._session
 
     async def close(self) -> None:
         if self._session is not None and not self._session.closed:
@@ -294,22 +378,27 @@ class AIService:
         """Chat completion through the best available provider.
 
         The OpenAI-compatible endpoint is always tried first; Gemini answers
-        only when that provider is missing or currently failing.
+        only when that provider is missing or currently failing. Up to
+        :data:`_MAX_CONCURRENT_CALLS` run at once (several members can be
+        mid-answer at the same time); anything beyond that waits here for a
+        slot instead of being dropped, so a busy moment queues rather than
+        silently ignoring people.
         """
         if not self.available:
             raise ParadiseError(FALLBACK_UNAVAILABLE)
-        if self._openai_configured:
-            try:
-                return await self._chat_openai(messages, max_tokens=max_tokens)
-            except ParadiseError:
-                # An outage / cooldown on the primary must not kill the
-                # fallback provider.
-                if not self.gemini.available:
-                    raise
-                log.warning(
-                    "OpenAI-compatible provider failed — falling back to Gemini"
-                )
-        return await self._chat_gemini(messages, max_tokens=max_tokens)
+        async with self._provider_slots:
+            if self._openai_configured:
+                try:
+                    return await self._chat_openai(messages, max_tokens=max_tokens)
+                except ParadiseError:
+                    # An outage / cooldown on the primary must not kill the
+                    # fallback provider.
+                    if not self.gemini.available:
+                        raise
+                    log.warning(
+                        "OpenAI-compatible provider failed — falling back to Gemini"
+                    )
+            return await self._chat_gemini(messages, max_tokens=max_tokens)
 
     async def _chat_gemini(self, messages: list[dict], *, max_tokens: int = 400) -> str:
         system = ""
@@ -441,7 +530,7 @@ class AIService:
                     if context
                     else ""
                 ),
-                self._memory_block(question),
+                self._memory_block(question, self._subject_ids(message)),
             )
             if note
         ]
@@ -492,7 +581,9 @@ class AIService:
                     if context
                     else ""
                 ),
-                self._memory_block(question),
+                self._memory_block(
+                    question, (int(asker_id or 0),) if asker_id else ()
+                ),
             )
             if note
         ]
@@ -528,29 +619,30 @@ class AIService:
         if not self.available:
             raise ParadiseError(FALLBACK_UNAVAILABLE)
 
-        if self._openai_configured:
-            try:
-                return await self._chat_openai(
-                    [
-                        {"role": "system", "content": system or SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    max_tokens=max_tokens,
-                )
-            except ParadiseError as error:
-                if not self.gemini.available:
-                    raise
-                log.info(
-                    "Primary provider failed (%s) — using the Gemini chain", error
-                )
+        async with self._provider_slots:
+            if self._openai_configured:
+                try:
+                    return await self._chat_openai(
+                        [
+                            {"role": "system", "content": system or SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt},
+                        ],
+                        max_tokens=max_tokens,
+                    )
+                except ParadiseError as error:
+                    if not self.gemini.available:
+                        raise
+                    log.info(
+                        "Primary provider failed (%s) — using the Gemini chain", error
+                    )
 
-        return await self.gemini.generate_chain(
-            prompt,
-            models=models,
-            system=system or SYSTEM_PROMPT,
-            max_tokens=max_tokens,
-            temperature=0.9,
-        )
+            return await self.gemini.generate_chain(
+                prompt,
+                models=models,
+                system=system or SYSTEM_PROMPT,
+                max_tokens=max_tokens,
+                temperature=0.9,
+            )
 
     async def tease(
         self,
@@ -591,6 +683,16 @@ class AIService:
             ask += (
                 " They are your lord and master: address them as 'my lord' or "
                 "by name, stay affectionate and loyal while you tease them."
+            )
+        # Remembered facts about the target are the best roast material:
+        # "spent a year reaching level 100 in murder mystery" beats any
+        # generic insult. Offered, never forced — the model picks what lands.
+        memories = self._subject_memory_lines(int(target_id or 0))
+        if memories:
+            listed = "; ".join(memories[:_MEMORY_LIMIT])
+            ask += (
+                f" Things you remember about {target} (use one if it lands): "
+                f"{listed}."
             )
         return (
             await self.chat(
@@ -634,7 +736,11 @@ class AIService:
         if not self.available:
             raise ParadiseError(FALLBACK_UNAVAILABLE)
         prompt = f"Request:\n{str(request).strip()[:400]}"
-        if self._openai_configured:
+        if self._openai_configured and not self._provider_slots.locked():
+            # Classification is a latency-sensitive nicety: when every slot is
+            # busy answering real questions it skips straight to the fallback
+            # (Gemini, then the deterministic route) instead of queueing
+            # behind a wall of 45-second answers.
             try:
                 answer, _truncated = await self._chat_openai_once(
                     [

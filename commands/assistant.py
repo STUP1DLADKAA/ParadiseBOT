@@ -67,7 +67,12 @@ from functions.weather import build_weather_embed, render_weather_card
 log = logging.getLogger(__name__)
 
 _USER_COOLDOWN = 5.0
+#: Same member, same channel: keeps one person from machine-gunning the bot.
 _CHANNEL_COOLDOWN = 2.0
+#: A *different* member asking while another answer is still in flight waits
+#: at most this long (usually for an AI slot) instead of being dropped —
+#: parallel requests queue, they never disappear.
+_AI_WAIT_TOLERANCE = 2.5
 _HINT_COOLDOWN = 120.0
 _FALLBACK_NOTE_COOLDOWN = 15 * 60
 
@@ -114,7 +119,9 @@ class Assistant(commands.Cog):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self._user_last: dict[int, float] = {}
-        self._channel_last: dict[int, float] = {}
+        # channel -> (when, who asked last): a different member is never
+        # blocked by the previous one (parallel, not spam).
+        self._channel_last: dict[int, tuple[float, int]] = {}
         self._hint_last: dict[int, float] = {}
         self._fallback_last: dict[int, float] = {}
         # The only image-search implementation in the bot. Key-less by
@@ -880,8 +887,14 @@ class Assistant(commands.Cog):
         ai = self.bot.ai
         if not ai.available:
             return await self._ai_unavailable_note(message)
-        if ai.cooldown_remaining(message) > 0:
-            return True
+        wait = max(0.0, ai.cooldown_remaining(message))
+        if wait > 0:
+            if wait > _AI_WAIT_TOLERANCE:
+                # The same member machine-gunning mentions: quiet, as ever.
+                return True
+            # A parallel request is finishing / an AI slot frees up in a
+            # moment: queue this one briefly instead of dropping it.
+            await asyncio.sleep(wait)
         try:
             answer = await asyncio.wait_for(ai.respond(message), timeout=45)
         except asyncio.TimeoutError:
@@ -915,19 +928,33 @@ class Assistant(commands.Cog):
         return True
 
     def _cooled(self, message: discord.Message) -> bool:
+        """Anti-spam, never anti-social.
+
+        Discord dispatches every message as its own task, so several members
+        can be mid-answer at once. The only thing paced here is *one member*
+        repeating themselves: the channel window applies solely to the person
+        who asked last. A different member asking right after them goes
+        straight through — parallel requests are the point, not a violation.
+        """
         now = time.monotonic()
         user_last = self._user_last.get(message.author.id)
         if user_last is not None and now - user_last < _USER_COOLDOWN:
             return False
         channel_last = self._channel_last.get(message.channel.id)
-        if channel_last is not None and now - channel_last < _CHANNEL_COOLDOWN:
+        if (
+            channel_last is not None
+            and channel_last[1] == message.author.id
+            and now - channel_last[0] < _CHANNEL_COOLDOWN
+        ):
             return False
         self._user_last[message.author.id] = now
-        self._channel_last[message.channel.id] = now
+        self._channel_last[message.channel.id] = (now, message.author.id)
         if len(self._user_last) > 512:
             cutoff = now - _USER_COOLDOWN
             self._user_last = {k: v for k, v in self._user_last.items() if v > cutoff}
-            self._channel_last = {k: v for k, v in self._channel_last.items() if v > cutoff}
+            self._channel_last = {
+                k: v for k, v in self._channel_last.items() if v[0] > cutoff
+            }
         return True
 
     async def _quiet_reply(self, message: discord.Message, content: str = "", **kwargs) -> None:

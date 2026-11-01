@@ -16,7 +16,7 @@ from discord.ext import commands
 from config import Config, load_config
 from functions import autoupdate, perf
 from functions.ai import AIService
-from functions.memory import MemoryStore
+from functions.memory import MemoryMirror, MemoryStore
 from functions.personality import Personality
 from functions.presence import PresenceManager
 from functions.startup import PRIMARY_GUILD_ID, CommandSynchronizer
@@ -114,6 +114,18 @@ class ParadiseBot(commands.Bot):
         self.memory = MemoryStore(
             config.memory_db_path, max_entries=config.memory_max_entries
         )
+        # The optional Supabase mirror of those memories — same project and
+        # credentials as the voice tracker (see supabase/migrations/
+        # 005_memory.sql). Unconfigured is a logged no-op; SQLite always
+        # stays the working store.
+        self.memory_mirror = MemoryMirror(
+            self.memory,
+            url=config.voice.supabase_url,
+            key=config.voice.supabase_secret_key,
+            interval=config.memory_supabase_interval,
+            request_timeout=config.memory_supabase_timeout,
+        )
+        self.memory_mirror_task: asyncio.Task | None = None
         self.afk_states: dict = {}
         self._afk_notice_last: dict[tuple[int, int], float] = {}
         self._ready_logged = False
@@ -177,6 +189,13 @@ class ParadiseBot(commands.Bot):
 
         self.presence_manager.start()
 
+        # Mirror /memory facts to Supabase every couple of minutes (no-op
+        # without credentials). Never fatal, never blocks a reply.
+        if self.memory_mirror.configured:
+            self.memory_mirror_task = asyncio.create_task(
+                self.memory_mirror.run_forever(), name="paradise-memory-mirror"
+            )
+
         # Keep the checkout fresh while online (the start-up check already
         # ran before login; this one handles long-lived processes).
         self.autoupdate_task = asyncio.create_task(
@@ -217,6 +236,13 @@ class ParadiseBot(commands.Bot):
             await self.presence_manager.stop()
         except Exception:
             log.debug("Presence stop failed", exc_info=True)
+        mirror_task = getattr(self, "memory_mirror_task", None)
+        if mirror_task is not None:
+            mirror_task.cancel()
+            try:
+                await mirror_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         try:
             await self.ai.close()
         except Exception:

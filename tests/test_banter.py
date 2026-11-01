@@ -11,8 +11,10 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import tempfile
 import unittest
 from collections import deque
+from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 from unittest.mock import AsyncMock
@@ -28,6 +30,7 @@ from commands.banter import (  # noqa: E402
     render_topic_meme,
 )
 from config import Config, PersonalityConfig  # noqa: E402
+from functions.memory import MemoryStore  # noqa: E402
 from functions.meme_feed import (  # noqa: E402
     ALLOWED_HOSTS,
     GifSearch,
@@ -736,6 +739,105 @@ class TestBanterConfig(unittest.TestCase):
     def test_a_silly_chance_falls_back(self):
         cfg = Config.from_env({"PERSONALITY_ROAST_CHANCE": "12"}).personality
         self.assertEqual(cfg.roast_chance, 0.12)
+
+
+# ---------------------------------------------------------------------------
+# The long memory: /memory facts quoted back at the right person
+# ---------------------------------------------------------------------------
+
+
+class TestMemoryCallbacks(unittest.IsolatedAsyncioTestCase):
+    """The passive layer: no AI call, one quoted fact, rare by design."""
+
+    def _with_memory(self, **overrides):
+        tmp = tempfile.TemporaryDirectory()
+        store = MemoryStore(Path(tmp.name) / "memory.db")
+        overrides.setdefault("interject_chance", 0.0)  # two-author tests below
+        personality = _personality(
+            memory_callback_chance=1.0,
+            memory_callback_cooldown=overrides.pop("cooldown", 0),
+            **overrides,
+        )
+        personality.bot.memory = store
+        personality._tmp = tmp  # keep the directory alive
+        return personality, store
+
+    async def test_a_remembered_fact_is_quoted_back(self):
+        personality, store = self._with_memory()
+        store.add(
+            "spent a year reaching level 100 in murder mystery",
+            subject_id=42,
+            subject_name="Ash",
+        )
+        msg = _make_msg("honestly ranked is a scam this season")
+        await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        sent = msg.reply.call_args.args[0]
+        self.assertIn("murder mystery", sent)
+        self.assertIn("Ash", sent)
+        # The fact is quoted verbatim, never rewritten by the frame.
+        self.assertIn('"', sent)
+
+    async def test_memories_about_somebody_else_stay_quiet(self):
+        personality, store = self._with_memory()
+        store.add("secretly loves one direction", subject_id=777, subject_name="Bob")
+        msg = _make_msg("just a normal message about my day")
+        await personality.handle(msg)
+        msg.reply.assert_not_called()
+
+    async def test_the_same_person_is_not_called_back_twice(self):
+        personality, store = self._with_memory(cooldown=3600)
+        store.add("once ate an entire birthday cake alone", subject_id=42)
+        first = _make_msg("anyone up for a game tonight")
+        await personality.handle(first)
+        first.reply.assert_awaited_once()
+        second = _make_msg("different message, same person, minutes later")
+        await personality.handle(second)
+        second.reply.assert_not_called()
+
+    async def test_a_different_person_gets_their_own_callback(self):
+        personality, store = self._with_memory(cooldown=3600)
+        store.add("once ate an entire birthday cake alone", subject_id=42)
+        store.add("afraid of escalators", subject_id=43, subject_name="Rohan")
+        first = _make_msg("anyone up for a game tonight", author_id=42)
+        await personality.handle(first)
+        first.reply.assert_awaited_once()
+        self.assertIn("birthday cake", first.reply.call_args.args[0])
+        second = _make_msg("a completely different message", author_id=43)
+        await personality.handle(second)
+        second.reply.assert_awaited_once()
+        self.assertIn("escalators", second.reply.call_args.args[0])
+
+    async def test_a_very_long_fact_is_capped(self):
+        personality, store = self._with_memory()
+        store.add(
+            "once " + "absolutely " * 40 + "refused to admit the earth is round",
+            subject_id=42,
+        )
+        msg = _make_msg("talking about geography again")
+        await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        sent = msg.reply.call_args.args[0]
+        self.assertIn("…", sent)
+        self.assertLessEqual(len(sent), 190)
+
+    async def test_without_a_store_nothing_happens(self):
+        personality = _personality(memory_callback_chance=1.0)
+        msg = _make_msg("just chatting here")
+        await personality.handle(msg)  # must not raise
+        msg.reply.assert_not_called()
+
+    async def test_a_broken_store_never_breaks_chat(self):
+        personality = _personality(memory_callback_chance=1.0)
+
+        class ExplodingStore:
+            def about(self, _subject_id):
+                raise RuntimeError("sqlite is having a moment")
+
+        personality.bot.memory = ExplodingStore()
+        msg = _make_msg("just chatting here")
+        await personality.handle(msg)  # must not raise
+        msg.reply.assert_not_called()
 
 
 if __name__ == "__main__":

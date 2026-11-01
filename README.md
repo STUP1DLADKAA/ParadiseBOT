@@ -43,7 +43,7 @@ cannot answer:
 | `@Paradise <complex question>` | the AI, in full character — OpenAI-compatible provider first, Gemini as the fallback | optional |
 | `@Paradise search <topic>` | forwarded straight to the AI (no web retrieval) and answered in character | optional |
 | `/summarize` | AI summary of recent conversation | optional |
-| `/memory add/list/remove/clear` | the lord teaches the bot facts it then folds into its answers | optional |
+| `/memory add/list/remove/clear [user]` | the lord teaches the bot facts about a member (or the server) that surface when that person talks | optional |
 | `@Paradise roast <someone>` | an AI tease about what that person actually just said (roast-book fallback) | optional |
 | Aliveness lines | a situation-aware one-liner when the server goes quiet or everyone moves into a voice call | optional |
 | Personality & banter | canned reactions, replies, stickers, context roasts, interjections, rendered memes, keyless internet memes and **keyless reaction GIFs** — **no model** for any of it | never |
@@ -75,7 +75,7 @@ conversation, `/summarize` and the AI-shaped answers are unavailable.
 | **Cards, drawn in code** | Dictionary, weather, recipe, mini-game and leaderboard visuals are Pillow-rendered at 2× supersampling — deterministic, cacheable, never generated. The leaderboard's contrast ratios are asserted in the test suite, not eyeballed. |
 | **Pronunciation** | Optional ElevenLabs voice for dictionary words, with an OpenAI-compatible and a free web fallback. Hindi, English and Hinglish. |
 | **It actually talks back** | Reactions, one-liners, stickers, roasts that quote your own words back at you, "hello!" interjections when two people are talking, reaction GIFs and memes pulled from real Reddit communities — none of it needs an API key. Say "roast me", type something cocky, or just be funny near it. [How it works](docs/humour.md). |
-| **Long-term memory** | The lord (`/memory`) teaches the bot facts, preferences and server lore; every AI answer from then on quietly uses them. |
+| **Long-term memory** | The lord (`/memory`) teaches the bot facts *about specific members* — they surface when that person talks or is asked about, never dumped into every reply. SQLite always, an optional Supabase mirror for durability, and a rare quoted callback from the personality. |
 | **It notices when it's dead** | When nobody has typed for a while — or when everyone who was chatting has moved into a voice call — the bot composes one short, situation-aware line for the actual numbers (minutes of silence, who is in VC and for how long, the IST time) and posts it in the home channel. |
 | **Silent presence** | Follows the crowd into the busiest voice channel and says nothing when it arrives. |
 | **Mini-games** | A recoverable SQLite scheduler, four modular games, aggregate-only leaderboard. |
@@ -105,6 +105,12 @@ red panda"` never touch a model. Everything a model *does* answer goes to the
 OpenAI-compatible provider first and falls back to Gemini when that provider
 is unconfigured or failing — and a provider outage is reported honestly
 instead of being guessed around.
+
+Several members can talk to the bot at once and every one of them gets an
+answer: requests run in parallel up to a small ceiling (`_MAX_CONCURRENT_CALLS`),
+one person's cooldown never gates another's, and the one-shot intent classifier
+never queues behind long answers — it skips straight to its fallback when the
+provider is busy.
 
 ---
 

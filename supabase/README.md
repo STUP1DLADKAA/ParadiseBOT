@@ -1,4 +1,4 @@
-# ParadiseBOT on Supabase — voice activity setup
+# ParadiseBOT on Supabase — voice activity & memory setup
 
 The `/vc` leaderboard, `/vc stats`, and the daily DM reports are backed by a
 **Supabase PostgreSQL database** (any project works; pick the region closest to
@@ -6,10 +6,14 @@ your members — this bot was developed against `ap-south-1`, Mumbai). SQLite re
 settings (timezones, DM preferences) and as a bounded, temporary fallback
 queue while Supabase is unreachable.
 
+The same project also holds the optional **long-term memory mirror**
+(`/memory`): `paradise_memories` keeps a durable copy of the lord's facts so
+they survive a reinstall or a move to another machine.
+
 > **The bot never creates or alters Supabase tables.** The schema below is
 > applied **manually, once**, by a project owner. The bot only *verifies* it
-> (via `voice_schema_version()`) and refuses to track voice data until it
-> exists.
+> (via `voice_schema_version()` / `paradise_memory_schema_version()`) and
+> refuses to track voice data until it exists.
 
 ## 1. Apply the schema (one-time, ~3 minutes)
 
@@ -19,11 +23,22 @@ queue while Supabase is unreachable.
 4. Run [`migrations/002_voice_ist_calendar.sql`](migrations/002_voice_ist_calendar.sql) second.
 5. Run [`migrations/003_voice_checkpoint.sql`](migrations/003_voice_checkpoint.sql) third.
 6. Run [`migrations/004_voice_credit_carry.sql`](migrations/004_voice_credit_carry.sql) fourth.
+7. Run [`migrations/005_memory.sql`](migrations/005_memory.sql) fifth (optional — memories).
 
 Each migration is transactional and safe to re-run. If the project already has
 schema version 1, apply migrations 002, 003 **and** 004. At version 2, apply
-**003 and 004**. At version 3, apply **only 004**. The bot requires schema
-version **4**.
+**003 and 004**. At version 3, apply **only 004**. The bot requires voice
+schema version **4**; the memory mirror requires memory schema version **1**
+and is optional — without 005 the bot keeps using local storage.
+
+> **What 005 adds.** One table, `paradise_memories` (id = the bot's local
+> SQLite rowid, so the bot is the only writer of ids), with RLS enabled and no
+> policies — the bot reaches it with the service-role key, nobody else can.
+> The mirror reconciles both ways every couple of minutes
+> (`MEMORY_SUPABASE_INTERVAL_SECONDS`): new local rows are pushed, rows added
+> in the Dashboard are pulled, and rows deleted in the Dashboard disappear
+> from the bot on the next pass. A missing 005 is a logged no-op, never an
+> error.
 
 > **What 004 fixes.** A day in a voice channel used to be credited a few
 > minutes short — 24 hours landed in the database as ~23 h 51 m. The checkpoint

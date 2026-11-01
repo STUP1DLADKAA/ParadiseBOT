@@ -40,6 +40,7 @@ import discord
 
 from config import PersonalityConfig
 from functions.grammar_nerd import detect_english_mistake, format_nerd_reply
+from functions.memory import clean_memory_text
 from functions.meme_feed import GifSearch, MemeFeed, OnlineMeme
 from functions.memes import (
     MEME_TEMPLATES,
@@ -111,6 +112,19 @@ LORD_LINES: tuple[str, ...] = (
 
 #: Cheaper than words: crown him.
 LORD_REACTIONS: tuple[str, ...] = ("👑", "🗿", "🫡")
+
+#: The long memory: once in a rare while, when somebody the bot actually
+#: knows something about talks, Paradise quotes it back at them. The memory
+#: text itself is quoted verbatim (cleaned and capped) so the frames only
+#: ever add a wrapper, never a fabrication.
+_MEMORY_CALLBACK_FRAMES: tuple[str, ...] = (
+    "\"{memory}\" — yeah i remember that, {name}. i keep receipts.",
+    "oh \"{memory}\"? filed that one away the moment it happened, {name}",
+    "\"{memory}\". i don't forget things, {name}. i just pretend to.",
+    "hold on. {name}. you're the \"{memory}\" person. legendary.",
+    "noted back then, noted now: \"{memory}\". right, {name}?",
+    "some things stay with a bot. \"{memory}\" is one of them, {name}.",
+)
 
 _SERIOUS_TOPIC_RE = re.compile(
     r"\b(passed away|died|funeral|hospital|cancer|suicide|self[- ]harm|depressed|grief|condolences|rest in peace)\b",
@@ -636,6 +650,8 @@ class Personality:
         self._last_grammar_by_channel: dict[int, float] = {}
         self._last_roast_by_user: dict[int, float] = {}
         self._last_roast_by_channel: dict[int, float] = {}
+        #: ``author_id -> when`` — the memory-callback clock (rare by design).
+        self._last_memory_callback: dict[int, float] = {}
         self._last_interject_by_channel: dict[int, float] = {}
         #: ``channel -> last action`` so the bot never does the same thing twice
         #: in a row. Two memes back to back reads as a broken bot, not a funny
@@ -724,6 +740,13 @@ class Personality:
             if random.random() < float(self.config.interject_chance):
                 if await self._send_interjection(message, now):
                     return
+
+        # 2d. The long memory (/memory): once in a rare while, when somebody
+        #     the bot was taught something about talks, quote it back. No AI
+        #     call — just a quoted fact and a frame. Rare on purpose: the
+        #     joke is the timing, not the volume.
+        if await self._send_memory_callback(message, now):
+            return
 
         # 3. Contextual pattern match: one of reply / meme / GIF / sticker /
         #    roast / reaction, never two.
@@ -1105,6 +1128,50 @@ class Personality:
         self._prune(now)
         return True
 
+    async def _send_memory_callback(self, message: discord.Message, now: float) -> bool:
+        """Quote one remembered fact back at the person it is about.
+
+        Passive by design: no AI call, one cleaned snippet, its own rare
+        chance and a per-person cooldown measured in hours. The store lives
+        on the bot (``bot.memory``); when the feature is off there is simply
+        no store to find.
+        """
+        store = getattr(self.bot, "memory", None)
+        if store is None:
+            return False
+        if random.random() >= float(self.config.memory_callback_chance):
+            return False
+        author_id = int(message.author.id)
+        if now - self._last_memory_callback.get(author_id, float("-inf")) < float(
+            self.config.memory_callback_cooldown
+        ):
+            return False
+        try:
+            facts = store.about(author_id)
+        except Exception:  # noqa: BLE001 - a memory must never break chat
+            return False
+        if not facts:
+            return False
+        snippet = clean_memory_text(facts[0].text)
+        if len(snippet) > 90:
+            snippet = snippet[:87].rstrip() + "…"
+        name = (
+            getattr(message.author, "display_name", None)
+            or getattr(message.author, "name", None)
+            or "friend"
+        )
+        line = random.choice(_MEMORY_CALLBACK_FRAMES).format(
+            name=name, memory=snippet
+        )
+        if not await self._deliver_text_reply(message, line):
+            return False
+        self._note_action("reply", message.channel.id)
+        self._mark(message.channel.id, now)
+        self._last_reply_by_channel[message.channel.id] = now
+        self._last_memory_callback[author_id] = now
+        self._prune(now)
+        return True
+
     def _roast_line_for(self, message: discord.Message) -> str:
         """The best roast for this person: about what they *just said* when
         we have their words (the lord gets the loyal-but-cheeky frames),
@@ -1360,6 +1427,7 @@ class Personality:
             self._last_roast_by_user,
             self._last_roast_by_channel,
             self._last_interject_by_channel,
+            self._last_memory_callback,
         ):
             stale = [key for key, value in bucket.items() if value <= cutoff]
             for key in stale:
