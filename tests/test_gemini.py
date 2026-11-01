@@ -688,9 +688,9 @@ class TestConcurrentAIRequests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(session.requests, 12)
         # They genuinely overlapped…
         self.assertGreaterEqual(session.max_inflight, 2)
-        # …but never more than the ceiling at once (8 now: a busy server
+        # …but never more than the ceiling at once (12 now: a busy server
         # should not feel a queue).
-        self.assertLessEqual(session.max_inflight, 8)
+        self.assertLessEqual(session.max_inflight, 12)
 
     async def test_a_different_member_is_not_blocked_by_the_channel(self):
         def message_from(member_id, name):
@@ -740,10 +740,10 @@ class TestConcurrentAIRequests(unittest.IsolatedAsyncioTestCase):
         instead of queueing behind a wall of long answers."""
         session = self.SlowSession(delay=10.0, responses=0)
         ai = self._ai(session)
-        # Occupy every slot with a slow request.
+        # Occupy every slot with a slow request (the ceiling is 12 now).
         tasks = [
             asyncio.create_task(ai.chat([{"role": "user", "content": f"q{index}"}]))
-            for index in range(8)
+            for index in range(12)
         ]
         await asyncio.sleep(0.05)
         self.assertTrue(ai._provider_slots.locked())

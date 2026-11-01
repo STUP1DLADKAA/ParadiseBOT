@@ -592,8 +592,8 @@ class TestConversationsAndTheLord(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(many.lord_user_ids, (111, 222, 333))
         # and the defaults match the shipped tuning
         defaults = Config.from_env({})
-        self.assertEqual(defaults.personality.meme_chance, 0.16)
-        self.assertEqual(defaults.personality.gif_chance, 0.10)
+        self.assertEqual(defaults.personality.meme_chance, 0.10)
+        self.assertEqual(defaults.personality.gif_chance, 0.06)
         # Stupid and Taher, both lords by default, same level of authority.
         self.assertEqual(
             defaults.lord_user_ids, (922359954025885737, 1049231767585964032)

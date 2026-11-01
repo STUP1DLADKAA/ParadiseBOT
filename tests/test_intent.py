@@ -24,8 +24,8 @@ from functions.intent import (  # noqa: E402
 )
 from functions.intent import _cache as intent_cache  # noqa: E402
 from functions.router import (  # noqa: E402
-    AI, CALCULATE, CONVERT, GIF, IMAGE, MEME, SEARCH, SUMMARIZE, TIME,
-    WEATHER, Route, route_query,
+    AI, CALCULATE, CONVERT, GIF, IMAGE, INFO, MEME, POLL, REMIND, SEARCH,
+    SUMMARIZE, TIME, UTILITY, WEATHER, Route, route_query,
 )
 
 
@@ -130,10 +130,37 @@ class TestToRoute(unittest.TestCase):
             ("recap", SUMMARIZE),
             ("meme", MEME),
             ("gif", GIF),
+            ("remind", REMIND),
+            ("poll", POLL),
+            ("whois", INFO),
+            ("avatar", INFO),
+            ("serverinfo", INFO),
+            ("countdown", UTILITY),
+            ("dice", UTILITY),
+            ("eightball", UTILITY),
+            ("password", UTILITY),
+            ("qr", UTILITY),
+            ("rps", UTILITY),
+            ("utility", UTILITY),
             ("chat", AI),
         ):
             route = IntentGuess(intent=intent, query="q").to_route(self.fallback)
             self.assertEqual(route.kind, expected, intent)
+
+    def test_toolkit_labels_carry_their_tool_key(self):
+        for intent, tool in (
+            ("countdown", "countdown"), ("dice", "dice"),
+            ("eightball", "eightball"), ("password", "password"),
+            ("qr", "qr"), ("rps", "rps"), ("uuid", "uuid"),
+            ("avatar", "avatar"), ("whois", "whois"), ("serverinfo", "server"),
+        ):
+            route = IntentGuess(intent=intent, query="q").to_route(self.fallback)
+            self.assertEqual(route.payload2, tool, intent)
+        # Labels without a sub-tool keep the fallback's payload2.
+        route = IntentGuess(intent="utility", query="rot13 hello").to_route(
+            Route(kind=AI, payload="rot13 hello", payload2="cipher")
+        )
+        self.assertEqual(route.payload2, "cipher")
 
     def test_needs_image_wins(self):
         route = IntentGuess(intent="search", query="a wolf", needs_image=True).to_route(

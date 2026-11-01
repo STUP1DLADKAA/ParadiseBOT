@@ -7,7 +7,7 @@ only here. A safe template is provided in ``.env.example``.
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 def _bool(raw: str | None, default: bool) -> bool:
@@ -145,24 +145,24 @@ class PersonalityConfig:
 
     enabled: bool = True
     # Chance to add a contextual reaction to a matching message.
-    reaction_chance: float = 0.22
+    reaction_chance: float = 0.18
     # Chance to react to a casual message that matched no pattern at all.
-    ambient_reaction_chance: float = 0.10
+    ambient_reaction_chance: float = 0.06
     # Chance to send a short contextual reply instead (never both).
-    reply_chance: float = 0.12
+    reply_chance: float = 0.08
     # Chance to reply to a casual message with a random Discord/vinyl sticker.
-    sticker_chance: float = 0.05
+    sticker_chance: float = 0.04
     # Chance to reply with a meme — from the internet when it is reachable,
     # rendered locally when it is not.
-    meme_chance: float = 0.16
+    meme_chance: float = 0.10
     # Of those meme drops, how many should try the internet first.
     online_meme_chance: float = 0.75
     # Chance to reply with a reaction GIF (keyless by default; keys add quality).
-    gif_chance: float = 0.10
+    gif_chance: float = 0.06
     # Chance to drop a spontaneous smart/stupid/unpredictable quip.
-    random_quip_chance: float = 0.14
+    random_quip_chance: float = 0.08
     # Chance to roast whoever just spoke.
-    roast_chance: float = 0.12
+    roast_chance: float = 0.08
     # "mild", "spicy" or "nuclear" — see functions/roasts.py.
     roast_intensity: str = "spicy"
     # Seconds before the same person can be roasted again.
@@ -172,9 +172,9 @@ class PersonalityConfig:
     # Seconds between ANY two personality actions, bot-wide.
     global_cooldown: int = 10
     # Seconds between personality actions in the same channel.
-    channel_cooldown: int = 35
+    channel_cooldown: int = 60
     # Extra spacing for pattern replies in the same channel.
-    reply_channel_cooldown: int = 150
+    reply_channel_cooldown: int = 180
     # Per-channel spacing for stickers, memes, GIFs and spontaneous quips.
     humour_cooldown: int = 45
     # Per-channel spacing for English grammar/spelling nerd corrections.
@@ -194,9 +194,10 @@ class PersonalityConfig:
     tenor_api_key: str = ""
     giphy_api_key: str = ""
     # Chance to say "hello!" when two people are having a conversation.
-    interject_chance: float = 0.08
+    # Low on purpose: unprompted chatter is the first thing that gets old.
+    interject_chance: float = 0.04
     # Seconds before the bot may interject in the same channel again.
-    interject_cooldown: int = 240
+    interject_cooldown: int = 600
     # Chance the bot acknowledges its lord when he speaks (reply or 👑).
     lord_reply_chance: float = 0.20
     # Chance to drop a "remember when …" callback when somebody the bot has
@@ -204,31 +205,34 @@ class PersonalityConfig:
     memory_callback_chance: float = 0.05
     # Seconds before the same person can be memory-called-back again.
     memory_callback_cooldown: int = 1800
+    # Hard ceiling on *unprompted* messages per channel per rolling hour
+    # (replies to mentions are never counted). 0 disables the ceiling.
+    ambient_hourly_cap: int = 6
 
     @classmethod
     def from_env(cls, env) -> "PersonalityConfig":
         return cls(
             enabled=_bool(env.get("PERSONALITY_ENABLED"), True),
-            reaction_chance=_chance(env.get("PERSONALITY_REACTION_CHANCE"), 0.22),
+            reaction_chance=_chance(env.get("PERSONALITY_REACTION_CHANCE"), 0.18),
             ambient_reaction_chance=_chance(
-                env.get("PERSONALITY_AMBIENT_REACTION_CHANCE"), 0.10
+                env.get("PERSONALITY_AMBIENT_REACTION_CHANCE"), 0.06
             ),
-            reply_chance=_chance(env.get("PERSONALITY_REPLY_CHANCE"), 0.12),
-            sticker_chance=_chance(env.get("PERSONALITY_STICKER_CHANCE"), 0.05),
-            meme_chance=_chance(env.get("PERSONALITY_MEME_CHANCE"), 0.16),
+            reply_chance=_chance(env.get("PERSONALITY_REPLY_CHANCE"), 0.08),
+            sticker_chance=_chance(env.get("PERSONALITY_STICKER_CHANCE"), 0.04),
+            meme_chance=_chance(env.get("PERSONALITY_MEME_CHANCE"), 0.10),
             online_meme_chance=_chance(
                 env.get("PERSONALITY_ONLINE_MEME_CHANCE"), 0.75
             ),
-            gif_chance=_chance(env.get("PERSONALITY_GIF_CHANCE"), 0.10),
-            random_quip_chance=_chance(env.get("PERSONALITY_QUIP_CHANCE"), 0.14),
-            roast_chance=_chance(env.get("PERSONALITY_ROAST_CHANCE"), 0.12),
+            gif_chance=_chance(env.get("PERSONALITY_GIF_CHANCE"), 0.06),
+            random_quip_chance=_chance(env.get("PERSONALITY_QUIP_CHANCE"), 0.08),
+            roast_chance=_chance(env.get("PERSONALITY_ROAST_CHANCE"), 0.08),
             roast_intensity=_roast_intensity(env.get("PERSONALITY_ROAST_INTENSITY")),
             roast_user_cooldown=_int(env.get("PERSONALITY_ROAST_USER_COOLDOWN"), 600),
             grammar_chance=_chance(env.get("PERSONALITY_GRAMMAR_CHANCE"), 0.70),
             global_cooldown=_int(env.get("PERSONALITY_GLOBAL_COOLDOWN"), 10),
-            channel_cooldown=_int(env.get("PERSONALITY_CHANNEL_COOLDOWN"), 35),
+            channel_cooldown=_int(env.get("PERSONALITY_CHANNEL_COOLDOWN"), 60),
             reply_channel_cooldown=_int(
-                env.get("PERSONALITY_REPLY_CHANNEL_COOLDOWN"), 150
+                env.get("PERSONALITY_REPLY_CHANNEL_COOLDOWN"), 180
             ),
             humour_cooldown=_int(env.get("PERSONALITY_HUMOUR_COOLDOWN"), 45),
             grammar_cooldown=_int(env.get("PERSONALITY_GRAMMAR_COOLDOWN"), 90),
@@ -236,9 +240,9 @@ class PersonalityConfig:
             online_timeout=_float(env.get("MEME_TIMEOUT"), 6.0),
             tenor_api_key=(env.get("TENOR_API_KEY") or "").strip(),
             giphy_api_key=(env.get("GIPHY_API_KEY") or "").strip(),
-            interject_chance=_chance(env.get("PERSONALITY_INTERJECT_CHANCE"), 0.08),
+            interject_chance=_chance(env.get("PERSONALITY_INTERJECT_CHANCE"), 0.04),
             interject_cooldown=_int(
-                env.get("PERSONALITY_INTERJECT_COOLDOWN"), 240
+                env.get("PERSONALITY_INTERJECT_COOLDOWN"), 600
             ),
             lord_reply_chance=_chance(env.get("PERSONALITY_LORD_REPLY_CHANCE"), 0.20),
             memory_callback_chance=_chance(
@@ -246,6 +250,9 @@ class PersonalityConfig:
             ),
             memory_callback_cooldown=_int(
                 env.get("PERSONALITY_MEMORY_CALLBACK_COOLDOWN"), 1800
+            ),
+            ambient_hourly_cap=_int(
+                env.get("PERSONALITY_AMBIENT_HOURLY_CAP"), 6
             ),
         )
 
@@ -674,6 +681,55 @@ class ImageSearchConfig:
         )
 
 
+class AIModelSpec:
+    """One OpenAI-compatible model and the role it is best at.
+
+    Roles: ``fast`` (labels, quips, anything latency-sensitive) and
+    ``deep`` (long answers, recaps, roasts). A model registered without a
+    role serves both.
+    """
+
+    __slots__ = ("name", "role")
+
+    def __init__(self, name: str, role: str = "") -> None:
+        self.name = str(name or "").strip()
+        self.role = str(role or "").strip().casefold()
+
+    @property
+    def valid(self) -> bool:
+        return bool(self.name) and self.role in ("", "fast", "deep")
+
+    def __repr__(self) -> str:  # pragma: no cover - debug aid
+        return f"AIModelSpec({self.name!r}, {self.role!r})"
+
+
+def parse_ai_models(raw: str) -> list[AIModelSpec]:
+    """Parse ``AI_MODELS``: "fast:gpt-4o-mini, deep:gpt-4o, llama3".
+
+    Entries may be ``role:model`` or a bare ``model``. Junk is dropped
+    rather than guessed at; duplicates keep their first position.
+    """
+    specs: list[AIModelSpec] = []
+    seen: set[str] = set()
+    for entry in str(raw or "").replace(";", ",").split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        role, _, name = entry.rpartition(":")
+        if not name:  # "model:" with nothing after it
+            continue
+        if role and ":" in name:
+            # A model name that itself contains ':' — the first segment is
+            # the role, everything after it is the model.
+            role, _, name = entry.partition(":")
+        spec = AIModelSpec(name, role) if role else AIModelSpec(entry)
+        if not spec.valid or spec.name.casefold() in seen:
+            continue
+        seen.add(spec.name.casefold())
+        specs.append(spec)
+    return specs
+
+
 @dataclass(frozen=True, slots=True)
 class GeminiConfig:
     """Google Gemini — the optional AI fallback provider (see functions/gemini.py).
@@ -733,6 +789,18 @@ class Config:
     ai_base_url: str = ""
     ai_api_key: str = ""
     ai_model: str = ""
+    # Optional extra models on the same endpoint, each tagged with a role:
+    # "fast:gpt-4o-mini,deep:gpt-4o". A bare model name takes the default
+    # role. Paradise routes by role (labels and quips → fast, long answers,
+    # recaps and roasts → deep) and fails over down the list, so several
+    # models can share one key. Unset → the single AI_MODEL does everything.
+    ai_models: list[AIModelSpec] = field(default_factory=list)
+    # Optional extra models on the same endpoint, each tagged with a role:
+    # "fast:gpt-4o-mini,deep:gpt-4o". A bare model name takes the default
+    # role. Paradise routes by role (labels and quips → fast, long answers,
+    # recaps and roasts → deep) and fails over down the list, so several
+    # models can share one key. Unset → the single AI_MODEL does everything.
+    ai_models: list[AIModelSpec] = field(default_factory=list)
 
     # Rare passive personality (reactions / short replies).
     personality: PersonalityConfig = PersonalityConfig()
@@ -824,6 +892,7 @@ class Config:
             ai_base_url=env.get("AI_BASE_URL", "").strip().rstrip("/"),
             ai_api_key=env.get("AI_API_KEY", "").strip(),
             ai_model=env.get("AI_MODEL", "").strip(),
+            ai_models=parse_ai_models(env.get("AI_MODELS", "")),
             personality=PersonalityConfig.from_env(env),
             dictionary=DictionaryConfig.from_env(env),
             elevenlabs=ElevenLabsConfig.from_env(env),

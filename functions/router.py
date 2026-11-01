@@ -45,7 +45,7 @@ from functions.keywords import keyword_route
 from functions.normalize import normalize_request
 from functions.routes import (
     AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
-    GIF, MEME, ROAST, SUMMARIZE,
+    GIF, INFO, MEME, POLL, REMIND, ROAST, SUMMARIZE, UTILITY,
     DETERMINISTIC_KINDS, HELP, HIGH_CONFIDENCE, IMAGE, MEDIUM_CONFIDENCE,
     PING, Route, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
 )
@@ -80,8 +80,11 @@ _ROAST_SELF = re.compile(
     r"^(?:roast me|insult me|say something mean to me|do your worst)\s*[?!.]*$",
     re.IGNORECASE,
 )
+# "pick a number between 1 and 10" is the RNG tool's job, not a choice
+# between the words of the sentence.
 _CHOOSE = re.compile(
-    r"^(?:choose|pick|decide between|choose between)\s+(?P<options>.+?)\s*[?!.]*$",
+    r"^(?:choose|pick|decide between|choose between)\s+(?!a number\b)"
+    r"(?P<options>.+?)\s*[?!.]*$",
     re.IGNORECASE,
 )
 _CALC_VERB = re.compile(
@@ -312,6 +315,130 @@ def _gif_route(cleaned: str) -> Route | None:
         )
     return None
 
+# ---------------------------------------------------------------------------
+# The free toolkit: deterministic offline tools, reminders, polls and
+# Discord-native info. All of these answer instantly and cost nothing.
+# ---------------------------------------------------------------------------
+
+# Each pattern yields (tool, args). Order matters: specific shapes first.
+_UTILITY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
+    (re.compile(r"^reverse\s+(?:the\s+|this\s+|that\s+)?(?:text|string|it)\s+(?P<args>.+)$", re.I), "reverse"),
+    (re.compile(r"^reverse[:\s]+(?P<args>.+)$", re.I), "reverse"),
+    (re.compile(r"^(?:mock|spongebob)(?:-?\s?case)?[:\s]+(?P<args>.+)$", re.I), "mock"),
+    (re.compile(r"^count\s+(?:the\s+)?(?:words?|characters?|letters?|chars?)\s+(?:in\s+)?(?P<args>.+)$", re.I), "count"),
+    (re.compile(r"^rot[\s-]?13[:\s]+(?P<args>.+)$", re.I), "cipher"),
+    (re.compile(r"^(?:caesar|shift)(?:\s+cipher)?[:\s]+(?P<args>-?\d+\s+.+)$", re.I), "cipher"),
+    (re.compile(r"^base[\s-]?64\s+(?:(?P<mode>encode|decode)\s+)?(?P<args>.+)$", re.I), "base64"),
+    (re.compile(r"^(?:hash|sha[\s-]?256|md5)(?:\s+(?:of|this|the))?[:\s]+(?P<args>.+)$", re.I), "hash"),
+    (re.compile(r"^morse(?:\s+code)?\s+(?:(?P<mode>encode|decode)\s+)?(?P<args>.+)$", re.I), "morse"),
+    (re.compile(r"^emojify(?:\s+(?:this|that|the))?[:\s]+(?P<args>.+)$", re.I), "emojify"),
+    (re.compile(r"^spoiler(?:\s+(?:this|that|it))?[:\s]+(?P<args>.+)$", re.I), "spoiler"),
+    (re.compile(r"^(?:generate|make|create|give|gimme|need|want|can i get|may i have)?\s*(?:me\s+)?(?:a\s+|an\s+)?(?:few\s+|couple of\s+)?(?P<args>\d?\s*)uuids?(?:\s+(?:for me|please)|\s*\d+)?\s*[?!.]*$", re.I), "uuid"),
+    (re.compile(r"^(?:(?:generate|make|create|give|gimme|need|want|can i get|may i have)\s+)?(?:me\s+)?(?:an?\s+)?(?:(?:strong|random|secure|new|good)\s+)*(?:\d{1,2}\s+)?(?:(?:character|char|long|digit|symbol|letter)s?\s+)*passwords?\b[^?]*[?!.]*$", re.I), "password"),
+    (re.compile(r"^(?:random\s+number|pick\s+a\s+number|choose\s+a\s+number|roll\s+a\s+number|give\s+me\s+a\s+number|number\s+between)(?:\s+(?:between|from)\s+(?P<args>-?\d+\s+(?:and|to|-)\s+-?\d+))?\s*(?:for me|please)?\s*[?!.]*$", re.I), "rng"),
+    (re.compile(r"^(?:(?:roll|throw|toss)\s+)?(?:a\s+|an\s+|me\s+)?(?P<args>\d*\s*d\s*\d+(?:\s*\+\s*\d+)?)\s*[?!.]*$", re.I), "dice"),
+    (re.compile(r"^(?:roll|throw|toss)\s+(?:the\s+|a\s+|an\s+|some\s+)?dice\s*[?!.]*$", re.I), "dice"),
+    (re.compile(r"^(?:a\s+|an\s+)?dice\s*[?!.]*$", re.I), "dice"),
+    (re.compile(r"^(?:8|eight)[\s-]?ball\b[:,]?\s*(?P<args>.*)$", re.I), "eightball"),
+    (re.compile(r"^(?:rock[\s-]?paper[\s-]?scissors|play\s+rps|rps)\s*(?P<args>.*)$", re.I), "rps"),
+    (re.compile(r"^lorem(?:\s+ipsum)?(?:\s+(?P<args>\d+))?\s*(?:paragraphs?|paras?)?\s*[?!.]*$", re.I), "lorem"),
+    (re.compile(r"^(?:(?:make|generate|create|draw|scan)\s+)?(?:me\s+)?(?:a\s+|an\s+)?qr(?:\s+code)?\s*(?:for|of)?\s*(?P<args>.+)$", re.I), "qr"),
+    (re.compile(r"^(?:what(?:'s| is|s)?\s+)?(?:the\s+)?(?:colou?r|swatch)\s+(?P<args>#[0-9a-f]{3,8}|(?:\d{1,3}[ ,]+){2}\d{1,3}|[a-z]{3,12})\s*\??$", re.I), "color"),
+    (re.compile(r"^(?:how many days|days|countdown)\s+(?:until|till|to)\s+(?P<args>.+?)\s*[?!.]*$", re.I), "countdown"),
+    (re.compile(r"^how long until\s+(?P<args>.+?)\s*[?!.]*$", re.I), "countdown"),
+)
+
+# Tools whose args live around the keyword rather than after it (the whole
+# sentence carries the numbers the tool needs).
+_WHOLE_SENTENCE_TOOLS = frozenset({"password", "uuid"})
+
+_REMIND = re.compile(
+    r"^(?:can you\s+|please\s+|could you\s+)?"
+    r"(?:set\s+(?:a|an)\s+)?remind(?:er)?\s+(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+_POLL = re.compile(
+    r"^(?:(?:can you\s+|please\s+)?(?:start|make|create|run|do|host)\s+(?:a\s+|an\s+)?|new\s+)?"
+    r"poll(?:\s*[:,]\s*|\s+)(?P<args>.+)$",
+    re.IGNORECASE,
+)
+_INFO_WHOIS = re.compile(
+    r"^who(?:'?s| is)\s+(?P<args>.+?)\s*[?!.]*$", re.IGNORECASE
+)
+_INFO_AVATAR = re.compile(
+    r"^(?:show\s+(?:me\s+)?)?(?:the\s+)?avatar(?:\s+(?:of|for|from))?\s*(?P<args>.*)$"
+    r"|^(?P<args2>.+?)'?s?\s+avatar\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_INFO_SERVER = re.compile(
+    r"^(?:server|guild)[\s-]*(?:info|stats|information|about)\s*[?!.]*$"
+    r"|^(?:info|stats|information|about)\s+(?:about\s+)?(?:this\s+)?(?:server|guild)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+
+
+def _utility_route(cleaned: str) -> Route | None:
+    """A deterministic toolkit tool (dice, qr, rot13, …), or None."""
+    for pattern, tool in _UTILITY_PATTERNS:
+        match = pattern.match(cleaned)
+        if match is None:
+            continue
+        groups = match.groupdict()
+        args = " ".join(str(groups.get("args") or "").split())
+        mode = str(groups.get("mode") or "").strip().casefold()
+        if mode:
+            args = f"{mode} {args}".strip()
+        if tool in _WHOLE_SENTENCE_TOOLS:
+            # "24 character password and 2 alternatives" — the numbers are
+            # scattered around the keyword; let the tool read them itself.
+            args = cleaned
+        return Route(kind=UTILITY, payload=args, payload2=tool, confidence=0.9)
+    return None
+
+
+def _remind_route(cleaned: str) -> Route | None:
+    """A natural reminder ("remind me in 20 minutes to …"), or None."""
+    match = _REMIND.match(cleaned)
+    if match is None:
+        return None
+    rest = " ".join(match.group("rest").split())
+    if not rest or rest.casefold().startswith("me to not"):
+        return None
+    return Route(kind=REMIND, payload=rest, confidence=0.9)
+
+
+def _poll_route(cleaned: str) -> Route | None:
+    """A reaction poll ("poll: pizza or burgers"), or None."""
+    match = _POLL.match(cleaned)
+    if match is None:
+        return None
+    args = " ".join(match.group("args").split())
+    if not args:
+        return None
+    return Route(kind=POLL, payload=args, confidence=0.9)
+
+
+def _info_route(cleaned: str) -> Route | None:
+    """Discord-native info: whois / avatar / server info, or None."""
+    if _INFO_SERVER.match(cleaned):
+        return Route(kind=INFO, payload2="server", confidence=0.9)
+    match = _INFO_AVATAR.match(cleaned)
+    if match is not None:
+        groups = match.groupdict()
+        args = " ".join(
+            str(groups.get("args") or groups.get("args2") or "").split()
+        )
+        # "avatar the last airbender" is a conversation, not a request: only
+        # claim it when a target is actually present (bare, a mention, or me).
+        if not args or "<@" in args or args.casefold() in ("me", "mine"):
+            return Route(kind=INFO, payload=args, payload2="avatar", confidence=0.85)
+    match = _INFO_WHOIS.match(cleaned)
+    if match is not None and "<@" in match.group("args"):
+        # Without a mention, "who is X" is a real question for the AI.
+        return Route(kind=INFO, payload=match.group("args"), payload2="whois", confidence=0.9)
+    return None
+
+
 _GREETING = re.compile(
     r"^(?:hey+|hi|hello|yo|hiya|howdy|sup|what's up|whats up|good (?:morning|evening|afternoon)|"
     r"thanks|thank you|thx|lol+|lmao|ok(?:ay)?|nice|cool|bye|good night|gn)\b[\s!.?]*$",
@@ -507,6 +634,23 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
     if gif is not None:
         return gif
 
+    # -- the free toolkit lane: dice, qr codes, rot13, passwords, countdowns,
+    # reminders, polls and Discord-native info. Every one of these answers
+    # instantly and costs nothing, so they claim their shapes before the
+    # language tools get a chance to overthink them.
+    remind = _remind_route(cleaned)
+    if remind is not None:
+        return remind
+    poll = _poll_route(cleaned)
+    if poll is not None:
+        return poll
+    info = _info_route(cleaned)
+    if info is not None:
+        return info
+    utility = _utility_route(cleaned)
+    if utility is not None:
+        return utility
+
     # -- implicit "what is X" definitions come after the tools that could
     # claim the same shape ("what's the date", "what's the weather in …").
     match = _DEFINE_WHAT_IS.match(cleaned) or _DEFINE_WHAT_IS_ONE_WORD.match(cleaned)
@@ -615,12 +759,13 @@ _MAX_COMPOUND_PARTS = 3
 # Kinds that can take part in a combined answer at all.
 _COMPOUND_KINDS = frozenset(
     {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, SEARCH, DEFINE,
-     MEME, GIF, SUMMARIZE}
+     MEME, GIF, SUMMARIZE, UTILITY, INFO, REMIND, POLL}
 )
 # At least one part must be an unambiguous deterministic tool, otherwise the
 # "and" was almost certainly part of a single sentence.
 _STRONG_KINDS = frozenset(
-    {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, MEME, GIF}
+    {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, MEME, GIF,
+     UTILITY, INFO}
 )
 
 

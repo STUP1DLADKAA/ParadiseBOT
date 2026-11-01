@@ -33,7 +33,7 @@ import logging
 import random
 import re
 import time
-from collections import deque
+from collections import defaultdict, deque
 from dataclasses import dataclass
 
 import discord
@@ -670,6 +670,10 @@ class Personality:
         #: ``author_id -> when`` — the memory-callback clock (rare by design).
         self._last_memory_callback: dict[int, float] = {}
         self._last_interject_by_channel: dict[int, float] = {}
+        #: ``channel -> recent unprompted-action timestamps`` — the hourly
+        #: ambient budget. Mentions and direct invitations never count;
+        #: only the bot deciding to pipe up on its own does.
+        self._ambient_log: dict[int, deque[float]] = defaultdict(deque)
         #: ``channel -> last action`` so the bot never does the same thing twice
         #: in a row. Two memes back to back reads as a broken bot, not a funny
         #: one, and the variety is most of the charm.
@@ -741,12 +745,18 @@ class Personality:
 
         if not self._cooldowns_ready(channel_id, now):
             return
+        # The hourly ambient budget: everything below is Paradise *choosing*
+        # to speak. Direct asks (mentions, "roast me", grammar bait) sit
+        # above this line and are never budget-limited.
+        if not self._ambient_budget_ok(channel_id, now):
+            return
 
         # 2b. The lord and master himself is speaking: once in a while, a
         #     loyal (and slightly cheeky) acknowledgement. Loyalty comes
         #     before everything else — but only with its own cooldown.
         if self._is_lord(message.author.id):
             if await self._maybe_acknowledge_lord(message, now):
+                self._record_ambient(channel_id, now)
                 return
 
         # 2c. Two people are actually having a conversation: a small chance
@@ -756,6 +766,7 @@ class Personality:
         ):
             if random.random() < float(self.config.interject_chance):
                 if await self._send_interjection(message, now):
+                    self._record_ambient(channel_id, now)
                     return
 
         # 2d. The long memory (/memory): once in a rare while, when somebody
@@ -763,6 +774,7 @@ class Personality:
         #     call — just a quoted fact and a frame. Rare on purpose: the
         #     joke is the timing, not the volume.
         if await self._send_memory_callback(message, now):
+            self._record_ambient(channel_id, now)
             return
 
         # 3. Contextual pattern match: one of reply / meme / GIF / sticker /
@@ -770,6 +782,7 @@ class Personality:
         pattern = self.match(content)
         if pattern is not None:
             if await self._run_pattern_menu(message, pattern, channel_id, now):
+                self._record_ambient(channel_id, now)
                 return
             return
 
@@ -777,7 +790,8 @@ class Personality:
         #    and idle reactions.
         if not self._is_casual_chat(content):
             return
-        await self._run_casual_menu(message, channel_id, now)
+        if await self._run_casual_menu(message, channel_id, now):
+            self._record_ambient(channel_id, now)
 
     # ------------------------------------------------------------------
     # The two menus: what Paradise might do about one message
@@ -827,7 +841,8 @@ class Personality:
 
     async def _run_casual_menu(
         self, message: discord.Message, channel_id: int, now: float
-    ) -> None:
+    ) -> bool:
+        """Maybe react to casual chat. True when something visible happened."""
         humour_ready = self._humour_ready(channel_id, now)
         if not humour_ready:
             # Outside the humour cooldown a bare reaction is still on the table:
@@ -835,8 +850,9 @@ class Personality:
             if self.config.ambient_reaction_chance > 0 and random.random() < (
                 self.config.ambient_reaction_chance
             ):
-                await self._send_ambient_reaction(message, now)
-            return
+                if await self._send_ambient_reaction(message, now):
+                    return True
+            return False
 
         segments: list[tuple[float, str]] = []
 
@@ -860,23 +876,23 @@ class Personality:
                 continue
             if action == "meme":
                 if await self._send_meme_reply(message, now):
-                    return
+                    return True
             elif action == "gif":
                 if await self._send_gif_reply(message, now):
-                    return
+                    return True
             elif action == "sticker":
                 if await self._send_sticker_reply(message, now):
-                    return
+                    return True
             elif action == "quip":
                 if await self._send_chaos_quip(message, now):
-                    return
+                    return True
             elif action == "roast":
                 if await self._send_roast(message, now):
-                    return
+                    return True
             elif action == "reaction":
                 if await self._send_ambient_reaction(message, now):
-                    return
-            return
+                    return True
+            return False
 
     # ------------------------------------------------------------------
     # Guards
@@ -961,6 +977,25 @@ class Personality:
             if now - stamp <= _CONVERSATION_WINDOW_SECONDS
         }
         return len(recent) >= 2
+
+    def _ambient_budget_ok(self, channel_id: int, now: float) -> bool:
+        """True while the channel still has unprompted actions left this hour.
+
+        Replies to mentions and direct invitations never pass through here —
+        only the bot deciding, on its own, to be part of the chat. The budget
+        keeps it alive without letting it narrate a whole evening.
+        """
+        cap = int(getattr(self.config, "ambient_hourly_cap", 0) or 0)
+        if cap <= 0:
+            return True
+        log = self._ambient_log[channel_id]
+        cutoff = now - 3600.0
+        while log and log[0] <= cutoff:
+            log.popleft()
+        return len(log) < cap
+
+    def _record_ambient(self, channel_id: int, now: float) -> None:
+        self._ambient_log[channel_id].append(now)
 
     def _interject_ready(self, channel_id: int, now: float) -> bool:
         last = self._last_interject_by_channel.get(channel_id, float("-inf"))

@@ -27,8 +27,9 @@ from dataclasses import dataclass
 from functions.cache import TTLCache
 from functions.helpers import ParadiseError
 from functions.routes import (
-    AI, CALCULATE, CONVERT, DATE, DEFINE, GIF, IMAGE, MEDIUM_CONFIDENCE, MEME,
-    SEARCH, SUMMARIZE, TIME, TRANSLATE, WEATHER, Route, clamp_confidence,
+    AI, CALCULATE, CONVERT, DATE, DEFINE, GIF, IMAGE, INFO, MEDIUM_CONFIDENCE,
+    MEME, POLL, REMIND, SEARCH, SUMMARIZE, TIME, TRANSLATE, UTILITY, WEATHER,
+    Route, clamp_confidence,
 )
 
 log = logging.getLogger(__name__)
@@ -50,8 +51,36 @@ _INTENT_TO_KIND: dict[str, str] = {
     "recap": SUMMARIZE,
     "meme": MEME,
     "gif": GIF,
+    "remind": REMIND,
+    "poll": POLL,
+    "whois": INFO,
+    "avatar": INFO,
+    "serverinfo": INFO,
+    "countdown": UTILITY,
+    "dice": UTILITY,
+    "eightball": UTILITY,
+    "password": UTILITY,
+    "qr": UTILITY,
+    "rps": UTILITY,
+    "uuid": UTILITY,
+    "utility": UTILITY,
     "chat": AI,
     "unknown": AI,
+}
+
+# The toolkit/info sub-tool for labels that carry one, so the classifier can
+# point at the right engine even when the phrasing beat the patterns.
+_INTENT_TOOLS: dict[str, str] = {
+    "countdown": "countdown",
+    "dice": "dice",
+    "eightball": "eightball",
+    "password": "password",
+    "qr": "qr",
+    "rps": "rps",
+    "uuid": "uuid",
+    "avatar": "avatar",
+    "whois": "whois",
+    "serverinfo": "server",
 }
 
 # Model output is data. Anything that looks like code, a command, a URL
@@ -97,9 +126,11 @@ class IntentGuess:
         elif kind == AI and self.needs_web:
             kind = SEARCH
         payload = self.query or fallback.payload
+        tool = _INTENT_TOOLS.get(self.intent, "") if kind in (UTILITY, INFO) else ""
         return Route(
             kind=kind,
             payload=payload,
+            payload2=tool or fallback.payload2,
             confidence=self.confidence,
             fresh=self.needs_web or fallback.fresh,
             reason_complex=fallback.reason_complex,

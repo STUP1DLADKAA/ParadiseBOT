@@ -27,18 +27,24 @@ message in
 
 | Layer | What it does | Setting | Default |
 | --- | --- | --- | --- |
-| Reaction | Emoji on a message that matched a known context (34 contexts) | `PERSONALITY_REACTION_CHANCE` | `0.22` |
-| Ambient reaction | Emoji on a message that matched *nothing* — presence without words | `PERSONALITY_AMBIENT_REACTION_CHANCE` | `0.10` |
-| Reply | A one-liner chosen for that context | `PERSONALITY_REPLY_CHANCE` | `0.12` |
-| Roast | A jab aimed at whoever just spoke — quoting their own words when there are enough to quote | `PERSONALITY_ROAST_CHANCE` | `0.12` |
-| Meme | A real meme from the internet, or a card drawn locally | `PERSONALITY_MEME_CHANCE` | `0.16` |
-| GIF | A reaction GIF — keyless by default | `PERSONALITY_GIF_CHANCE` | `0.10` |
-| Sticker | A native Discord sticker, or a drawn one | `PERSONALITY_STICKER_CHANCE` | `0.05` |
-| Quip | An unprompted 200-IQ / 2-IQ observation | `PERSONALITY_QUIP_CHANCE` | `0.14` |
+| Reaction | Emoji on a message that matched a known context (34 contexts) | `PERSONALITY_REACTION_CHANCE` | `0.18` |
+| Ambient reaction | Emoji on a message that matched *nothing* — presence without words | `PERSONALITY_AMBIENT_REACTION_CHANCE` | `0.06` |
+| Reply | A one-liner chosen for that context | `PERSONALITY_REPLY_CHANCE` | `0.08` |
+| Roast | A jab aimed at whoever just spoke — quoting their own words when there are enough to quote | `PERSONALITY_ROAST_CHANCE` | `0.08` |
+| Meme | A real meme from the internet, or a card drawn locally | `PERSONALITY_MEME_CHANCE` | `0.10` |
+| GIF | A reaction GIF — keyless by default | `PERSONALITY_GIF_CHANCE` | `0.06` |
+| Sticker | A native Discord sticker, or a drawn one | `PERSONALITY_STICKER_CHANCE` | `0.04` |
+| Quip | An unprompted 200-IQ / 2-IQ observation | `PERSONALITY_QUIP_CHANCE` | `0.08` |
 | Nerd | Grammar/spelling correction, English only | `PERSONALITY_GRAMMAR_CHANCE` | `0.70` |
-| Interjection | A "hello!" when two people are talking (10-minute window) | `PERSONALITY_INTERJECT_CHANCE` | `0.08` |
+| Interjection | A "hello!" when two people are talking (10-minute window) | `PERSONALITY_INTERJECT_CHANCE` | `0.04` |
 | Lord | A loyal acknowledgement when a lord and master speaks | `PERSONALITY_LORD_REPLY_CHANCE` | `0.20` |
 | Memory callback | One fact the bot "already knew" quoted back at the person it's about | `PERSONALITY_MEMORY_CALLBACK_CHANCE` | `0.05` |
+| **Ambient budget** | Hard ceiling on *unprompted* chatter per channel per rolling hour — mentions, invited roasts and grammar bait never count | `PERSONALITY_AMBIENT_HOURLY_CAP` | `6` |
+
+Alive, but controlled: every ambient chance above is now noticeably lower, the
+interjection cooldown is 10 minutes, and the ambient budget is a hard ceiling
+on how often Paradise pipes up on its own. The joke was never the volume —
+it's the timing.
 
 New layers:
 
@@ -186,6 +192,13 @@ GIF reply fire. Without one, `/gif` says so and sends a meme instead.
 | `@Paradise meme [about X]` | The same meme pipeline, by plain mention |
 | `@Paradise gif [of X]` / "bruh gif" | The same GIF tiers, by plain mention |
 | `@Paradise summarize` | An AI recap of the recent chat ("recap", "tl;dr", "what did i miss" all work) |
+| `@Paradise roll 2d20+3` · `8ball` · `rps` · `pick a number between 1 and 100` | The free fun toolkit — dice, 8-ball, rock-paper-scissors, RNG |
+| `@Paradise qr code for <link>` · `password` · `uuid` · `lorem 2` | Offline generators — QR codes, strong passwords, IDs, filler text |
+| `@Paradise rot13 …` · `caesar 3 …` · `base64 …` · `hash …` · `morse …` | Ciphers and encodings |
+| `@Paradise reverse/mock/count/emojify/spoiler …` | The text utilities |
+| `@Paradise days until christmas` · `color #5865F2` | Countdowns and colour cards |
+| `@Paradise remind me in 20 minutes to …` · `poll: pizza or burgers` | The reminder and poll engines, by mention |
+| `@Paradise who is @user` · `avatar` · `server info` | Discord-native info cards |
 | `/memory add/list/remove/clear` | Teach the bot facts it remembers (the lords only) |
 
 ## Quiet mode

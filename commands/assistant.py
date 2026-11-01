@@ -5,8 +5,10 @@ the request with the deterministic router (functions/router.py) and sends
 it to the most specialised tool:
 
     calculator · define · convert · image search · weather · time/date
-    · translate · meme · gif · recap → the AI (openai-compatible first,
-    gemini fallback)
+    · translate · meme · gif · recap · the free toolkit (dice, qr codes,
+    passwords, ciphers, countdowns, text tools) · reminders · polls
+    · whois/avatar/server info → the AI (openai-compatible first, with
+    per-role model routing, gemini fallback)
 
 Search-shaped requests are no longer answered by retrieving the web: the
 request is forwarded straight to the AI and the AI replies, in character
@@ -60,10 +62,11 @@ from functions.roasts import (
 )
 from functions.router import (
     AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
-    GIF, HELP, IMAGE, MEME, PING, ROAST, SEARCH, SUMMARIZE, TIME, TRANSLATE,
-    UNKNOWN, WEATHER,
+    GIF, HELP, IMAGE, INFO, MEME, PING, POLL, REMIND, ROAST, SEARCH, SUMMARIZE,
+    TIME, TRANSLATE, UNKNOWN, UTILITY, WEATHER,
     Route, route_many,
 )
+from functions.toolkit import parse_duration, run_tool
 from functions.time import build_time_embed, get_current_time_for_zone, resolve_timezone
 from functions.translate import resolve_language, translate_text
 from functions.weather import build_weather_embed, render_weather_card
@@ -95,6 +98,9 @@ ASK_HINT = (
     "• `@Paradise flip a coin`  ·  `@Paradise choose pizza or burgers`\n"
     "• `@Paradise roast me`  ·  `@Paradise meme`  ·  `@Paradise bruh gif`\n"
     "• `@Paradise summarize`  (recap of the recent chat)\n"
+    "and the free toolkit: `@Paradise roll 2d20+3` · `password` · `qr code for <link>`\n"
+    "· `rot13 <text>` · `days until christmas` · `remind me in 20 minutes to …`\n"
+    "· `poll pizza or burgers` · `who is @user` · `avatar`\n"
     "no commands to remember — just say it normally."
 )
 
@@ -253,6 +259,14 @@ class Assistant(commands.Cog):
             return await self._meme(message, route)
         if kind == GIF:
             return await self._gif(message, route)
+        if kind == UTILITY:
+            return await self._utility(message, route)
+        if kind == REMIND:
+            return await self._remind(message, route)
+        if kind == POLL:
+            return await self._poll(message, route)
+        if kind == INFO:
+            return await self._info(message, route)
         if kind == SEARCH:
             return await self._search(message, route)
         if kind in (AI, UNKNOWN):
@@ -379,21 +393,32 @@ class Assistant(commands.Cog):
         )
         started = time.monotonic()
         # ``routes`` is capped at three by the router, so this is a bounded
-        # fan-out, not an unbounded promise explosion.
+        # fan-out, not an unbounded promise explosion. Kinds that naturally
+        # send their own message (a reminder, a poll, an info card) are
+        # dispatched in full; everything else is compacted into one reply.
         asker = getattr(message.author, "display_name", None) or "someone"
+        own_kinds = (REMIND, POLL, INFO)
+        compact_routes = [route for route in routes if route.kind not in own_kinds]
+        own_routes = [route for route in routes if route.kind in own_kinds]
         outcomes = await asyncio.gather(
-            *(self._compact(route, asker=asker) for route in routes),
+            *(self._compact(route, asker=asker) for route in compact_routes),
+            *(self._dispatch(message, route, "") for route in own_routes),
             return_exceptions=True,
         )
 
         lines: list[str] = []
         embeds: list[discord.Embed] = []
-        for route, outcome in zip(routes, outcomes, strict=False):
+        handled_own = 0
+        for route, outcome in zip(compact_routes + own_routes, outcomes, strict=False):
             if isinstance(outcome, BaseException):
                 if isinstance(outcome, asyncio.CancelledError):
                     raise outcome
                 log.warning("Combined %s part failed", route.kind, exc_info=outcome)
                 lines.append(f"• couldn't finish the *{route.kind}* part of that.")
+                continue
+            if route.kind in own_kinds:
+                if outcome:
+                    handled_own += 1
                 continue
             text, part_embeds = outcome
             if text:
@@ -406,6 +431,8 @@ class Assistant(commands.Cog):
             len(routes),
         )
         if not lines and not embeds:
+            if handled_own:
+                return True  # the separate messages already answered it
             await self._quiet_reply(message, SEARCH_FAIL_LINE)
             return True
         extras: dict = {}
@@ -437,6 +464,14 @@ class Assistant(commands.Cog):
                 return await self._compact_translate(route)
             if kind in (MEME, GIF):
                 return await self._compact_media(route)
+            if kind == UTILITY:
+                result = run_tool(route.payload2, route.payload)
+                return result.text, []
+            if kind in (REMIND, POLL, INFO):
+                return (
+                    f"• the *{kind}* part needs its own message — ask it on its own.",
+                    [],
+                )
             if kind == SUMMARIZE:
                 return (
                     "📋 the recap needs its own message — just say "
@@ -843,6 +878,195 @@ class Assistant(commands.Cog):
         return True
 
     # -- search (forwarded straight to the AI) --------------------------------------------
+
+    # ------------------------------------------------------------------
+    # The free toolkit lane (dice, qr, passwords, …) + reminders, polls
+    # and Discord-native info — all offline, all instant.
+    # ------------------------------------------------------------------
+
+    async def _utility(self, message: discord.Message, route: Route) -> bool:
+        """Run one deterministic toolkit tool and attach its image if any."""
+        result = run_tool(
+            route.payload2, route.payload,
+            author=getattr(message.author, "display_name", "") or "",
+        )
+        if result.image:
+            await self._quiet_reply(
+                message,
+                result.text,
+                file=discord.File(io.BytesIO(result.image), filename=result.filename or "tool.png"),
+            )
+            return True
+        await self._quiet_reply(message, result.text)
+        return True
+
+    async def _remind(self, message: discord.Message, route: Route) -> bool:
+        """'remind me in 20 minutes to …' — the /remind engine by mention."""
+        utility = self.bot.get_cog("Utility")
+        if utility is None or message.channel.id is None:
+            await self._quiet_reply(message, "the reminder engine isn't loaded right now.")
+            return True
+        when, what = self._split_reminder(route.payload)
+        if when is None or not what:
+            await self._quiet_reply(
+                message,
+                "when? try `remind me in 20 minutes to check the oven` "
+                "(minutes, hours or days).",
+            )
+            return True
+        minutes = max(1, min(int(when // 60) or 1, 10_080))
+        okay, note = await utility.create_reminder(
+            message.author.id, message.channel.id, minutes, what
+        )
+        await self._quiet_reply(message, note if okay else f"• {note}")
+        return True
+
+    @staticmethod
+    def _split_reminder(rest: str) -> tuple[float | None, str]:
+        """Split 'me in 20 minutes to X' into (seconds, text)."""
+        import re as _re
+
+        value = " ".join(str(rest or "").split()).strip()
+        if value.casefold().startswith(("me ", "us ")):
+            value = value.split(" ", 1)[1] if " " in value else ""
+        if not value:
+            return None, ""
+        match = _re.search(
+            r"\bin\s+(?P<dur>[^,]+?)\s+(?:to|about|that|for)\s+(?P<what>.+)$",
+            value, _re.IGNORECASE,
+        )
+        if match is None:
+            match = _re.search(
+                r"^(?P<what>.+?)\s+in\s+(?P<dur>[^,]+)$", value, _re.IGNORECASE
+            )
+        if match is None:
+            # "remind me to X" with no time at all.
+            head = _re.sub(r"^(?:to|about)\s+", "", value, flags=_re.IGNORECASE)
+            return None, head
+        seconds = parse_duration(f"in {match.group('dur')}")
+        what = " ".join(match.group("what").split())
+        if what.casefold().startswith("to "):
+            what = what[3:]
+        return seconds, what
+
+    async def _poll(self, message: discord.Message, route: Route) -> bool:
+        """'poll pizza or burgers' — the /poll engine by mention."""
+        utility = self.bot.get_cog("Utility")
+        channel = getattr(message, "channel", None)
+        if utility is None or channel is None:
+            await self._quiet_reply(message, "the poll engine isn't loaded right now.")
+            return True
+        payload = route.payload
+        question, _, options_text = payload.partition(":")
+        if not options_text.strip():
+            question, options_text = "", payload
+        # Natural separators: "pizza or burgers", "manga vs anime", "a | b".
+        import re as _re
+
+        options_text = _re.sub(
+            r"\s+(?:or|vs|versus)\s+", "|", options_text, flags=_re.IGNORECASE
+        )
+        choices = [c.strip() for c in options_text.split("|") if c.strip()]
+        question = question.strip() or f"{getattr(message.author, 'display_name', 'someone')} asks"
+        if not 2 <= len(choices) <= 10:
+            await self._quiet_reply(
+                message, "give me 2–10 options — `poll: pizza or burgers or pasta`."
+            )
+            return True
+        okay = await utility.deploy_poll(
+            channel, question, choices,
+            getattr(message.author, "display_name", "someone"),
+        )
+        if not okay:
+            await self._quiet_reply(message, "the poll fell over. permissions, probably.")
+        return True
+
+    async def _info(self, message: discord.Message, route: Route) -> bool:
+        """Discord-native info: whois, avatar, server card. No API calls."""
+        tool = route.payload2 or "whois"
+        guild = message.guild
+        if tool == "server":
+            if guild is None:
+                await self._quiet_reply(message, "that only works inside a server.")
+                return True
+            embed = discord.Embed(
+                title=f"🏡 {guild.name}",
+                colour=discord.Colour.blurple(),
+            )
+            if guild.icon:
+                embed.set_thumbnail(url=guild.icon.url)
+            created = getattr(guild, "created_at", None)
+            embed.add_field(name="members", value=str(getattr(guild, "member_count", "?")))
+            embed.add_field(
+                name="created",
+                value=created.strftime("%d %b %Y") if created else "?",
+            )
+            embed.add_field(name="boosts", value=str(getattr(guild, "premium_subscription_count", 0) or 0))
+            owner = getattr(guild, "owner", None)
+            if owner is not None:
+                embed.add_field(name="owner", value=owner.display_name)
+            await self._quiet_reply(message, embed=embed)
+            return True
+
+        member = await self._resolve_member(message, route)
+        if member is None:
+            await self._quiet_reply(message, "who? mention them — `who is @someone`.")
+            return True
+        if tool == "avatar":
+            embed = discord.Embed(
+                title=f"🖼️ {member.display_name}'s avatar",
+                colour=discord.Colour.blurple(),
+            )
+            avatar = getattr(member, "display_avatar", None)
+            if avatar is not None:
+                embed.set_image(url=avatar.url)
+            await self._quiet_reply(message, embed=embed)
+            return True
+        embed = discord.Embed(
+            title=f"👤 {member.display_name}",
+            colour=discord.Colour.blurple(),
+        )
+        avatar = getattr(member, "display_avatar", None)
+        if avatar is not None:
+            embed.set_thumbnail(url=avatar.url)
+        created = getattr(member, "created_at", None)
+        joined = getattr(member, "joined_at", None)
+        if joined is not None:
+            embed.add_field(name="joined", value=joined.strftime("%d %b %Y"))
+        if created is not None:
+            embed.add_field(name="account made", value=created.strftime("%d %b %Y"))
+        roles = getattr(member, "roles", None) or []
+        if roles:
+            names = [role.name for role in roles if role.name != "@everyone"]
+            if names:
+                embed.add_field(
+                    name=f"roles ({len(names)})",
+                    value=shorten(", ".join(names), 100),
+                    inline=False,
+                )
+        await self._quiet_reply(message, embed=embed)
+        return True
+
+    async def _resolve_member(self, message: discord.Message, route: Route):
+        """The member an info route points at (mention), else the asker."""
+        import re as _re
+
+        target = None
+        for mention in getattr(message, "mentions", []) or []:
+            if getattr(mention, "bot", False):
+                continue
+            target = mention
+            break
+        if target is None:
+            match = _re.search(r"<@!?(\d+)>", route.payload or "")
+            if match and message.guild is not None:
+                try:
+                    target = message.guild.get_member(int(match.group(1))) or (
+                        await message.guild.fetch_member(int(match.group(1)))
+                    )
+                except (discord.DiscordException, ValueError):
+                    target = None
+        return target or getattr(message, "author", None)
 
     async def _search(
         self, message: discord.Message, route: Route, *, query: str | None = None
