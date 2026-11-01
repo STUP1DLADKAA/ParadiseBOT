@@ -7,6 +7,23 @@ All notable changes to Paradise are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- **The ParadiseBOT character bible.** The AI's system prompt
+  (`functions/ai.py`) is the full personality: resident menace of the server,
+  chronically online, terminally sarcastic, ragebait enthusiast, toxic (but
+  never hateful) humour, deadpan/absurd/self-deprecating jokes, natural moods
+  (menace, intellectual, sleep-deprived, competitive, disappointed…), openly
+  flawed, and fiercely loyal to Stupid — the lord and founding father gets
+  defended with signature aggression the moment an outsider disrespects him.
+  Genuine questions are never refused: no moralising, no "as an AI", no
+  watered-down non-answers. The same hard lines as the roast book still apply
+  (behaviour, not identity; jokes off when somebody sounds hurt).
+- **The supreme loyalty, passively.** A `loyalty` pattern at the top of the
+  personality engine: any message containing "stupid" can earn a defence line
+  ("watch your mouth. that's the founding father you're talking about."),
+  and the greeting pattern learned the character bible's arrivals ("Oh look
+  who's alive.", "There goes the neighbourhood.").
+- `AIService.answer_question()` — the direct, in-character answer path that
+  search requests are forwarded to.
 - **It talks back now.** The personality engine went from "rare and polite" to
   actually present: more than double the chance of a reaction or a reply, an
   ambient reaction on messages that match nothing at all, a shorter global and
@@ -36,6 +53,18 @@ All notable changes to Paradise are recorded here. The format follows
   `MEME_SOURCES`, `MEME_TIMEOUT`, `TENOR_API_KEY`, `GIPHY_API_KEY`.
 
 ### Changed
+- **The OpenAI-compatible provider is now the primary.** Every AI request
+  (`chat`, `answer_quick`, `reason`, `answer_question`) goes to
+  `AI_BASE_URL`/`AI_MODEL` first and falls back to Gemini only when that
+  endpoint is unconfigured, rejected or cooling down. `provider_name` and
+  `describe()` report the new order. Temperature for conversational calls rose
+  to match the unhinged persona.
+- **Search no longer reaches the internet.** "search …" (and anything the
+  router shapes as a search) is forwarded straight to the AI, which answers
+  in character; the placeholder card, the sourced-answer pipeline and the
+  browse view are gone with it. Dictionary misses and failed image lookups
+  fall back to the same AI path. `functions/search/` and its engines were
+  removed; image search (real photos) is untouched.
 - **The bot is lighter and faster to run.** With speech recognition gone, there
   is no model in memory, no per-utterance recognition on the CPU and no worker
   thread for it; the receive path only decrypts and buffers. One export runs at

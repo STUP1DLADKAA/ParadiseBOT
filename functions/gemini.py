@@ -6,10 +6,11 @@ Design rules from the architecture brief:
   ``x-goog-api-key`` header — never in request URLs, never in logs
   (only the masked form may be logged), never in bot messages, never
   in source control.
-- Gemini is strictly the *last-resort* reasoning layer. Deterministic
-  tools answer everything they can without any AI call; with no key
-  configured the bot keeps working — this module simply reports
-  ``available is False``.
+- Gemini is the *fallback* reasoning layer: the OpenAI-compatible
+  provider is asked first and Gemini answers only when that endpoint is
+  unconfigured or failing. Deterministic tools answer everything they can
+  without any AI call; with no key configured the bot keeps working —
+  this module simply reports ``available is False``.
 - Invalid, expired or quota-exhausted keys degrade gracefully: the
   provider disables itself or backs off with a cooldown while the rest
   of the bot stays unaffected.
@@ -58,8 +59,9 @@ _REASONING_SYSTEM = (
 )
 
 # A deliberately tiny classifier: the output is a single JSON object and
-# nothing else, so the call costs a handful of tokens.
-_CLASSIFY_SYSTEM = (
+# nothing else, so the call costs a handful of tokens. Shared with the
+# OpenAI-compatible leg of the provider chain (functions/ai.py).
+CLASSIFY_SYSTEM = (
     "You label Discord requests for a bot's tool router. Reply with ONE "
     "minified JSON object and nothing else — no prose, no markdown, no "
     "explanation, no reasoning.\n"
@@ -399,7 +401,7 @@ class GeminiService:
         """
         prompt = f"Request:\n{str(request).strip()[:400]}"
         text, _ = await self._generate_once(
-            prompt, system=_CLASSIFY_SYSTEM, max_tokens=max(64, int(max_tokens)), temperature=0.0
+            prompt, system=CLASSIFY_SYSTEM, max_tokens=max(64, int(max_tokens)), temperature=0.0
         )
         return text
 

@@ -33,7 +33,7 @@ from functions.memes import (
     render_meme_png,
     render_sticker_png,
 )
-from functions.personality import CHAOS_QUIPS, Personality
+from functions.personality import CHAOS_QUIPS, PATTERNS, Personality
 from functions.presence import PresenceManager
 
 
@@ -173,6 +173,53 @@ class TestMemesAndStickers(unittest.TestCase):
         ]
         self.assertTrue(all(p in (s1, std) for p in picked))
         self.assertNotIn(s2, picked)
+
+
+class TestSupremeLoyalty(unittest.IsolatedAsyncioTestCase):
+    """The word "stupid" is the lord's name — Paradise defends it."""
+
+    def _personality(self):
+        cfg = PersonalityConfig(
+            enabled=True,
+            reaction_chance=0.0,
+            reply_chance=1.0,
+            sticker_chance=0.0,
+            meme_chance=0.0,
+            gif_chance=0.0,
+            random_quip_chance=0.0,
+            roast_chance=0.0,
+            ambient_reaction_chance=0.0,
+            grammar_chance=0.0,
+            global_cooldown=0,
+            channel_cooldown=0,
+            reply_channel_cooldown=0,
+            humour_cooldown=0,
+        )
+        return Personality(SimpleNamespace(user=SimpleNamespace(id=999)), cfg)
+
+    async def test_disrespecting_stupid_gets_a_defence(self):
+        personality = self._personality()
+        msg = _make_msg("stupid is so bad at this game lol")
+        await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        sent = msg.reply.call_args.args[0]
+        loyalty = next(p for p in PATTERNS if p.name == "loyalty")
+        self.assertIn(sent, loyalty.replies)
+
+    async def test_the_owner_himself_gets_the_same_energy(self):
+        personality = self._personality()
+        msg = _make_msg("i am stupid")
+        await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        sent = msg.reply.call_args.args[0]
+        loyalty = next(p for p in PATTERNS if p.name == "loyalty")
+        self.assertIn(sent, loyalty.replies)
+
+    async def test_no_stupid_no_loyalty(self):
+        personality = self._personality()
+        msg = _make_msg("honestly i think cereal is technically cold soup")
+        await personality.handle(msg)
+        msg.reply.assert_not_awaited()
 
 
 class TestHumourPersonalityIntegration(unittest.IsolatedAsyncioTestCase):

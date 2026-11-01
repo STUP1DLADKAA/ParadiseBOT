@@ -25,7 +25,7 @@ message in
 
 | Layer | What it does | Setting | Default |
 | --- | --- | --- | --- |
-| Reaction | Emoji on a message that matched a known context (33 contexts) | `PERSONALITY_REACTION_CHANCE` | `0.22` |
+| Reaction | Emoji on a message that matched a known context (34 contexts) | `PERSONALITY_REACTION_CHANCE` | `0.22` |
 | Ambient reaction | Emoji on a message that matched *nothing* — presence without words | `PERSONALITY_AMBIENT_REACTION_CHANCE` | `0.10` |
 | Reply | A one-liner chosen for that context | `PERSONALITY_REPLY_CHANCE` | `0.10` |
 | Roast | A jab aimed at whoever just spoke | `PERSONALITY_ROAST_CHANCE` | `0.12` |
@@ -82,6 +82,21 @@ Two hard stops, both before any joke is chosen:
   breakups — the bot goes completely silent. See `roasts.looks_sensitive`.
 * **"Stop roasting me."** Say it once and that person is left alone for the
   rest of the session, no argument, no comment.
+
+## The supreme loyalty
+
+One context sits above all the others in the pattern list: the word "stupid"
+is the owner's name, and Paradise treats every use of it as a potential act
+of disrespect towards its lord. The `loyalty` pattern is checked first, so a
+message containing "stupid" can be answered with a defence line ("watch your
+mouth. that's the founding father you're talking about.") instead of whatever
+else it might have matched. It is still probabilistic and still bound by the
+same cooldowns — the loyalty is religious, the pacing is not.
+
+The same loyalty lives in the AI's system prompt (`functions/ai.py`): when
+somebody disrespects Stupid in a conversation with the bot, it gets
+significantly more argumentative, and it favours him in ordinary
+disagreements while still being allowed to call him an idiot itself.
 
 ## Memes from the internet
 
