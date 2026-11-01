@@ -588,7 +588,7 @@ class TestAIProviderChain(unittest.IsolatedAsyncioTestCase):
             self.assertIn("about Aryan", content)
             self.assertIn("cannot aim", content)
 
-    async def test_tease_offers_the_targets_remembered_facts(self):
+    async def test_tease_offers_the_targets_known_facts(self):
         import tempfile
         from pathlib import Path
 
@@ -602,8 +602,38 @@ class TestAIProviderChain(unittest.IsolatedAsyncioTestCase):
             )
             await ai.tease("Rohan", "i finally hit diamond", target_id=555)
             content = ai._session.requests[0]["json"]["messages"][1]["content"]
-            self.assertIn("Things you remember about Rohan", content)
+            self.assertIn("Things you already know about Rohan", content)
             self.assertIn("murder mystery", content)
+
+    async def test_memory_facts_are_framed_as_prior_knowledge(self):
+        """The bot never says "i remember" — it just knows, because it
+        stalks the server. The prompt must not prime the model with
+        remembering/teaching language."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ai = self._primary_ai()
+            ai.bot.memory = MemoryStore(Path(tmp) / "memory.db")
+            ai.bot.memory.add(
+                "spent more than a year to reach level 100 in murder mystery",
+                subject_id=555,
+                subject_name="Rohan",
+            )
+            await ai.answer_question(
+                "what game should we play tonight", asker="Rohan", asker_id=555
+            )
+            content = ai._session.requests[0]["json"]["messages"][1]["content"]
+            self.assertIn("you just know", content)
+            self.assertIn("about Rohan", content)
+            # The old framing — which the model echoed back as "i remember" —
+            # must be gone.
+            for banned in (
+                "things you remember",
+                "your lord taught",
+                "taught you these",
+            ):
+                self.assertNotIn(banned, content.lower(), banned)
 
     async def test_validate_startup_skips_without_key(self):
         ai = self.make_ai(Config())

@@ -67,7 +67,7 @@ THE RULES
    know, say so plainly.
 2. Don't introduce yourself as an AI unless directly asked, and never act
    like customer support or agree with everything.
-3. Stay factual. Use only the context you are given; never invent memories,
+3. Stay factual. Use only the context you are given; never invent facts,
    events, sources or running jokes that aren't in front of you.
 4. Never be actually mean: no insults about someone's body, family,
    religion, caste, sexuality, gender, race, disability or insecurities.
@@ -214,12 +214,14 @@ class AIService:
         question: str,
         subject_ids: tuple[int, ...] | list[int] = (),
     ) -> str:
-        """Facts the lord asked Paradise to remember, for exactly these people.
+        """Facts the bot "just knows", for exactly these people.
 
         ``subject_ids`` are the members involved in this exchange (the asker
         and anyone they mentioned). Memories *about* them come first — that
         is the "roast him about the murder-mystery year at the right moment"
-        ammunition — then keyword matches, then recent general context.
+        ammunition — then keyword matches, then recent general context. The
+        block is framed as prior knowledge (the bot watches everyone), never
+        as remembering, so replies never say "i remember" or "you told me".
 
         Reads ``bot.memory`` (a :class:`functions.memory.MemoryStore`) and
         never raises — a broken memory must never break the answer.
@@ -252,9 +254,13 @@ class AIService:
             return ""
         listed = "\n".join(lines)
         return (
-            "Things you remember (your lord taught you these; use them "
-            "naturally at exactly the right moment — a joke, a callback, a "
-            "relevant aside — and never forced, never listed back):\n" + listed
+            "Things you already know about these people (you've been in this "
+            "server forever and you pay attention to everyone — you just know "
+            "this stuff; never say you remember, were told or taught, never "
+            "mention memory, and if someone asks how you know, be smug and "
+            "vague). Use them at exactly the right moment — a joke, a "
+            "callback, a relevant aside — never forced, never listed back:\n"
+            + listed
         )
 
     def _subject_memory_lines(self, subject_id: int) -> list[str]:
@@ -684,15 +690,18 @@ class AIService:
                 " They are your lord and master: address them as 'my lord' or "
                 "by name, stay affectionate and loyal while you tease them."
             )
-        # Remembered facts about the target are the best roast material:
+        # Facts about the target are the best roast material:
         # "spent a year reaching level 100 in murder mystery" beats any
         # generic insult. Offered, never forced — the model picks what lands.
+        # Presented as things the bot just knows (it watches everyone), never
+        # as memories, so the jab never starts with "i remember".
         memories = self._subject_memory_lines(int(target_id or 0))
         if memories:
             listed = "; ".join(memories[:_MEMORY_LIMIT])
             ask += (
-                f" Things you remember about {target} (use one if it lands): "
-                f"{listed}."
+                f" Things you already know about {target} (you watch everyone "
+                "in this server — use one if it lands, never mention how you "
+                f"know): {listed}."
             )
         return (
             await self.chat(

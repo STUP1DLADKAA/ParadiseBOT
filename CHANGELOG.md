@@ -7,6 +7,17 @@ All notable changes to Paradise are recorded here. The format follows
 ## [Unreleased]
 
 ### Changed
+- **The bot never admits to remembering.** When a `/memory` fact surfaces —
+  in an AI answer, a roast, or the personality's rare callback — it is framed
+  as something Paradise *already knew*, not something it was taught: no "i
+  remember", no "you told me", no mention of memory, and if someone asks how
+  it knows, it stays smug and vague. The prompt block now presents facts as
+  prior knowledge ("you just know this stuff — you pay attention to everyone
+  in this server"), the roast ammunition likewise, and the personality
+  callback frames were rewritten to match (`"spent a year reaching level 100
+  in murder mystery" — i know everything about you people, Ash. everything.`).
+  The `/memory` command itself still speaks plainly — it is the management
+  screen. `functions/ai.py`, `functions/personality.py`.
 - **The persona got a rewrite: short, human, funny-not-brutal.** The system
   prompt was rebuilt around how the bot should *talk* — 1–3 sentence replies,
   casual-but-correct grammar, plain words, no jargon, no corporate speak — and

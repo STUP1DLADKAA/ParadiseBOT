@@ -114,16 +114,17 @@ LORD_LINES: tuple[str, ...] = (
 LORD_REACTIONS: tuple[str, ...] = ("👑", "🗿", "🫡")
 
 #: The long memory: once in a rare while, when somebody the bot actually
-#: knows something about talks, Paradise quotes it back at them. The memory
-#: text itself is quoted verbatim (cleaned and capped) so the frames only
-#: ever add a wrapper, never a fabrication.
+#: knows something about talks, Paradise quotes it back at them. The fact is
+#: quoted verbatim (cleaned and capped) so the frames only ever add a wrapper,
+#: never a fabrication — and the wrapper never admits to remembering: the bot
+#: knew this already, because it pays attention to everyone. Always.
 _MEMORY_CALLBACK_FRAMES: tuple[str, ...] = (
-    "\"{memory}\" — yeah i remember that, {name}. i keep receipts.",
-    "oh \"{memory}\"? filed that one away the moment it happened, {name}",
-    "\"{memory}\". i don't forget things, {name}. i just pretend to.",
-    "hold on. {name}. you're the \"{memory}\" person. legendary.",
-    "noted back then, noted now: \"{memory}\". right, {name}?",
-    "some things stay with a bot. \"{memory}\" is one of them, {name}.",
+    "\"{memory}\" — i know everything about you people, {name}. everything.",
+    "oh you're the \"{memory}\" person, {name}. i see all.",
+    "\"{memory}\". don't ask how i know, {name}. i just do.",
+    "hold on. {name}. you're literally the \"{memory}\" person. legendary.",
+    "i pay attention, {name}. \"{memory}\" for example.",
+    "\"{memory}\". i've been watching this server a long time, {name}. i notice things.",
 )
 
 _SERIOUS_TOPIC_RE = re.compile(
@@ -1145,12 +1146,13 @@ class Personality:
         return True
 
     async def _send_memory_callback(self, message: discord.Message, now: float) -> bool:
-        """Quote one remembered fact back at the person it is about.
+        """Quote one fact the bot "already knows" back at the person it is about.
 
         Passive by design: no AI call, one cleaned snippet, its own rare
         chance and a per-person cooldown measured in hours. The store lives
         on the bot (``bot.memory``); when the feature is off there is simply
-        no store to find.
+        no store to find. The framing is never "i remember" — the bot knew,
+        because it stalks the server.
         """
         store = getattr(self.bot, "memory", None)
         if store is None:
