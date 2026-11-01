@@ -10,7 +10,7 @@ only ever the *last* resort.
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![discord.py 2.6+](https://img.shields.io/badge/discord.py-2.6%2B-5865F2?logo=discord&logoColor=white)](https://github.com/Rapptz/discord.py)
 [![License: MIT](https://img.shields.io/badge/license-MIT-8B5CF6)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-926%20passing-2DD4BF)](#testing)
+[![Tests](https://img.shields.io/badge/tests-1001%20passing-2DD4BF)](#testing)
 [![AI generated](https://img.shields.io/badge/parts%20of%20this%20project-AI%20generated-F472B6)](#built-with-ai)
 
 [Quick start](#quick-start) · [Features](#what-it-does) · [Screenshots](#screenshots) ·
@@ -43,7 +43,10 @@ cannot answer:
 | `@Paradise <complex question>` | the AI, in full character — OpenAI-compatible provider first, Gemini as the fallback | optional |
 | `@Paradise search <topic>` | forwarded straight to the AI (no web retrieval) and answered in character | optional |
 | `/summarize` | AI summary of recent conversation | optional |
-| Personality & banter | canned reactions, replies, stickers, roasts, rendered memes and keyless internet memes — **no model** for any of it | never |
+| `/memory add/list/remove/clear` | the lord teaches the bot facts it then folds into its answers | optional |
+| `@Paradise roast <someone>` | an AI tease about what that person actually just said (roast-book fallback) | optional |
+| Aliveness lines | a situation-aware one-liner when the server goes quiet or everyone moves into a voice call | optional |
+| Personality & banter | canned reactions, replies, stickers, context roasts, interjections, rendered memes, keyless internet memes and **keyless reaction GIFs** — **no model** for any of it | never |
 
 **3. What is *not* AI.** Every image the bot produces — leaderboard cards,
 dictionary cards, weather cards, recipe cards — is drawn programmatically with
@@ -71,7 +74,9 @@ conversation, `/summarize` and the AI-shaped answers are unavailable.
 | **Voice leaderboards** | Supabase-backed tracking with crash-safe checkpoints, IST calendar windows and a daily DM that reads like a note from a person. The card is a rendered page — a podium, then one grouped list, in white on light grey with a single accent per period. |
 | **Cards, drawn in code** | Dictionary, weather, recipe, mini-game and leaderboard visuals are Pillow-rendered at 2× supersampling — deterministic, cacheable, never generated. The leaderboard's contrast ratios are asserted in the test suite, not eyeballed. |
 | **Pronunciation** | Optional ElevenLabs voice for dictionary words, with an OpenAI-compatible and a free web fallback. Hindi, English and Hinglish. |
-| **It actually talks back** | Reactions, one-liners, stickers, roasts, reaction GIFs and memes pulled from real Reddit communities — no API key needed. Say "roast me", type something cocky, or just be funny near it. [How it works](docs/humour.md). |
+| **It actually talks back** | Reactions, one-liners, stickers, roasts that quote your own words back at you, "hello!" interjections when two people are talking, reaction GIFs and memes pulled from real Reddit communities — none of it needs an API key. Say "roast me", type something cocky, or just be funny near it. [How it works](docs/humour.md). |
+| **Long-term memory** | The lord (`/memory`) teaches the bot facts, preferences and server lore; every AI answer from then on quietly uses them. |
+| **It notices when it's dead** | When nobody has typed for a while — or when everyone who was chatting has moved into a voice call — the bot composes one short, situation-aware line for the actual numbers (minutes of silence, who is in VC and for how long, the IST time) and posts it in the home channel. |
 | **Silent presence** | Follows the crowd into the busiest voice channel and says nothing when it arrives. |
 | **Mini-games** | A recoverable SQLite scheduler, four modular games, aggregate-only leaderboard. |
 | **Self-updating** | Pulls the latest revision from GitHub on start-up and while online — validated, backed up, crash-loop guarded, and it never touches `.env` or `data/`. |
@@ -135,6 +140,9 @@ python bot.py
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
 2. On the **Bot** page enable **Message Content Intent** and **Server Members
    Intent** (used for mentions, AFK handling, personality and voice tracking).
+   **Presence Intent** is optional: only needed if you set
+   `PRESENCE_INTENT_ENABLED=true` so the aliveness lines can mention how many
+   members are online.
 3. Invite it with the `bot` and `applications.commands` scopes. Recommended
    permissions: View Channels, Send Messages, Embed Links, Attach Files, Add
    Reactions, Read Message History, Connect, Speak.
@@ -209,7 +217,7 @@ ParadiseBOT/
 ├── docs/                      setup guides and engineering write-ups
 │   └── engineering/           incident report and optimisation report
 ├── supabase/                  SQL migrations, local validator, schema docs
-├── tests/                     926 offline tests — no network, no credentials
+├── tests/                     1001 offline tests — no network, no credentials
 ├── tools/                     review agent, asset generator
 │   └── repro/                 incident reproducers and the invariant fuzzer
 ├── .env.example · requirements.txt · pyproject.toml · LICENSE
@@ -229,7 +237,7 @@ ParadiseBOT/
 
 ```bash
 python -m pip install -r requirements-dev.txt
-python -m pytest -q                       # 926 passed
+python -m pytest -q                       # 1001 passed
 python tools/review_agent.py --self-test  # static-review rules
 python benchmarks/voice_pipeline.py --label ci --latency 0 --users 4 --toggles 1
 ```

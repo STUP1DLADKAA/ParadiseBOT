@@ -16,6 +16,7 @@ from discord.ext import commands
 from config import Config, load_config
 from functions import autoupdate, perf
 from functions.ai import AIService
+from functions.memory import MemoryStore
 from functions.personality import Personality
 from functions.presence import PresenceManager
 from functions.startup import PRIMARY_GUILD_ID, CommandSynchronizer
@@ -36,6 +37,8 @@ EXTENSIONS = (
     "commands.system",
     "commands.assistant",
     "commands.edit",
+    "commands.memory",
+    "commands.aliveness",
 )
 
 
@@ -91,6 +94,12 @@ class ParadiseBot(commands.Bot):
         # voice leaderboards cannot resolve names/avatars (shows "User <id>").
         # Must also be enabled in the Discord Developer Portal for this bot.
         intents.members = True
+        # Presence intent (who is online): optional, OFF by default. It only
+        # works when the toggle is ALSO on in the Discord Developer Portal —
+        # otherwise login fails with PrivilegedIntentsRequired. The aliveness
+        # watcher works without it (it just can't count online members).
+        if config.presence_intent:
+            intents.presences = True
         super().__init__(
             command_prefix=commands.when_mentioned,
             intents=intents,
@@ -101,6 +110,10 @@ class ParadiseBot(commands.Bot):
         self.personality = Personality(self, config.personality)
         self.presence_manager = PresenceManager(self)
         self.ai = AIService(self, config)
+        # Long-term memory (the lord's /memory facts), folded into AI replies.
+        self.memory = MemoryStore(
+            config.memory_db_path, max_entries=config.memory_max_entries
+        )
         self.afk_states: dict = {}
         self._afk_notice_last: dict[tuple[int, int], float] = {}
         self._ready_logged = False
@@ -208,6 +221,10 @@ class ParadiseBot(commands.Bot):
             await self.ai.close()
         except Exception:
             log.debug("Shutdown step failed", exc_info=True)
+        try:
+            self.memory.close()
+        except Exception:
+            log.debug("Memory store shutdown failed", exc_info=True)
         try:
             await perf.close_shared_sessions()
             await perf.shutdown_render_pool()
@@ -460,6 +477,16 @@ def main() -> int:
         bot.run(config.token, log_handler=None)
     except discord.LoginFailure:
         log.error("Discord rejected the token. Check DISCORD_TOKEN in .env.")
+        return 1
+    except discord.PrivilegedIntentsRequired:
+        log.error(
+            "Discord refused to start Paradise because a privileged intent is "
+            "enabled in .env but NOT in the Developer Portal. If you set "
+            "PRESENCE_INTENT_ENABLED=true, also open "
+            "https://discord.com/developers/applications -> Bot -> Privileged "
+            "Gateway Intents and enable 'Presence Intent'. (Server Members "
+            "Intent must be on there too.)"
+        )
         return 1
     except KeyboardInterrupt:
         pass

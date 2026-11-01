@@ -18,7 +18,9 @@ message in
    ├─ "roast me" / "1v1 me" → a roast, right now
    │
    └─ everything else (all gated by the channel cooldowns)
-        one of: reply · roast · meme · GIF · sticker · quip · reaction
+        ├─ the lord himself spoke? → a "my lord 👑" line or a crown
+        ├─ two people talking?     → a small chance of "hello!"
+        └─ one of: reply · roast · meme · GIF · sticker · quip · reaction
 ```
 
 ## The layers
@@ -27,13 +29,33 @@ message in
 | --- | --- | --- | --- |
 | Reaction | Emoji on a message that matched a known context (34 contexts) | `PERSONALITY_REACTION_CHANCE` | `0.22` |
 | Ambient reaction | Emoji on a message that matched *nothing* — presence without words | `PERSONALITY_AMBIENT_REACTION_CHANCE` | `0.10` |
-| Reply | A one-liner chosen for that context | `PERSONALITY_REPLY_CHANCE` | `0.10` |
-| Roast | A jab aimed at whoever just spoke | `PERSONALITY_ROAST_CHANCE` | `0.12` |
-| Meme | A real meme from the internet, or a card drawn locally | `PERSONALITY_MEME_CHANCE` | `0.10` |
-| GIF | A reaction GIF (needs a free key) | `PERSONALITY_GIF_CHANCE` | `0.05` |
+| Reply | A one-liner chosen for that context | `PERSONALITY_REPLY_CHANCE` | `0.12` |
+| Roast | A jab aimed at whoever just spoke — quoting their own words when there are enough to quote | `PERSONALITY_ROAST_CHANCE` | `0.12` |
+| Meme | A real meme from the internet, or a card drawn locally | `PERSONALITY_MEME_CHANCE` | `0.16` |
+| GIF | A reaction GIF — keyless by default | `PERSONALITY_GIF_CHANCE` | `0.10` |
 | Sticker | A native Discord sticker, or a drawn one | `PERSONALITY_STICKER_CHANCE` | `0.05` |
-| Quip | An unprompted 200-IQ / 2-IQ observation | `PERSONALITY_QUIP_CHANCE` | `0.12` |
+| Quip | An unprompted 200-IQ / 2-IQ observation | `PERSONALITY_QUIP_CHANCE` | `0.14` |
 | Nerd | Grammar/spelling correction, English only | `PERSONALITY_GRAMMAR_CHANCE` | `0.70` |
+| Interjection | A "hello!" when two people are talking (10-minute window) | `PERSONALITY_INTERJECT_CHANCE` | `0.08` |
+| Lord | A loyal acknowledgement when the lord and master speaks | `PERSONALITY_LORD_REPLY_CHANCE` | `0.20` |
+
+New layers:
+
+* **Interjection** — when two or more distinct humans have spoken in a channel
+  within ten minutes, the conversation is "live" and Paradise may drop one
+  short line of its own ("hello!", "continue, i'm invested now"). Its own
+  cooldown (`PERSONALITY_INTERJECT_COOLDOWN`, default 240 s) keeps it a
+  surprise rather than a photobombber.
+* **Lord** — user `922359954025885737` (configurable with
+  `PARADISE_LORD_USER_ID`) is the lord and master. When he speaks, Paradise
+  occasionally answers with a loyal, slightly cheeky line ("my lord has spoken
+  👑") or just drops a crown reaction on the message. He is also the only
+  person who can teach the bot long-term memories (`/memory`), and the AI
+  addresses him as "my lord" — while still teasing him, because he expects it.
+* **Context roasts** — when the roast target's last words are long enough, the
+  roast *quotes them back* ("bro woke up today and chose to say \"pineapple
+  belongs on pizza\" out loud."). Roasting the lord uses the loyal-but-cheeky
+  frames instead. Short messages fall back to the classic book.
 
 At most **one** of these happens per message, and only when the channel is not
 already firing (`PERSONALITY_CHANNEL_COOLDOWN`, default 35 s) and the bot has
@@ -104,7 +126,7 @@ disagreements while still being allowed to call him an idiot itself.
 [meme-api.com](https://meme-api.com), which needs **no key at all**:
 
 ```env
-MEME_SOURCES=dankmemes,memes,me_irl,wholesomememes
+MEME_SOURCES=dankmemes,memes,me_irl,wholesomememes,terriblefacebookmemes,historymemes
 MEME_TIMEOUT=6
 ```
 
@@ -123,16 +145,44 @@ a meme card locally instead. The feature never goes dark.
 
 ## Reaction GIFs
 
-GIFs come from Tenor or Giphy, and both need a **free** key. Set one:
+GIFs work **without any key**: a free Tenor (or Giphy) key makes the results
+better, but a fresh `.env` already gets keyless GIFs through Tenor's legacy
+public endpoint. If that endpoint ever goes away, every request quietly
+returns nothing and the bot falls back to memes — the feature never shows a
+broken link.
 
 ```env
-TENOR_API_KEY=
-GIPHY_API_KEY=
+TENOR_API_KEY=     # optional; improves quality and speed
+GIPHY_API_KEY=     # optional; same deal
 ```
 
-With a key, `/gif bruh` and the occasional automatic GIF reply work. Without
-one, nothing breaks: `/gif` explains how to turn it on and sends a meme, and the
-automatic GIF path is skipped entirely.
+With any of the three tiers working, `/gif bruh` and the occasional automatic
+GIF reply fire. Without one, `/gif` says so and sends a meme instead.
+
+## The aliveness watcher
+
+The part that makes the bot feel like it *lives* here, not just answers here.
+`functions/aliveness.py` + `commands/aliveness.py` watch the server and, when
+the picture says so, post one short, situation-aware line in the home channel
+(`ALIVENESS_CHANNEL_ID`, default `1181574439893217280`):
+
+* **dead** — no human message anywhere for `ALIVENESS_DEAD_AFTER_MINUTES`
+  (default 25) minutes;
+* **everyone's in VC** — everyone who chatted in the last couple of hours has
+  gone quiet and is sitting in a voice call together (at least
+  `ALIVENESS_MIN_VC_GROUP`, quiet for `ALIVENESS_VC_QUIET_MINUTES`).
+
+The line is written by the AI from the *real* signals — minutes of silence,
+who is in which voice channel and for how long (`VoiceState.joined_at`),
+member count, IST time of day, and (only when `PRESENCE_INTENT_ENABLED=true`
+**and** the portal toggle is on) how many members are online. No AI
+configured? A canned, still-situational line is posted instead.
+
+Guard rails: one post per `ALIVENESS_POST_COOLDOWN_MINUTES` (45), nothing at
+all during `ALIVENESS_QUIET_HOURS` (01:00–07:00 IST by default), and a fresh
+boot never calls a server dead until it has actually been watching for
+`dead_after` minutes (it also seeds "last message" from the channel's history,
+so a restart can't produce a false alarm).
 
 ## Commands
 
@@ -140,7 +190,8 @@ automatic GIF path is skipped entirely.
 | --- | --- |
 | `/roast [member]` | Roast someone, or yourself |
 | `/meme [topic]` | A random internet meme, or a drawn card about `topic` |
-| `/gif <query>` | A reaction GIF (free key required) |
+| `/gif <query>` | A reaction GIF (works keyless) |
+| `/memory add/list/remove/clear` | Teach the bot facts it remembers (the lord only) |
 
 ## Quiet mode
 
@@ -158,4 +209,8 @@ working.
 `tests/test_banter.py` covers the book (every intensity, anti-repetition, no
 slurs), the guards (distress, opt-out, per-person cooldown), the meme feed
 (validation, NSFW filtering, caching, backoff, garbage payloads) and the GIF
-providers — all with an injected fetcher, so the suite stays completely offline.
+providers (including the keyless tier and its graceful failure).
+`tests/test_humour.py` covers the interjections, the lord acknowledgements and
+the context roasts; `tests/test_memory.py` the long-term memory and its
+command; `tests/test_aliveness.py` the dead-server watcher — all with an
+injected clock and fetcher, so the suite stays completely offline.

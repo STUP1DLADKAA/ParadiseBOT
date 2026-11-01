@@ -63,12 +63,14 @@ class FakeMessage:
 
 
 class FakeAI:
-    def __init__(self, *, available=False, answer="ai answer"):
+    def __init__(self, *, available=False, answer="ai answer", tease_error=None):
         self.available = available
         self._answer = answer
+        self.tease_error = tease_error
         self.responded_to = []
         self.questions = []
         self.classified = []
+        self.teased = []
 
     def should_reply_to(self, message):
         return message._addressed
@@ -91,6 +93,12 @@ class FakeAI:
     async def classify(self, request, max_tokens=120):
         self.classified.append(request)
         return ""
+
+    async def tease(self, name, text="", *, target_id=0, max_tokens=140):
+        self.teased.append((name, text, target_id))
+        if self.tease_error is not None:
+            raise self.tease_error
+        return self._answer
 
     def reset(self):
         self.classified = []
@@ -197,6 +205,26 @@ class TestAssistantDispatch(unittest.IsolatedAsyncioTestCase):
         handled = await assistant.handle_message(message)
         self.assertTrue(handled)
         self.assertIn("guy who lost", message.replies[0]["content"])
+
+    async def test_roast_uses_the_ai_tease_when_it_is_awake(self):
+        ai = FakeAI(available=True)
+        assistant, _ = make_assistant(ai=ai)
+        message = mention("roast the guy who lost")
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        # The AI tier answered, in the target's direction.
+        self.assertEqual(message.replies[0]["content"], "ai answer")
+        self.assertEqual(len(ai.teased), 1)
+        self.assertIn("guy who lost", ai.teased[0][0])
+
+    async def test_roast_falls_back_to_the_book_when_the_ai_tease_fails(self):
+        ai = FakeAI(available=True, tease_error=RuntimeError("brain offline"))
+        assistant, _ = make_assistant(ai=ai)
+        message = mention("roast the guy who lost")
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        sent = message.replies[0]["content"]
+        self.assertIn("guy who lost", sent)  # the roast book answered instead
 
     async def test_unaddressed_messages_ignored(self):
         assistant, _ = make_assistant()

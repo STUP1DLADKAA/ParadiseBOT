@@ -3,6 +3,9 @@
 - Random native Discord stickers & die-cut PNG sticker fallback
 - Dynamic Pillow message-meme generation & replies
 - Unpredictable smart/stupid chaos quips & rotating random statuses
+- Conversation interjections ("hello!" when two people are talking)
+- The lord's acknowledgement (crown him when he speaks)
+- Context roasts (quoting someone's own words back at them)
 """
 
 from __future__ import annotations
@@ -13,7 +16,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from PIL import Image
 import discord
@@ -33,8 +36,20 @@ from functions.memes import (
     render_meme_png,
     render_sticker_png,
 )
-from functions.personality import CHAOS_QUIPS, PATTERNS, Personality
+from functions.personality import (
+    CHAOS_QUIPS,
+    INTERJECTION_LINES,
+    LORD_LINES,
+    LORD_REACTIONS,
+    PATTERNS,
+    Personality,
+)
 from functions.presence import PresenceManager
+from functions.roasts import (
+    CONTEXT_ROAST_FRAMES,
+    LORD_CONTEXT_FRAMES,
+    clean_snippet,
+)
 
 
 def _make_msg(
@@ -364,6 +379,135 @@ class TestHumourPersonalityIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertGreater(len(seen_labels), 25)
         self.assertIn(discord.ActivityType.custom, seen_types)
 
+class TestConversationsAndTheLord(unittest.IsolatedAsyncioTestCase):
+    """Interjections when people talk; crowns when the lord talks."""
+
+    LORD_ID = 922359954025885737
+
+    def _personality(self, **overrides):
+        defaults = dict(
+            enabled=True,
+            reaction_chance=0.0,
+            reply_chance=0.0,
+            sticker_chance=0.0,
+            meme_chance=0.0,
+            gif_chance=0.0,
+            random_quip_chance=0.0,
+            roast_chance=0.0,
+            ambient_reaction_chance=0.0,
+            grammar_chance=0.0,
+            global_cooldown=0,
+            channel_cooldown=0,
+            reply_channel_cooldown=0,
+            humour_cooldown=0,
+            roast_user_cooldown=0,
+            interject_cooldown=0,
+        )
+        defaults.update(overrides)
+        cfg = PersonalityConfig(**defaults)
+        bot = SimpleNamespace(
+            user=SimpleNamespace(id=999),
+            config=SimpleNamespace(lord_user_id=self.LORD_ID),
+        )
+        return Personality(bot, cfg)
+
+    async def test_two_people_talking_get_a_hello(self):
+        personality = self._personality(interject_chance=1.0)
+        first = _make_msg("good morning everyone, i slept great", author_id=1)
+        await personality.handle(first)
+        first.reply.assert_not_awaited()  # one voice is not a conversation
+
+        second = _make_msg("nobody cares, i've been up since four", author_id=2)
+        await personality.handle(second)
+        second.reply.assert_awaited_once()
+        self.assertIn(second.reply.call_args.args[0], INTERJECTION_LINES)
+
+    async def test_a_monologue_does_not_get_interjected(self):
+        personality = self._personality(interject_chance=1.0)
+        for text in ("i keep saying things", "still just me talking", "anyone? no?"):
+            msg = _make_msg(text, author_id=1)
+            await personality.handle(msg)
+            msg.reply.assert_not_awaited()
+
+    async def test_interjections_respect_their_cooldown(self):
+        personality = self._personality(
+            interject_chance=1.0, interject_cooldown=240
+        )
+        await personality.handle(_make_msg("hi all", author_id=1))
+        second = _make_msg("hello hello", author_id=2)
+        await personality.handle(second)
+        second.reply.assert_awaited_once()
+
+        third = _make_msg("still here, still chatting", author_id=1)
+        await personality.handle(third)
+        third.reply.assert_not_awaited()  # the interjection cooldown holds
+
+    async def test_the_lord_gets_a_crown_when_he_speaks(self):
+        personality = self._personality(lord_reply_chance=1.0)
+        with patch("functions.personality.random.random", return_value=0.0):
+            msg = _make_msg("i have returned", author_id=self.LORD_ID)
+            await personality.handle(msg)
+        msg.add_reaction.assert_awaited_once()
+        self.assertIn(msg.add_reaction.call_args.args[0], LORD_REACTIONS)
+
+    async def test_the_lord_gets_a_loyal_line_when_he_speaks(self):
+        personality = self._personality(lord_reply_chance=1.0)
+        with patch("functions.personality.random.random", return_value=0.9):
+            msg = _make_msg("i have returned again", author_id=self.LORD_ID)
+            await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        self.assertIn(msg.reply.call_args.args[0], LORD_LINES)
+
+    async def test_everyone_else_is_not_the_lord(self):
+        personality = self._personality(lord_reply_chance=1.0, interject_chance=0.0)
+        msg = _make_msg("i am definitely not the lord", author_id=42)
+        await personality.handle(msg)
+        msg.reply.assert_not_awaited()
+        msg.add_reaction.assert_not_awaited()
+
+    async def test_roasts_quote_what_the_person_actually_said(self):
+        personality = self._personality(
+            roast_chance=1.0, lord_reply_chance=0.0, interject_chance=0.0
+        )
+        content = "pineapple belongs on pizza and i will die on this hill"
+        msg = _make_msg(content, author_id=7)
+        await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        sent = msg.reply.call_args.args[0]
+        snippet = clean_snippet(content)
+        rendered = {
+            frame.format(name="Ash", snippet=snippet)
+            for frame in CONTEXT_ROAST_FRAMES
+        }
+        self.assertIn(sent, rendered)
+        self.assertIn(snippet, sent)  # their own words, quoted back
+
+    async def test_the_lord_is_roasted_with_loyalty(self):
+        personality = self._personality(
+            roast_chance=1.0, lord_reply_chance=0.0, interject_chance=0.0
+        )
+        content = "i have decided the bot pays for discord nitro now"
+        msg = _make_msg(content, author_id=self.LORD_ID)
+        await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        sent = msg.reply.call_args.args[0]
+        snippet = clean_snippet(content)
+        rendered = {
+            frame.format(name="Ash", snippet=snippet)
+            for frame in LORD_CONTEXT_FRAMES
+        }
+        self.assertIn(sent, rendered)
+
+    async def test_short_last_words_get_the_classic_roast_book(self):
+        personality = self._personality(roast_chance=1.0)
+        msg = _make_msg("roast me", author_id=7)
+        await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        sent = msg.reply.call_args.args[0]
+        self.assertIn("Ash", sent)  # the roast book always names the target
+        self.assertNotIn('"roast me"', sent)  # nothing short was worth quoting
+
+
     def test_config_parses_new_humour_env_vars(self):
         cfg = Config.from_env(
             {
@@ -381,6 +525,27 @@ class TestHumourPersonalityIntegration(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cfg.personality.grammar_chance, 0.85)
         self.assertEqual(cfg.personality.humour_cooldown, 90)
         self.assertEqual(cfg.personality.grammar_cooldown, 60)
+
+    def test_config_parses_social_layers_env_vars(self):
+        cfg = Config.from_env(
+            {
+                "PERSONALITY_INTERJECT_CHANCE": "0.3",
+                "PERSONALITY_INTERJECT_COOLDOWN": "120",
+                "PERSONALITY_LORD_REPLY_CHANCE": "0.5",
+                "PARADISE_LORD_USER_ID": "922359954025885737",
+                "PRESENCE_INTENT_ENABLED": "true",
+            }
+        )
+        self.assertEqual(cfg.personality.interject_chance, 0.3)
+        self.assertEqual(cfg.personality.interject_cooldown, 120)
+        self.assertEqual(cfg.personality.lord_reply_chance, 0.5)
+        self.assertEqual(cfg.lord_user_id, 922359954025885737)
+        self.assertTrue(cfg.presence_intent)
+        # and the defaults match the shipped tuning
+        defaults = Config.from_env({})
+        self.assertEqual(defaults.personality.meme_chance, 0.16)
+        self.assertEqual(defaults.personality.gif_chance, 0.10)
+        self.assertFalse(defaults.presence_intent)
 
 
 if __name__ == "__main__":

@@ -49,7 +49,12 @@ from functions.images import (
     NO_IMAGE_LINE, ImageSearchService, build_image_embeds,
 )
 from functions.intent import classify_request, should_classify
-from functions.roasts import build_roast, clean_name, sanitize_intensity
+from functions.roasts import (
+    build_context_roast,
+    build_roast,
+    clean_name,
+    sanitize_intensity,
+)
 from functions.router import (
     AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
     HELP, IMAGE, PING, ROAST, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
@@ -68,7 +73,7 @@ _FALLBACK_NOTE_COOLDOWN = 15 * 60
 
 # How long the AI may think before the placeholder is replaced with an
 # apology (the model itself gets its own, longer timeout).
-_AI_TIMEOUT = 60.0
+_AI_TIMEOUT = 45.0
 
 ASK_HINT = (
     "hey! just ask me things like:\n"
@@ -240,19 +245,76 @@ class Assistant(commands.Cog):
         return await self._ai(message, text)
 
     async def _roast(self, message: discord.Message, route: Route) -> bool:
-        """``@Paradise roast <someone>`` — a jab, aimed at the right person."""
+        """``@Paradise roast <someone>`` — a jab aimed at the right person,
+        about what they actually just said when Paradise knows it."""
         target = self._roast_target(message, route.payload or "")
         engine = getattr(self.bot, "personality", None)
         intensity = sanitize_intensity(getattr(engine, "roast_intensity", "spicy"))
-        line = build_roast(
-            target.name,
-            intensity=intensity,
-            recent=getattr(engine, "_recent_roasts", None),
-        )
+        recent = getattr(engine, "_recent_roasts", None)
+        context = self._target_last_words(message, target)
+        line = await self._tease_with_ai(message, target, context)
+        if line is None:
+            if context:
+                line = build_context_roast(target.name, context, recent=recent)
+            line = line or build_roast(
+                target.name, intensity=intensity, recent=recent
+            )
         if target.self_roast:
             line = f"roasting myself, since you asked: {line}"
         await self._quiet_reply(message, line)
         return True
+
+    def _target_last_words(self, message: discord.Message, target) -> str:
+        """What the roast target last said — the roast should be about that.
+
+        Never the triggering request itself (that's "roast me", not content),
+        and never a hard dependency: any missing piece means "no context",
+        which falls back to the classic roast book.
+        """
+        if getattr(target, "self_roast", False):
+            return ""
+        words = getattr(getattr(self.bot, "personality", None), "_last_words", None)
+        target_id = int(getattr(target, "id", 0) or 0)
+        if isinstance(words, dict) and target_id:
+            candidate = words.get(target_id)
+            if candidate:
+                return str(candidate)
+        ai = getattr(self.bot, "ai", None)
+        last_words = getattr(ai, "last_words", None)
+        if callable(last_words):
+            try:
+                return str(last_words(message.channel.id, target.name) or "")
+            except Exception:  # noqa: BLE001 - context is a bonus, never a need
+                log.debug("Looking up last words failed", exc_info=True)
+        return ""
+
+    async def _tease_with_ai(self, message: discord.Message, target, context: str) -> str | None:
+        """A context-specific AI tease of the target, or ``None``.
+
+        The AI tier of the roast pipeline: what the target actually said,
+        made fun of in Paradise's own voice. Any failure falls straight
+        through to the roast book — a roast should never 500.
+        """
+        ai = getattr(self.bot, "ai", None)
+        if ai is None or not getattr(ai, "available", False):
+            return None
+        tease = getattr(ai, "tease", None)
+        if not callable(tease):
+            return None
+        try:
+            text = await asyncio.wait_for(
+                tease(
+                    target.name,
+                    context or "",
+                    target_id=int(getattr(target, "id", 0) or 0),
+                ),
+                timeout=_AI_TIMEOUT,
+            )
+        except Exception:  # noqa: BLE001 - the roast book is always ready
+            log.debug("AI tease failed; using the roast book", exc_info=True)
+            return None
+        text = str(text or "").strip().strip('"')
+        return text or None
 
     @staticmethod
     def _roast_target(message: discord.Message, payload: str):
@@ -267,7 +329,11 @@ class Assistant(commands.Cog):
                     or getattr(member, "name", None)
                     or "them"
                 )
-                return SimpleNamespace(name=clean_name(name, fallback="them"), self_roast=False)
+                return SimpleNamespace(
+                    name=clean_name(name, fallback="them"),
+                    self_roast=False,
+                    id=int(getattr(member, "id", 0) or 0),
+                )
         lowered = text.lower()
         if not text or lowered == "me" or lowered.startswith("me ") or lowered == "myself":
             name = (
@@ -275,8 +341,14 @@ class Assistant(commands.Cog):
                 or getattr(message.author, "name", None)
                 or "you"
             )
-            return SimpleNamespace(name=clean_name(name, fallback="you"), self_roast=True)
-        return SimpleNamespace(name=clean_name(text, fallback="them"), self_roast=False)
+            return SimpleNamespace(
+                name=clean_name(name, fallback="you"),
+                self_roast=True,
+                id=int(getattr(message.author, "id", 0) or 0),
+            )
+        return SimpleNamespace(
+            name=clean_name(text, fallback="them"), self_roast=False, id=0
+        )
 
     # ------------------------------------------------------------------
     # Multi-tool requests ("weather in Delhi and time in Tokyo")
@@ -811,7 +883,7 @@ class Assistant(commands.Cog):
         if ai.cooldown_remaining(message) > 0:
             return True
         try:
-            answer = await asyncio.wait_for(ai.respond(message), timeout=60)
+            answer = await asyncio.wait_for(ai.respond(message), timeout=45)
         except asyncio.TimeoutError:
             log.warning("Assistant AI answer timed out")
             await self._quiet_reply(message, "AI's having a moment. try again.")

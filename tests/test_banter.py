@@ -96,9 +96,16 @@ def _personality(**overrides) -> Personality:
         roast_user_cooldown=0,
     )
     defaults.update(overrides)
+    gif_search = defaults.pop("_gif_search", None)
     config = PersonalityConfig(**defaults)
     bot = SimpleNamespace(user=SimpleNamespace(id=999))
-    return Personality(bot, config)
+    return Personality(
+        bot,
+        config,
+        gif_search=gif_search if gif_search is not None else GifSearch(
+            keyless=False
+        ),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -313,10 +320,75 @@ class TestGifProviders(unittest.TestCase):
         ]
     }
 
-    def test_without_a_key_nothing_happens(self):
-        search = GifSearch(tenor_key="", giphy_key="")
+    TENOR_V1 = {
+        "results": [
+            {"media": [{"gif": {"url": "https://media.tenor.com/abc/base.gif"},
+                        "tinygif": {"url": "https://media.tenor.com/abc/tiny.gif"}}],
+             "itemurl": "https://tenor.com/view/x"},
+        ]
+    }
+
+    def test_without_a_key_the_keyless_tenor_tier_is_used(self):
+        """GIFs work on a fresh .env: no key -> the legacy Tenor endpoint."""
+        calls = []
+
+        async def fetch(url, params, timeout):
+            calls.append(url)
+            return self.TENOR_V1
+
+        search = GifSearch(tenor_key="", giphy_key="", fetch_json=fetch)
+        self.assertTrue(search.available)
+        self.assertEqual(search.provider, "tenor-keyless")
+        meme = asyncio.run(search.search("bruh"))
+        self.assertIsNotNone(meme)
+        self.assertEqual(meme.source, "tenor-keyless")
+        self.assertTrue(meme.is_gif)
+        self.assertEqual(calls, ["https://gapi.tenor.com/v1/search"])
+        self.assertTrue(
+            all(host in ALLOWED_HOSTS for host in ("media.tenor.com",))
+        )
+
+    def test_the_keyless_tier_can_be_switched_off(self):
+        async def fetch(url, params, timeout):
+            raise AssertionError("should not be called")
+
+        search = GifSearch(tenor_key="", giphy_key="", fetch_json=fetch, keyless=False)
         self.assertFalse(search.available)
+        self.assertEqual(search.provider, "")
         self.assertIsNone(asyncio.run(search.search("bruh")))
+
+    def test_a_dead_keyless_endpoint_degrades_to_none(self):
+        """If Tenor ever retires the public endpoint, callers get None."""
+        async def fetch(url, params, timeout):
+            raise OSError("endpoint retired")
+
+        search = GifSearch(tenor_key="", giphy_key="", fetch_json=fetch)
+        self.assertTrue(search.available)
+        self.assertIsNone(asyncio.run(search.search("bruh")))
+
+    def test_tenor_v1_parses(self):
+        from functions.meme_feed import parse_tenor_v1
+
+        meme = parse_tenor_v1(self.TENOR_V1)
+        self.assertIsNotNone(meme)
+        self.assertTrue(meme.is_gif)
+        self.assertEqual(meme.url, "https://media.tenor.com/abc/base.gif")
+        self.assertEqual(meme.source, "tenor-keyless")
+
+    def test_keys_are_preferred_over_the_keyless_tier(self):
+        calls = []
+
+        async def fetch(url, params, timeout):
+            calls.append(url)
+            return self.TENOR
+
+        search = GifSearch(tenor_key="t", giphy_key="", fetch_json=fetch)
+        self.assertEqual(search.provider, "tenor")
+        meme = asyncio.run(search.search("bruh"))
+        self.assertEqual(meme.source, "tenor")
+        self.assertEqual(
+            calls, ["https://tenor.googleapis.com/v2/search"]
+        )
 
     def test_tenor_parses(self):
         meme = parse_tenor(self.TENOR)
@@ -503,7 +575,12 @@ class TestLouderPersonality(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attached.filename, "paradise_meme.png")
 
     async def test_no_gif_key_means_no_gif_attempt(self):
-        personality = _personality(meme_chance=1.0, gif_chance=1.0, online_meme_chance=0.0)
+        personality = _personality(
+            meme_chance=1.0,
+            gif_chance=1.0,
+            online_meme_chance=0.0,
+            _gif_search=GifSearch(keyless=False),
+        )
         self.assertFalse(personality.gif_search.available)
         msg = _make_msg("honestly i think cereal is technically cold soup")
         await personality.handle(msg)
@@ -576,7 +653,9 @@ class TestBanterCommands(unittest.IsolatedAsyncioTestCase):
     async def test_gif_without_a_key_explains_and_offers_a_meme(self):
         meme = OnlineMeme(url="https://i.redd.it/x.jpg", title="t", source="memes")
         feed = SimpleNamespace(pick=AsyncMock(return_value=meme))
-        cog = self._cog(feed=feed, gifs=GifSearch(tenor_key="", giphy_key=""))
+        cog = self._cog(
+            feed=feed, gifs=GifSearch(tenor_key="", giphy_key="", keyless=False)
+        )
         interaction = self._interaction()
         await cog.gif.callback(cog, interaction, "bruh")
         args = interaction.followup.send.call_args
