@@ -87,21 +87,21 @@ FALLBACK_UNAVAILABLE = (
     "my brain isn't plugged in right now — no AI is configured. try /help meanwhile."
 )
 
-_CONTEXT_MESSAGES = 16
-_CONTEXT_CHARS = 3200
+_CONTEXT_MESSAGES = 32
+_CONTEXT_CHARS = 6000
 #: Same user asking again: wait this long (spam guard).
-_USER_COOLDOWN = 12.0
+_USER_COOLDOWN = 8.0
 #: Same user, same channel: belt and braces on top of the user cooldown.
-_CHANNEL_COOLDOWN = 5.0
+_CHANNEL_COOLDOWN = 3.0
 #: How many AI provider calls may be in flight at once. Discord dispatches
 #: every event as its own task, so several members can be mid-answer at the
 #: same time; beyond this the extra calls queue (they are never dropped).
-_MAX_CONCURRENT_CALLS = 4
+_MAX_CONCURRENT_CALLS = 8
 _FAILURE_COOLDOWN = 60.0
 #: How much of a message is kept for context (record() and replies).
 _SNIPPET_CHARS = 400
 #: How many memories are folded into a prompt at most.
-_MEMORY_LIMIT = 6
+_MEMORY_LIMIT = 8
 
 
 class AIService:
@@ -110,7 +110,7 @@ class AIService:
         self.config = config
         self.available = config.ai_configured
         self._history: dict[int, deque[tuple[str, str]]] = defaultdict(
-            lambda: deque(maxlen=40)
+            lambda: deque(maxlen=80)
         )
         self._session: aiohttp.ClientSession | None = None
         self._session_lock = asyncio.Lock()
@@ -712,27 +712,6 @@ class AIService:
                 max_tokens=max_tokens,
             )
         ).strip()
-
-    async def improvise(self, prompt: str, *, max_tokens: int = 200) -> str:
-        """One short in-character line from a system-generated situation.
-
-        The aliveness pipeline's only creative call: the watcher describes
-        the exact situation (dead server, everyone in VC) and Paradise
-        answers as itself — one line, no follow-up, no memory of it.
-        """
-        if not self.available:
-            raise ParadiseError(FALLBACK_UNAVAILABLE)
-        prompt = str(prompt or "").strip()
-        if not prompt:
-            raise ParadiseError("nothing to improvise from.")
-        answer = await self.chat(
-            [
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=max(60, int(max_tokens)),
-        )
-        return answer.strip()
 
     async def classify(self, request: str, *, max_tokens: int = 120) -> str:
         """Return the raw JSON label for *request* (see ``functions.intent``).

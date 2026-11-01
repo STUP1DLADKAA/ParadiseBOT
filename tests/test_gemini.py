@@ -505,23 +505,6 @@ class TestAIProviderChain(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(ParadiseError):
             await ai.tease("Rohan", "anything")
 
-    async def test_improvise_answers_one_line_in_character(self):
-        ai = self._primary_ai()
-        out = await ai.improvise("the server has been dead for 40 minutes")
-        self.assertEqual(out, "primary answer")
-        messages = ai._session.requests[0]["json"]["messages"]
-        self.assertEqual(messages[0]["role"], "system")
-        self.assertEqual(messages[0]["content"], SYSTEM_PROMPT)
-        self.assertIn("dead for 40 minutes", messages[1]["content"])
-        self.assertLessEqual(
-            ai._session.requests[0]["json"]["max_tokens"], 200
-        )
-
-    async def test_improvise_without_a_prompt_raises(self):
-        ai = self._primary_ai()
-        with self.assertRaises(ParadiseError):
-            await ai.improvise("   ")
-
     def test_response_budgets_stay_small(self):
         # Small budgets = short replies and faster turns.
         self.assertEqual(AIService._response_budget("hi"), 200)
@@ -697,16 +680,17 @@ class TestConcurrentAIRequests(unittest.IsolatedAsyncioTestCase):
         answers = await asyncio.gather(
             *[
                 ai.chat([{"role": "user", "content": f"question {index}"}])
-                for index in range(8)
+                for index in range(12)
             ]
         )
-        self.assertEqual(len(answers), 8)
+        self.assertEqual(len(answers), 12)
         self.assertTrue(all(answer == "parallel ok" for answer in answers))
-        self.assertEqual(session.requests, 8)
+        self.assertEqual(session.requests, 12)
         # They genuinely overlapped…
         self.assertGreaterEqual(session.max_inflight, 2)
-        # …but never more than the ceiling at once.
-        self.assertLessEqual(session.max_inflight, 4)
+        # …but never more than the ceiling at once (8 now: a busy server
+        # should not feel a queue).
+        self.assertLessEqual(session.max_inflight, 8)
 
     async def test_a_different_member_is_not_blocked_by_the_channel(self):
         def message_from(member_id, name):
@@ -759,7 +743,7 @@ class TestConcurrentAIRequests(unittest.IsolatedAsyncioTestCase):
         # Occupy every slot with a slow request.
         tasks = [
             asyncio.create_task(ai.chat([{"role": "user", "content": f"q{index}"}]))
-            for index in range(4)
+            for index in range(8)
         ]
         await asyncio.sleep(0.05)
         self.assertTrue(ai._provider_slots.locked())

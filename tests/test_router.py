@@ -14,8 +14,8 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from functions.router import (
-    AI, CALCULATE, CONVERT, DATE, DEFINE, HELP, IMAGE, ROAST,
-    SEARCH, TIME, TRANSLATE, WEATHER, route_many, route_query,
+    AI, CALCULATE, CONVERT, DATE, DEFINE, GIF, HELP, IMAGE, MEME, ROAST,
+    SEARCH, SUMMARIZE, TIME, TRANSLATE, WEATHER, route_many, route_query,
 )
 
 
@@ -149,6 +149,79 @@ class TestRouter(unittest.TestCase):
         self.assertEqual(route.payload, "15% of 500")
         route = self.route("define    'serendipity'  ")
         self.assertEqual(route.payload, "serendipity")
+
+
+class TestMediaAndRecapRouting(unittest.TestCase):
+    """@Paradise meme / gif / summarize — more capabilities per ping."""
+
+    def route(self, text: str):
+        return route_query(text)
+
+    def test_recap_phrasings_all_summarize(self):
+        for text in (
+            "summarize",
+            "summarise",
+            "summarize the last 20 messages",
+            "recap",
+            "recap please",
+            "tl;dr",
+            "tldr",
+            "what did i miss",
+            "catch me up",
+            "fill me in",
+        ):
+            route = self.route(text)
+            self.assertEqual(route.kind, SUMMARIZE, text)
+            self.assertGreaterEqual(route.confidence, 0.9, text)
+
+    def test_meme_requests(self):
+        for text, payload in (
+            ("meme", ""),
+            ("memes", ""),
+            ("send me a meme", ""),
+            ("give me a meme about exams", "exams"),
+            ("drop a meme please", ""),
+            ("valorant meme", "valorant"),
+            ("make a meme about monday", "monday"),
+        ):
+            route = self.route(text)
+            self.assertEqual(route.kind, MEME, text)
+            self.assertEqual(route.payload, payload, text)
+
+    def test_gif_requests(self):
+        for text, payload in (
+            ("gif", ""),
+            ("send a gif", ""),
+            ("bruh gif", "bruh"),
+            ("show me a gif of a cat failing a jump", "cat failing a jump"),
+            ("send a gif of this is fine", "this is fine"),
+        ):
+            route = self.route(text)
+            self.assertEqual(route.kind, GIF, text)
+            self.assertEqual(route.payload, payload, text)
+
+    def test_meme_and_gif_join_compound_requests(self):
+        routes = route_many("weather in delhi and send me a meme")
+        self.assertEqual(
+            [(r.kind, r.payload) for r in routes],
+            [("weather", "delhi"), ("meme", "")],
+        )
+        routes = route_many("what time is it in tokyo and show me a gif of tokyo")
+        self.assertEqual(
+            [(r.kind, r.payload) for r in routes],
+            [("time", "tokyo"), ("gif", "tokyo")],
+        )
+        routes = route_many("summarize and then show me a gif")
+        self.assertEqual([r.kind for r in routes], ["summarize", "gif"])
+
+    def test_questions_about_memes_stay_questions(self):
+        # A question mentioning the word is not a delivery request.
+        self.assertEqual(self.route("what is a meme").kind, DEFINE)
+        self.assertEqual(self.route("define meme").kind, DEFINE)
+        self.assertNotEqual(self.route("how do i make a gif").kind, GIF)
+        self.assertNotEqual(
+            self.route("summarize the plot of interstellar").kind, SUMMARIZE
+        )
 
 
 class TestRoastRouting(unittest.TestCase):

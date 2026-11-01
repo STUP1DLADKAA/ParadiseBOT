@@ -576,7 +576,6 @@ class TestConversationsAndTheLord(unittest.IsolatedAsyncioTestCase):
                 "PERSONALITY_INTERJECT_COOLDOWN": "120",
                 "PERSONALITY_LORD_REPLY_CHANCE": "0.5",
                 "PARADISE_LORD_USER_ID": "922359954025885737",
-                "PRESENCE_INTENT_ENABLED": "true",
             }
         )
         self.assertEqual(cfg.personality.interject_chance, 0.3)
@@ -586,7 +585,6 @@ class TestConversationsAndTheLord(unittest.IsolatedAsyncioTestCase):
         # A configured single lord replaces the shipped pair (old behaviour).
         self.assertEqual(cfg.lord_user_ids, (922359954025885737,))
         self.assertFalse(cfg.is_lord(1049231767585964032))
-        self.assertTrue(cfg.presence_intent)
         # the multi-lord form, and the two forms merging
         many = Config.from_env(
             {"PARADISE_LORD_USER_IDS": "111, 222", "PARADISE_LORD_USER_ID": "333"}
@@ -596,7 +594,6 @@ class TestConversationsAndTheLord(unittest.IsolatedAsyncioTestCase):
         defaults = Config.from_env({})
         self.assertEqual(defaults.personality.meme_chance, 0.16)
         self.assertEqual(defaults.personality.gif_chance, 0.10)
-        self.assertFalse(defaults.presence_intent)
         # Stupid and Taher, both lords by default, same level of authority.
         self.assertEqual(
             defaults.lord_user_ids, (922359954025885737, 1049231767585964032)

@@ -111,18 +111,24 @@ class TestMemoryStore(unittest.TestCase):
         hits = self.store.relevant("what does rohan do at night?")
         self.assertEqual(hits[0].text, "Rohan sleeps at 4am")
 
-    def test_relevant_falls_back_to_recent_when_no_overlap(self):
+    def test_unrelated_questions_get_no_memories_at_all(self):
+        """Relevance is a hard filter now: dragging an unrelated memory into
+        an unrelated reply is the bot "bringing up old stuff"."""
         self.store.add("Aryan only plays Valorant", author_id=LORD_ID)
         self.store.add("Rohan sleeps at 4am", author_id=LORD_ID)
-        # Nothing overlaps with "explain quantum tunnelling" -> recent memories
         hits = self.store.relevant("explain quantum tunnelling")
-        self.assertEqual(len(hits), 2)
+        self.assertEqual(hits, [])
+        # Stop-word-only questions have no keywords to match either.
+        self.assertEqual(self.store.relevant("the of and"), [])
 
-    def test_relevant_on_empty_store_and_stopwords(self):
-        self.assertEqual(self.store.relevant("anything"), [])
+    def test_relevant_still_finds_real_matches(self):
+        self.store.add("Aryan only plays Valorant", author_id=LORD_ID)
         self.store.add("Rohan sleeps at 4am", author_id=LORD_ID)
-        # A question of only stop words still returns the recent memories.
-        self.assertEqual(len(self.store.relevant("the of and")), 1)
+        hits = self.store.relevant("what game does aryan play")
+        self.assertEqual([entry.text for entry in hits], ["Aryan only plays Valorant"])
+
+    def test_relevant_on_empty_store(self):
+        self.assertEqual(self.store.relevant("anything"), [])
 
     def test_relevant_limit_is_respected(self):
         for index in range(10):

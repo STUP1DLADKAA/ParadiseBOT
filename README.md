@@ -42,10 +42,12 @@ cannot answer:
 | --- | --- | --- |
 | `@Paradise <complex question>` | the AI, in full character — OpenAI-compatible provider first, Gemini as the fallback | optional |
 | `@Paradise search <topic>` | forwarded straight to the AI (no web retrieval) and answered in character | optional |
+| `@Paradise summarize` (or "recap", "tl;dr", "what did i miss") | AI recap of the recent conversation — no slash command needed | optional |
+| `@Paradise meme [about X]` | a real internet meme, or a locally drawn one about X | never |
+| `@Paradise gif [of X]` / "bruh gif" | a reaction GIF — keyless by default | never |
 | `/summarize` | AI summary of recent conversation | optional |
 | `/memory add/list/remove/clear [user]` | the lords (Stupid, Taher) teach the bot facts about a member (or the server) that surface when that person talks | optional |
 | `@Paradise roast <someone>` | an AI tease about what that person actually just said (roast-book fallback) | optional |
-| Aliveness lines | a situation-aware one-liner when the server goes quiet or everyone moves into a voice call | optional |
 | Personality & banter | canned reactions, replies, stickers, context roasts, interjections, rendered memes, keyless internet memes and **keyless reaction GIFs** — **no model** for any of it | never |
 
 **3. What is *not* AI.** Every image the bot produces — leaderboard cards,
@@ -76,7 +78,6 @@ conversation, `/summarize` and the AI-shaped answers are unavailable.
 | **Pronunciation** | Optional ElevenLabs voice for dictionary words, with an OpenAI-compatible and a free web fallback. Hindi, English and Hinglish. |
 | **It actually talks back** | Reactions, one-liners, stickers, roasts that quote your own words back at you, "hello!" interjections when two people are talking, reaction GIFs and memes pulled from real Reddit communities — none of it needs an API key. Say "roast me", type something cocky, or just be funny near it. [How it works](docs/humour.md). |
 | **Long-term memory** | The lords (`/memory`) teach the bot facts *about specific members* — they surface when that person talks or is asked about, never dumped into every reply. The bot never says "I remember": it acts like it always knew, because it watches everyone. SQLite always, an optional Supabase mirror for durability, and a rare quoted callback from the personality. |
-| **It notices when it's dead** | When nobody has typed for a while — or when everyone who was chatting has moved into a voice call — the bot composes one short, situation-aware line for the actual numbers (minutes of silence, who is in VC and for how long, the IST time) and posts it in the home channel. |
 | **Silent presence** | Follows the crowd into the busiest voice channel and says nothing when it arrives. |
 | **Mini-games** | A recoverable SQLite scheduler, four modular games, aggregate-only leaderboard. |
 | **Self-updating** | Pulls the latest revision from GitHub on start-up and while online — validated, backed up, crash-loop guarded, and it never touches `.env` or `data/`. |
@@ -91,7 +92,7 @@ request normalizer (typos, slang, Hinglish, emoji, filler)
    ↓
 intent router (deterministic, microseconds)
    ↓
-can a native tool answer?   calculator · define · convert · image · weather · time · translate
+can a native tool answer?   calculator · define · convert · image · weather · time · translate · meme · gif · recap
    ├── YES → specialised tool, zero AI
    └── NO
         search-shaped or factual?  → forwarded straight to the AI, no web retrieval
@@ -107,10 +108,11 @@ is unconfigured or failing — and a provider outage is reported honestly
 instead of being guessed around.
 
 Several members can talk to the bot at once and every one of them gets an
-answer: requests run in parallel up to a small ceiling (`_MAX_CONCURRENT_CALLS`),
-one person's cooldown never gates another's, and the one-shot intent classifier
-never queues behind long answers — it skips straight to its fallback when the
-provider is busy.
+answer: up to eight AI requests run in parallel, one person's cooldown never
+gates another's, and the one-shot intent classifier never queues behind long
+answers — it skips straight to its fallback when the provider is busy. The
+model sees the last 32 messages of channel context (6,000 characters), so
+answers are grounded in the conversation actually happening.
 
 ---
 
@@ -146,9 +148,6 @@ python bot.py
 1. Create an application in the [Discord Developer Portal](https://discord.com/developers/applications).
 2. On the **Bot** page enable **Message Content Intent** and **Server Members
    Intent** (used for mentions, AFK handling, personality and voice tracking).
-   **Presence Intent** is optional: only needed if you set
-   `PRESENCE_INTENT_ENABLED=true` so the aliveness lines can mention how many
-   members are online.
 3. Invite it with the `bot` and `applications.commands` scopes. Recommended
    permissions: View Channels, Send Messages, Embed Links, Attach Files, Add
    Reactions, Read Message History, Connect, Speak.

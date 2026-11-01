@@ -176,31 +176,6 @@ GIPHY_API_KEY=     # optional; same deal
 With any of the three tiers working, `/gif bruh` and the occasional automatic
 GIF reply fire. Without one, `/gif` says so and sends a meme instead.
 
-## The aliveness watcher
-
-The part that makes the bot feel like it *lives* here, not just answers here.
-`functions/aliveness.py` + `commands/aliveness.py` watch the server and, when
-the picture says so, post one short, situation-aware line in the home channel
-(`ALIVENESS_CHANNEL_ID`, default `1181574439893217280`):
-
-* **dead** — no human message anywhere for `ALIVENESS_DEAD_AFTER_MINUTES`
-  (default 25) minutes;
-* **everyone's in VC** — everyone who chatted in the last couple of hours has
-  gone quiet and is sitting in a voice call together (at least
-  `ALIVENESS_MIN_VC_GROUP`, quiet for `ALIVENESS_VC_QUIET_MINUTES`).
-
-The line is written by the AI from the *real* signals — minutes of silence,
-who is in which voice channel and for how long (`VoiceState.joined_at`),
-member count, IST time of day, and (only when `PRESENCE_INTENT_ENABLED=true`
-**and** the portal toggle is on) how many members are online. No AI
-configured? A canned, still-situational line is posted instead.
-
-Guard rails: one post per `ALIVENESS_POST_COOLDOWN_MINUTES` (45), nothing at
-all during `ALIVENESS_QUIET_HOURS` (01:00–07:00 IST by default), and a fresh
-boot never calls a server dead until it has actually been watching for
-`dead_after` minutes (it also seeds "last message" from the channel's history,
-so a restart can't produce a false alarm).
-
 ## Commands
 
 | Command | What it does |
@@ -208,6 +183,9 @@ so a restart can't produce a false alarm).
 | `/roast [member]` | Roast someone, or yourself |
 | `/meme [topic]` | A random internet meme, or a drawn card about `topic` |
 | `/gif <query>` | A reaction GIF (works keyless) |
+| `@Paradise meme [about X]` | The same meme pipeline, by plain mention |
+| `@Paradise gif [of X]` / "bruh gif" | The same GIF tiers, by plain mention |
+| `@Paradise summarize` | An AI recap of the recent chat ("recap", "tl;dr", "what did i miss" all work) |
 | `/memory add/list/remove/clear` | Teach the bot facts it remembers (the lords only) |
 
 ## Quiet mode
@@ -230,6 +208,5 @@ providers (including the keyless tier and its graceful failure).
 `tests/test_humour.py` covers the interjections, the lord acknowledgements and
 the context roasts; `tests/test_banter.py` the memory callbacks;
 `tests/test_memory.py` the long-term memory, its command and the Supabase
-mirror (against a fake client); `tests/test_aliveness.py` the dead-server
-watcher — all with an injected clock and fetcher, so the suite stays
-completely offline.
+mirror (against a fake client) — all with an injected clock and fetcher, so
+the suite stays completely offline.

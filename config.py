@@ -7,7 +7,6 @@ only here. A safe template is provided in ``.env.example``.
 from __future__ import annotations
 
 import os
-import re
 from dataclasses import dataclass
 
 
@@ -721,73 +720,6 @@ class GeminiConfig:
         )
 
 
-def _quiet_hours(raw: str | None) -> tuple[int, int]:
-    """Parse ``ALIVENESS_QUIET_HOURS`` ("1-7") into an IST quiet window.
-
-    Anything unparsable falls back to the default 01:00–07:00 IST; an explicit
-    ``off``/``none``/``""`` disables quiet hours entirely (both ends -1).
-    """
-    text = (raw or "").strip().lower()
-    if text in {"off", "none", "disabled", "false", "0"}:
-        return (-1, -1)
-    match = re.match(r"^(\d{1,2})\s*[-–to ]+\s*(\d{1,2})$", (raw or "").strip())
-    if match:
-        start = max(0, min(23, int(match.group(1))))
-        end = max(0, min(24, int(match.group(2))))
-        return (start, end)
-    return (1, 7)
-
-
-@dataclass(frozen=True, slots=True)
-class AlivenessConfig:
-    """Tuning for the "is this server dead?" watcher (commands/aliveness.py).
-
-    Paradise keeps an eye on the chat: how long since the last human message,
-    who is in voice, how long they have been there and what time it is. When
-    the server goes quiet — or when everyone who was chatting has moved into
-    a voice call — it generates one short in-character line for that exact
-    situation, so the server never feels abandoned.
-    """
-
-    # Master switch for the watcher loop.
-    enabled: bool = True
-    # The channel the "still alive over here" lines are posted in.
-    channel_id: int = 1181574439893217280
-    # How often the loop wakes up and looks at the server.
-    interval: int = 150
-    # "Dead" = no human message anywhere for this many minutes.
-    dead_after: int = 25
-    # "Everyone is in VC" = the chatters went quiet this many minutes ago.
-    vc_quiet: int = 10
-    # How far back "recently chatted" is measured, in minutes.
-    recent_window: int = 120
-    # A voice call only counts as "everyone is in VC" with at least this many.
-    min_vc_group: int = 2
-    # Minimum minutes between two aliveness posts.
-    post_cooldown: int = 45
-    # IST hours during which Paradise lets a quiet server sleep (inclusive
-    # start, exclusive end, wrapping across midnight when start > end).
-    quiet_hours: tuple[int, int] = (1, 7)
-
-    @classmethod
-    def from_env(cls, env) -> "AlivenessConfig":
-        return cls(
-            enabled=_bool(env.get("ALIVENESS_ENABLED"), True),
-            channel_id=max(0, _int(env.get("ALIVENESS_CHANNEL_ID"), 1181574439893217280)),
-            interval=max(30, _int(env.get("ALIVENESS_INTERVAL_SECONDS"), 150)),
-            dead_after=max(5, _int(env.get("ALIVENESS_DEAD_AFTER_MINUTES"), 25)),
-            vc_quiet=max(2, _int(env.get("ALIVENESS_VC_QUIET_MINUTES"), 10)),
-            recent_window=max(
-                15, _int(env.get("ALIVENESS_RECENT_WINDOW_MINUTES"), 120)
-            ),
-            min_vc_group=max(2, _int(env.get("ALIVENESS_MIN_VC_GROUP"), 2)),
-            post_cooldown=max(
-                5, _int(env.get("ALIVENESS_POST_COOLDOWN_MINUTES"), 45)
-            ),
-            quiet_hours=_quiet_hours(env.get("ALIVENESS_QUIET_HOURS")),
-        )
-
-
 @dataclass(frozen=True, slots=True)
 class Config:
     """Everything Paradise reads from the environment."""
@@ -854,7 +786,6 @@ class Config:
     lord_user_ids: tuple[int, ...] = (922359954025885737, 1049231767585964032)
 
     # The dead-server / everyone-in-VC watcher.
-    aliveness: AlivenessConfig = AlivenessConfig()
 
     # Long-term memory (/memory) — a tiny SQLite database of things the lord
     # asked Paradise to remember, folded into AI replies. When the Supabase
@@ -867,12 +798,6 @@ class Config:
     memory_supabase_interval: int = 120
     # Per-request deadline for the memory mirror, in seconds.
     memory_supabase_timeout: float = 10.0
-
-    # Request the presence (online status) intent at login. Discord must ALSO
-    # have it enabled in the developer portal — if the portal toggle is off,
-    # login fails with PrivilegedIntentsRequired, so this ships off by default
-    # and the aliveness watcher works without it.
-    presence_intent: bool = False
 
     @property
     def lord_user_id(self) -> int:
@@ -914,7 +839,6 @@ class Config:
             clip_user_ids=_ids(env.get("CLIP_ALLOWED_USER_IDS")),
             deaf_exempt_user_ids=_ids(env.get("VOICE_DEAF_EXEMPT_USER_IDS")),
             lord_user_ids=_lord_ids_from_env(env),
-            aliveness=AlivenessConfig.from_env(env),
             memory_db_path=(
                 str(env.get("MEMORY_DB_PATH", "") or "").strip()
                 or os.path.join(
@@ -934,7 +858,6 @@ class Config:
             memory_supabase_timeout=max(
                 3.0, _float(env.get("MEMORY_SUPABASE_TIMEOUT"), 10.0)
             ),
-            presence_intent=_bool(env.get("PRESENCE_INTENT_ENABLED"), False),
             tts_cache_dir=(
                 str(env.get("TTS_CACHE_DIR", "") or "").strip()
                 or os.path.join(
