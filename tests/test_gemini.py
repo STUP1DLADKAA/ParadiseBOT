@@ -5,9 +5,11 @@ All offline: HTTP is faked at the session boundary.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import unittest
+from types import SimpleNamespace
 from urllib.parse import urlparse
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -517,9 +519,209 @@ class TestAIProviderChain(unittest.IsolatedAsyncioTestCase):
         self.assertLess(_USER_COOLDOWN, 15)
         self.assertLess(_CHANNEL_COOLDOWN, 8)
 
+    async def test_memories_about_the_asker_reach_the_prompt(self):
+        """The 'correct time and spot' rule: what the lord taught the bot
+        about the person who is talking surfaces in their conversation."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ai = self._primary_ai()
+            ai.bot.memory = MemoryStore(Path(tmp) / "memory.db")
+            ai.bot.memory.add(
+                "spent more than a year to reach level 100 in murder mystery",
+                subject_id=555,
+                subject_name="Rohan",
+            )
+            ai.bot.memory.add("the server was founded in 2023")
+            await ai.answer_question(
+                "what game should we play tonight", asker="Rohan", asker_id=555
+            )
+            content = ai._session.requests[0]["json"]["messages"][1]["content"]
+            self.assertIn("about Rohan", content)
+            self.assertIn("murder mystery", content)
+            self.assertIn("right moment", content)
+
+    async def test_memories_about_a_mentioned_member_reach_the_prompt(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ai = self._primary_ai()
+            ai.bot.memory = MemoryStore(Path(tmp) / "memory.db")
+            ai.bot.memory.add(
+                "cannot aim in valorant", subject_id=777, subject_name="Aryan"
+            )
+            message = SimpleNamespace(
+                content=f"<@{999}> what do you think of <@{777}>",
+                author=SimpleNamespace(id=555, display_name="Rohan"),
+                channel=SimpleNamespace(id=10),
+                guild=SimpleNamespace(id=1),
+                mentions=[SimpleNamespace(id=777, bot=False)],
+            )
+            ai._session = FakeSession(post_responses=[
+                FakeResponse(200, {"choices": [{"message": {"content": "he cannot aim"}}]})
+            ])
+            await ai.respond(message)
+            content = ai._session.requests[0]["json"]["messages"][1]["content"]
+            self.assertIn("about Aryan", content)
+            self.assertIn("cannot aim", content)
+
+    async def test_tease_offers_the_targets_remembered_facts(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ai = self._primary_ai()
+            ai.bot.memory = MemoryStore(Path(tmp) / "memory.db")
+            ai.bot.memory.add(
+                "spent a year reaching level 100 in murder mystery",
+                subject_id=555,
+                subject_name="Rohan",
+            )
+            await ai.tease("Rohan", "i finally hit diamond", target_id=555)
+            content = ai._session.requests[0]["json"]["messages"][1]["content"]
+            self.assertIn("Things you remember about Rohan", content)
+            self.assertIn("murder mystery", content)
+
     async def test_validate_startup_skips_without_key(self):
         ai = self.make_ai(Config())
         self.assertFalse(await ai.validate_startup())
+
+
+# ---------------------------------------------------------------------------
+# AIService: several members mid-answer at once
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrentAIRequests(unittest.IsolatedAsyncioTestCase):
+    """Parallelism with a ceiling: requests run together, never unbounded."""
+
+    class SlowSession:
+        """Counts in-flight POSTs; each takes a moment to answer."""
+
+        closed = False
+
+        def __init__(self, delay: float = 0.05, responses: int = 16):
+            self.delay = delay
+            self.remaining = responses
+            self.inflight = 0
+            self.max_inflight = 0
+            self.requests = 0
+
+        def post(self, url, headers=None, json=None, **kwargs):
+            owner = self
+
+            class _Context:
+                async def __aenter__(self):
+                    owner.inflight += 1
+                    owner.max_inflight = max(owner.max_inflight, owner.inflight)
+                    owner.requests += 1
+                    await asyncio.sleep(owner.delay)
+                    if owner.remaining <= 0:
+                        return FakeResponse(500, text="exhausted")
+                    owner.remaining -= 1
+                    return FakeResponse(
+                        200, {"choices": [{"message": {"content": "parallel ok"}}]}
+                    )
+
+                async def __aexit__(self, *args):
+                    owner.inflight -= 1
+                    return False
+
+            return _Context()
+
+    def _ai(self, session) -> AIService:
+        config = Config(
+            ai_base_url="http://local.test/v1",
+            ai_model="llama",
+        )
+        ai = AIService(FakeBot(), config)
+        ai._session = session
+        return ai
+
+    async def test_parallel_requests_all_answer_and_share_slots(self):
+        session = self.SlowSession()
+        ai = self._ai(session)
+        answers = await asyncio.gather(
+            *[
+                ai.chat([{"role": "user", "content": f"question {index}"}])
+                for index in range(8)
+            ]
+        )
+        self.assertEqual(len(answers), 8)
+        self.assertTrue(all(answer == "parallel ok" for answer in answers))
+        self.assertEqual(session.requests, 8)
+        # They genuinely overlapped…
+        self.assertGreaterEqual(session.max_inflight, 2)
+        # …but never more than the ceiling at once.
+        self.assertLessEqual(session.max_inflight, 4)
+
+    async def test_a_different_member_is_not_blocked_by_the_channel(self):
+        def message_from(member_id, name):
+            return SimpleNamespace(
+                content=f"<@{999}> question from {name}",
+                author=SimpleNamespace(id=member_id, display_name=name),
+                channel=SimpleNamespace(id=10),
+                guild=SimpleNamespace(id=1),
+                mentions=[],
+            )
+
+        first = message_from(1, "Ash")
+        second = message_from(2, "Rohan")
+        ai = self._ai(
+            FakeSession(post_responses=[
+                FakeResponse(200, {"choices": [{"message": {"content": "first"}}]}),
+                FakeResponse(200, {"choices": [{"message": {"content": "second"}}]}),
+            ])
+        )
+        self.assertEqual(await ai.respond(first), "first")
+        # A different member, same channel, immediately after: no wait at all.
+        self.assertEqual(ai.cooldown_remaining(second), 0.0)
+        self.assertEqual(await ai.respond(second), "second")
+
+    async def test_the_same_member_still_waits(self):
+        def message_from(member_id, name):
+            return SimpleNamespace(
+                content=f"<@{999}> question from {name}",
+                author=SimpleNamespace(id=member_id, display_name=name),
+                channel=SimpleNamespace(id=10),
+                guild=SimpleNamespace(id=1),
+                mentions=[],
+            )
+
+        first = message_from(1, "Ash")
+        ai = self._ai(
+            FakeSession(post_responses=[
+                FakeResponse(200, {"choices": [{"message": {"content": "first"}}]}),
+            ])
+        )
+        await ai.respond(first)
+        self.assertGreater(ai.cooldown_remaining(first), 0.0)
+        self.assertLessEqual(ai.cooldown_remaining(first), 12.5)
+
+    async def test_classification_never_queues_behind_answers(self):
+        """All slots busy → the classifier skips straight to its fallback
+        instead of queueing behind a wall of long answers."""
+        session = self.SlowSession(delay=10.0, responses=0)
+        ai = self._ai(session)
+        # Occupy every slot with a slow request.
+        tasks = [
+            asyncio.create_task(ai.chat([{"role": "user", "content": f"q{index}"}]))
+            for index in range(4)
+        ]
+        await asyncio.sleep(0.05)
+        self.assertTrue(ai._provider_slots.locked())
+
+        # The classify path refuses to wait: it fails over within a second.
+        with self.assertRaises((ParadiseError, asyncio.TimeoutError)):
+            await asyncio.wait_for(ai.classify("weather in delhi"), timeout=1.0)
+
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 
 
 if __name__ == "__main__":  # pragma: no cover

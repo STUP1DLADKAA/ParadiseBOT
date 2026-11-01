@@ -52,6 +52,10 @@ they are written, and because a leaderboard should survive a bot restart.
      — apply this one even if you already have 003: without it every
      checkpoint can shave a fraction of a second off a long session, which adds
      up to minutes over a day.
+   - [`supabase/migrations/005_memory.sql`](../supabase/migrations/005_memory.sql)
+     — optional: mirrors the `/memory` facts to the same project so they
+     survive a reinstall or a move to another machine. Without it the bot
+     keeps memories locally; nothing errors.
 
    Each file is transactional and safe to re-run. The bot requires schema
    version 4 and refuses to track until it sees it (it says so in the log).

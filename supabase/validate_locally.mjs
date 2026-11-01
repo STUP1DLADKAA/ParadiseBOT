@@ -27,6 +27,7 @@ const baseMigrationSql = readFileSync(join(here, "migrations", "001_voice_activi
 const istMigrationSql = readFileSync(join(here, "migrations", "002_voice_ist_calendar.sql"), "utf8");
 const checkpointMigrationSql = readFileSync(join(here, "migrations", "003_voice_checkpoint.sql"), "utf8");
 const carryMigrationSql = readFileSync(join(here, "migrations", "004_voice_credit_carry.sql"), "utf8");
+const memoryMigrationSql = readFileSync(join(here, "migrations", "005_memory.sql"), "utf8");
 
 const db = new PGlite();
 let passed = 0;
@@ -762,6 +763,120 @@ console.log("\n== 9. README diagnostic queries ==");
     limit 50`);
   check("README: corrections-audit query runs against the real columns",
     Array.isArray(corrections));
+}
+
+// ---------------------------------------------------------------------------
+console.log("\n== 0e. the long-term memory table (005) ==");
+// /memory facts mirror into paradise_memories. The local SQLite row id IS the
+// primary key, RLS is enabled with no policies (service role only), and the
+// whole migration is additive — it must not touch a single voice object.
+
+await db.exec(memoryMigrationSql);
+await db.exec(memoryMigrationSql);
+console.log("  ok   memory migration applied and re-applied (idempotent)");
+passed++;
+
+check("memory schema version is 1",
+  (await scalar("select public.paradise_memory_schema_version()")) === 1);
+check("the voice schema is untouched by 005 (still 4)",
+  (await scalar("select public.voice_schema_version()")) === 4);
+
+{
+  const cols = await q(`
+    select column_name, data_type, column_default, is_nullable
+    from information_schema.columns
+    where table_schema = 'public' and table_name = 'paradise_memories'
+    order by ordinal_position`);
+  const byName = Object.fromEntries(cols.map((c) => [c.column_name, c]));
+  check("paradise_memories has the bot's columns",
+    ["id", "text", "author_id", "subject_id", "subject_name", "created_at", "updated_at"]
+      .every((name) => byName[name]),
+    JSON.stringify(Object.keys(byName)));
+  check("id is the plain primary key (the SQLite row id)",
+    byName.id && byName.id.data_type === "bigint" && byName.id.column_default === null);
+  check("text is mandatory (a memory is the fact)",
+    byName.text && byName.text.is_nullable === "NO");
+  check("subject fields default to server-wide (0 / '')",
+    byName.subject_id && byName.subject_id.column_default !== null &&
+    byName.subject_name && byName.subject_name.column_default !== null);
+
+  const idx = await scalar(`
+    select count(*) from pg_indexes
+    where schemaname = 'public' and tablename = 'paradise_memories'`);
+  check("the subject index exists (who-is-this-about lookups)", Number(idx) >= 2, `got ${idx}`);
+
+  const rls = await scalar(
+    "select relrowsecurity from pg_class c join pg_namespace n on n.oid=c.relnamespace " +
+    "where n.nspname='public' and c.relname='paradise_memories'");
+  check("paradise_memories has row level security enabled", rls === true);
+  const policies = await scalar(
+    "select count(*) from pg_policies where schemaname='public' and tablename='paradise_memories'");
+  check("no RLS policies (service role only, by design)", Number(policies) === 0, `got ${policies}`);
+}
+
+// The mirror's exact write pattern: upsert by id, select ordered, delete by id.
+await db.exec("set role service_role");
+await db.query(
+  "insert into public.paradise_memories (id, text, author_id, subject_id, subject_name, created_at) values ($1,$2,$3,$4,$5,$6)",
+  [1, "spent a year reaching level 100 in murder mystery", 922359954025885737, 555, "Rohan", "2026-10-31T18:00:00+00:00"]);
+await db.query(
+  "insert into public.paradise_memories (id, text, author_id, subject_id, subject_name, created_at) values ($1,$2,$3,$4,$5,$6) " +
+  "on conflict (id) do update set text = excluded.text, updated_at = now()",
+  [1, "spent MORE than a year reaching level 100 in murder mystery", 922359954025885737, 555, "Rohan", "2026-10-31T18:00:00+00:00"]);
+await db.query(
+  "insert into public.paradise_memories (id, text) values ($1,$2) on conflict (id) do nothing",
+  [2, "the server was founded in 2023"]);
+const pulled = await q("select id, text, subject_id, subject_name from public.paradise_memories order by id");
+check("the mirror's upsert pattern keeps one row per id",
+  pulled.length === 2 && pulled[0].text.includes("MORE than a year"), JSON.stringify(pulled));
+check("subject columns persist (who the memory is about)",
+  pulled[0].subject_id === 555 && pulled[0].subject_name === "Rohan");
+check("defaults fill the server-wide case",
+  pulled[1].subject_id === 0 && pulled[1].subject_name === "");
+await db.query("delete from public.paradise_memories where id = any($1)", [[2]]);
+const afterDelete = await scalar("select count(*) from public.paradise_memories");
+check("delete-by-id removes exactly the tombstoned row", Number(afterDelete) === 1);
+await db.exec("reset role");
+
+// anon must see and change nothing, even with table grants forced on.
+await db.exec("grant select, insert, update, delete on public.paradise_memories to anon;");
+{
+let anonRows = null;
+try {
+  await db.exec("set role anon");
+  anonRows = await q("select count(*) as c from public.paradise_memories");
+  await db.exec("reset role");
+} catch (e) {
+  await db.exec("reset role");
+  anonRows = [{ c: "permission denied" }];
+}
+check("anon sees zero memory rows (RLS, no policies)",
+  Number(anonRows[0].c) === 0, JSON.stringify(anonRows));
+let anonInsertErr = null;
+try {
+  await db.exec("set role anon");
+  await db.query(
+    "insert into public.paradise_memories (id, text) values ($1,$2)",
+    [99, "anon tried to teach the bot"]);
+  await db.exec("reset role");
+} catch (e) {
+  await db.exec("reset role");
+  anonInsertErr = e.message;
+}
+check("anon cannot insert a memory",
+  /row-level security|permission denied/i.test(anonInsertErr ?? ""), anonInsertErr ?? "no error");
+let anonVersionErr = null;
+try {
+  await db.exec("set role anon");
+  await q("select public.paradise_memory_schema_version()");
+  await db.exec("reset role");
+} catch (e) {
+  await db.exec("reset role");
+  anonVersionErr = e.message;
+}
+check("anon cannot execute the memory version function",
+  /permission denied for function paradise_memory_schema_version/i.test(anonVersionErr ?? ""),
+  anonVersionErr ?? "no error");
 }
 
 // ---------------------------------------------------------------------------

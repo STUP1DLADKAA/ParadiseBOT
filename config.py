@@ -163,6 +163,11 @@ class PersonalityConfig:
     interject_cooldown: int = 240
     # Chance the bot acknowledges its lord when he speaks (reply or 👑).
     lord_reply_chance: float = 0.20
+    # Chance to drop a "remember when …" callback when somebody the bot has
+    # memories about speaks (see /memory). Occasional on purpose.
+    memory_callback_chance: float = 0.05
+    # Seconds before the same person can be memory-called-back again.
+    memory_callback_cooldown: int = 1800
 
     @classmethod
     def from_env(cls, env) -> "PersonalityConfig":
@@ -200,6 +205,12 @@ class PersonalityConfig:
                 env.get("PERSONALITY_INTERJECT_COOLDOWN"), 240
             ),
             lord_reply_chance=_chance(env.get("PERSONALITY_LORD_REPLY_CHANCE"), 0.20),
+            memory_callback_chance=_chance(
+                env.get("PERSONALITY_MEMORY_CALLBACK_CHANCE"), 0.05
+            ),
+            memory_callback_cooldown=_int(
+                env.get("PERSONALITY_MEMORY_CALLBACK_COOLDOWN"), 1800
+            ),
         )
 
 
@@ -808,9 +819,16 @@ class Config:
     aliveness: AlivenessConfig = AlivenessConfig()
 
     # Long-term memory (/memory) — a tiny SQLite database of things the lord
-    # asked Paradise to remember, folded into AI replies.
+    # asked Paradise to remember, folded into AI replies. When the Supabase
+    # project is configured (the same SUPABASE_URL/SUPABASE_SECRET_KEY as the
+    # voice tracker), memories are also mirrored there — see
+    # supabase/migrations/005_memory.sql.
     memory_db_path: str = ""
     memory_max_entries: int = 200
+    # How often the Supabase memory mirror reconciles, in seconds.
+    memory_supabase_interval: int = 120
+    # Per-request deadline for the memory mirror, in seconds.
+    memory_supabase_timeout: float = 10.0
 
     # Request the presence (online status) intent at login. Discord must ALSO
     # have it enabled in the developer portal — if the portal toggle is off,
@@ -864,6 +882,12 @@ class Config:
             ),
             memory_max_entries=max(
                 10, _int(env.get("MEMORY_MAX_ENTRIES"), 200)
+            ),
+            memory_supabase_interval=max(
+                15, _int(env.get("MEMORY_SUPABASE_INTERVAL_SECONDS"), 120)
+            ),
+            memory_supabase_timeout=max(
+                3.0, _float(env.get("MEMORY_SUPABASE_TIMEOUT"), 10.0)
             ),
             presence_intent=_bool(env.get("PRESENCE_INTENT_ENABLED"), False),
             tts_cache_dir=(

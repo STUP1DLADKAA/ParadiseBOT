@@ -632,9 +632,10 @@ class TestAssistantSafety(unittest.IsolatedAsyncioTestCase):
         assistant, _ = make_assistant()
         for index in range(900):
             assistant._user_last[index] = 0.0
-            assistant._channel_last[index] = 0.0
+            assistant._channel_last[index] = (0.0, index)
         assistant._cooled(mention("hi"))
         self.assertLessEqual(len(assistant._user_last), 600)
+        self.assertLessEqual(len(assistant._channel_last), 600)
 
     async def test_oversized_answer_is_split_not_dropped(self):
         ai = FakeAI(available=True, answer="word " * 1200)
@@ -656,6 +657,70 @@ class TestAssistantSafety(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(assistant.images.calls, [])
         self.assertEqual(ai.questions, [])
         self.assertEqual(ai.responded_to, [])
+
+
+class TestParallelRequests(unittest.IsolatedAsyncioTestCase):
+    """Several members talking to the bot at once: everyone gets an answer.
+
+    Discord dispatches every message as its own task; the bot's own gates
+    must never turn that back into a queue where only the first person is
+    answered and everyone else is silently ignored.
+    """
+
+    @staticmethod
+    def _from(assistant_message, member_id, name):
+        assistant_message.author = SimpleNamespace(id=member_id, bot=False, display_name=name)
+        return assistant_message
+
+    async def test_a_second_member_is_never_channel_blocked(self):
+        assistant, _ = make_assistant()
+        first = self._from(mention("hello there friend"), 1, "Ash")
+        second = self._from(mention("hello there friend"), 2, "Rohan")
+        self.assertTrue(assistant._cooled(first))
+        # Different member, same channel, immediately after: straight through.
+        self.assertTrue(assistant._cooled(second))
+
+    async def test_the_same_member_is_still_paced(self):
+        assistant, _ = make_assistant()
+        first = self._from(mention("hello there friend"), 1, "Ash")
+        self.assertTrue(assistant._cooled(first))
+        self.assertFalse(assistant._cooled(self._from(mention("again"), 1, "Ash")))
+
+    async def test_two_members_get_real_answers_back_to_back(self):
+        assistant, _ = make_assistant()
+        first = self._from(mention("25% of 800"), 1, "Ash")
+        second = self._from(mention("15% of 200"), 2, "Rohan")
+        handled_one = await assistant.handle_message(first)
+        handled_two = await assistant.handle_message(second)
+        self.assertTrue(handled_one)
+        self.assertTrue(handled_two)
+        self.assertIn("200", first.replies[0]["content"])
+        self.assertIn("30", second.replies[0]["content"])
+
+    async def test_a_short_ai_cooldown_is_waited_out_not_dropped(self):
+        class SlowCooldownAI(FakeAI):
+            def __init__(self):
+                super().__init__(available=True)
+                self.waited = []
+
+            def cooldown_remaining(self, message):
+                remaining = self._remaining.get(message.author.id, 0.0)
+                self.waited.append(remaining)
+                return remaining
+
+        ai = SlowCooldownAI()
+        ai._remaining = {2: 0.05}  # a parallel request finishing any moment
+        assistant, _ = make_assistant(ai=ai)
+        message = self._from(mention("what is a black hole"), 2, "Rohan")
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        self.assertTrue(message.replies)  # waited, then answered — not dropped
+
+        ai._remaining = {3: 30.0}  # the same member machine-gunning: quiet
+        spam = self._from(mention("what is a black hole"), 3, "Spammer")
+        handled = await assistant.handle_message(spam)
+        self.assertTrue(handled)
+        self.assertFalse(spam.replies)
 
 
 class TestLiveDataHonesty(unittest.IsolatedAsyncioTestCase):

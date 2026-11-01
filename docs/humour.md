@@ -38,6 +38,7 @@ message in
 | Nerd | Grammar/spelling correction, English only | `PERSONALITY_GRAMMAR_CHANCE` | `0.70` |
 | Interjection | A "hello!" when two people are talking (10-minute window) | `PERSONALITY_INTERJECT_CHANCE` | `0.08` |
 | Lord | A loyal acknowledgement when the lord and master speaks | `PERSONALITY_LORD_REPLY_CHANCE` | `0.20` |
+| Memory callback | One remembered fact quoted back at the person it's about | `PERSONALITY_MEMORY_CALLBACK_CHANCE` | `0.05` |
 
 New layers:
 
@@ -56,6 +57,17 @@ New layers:
   roast *quotes them back* ("bro woke up today and chose to say \"pineapple
   belongs on pizza\" out loud."). Roasting the lord uses the loyal-but-cheeky
   frames instead. Short messages fall back to the classic book.
+* **Memory callback** — the long memory has a life outside the AI, too. When
+  somebody the bot was taught a fact about (`/memory add … user: @them`)
+  speaks, there is a rare chance (`PERSONALITY_MEMORY_CALLBACK_CHANCE`,
+  default 0.05 — roughly once every few hours per person) that Paradise just
+  *quotes the fact back at them*: `"spent a year reaching level 100 in murder
+  mystery" — yeah i remember that, Ash. i keep receipts.` No AI call, no
+  rewriting — the fact is quoted verbatim (cleaned, capped at 90 characters)
+  and only the frame around it is chosen. The same person is safe for half an
+  hour afterwards (`PERSONALITY_MEMORY_CALLBACK_COOLDOWN`, default 1800 s).
+  The joke is the timing, not the volume: it works precisely because it is
+  rare.
 
 At most **one** of these happens per message, and only when the channel is not
 already firing (`PERSONALITY_CHANNEL_COOLDOWN`, default 35 s) and the bot has
@@ -211,6 +223,8 @@ slurs), the guards (distress, opt-out, per-person cooldown), the meme feed
 (validation, NSFW filtering, caching, backoff, garbage payloads) and the GIF
 providers (including the keyless tier and its graceful failure).
 `tests/test_humour.py` covers the interjections, the lord acknowledgements and
-the context roasts; `tests/test_memory.py` the long-term memory and its
-command; `tests/test_aliveness.py` the dead-server watcher — all with an
-injected clock and fetcher, so the suite stays completely offline.
+the context roasts; `tests/test_banter.py` the memory callbacks;
+`tests/test_memory.py` the long-term memory, its command and the Supabase
+mirror (against a fake client); `tests/test_aliveness.py` the dead-server
+watcher — all with an injected clock and fetcher, so the suite stays
+completely offline.

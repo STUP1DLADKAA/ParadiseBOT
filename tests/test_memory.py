@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 import tempfile
@@ -14,6 +15,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from functions.memory import (
     MAX_MEMORY_CHARS,
     MemoryEntry,
+    MemoryMirror,
     MemoryStore,
     clean_memory_text,
 )
@@ -104,10 +106,10 @@ class TestMemoryStore(unittest.TestCase):
 
         hits = self.store.relevant("who plays valorant in this server?")
         self.assertTrue(hits)
-        self.assertEqual(hits[0], "Aryan only plays Valorant")
+        self.assertEqual(hits[0].text, "Aryan only plays Valorant")
 
         hits = self.store.relevant("what does rohan do at night?")
-        self.assertEqual(hits[0], "Rohan sleeps at 4am")
+        self.assertEqual(hits[0].text, "Rohan sleeps at 4am")
 
     def test_relevant_falls_back_to_recent_when_no_overlap(self):
         self.store.add("Aryan only plays Valorant", author_id=LORD_ID)
@@ -126,6 +128,59 @@ class TestMemoryStore(unittest.TestCase):
         for index in range(10):
             self.store.add(f"valorant fact {index}", author_id=LORD_ID)
         self.assertEqual(len(self.store.relevant("valorant", limit=4)), 4)
+
+    def test_for_prompt_prioritises_memories_about_the_people_involved(self):
+        """The 'correct time and spot' rule: memories about whoever is talking
+        (or being talked about) come first, keyword matches after."""
+        self.store.add("the server was founded in 2023", author_id=LORD_ID)
+        self.store.add(
+            "spent more than a year to reach level 100 in murder mystery",
+            author_id=LORD_ID,
+            subject_id=555,
+            subject_name="Rohan",
+        )
+        self.store.add("valorant is the server's main game", author_id=LORD_ID)
+
+        picks = self.store.for_prompt(
+            "what game should we play tonight", subject_ids=(555,)
+        )
+        self.assertEqual(picks[0].subject_id, 555)
+        self.assertIn("murder mystery", picks[0].text)
+        # keyword matches come next, general context last
+        self.assertTrue(
+            any("valorant" in entry.text for entry in picks[1:]),
+            picks,
+        )
+
+    def test_about_returns_only_that_members_memories(self):
+        self.store.add("sleeps at 4am", subject_id=555, subject_name="Rohan")
+        self.store.add("makes great chai", subject_id=556, subject_name="Aryan")
+        self.store.add("the server was founded in 2023")
+        about = self.store.about(555)
+        self.assertEqual(len(about), 1)
+        self.assertEqual(about[0].text, "sleeps at 4am")
+        self.assertEqual(about[0].subject_name, "Rohan")
+        self.assertEqual(self.store.about(0), [])
+        self.assertEqual(self.store.about(99999), [])
+
+    def test_cap_evictions_are_tombstoned_for_the_mirror(self):
+        store = make_store(max_entries=2)
+        try:
+            first = store.add("fact one", author_id=LORD_ID)
+            store.add("fact two", author_id=LORD_ID)
+            third = store.add("fact three", author_id=LORD_ID)
+            self.assertEqual(
+                [entry.text for entry in store.entries()],
+                ["fact three", "fact two"],
+            )
+            tombstones = store.pending_tombstones()
+            self.assertIn(first.id, tombstones)
+            self.assertNotIn(third.id, tombstones)
+            store.drop_tombstones(tombstones)
+            self.assertEqual(store.pending_tombstones(), [])
+        finally:
+            store.close()
+            store._tmp.cleanup()
 
 
 class TestPersistence(unittest.TestCase):
@@ -244,6 +299,77 @@ class TestMemoryCommand(unittest.IsolatedAsyncioTestCase):
             "isn't wired up", interaction.response.send_message.call_args.args[0]
         )
 
+    async def test_add_about_a_member(self):
+        cog = self._cog()
+        interaction = make_interaction(self.LORD_ID)
+        rohan = SimpleNamespace(id=555, display_name="Rohan", name="Rohan")
+        await cog.add.callback(
+            cog, interaction, "spent a year reaching level 100 in murder mystery", rohan
+        )
+        stored = cog.bot.memory.entries()
+        self.assertEqual(len(stored), 1)
+        self.assertEqual(stored[0].subject_id, 555)
+        self.assertEqual(stored[0].subject_name, "Rohan")
+        reply = str(interaction.response.send_message.call_args.args[0])
+        self.assertIn("about **Rohan**", reply)
+        self.assertIn("murder mystery", reply)
+
+    async def test_a_mention_in_the_text_marks_the_subject(self):
+        cog = self._cog()
+        interaction = make_interaction(self.LORD_ID)
+        interaction.guild = SimpleNamespace(
+            get_member=lambda member_id: SimpleNamespace(
+                id=member_id, display_name="Rohan", name="Rohan"
+            )
+            if member_id == 555
+            else None
+        )
+        await cog.add.callback(
+            cog, interaction, "<@555> spent a year reaching level 100", None
+        )
+        stored = cog.bot.memory.entries()
+        self.assertEqual(stored[0].subject_id, 555)
+        self.assertEqual(stored[0].subject_name, "Rohan")
+
+    async def test_the_list_marks_whose_memory_it_is(self):
+        cog = self._cog()
+        cog.bot.memory.add("sleeps at 4am", subject_id=555, subject_name="Rohan")
+        cog.bot.memory.add("the server was founded in 2023")
+        interaction = make_interaction(self.LORD_ID)
+        await cog.list_memories.callback(cog, interaction)
+        listed = str(interaction.response.send_message.call_args.args[0])
+        self.assertIn("[about Rohan] sleeps at 4am", listed)
+        self.assertIn("the server was founded in 2023", listed)
+
+    async def test_mutations_nudge_the_mirror(self):
+        class FakeMirror:
+            def __init__(self):
+                self.reconciles = 0
+
+            async def reconcile(self):
+                self.reconciles += 1
+                return True
+
+        cog = self._cog()
+        mirror = FakeMirror()
+        cog.bot.memory_mirror = mirror
+
+        interaction = make_interaction(self.LORD_ID)
+        await cog.add.callback(cog, interaction, "a fact for the mirror", None)
+        await asyncio.sleep(0.05)  # the nudge is a background task
+        self.assertGreaterEqual(mirror.reconciles, 1)
+
+        interaction = make_interaction(self.LORD_ID)
+        entry = cog.bot.memory.entries()[0]
+        await cog.remove.callback(cog, interaction, entry.id)
+        await asyncio.sleep(0.05)
+        self.assertGreaterEqual(mirror.reconciles, 2)
+
+        interaction = make_interaction(self.LORD_ID)
+        await cog.clear.callback(cog, interaction)
+        await asyncio.sleep(0.05)
+        self.assertGreaterEqual(mirror.reconciles, 3)
+
     async def test_an_empty_list_gets_a_hint(self):
         cog = self._cog()
         interaction = make_interaction(self.LORD_ID)
@@ -252,6 +378,211 @@ class TestMemoryCommand(unittest.IsolatedAsyncioTestCase):
             "haven't taught me anything",
             interaction.response.send_message.call_args.args[0],
         )
+
+
+# ---------------------------------------------------------------------------
+# MemoryMirror — the optional Supabase copy of the memories
+# ---------------------------------------------------------------------------
+
+
+class FakeRemoteTable:
+    """Just enough of the PostgREST chainable builder to fake a table."""
+
+    def __init__(self, remote: "FakeRemoteSupabase"):
+        self._remote = remote
+        self._mode = None
+        self._payload = None
+
+    def select(self, _columns):
+        self._mode = "select"
+        return self
+
+    def order(self, _column):
+        return self
+
+    def upsert(self, payload, on_conflict=None):
+        self._mode = "upsert"
+        self._payload = payload
+        return self
+
+    def delete(self):
+        self._mode = "delete"
+        return self
+
+    def in_(self, _column, ids):
+        self._payload = list(ids)
+        return self
+
+    async def execute(self):
+        if self._mode == "select":
+            return SimpleNamespace(data=[dict(row) for row in self._remote.rows.values()])
+        if self._mode == "upsert":
+            for row in self._payload if isinstance(self._payload, list) else [self._payload]:
+                self._remote.rows[int(row["id"])] = dict(row)
+                self._remote.upserts.append(int(row["id"]))
+            return SimpleNamespace(data=[])
+        if self._mode == "delete":
+            for row_id in self._payload or []:
+                self._remote.rows.pop(int(row_id), None)
+                self._remote.deletes.append(int(row_id))
+            return SimpleNamespace(data=[])
+        raise AssertionError("unexpected query")
+
+
+class FakeRemoteSupabase:
+    """A fake supabase.AsyncClient standing in for the real project."""
+
+    def __init__(self, version: int = MemoryMirror.SCHEMA_VERSION):
+        self.rows: dict[int, dict] = {}
+        self.upserts: list[int] = []
+        self.deletes: list[int] = []
+        self._version = version
+        self.rpc_calls = 0
+
+    def rpc(self, _name):
+        self.rpc_calls += 1
+        remote = self
+
+        class _Rpc:
+            async def execute(self):
+                if remote._version < 0:  # "function does not exist"
+                    raise RuntimeError("function paradise_memory_schema_version "
+                                       "does not exist")
+                return SimpleNamespace(data=remote._version)
+
+        return _Rpc()
+
+    def table(self, _name):
+        return FakeRemoteTable(self)
+
+
+class TestMemoryMirror(unittest.IsolatedAsyncioTestCase):
+    def _mirror(self, store, remote=None, **kwargs):
+        if remote is None:
+            remote = FakeRemoteSupabase()
+        mirror = MemoryMirror(
+            store,
+            url="https://paradise.supabase.co",
+            key="sb-secret-key",
+            interval=15,
+            request_timeout=1.0,
+            client=remote,
+            **kwargs,
+        )
+        return mirror, remote
+
+    async def test_unconfigured_mirror_is_a_noop(self):
+        store = make_store()
+        mirror = MemoryMirror(store)
+        self.assertFalse(mirror.configured)
+        self.assertFalse(await mirror.reconcile())
+        self.assertEqual(store.entries(), [])
+
+    async def test_local_rows_are_pushed_once(self):
+        store = make_store()
+        store.add("paradise remembers the first fact", subject_id=1, subject_name="Ash")
+        mirror, remote = self._mirror(store)
+        self.assertTrue(await mirror.reconcile())
+        self.assertEqual(remote.upserts, [1])
+        # Idempotent: a clean second pass pushes nothing new.
+        self.assertTrue(await mirror.reconcile())
+        self.assertEqual(remote.upserts, [1])
+        self.assertEqual(mirror.metrics["reconciles"], 2)
+
+    async def test_remote_rows_are_pulled_and_ids_continue(self):
+        store = make_store()
+        remote = FakeRemoteSupabase()
+        remote.rows[50] = {
+            "id": 50,
+            "text": "a fact stored on the server",
+            "author_id": 3,
+            "created_at": "2025-01-01T00:00:00+00:00",
+            "subject_id": 7,
+            "subject_name": "Rohan",
+        }
+        mirror, remote = self._mirror(store, remote)
+        self.assertTrue(await mirror.reconcile())
+        pulled = store.entries()
+        self.assertEqual(len(pulled), 1)
+        self.assertEqual(pulled[0].text, "a fact stored on the server")
+        self.assertEqual(pulled[0].subject_name, "Rohan")
+        # The local rowid continues past the imported id.
+        self.assertEqual(store.add("one more").id, 51)
+
+    async def test_rows_deleted_remotely_disappear_locally(self):
+        store = make_store()
+        store.add("temp fact")
+        mirror, remote = self._mirror(store)
+        self.assertTrue(await mirror.reconcile())
+        self.assertEqual(remote.upserts, [1])
+        # Somebody drops the row in the Supabase Dashboard…
+        remote.rows.clear()
+        self.assertTrue(await mirror.reconcile())
+        self.assertEqual(store.entries(), [])
+        # …and the pass after that settles down (no re-push, no crash).
+        self.assertTrue(await mirror.reconcile())
+        self.assertEqual(remote.upserts, [1])
+        self.assertEqual(store.entries(), [])
+
+    async def test_local_deletes_reach_the_remote_table(self):
+        store = make_store()
+        store.add("doomed fact")
+        mirror, remote = self._mirror(store)
+        self.assertTrue(await mirror.reconcile())
+        store.remove(1)
+        self.assertTrue(await mirror.reconcile())
+        self.assertEqual(remote.deletes, [1])
+        # The tombstone is consumed: no delete storm on later passes.
+        self.assertTrue(await mirror.reconcile())
+        self.assertEqual(remote.deletes, [1])
+
+    async def test_a_missing_schema_is_a_logged_noop(self):
+        store = make_store()
+        store.add("fact that stays local")
+        remote = FakeRemoteSupabase(version=-1)
+        mirror, remote = self._mirror(store, remote)
+        self.assertFalse(await mirror.reconcile())
+        self.assertEqual(remote.upserts, [])
+        self.assertEqual(store.entries()[0].text, "fact that stays local")
+        self.assertEqual(mirror.metrics["failures"], 0)
+
+    async def test_an_old_schema_version_blocks_sync(self):
+        store = make_store()
+        remote = FakeRemoteSupabase(version=0)
+        mirror, remote = self._mirror(store, remote)
+        self.assertFalse(await mirror.reconcile())
+        self.assertEqual(remote.upserts, [])
+
+    async def test_run_forever_reconciles_and_stops_cleanly(self):
+        store = make_store()
+        mirror, remote = self._mirror(store)
+        task = asyncio.create_task(mirror.run_forever())
+        await asyncio.sleep(0.05)
+        self.assertGreaterEqual(mirror.metrics["reconciles"], 1)
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        self.assertTrue(remote.rpc_calls >= 1)
+
+    async def test_a_failing_client_is_survived(self):
+        class ExplodingClient(FakeRemoteSupabase):
+            def table(self, _name):
+                raise RuntimeError("supabase is down")
+
+        store = make_store()
+        store.add("a fact")
+        mirror = MemoryMirror(
+            store,
+            url="https://paradise.supabase.co",
+            key="sb-secret-key",
+            interval=15,
+            client=ExplodingClient(),
+        )
+        self.assertFalse(await mirror.reconcile())
+        self.assertEqual(mirror.metrics["failures"], 1)
+        self.assertEqual(store.entries()[0].text, "a fact")
 
 
 if __name__ == "__main__":

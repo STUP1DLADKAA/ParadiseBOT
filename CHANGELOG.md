@@ -34,6 +34,31 @@ All notable changes to Paradise are recorded here. The format follows
   someone who has lived in the server. The command is the lord's alone;
   everyone else is told the memories aren't theirs to touch.
   `functions/memory.py`, `commands/memory.py`.
+- **Memories are about people, and they surface at the right moment.**
+  `/memory add <fact> user:<@member>` (or just mentioning them in the fact)
+  files the memory *under that member*; the AI then sees it only when that
+  member is the one talking, is mentioned in the question, or is the target of
+  a roast — never force-dropped into unrelated replies. `/memory list` marks
+  each entry `[about NAME]`, and old databases migrate in place.
+- **Memories survive a reinstall — Supabase.** With the same
+  `SUPABASE_URL`/`SUPABASE_SECRET_KEY` as the voice tracker and
+  [`supabase/migrations/005_memory.sql`](supabase/migrations/005_memory.sql)
+  applied, every memory is mirrored to the `paradise_memories` table (RLS on,
+  service-role only) and back: new local rows are pushed, rows added in the
+  Dashboard are pulled, rows deleted there disappear here, and the local ids
+  *are* the remote primary keys. SQLite stays the working store; Supabase is
+  the durable copy, reconciled every couple of minutes
+  (`MEMORY_SUPABASE_INTERVAL_SECONDS`) and never on the reply path.
+- **Parallel conversations.** Several members can talk to the bot at once and
+  every one of them gets an answer: AI requests run concurrently up to a small
+  ceiling (4), one member's cooldown no longer gates another's (per-user
+  cooldowns only), short waits are queued instead of dropped, and the one-shot
+  intent classifier never queues behind long answers — it fails over to its
+  fallback the moment the provider is busy.
+- **Memory callbacks in the personality.** Rarely (default 0.05, once every
+  30 minutes per person at most) the bot quotes a remembered fact back at the
+  person it is about — verbatim, cleaned, capped at 90 characters, no AI call.
+  `PERSONALITY_MEMORY_CALLBACK_CHANCE`, `PERSONALITY_MEMORY_CALLBACK_COOLDOWN`.
 - **The aliveness watcher.** Paradise now notices when its own server goes
   quiet. When nobody has typed for 25 minutes (`ALIVENESS_DEAD_AFTER_MINUTES`)
   — or when everyone who was chatting has moved into a voice call — it
