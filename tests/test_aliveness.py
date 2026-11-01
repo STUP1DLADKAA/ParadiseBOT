@@ -471,6 +471,11 @@ class TestAliveCog(unittest.IsolatedAsyncioTestCase):
             intents=SimpleNamespace(presences=False),
         )
         cog = Alive(bot)
+        # Pin the IST wall clock: these tests are about the dead/alive
+        # verdicts, not the hour — without this they silently fail whenever
+        # the real clock happens to sit inside the 01:00-07:00 IST quiet
+        # hours (a CI that runs at night in India would look broken).
+        cog.engine._now_fn = lambda: AWAKE_NOW
         return cog, bot, channel
 
     async def test_a_dead_server_gets_an_ai_line(self):

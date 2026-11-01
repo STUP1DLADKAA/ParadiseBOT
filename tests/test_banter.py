@@ -821,6 +821,25 @@ class TestMemoryCallbacks(unittest.IsolatedAsyncioTestCase):
         self.assertIn("…", sent)
         self.assertLessEqual(len(sent), 190)
 
+    def test_the_frames_never_admit_to_remembering(self):
+        """The bot knew already — it stalks the server. No frame may say
+        "i remember", "you told me", or anything memory-flavoured, and every
+        frame must address the person by name."""
+        for frame in personality_module._MEMORY_CALLBACK_FRAMES:
+            lowered = frame.lower()
+            self.assertIn("{name}", frame)
+            self.assertIn("{memory}", frame)
+            for banned in (
+                "remember",
+                "taught",
+                "told me",
+                "noted",
+                "filed",
+                "memory #",
+                "you told",
+            ):
+                self.assertNotIn(banned, lowered, f"{banned!r} in {frame!r}")
+
     async def test_without_a_store_nothing_happens(self):
         personality = _personality(memory_callback_chance=1.0)
         msg = _make_msg("just chatting here")
