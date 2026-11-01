@@ -37,6 +37,7 @@ from __future__ import annotations
 import re
 
 from functions.calculator import extract_expression, looks_like_math
+from functions.toolkit import MEETTIME_SHAPE
 from functions.conversion import parse_conversion_query
 from functions.conversion.currency import resolve_currency
 from functions.conversion.units import TEMP_UNITS, resolve_unit
@@ -45,7 +46,8 @@ from functions.keywords import keyword_route
 from functions.normalize import normalize_request
 from functions.routes import (
     AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
-    GIF, INFO, MEME, POLL, REMIND, ROAST, SUMMARIZE, UTILITY,
+    DEV, GIF, INFO, MEME, POLL, REMIND, RESEARCH, ROAST, SUMMARIZE, UTILITY,
+    WRITE,
     DETERMINISTIC_KINDS, HELP, HIGH_CONFIDENCE, IMAGE, MEDIUM_CONFIDENCE,
     PING, Route, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
 )
@@ -209,6 +211,16 @@ _FRESH_WORDS = re.compile(
     re.IGNORECASE,
 )
 
+#: Freshness words appear in casual sentences too ("sort of tired today").
+#: The low-confidence fresh lane only claims a request when it also looks
+#: like an information ask — an info noun or an actual question mark.
+_FRESH_INFO_SHAPE = re.compile(
+    r"\b(?:latest|newest|recent|update[sd]?|news|released?|version|patch|"
+    r"score|price[sd]?|rumou?rs?|leak[sd]?|dropped|announced|trailer|"
+    r"episode|chapter|season)\b|[?]",
+    re.IGNORECASE,
+)
+
 _FACTUAL_QUESTION = re.compile(
     r"^(?:who|what|when|where|which|how)\b.*", re.IGNORECASE | re.DOTALL
 )
@@ -344,13 +356,41 @@ _UTILITY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^lorem(?:\s+ipsum)?(?:\s+(?P<args>\d+))?\s*(?:paragraphs?|paras?)?\s*[?!.]*$", re.I), "lorem"),
     (re.compile(r"^(?:(?:make|generate|create|draw|scan)\s+)?(?:me\s+)?(?:a\s+|an\s+)?qr(?:\s+code)?\s*(?:for|of)?\s*(?P<args>.+)$", re.I), "qr"),
     (re.compile(r"^(?:what(?:'s| is|s)?\s+)?(?:the\s+)?(?:colou?r|swatch)\s+(?P<args>#[0-9a-f]{3,8}|(?:\d{1,3}[ ,]+){2}\d{1,3}|[a-z]{3,12})\s*\??$", re.I), "color"),
+    (re.compile(
+        r"^(?:make|create|build|generate|split|divide|shuffle|balance|team)\s+"
+        r"(?:(?:\d+|two|three|four|five|six)\s+)?(?:us\s+)?(?:into\s+)?"
+        r"(?:(?:\d+|two|three|four|five|six)\s+)?(?:balanced\s+|fair\s+|random\s+)?"
+        r"teams?\b[\s:,-]*(?P<args>.+)$", re.I), "teams"),
+    (re.compile(r"^teams?\s*[:,]\s*(?P<args>.+)$", re.I), "teams"),
+    (re.compile(MEETTIME_SHAPE.pattern, re.IGNORECASE), "meettime"),
+    (re.compile(
+        r"^(?:what\s+day\s+(?:of\s+the\s+week\s+)?(?:is|was|will\s+be)|"
+        r"what\s+weekday\s+(?:is|was)|which\s+day\s+(?:is|was))\s+"
+        r"(?!it(?:\s|$)|today|tomorrow|tonight)(?P<args>.+?)\s*[?!.]*$", re.I), "weekday"),
+    (re.compile(
+        r"^(?:make|create|generate|give\s+me)?\s*(?:me\s+)?(?:a\s+)?"
+        r"discord\s+timestamps?\s*(?:for|of)?\s*[:]??\s*(?P<args>.+)$", re.I), "timestamp"),
+    (re.compile(r"^timestamps?\s+(?:for|of)?\s*(?P<args>.+)$", re.I), "timestamp"),
+    (re.compile(
+        r"^(?P<mode>validate|check|verify|format|pretty(?:\s?-?\s?print)?|prettify|"
+        r"beautify|fix)\s+(?:this\s+|my\s+|the\s+)?json\b\s*[:?]?\s*(?P<args>.+)$",
+        re.I), "json"),
+    (re.compile(r"^is\s+(?P<args>\{.*\}|\[.*\])\s+valid\s+json\s*\??$", re.I), "json"),
+    (re.compile(r"^sort\s+(?P<args>[^?]+[,;][^?]*)$", re.I), "sort"),
+    (re.compile(
+        r"^(?:dedupe|deduplicate|remove\s+dup(?:licate)?s?|unique(?:\s+lines?)?)\s*"
+        r"(?:from|in)?\s*(?:this|these|the|my)?\s*[:]??\s*(?P<args>.+)$", re.I), "dedupe"),
+    (re.compile(
+        r"^(?:readability(?:\s+(?:score|check))?|reading\s+level|"
+        r"flesch(?:\s+kincaid)?(?:\s+score)?)\s*(?:of|for|check)?\s*[:]??\s*(?P<args>.+)$",
+        re.I), "readability"),
     (re.compile(r"^(?:how many days|days|countdown)\s+(?:until|till|to)\s+(?P<args>.+?)\s*[?!.]*$", re.I), "countdown"),
     (re.compile(r"^how long until\s+(?P<args>.+?)\s*[?!.]*$", re.I), "countdown"),
 )
 
 # Tools whose args live around the keyword rather than after it (the whole
 # sentence carries the numbers the tool needs).
-_WHOLE_SENTENCE_TOOLS = frozenset({"password", "uuid"})
+_WHOLE_SENTENCE_TOOLS = frozenset({"password", "uuid", "meettime"})
 
 _REMIND = re.compile(
     r"^(?:can you\s+|please\s+|could you\s+)?"
@@ -437,6 +477,201 @@ def _info_route(cleaned: str) -> Route | None:
         # Without a mention, "who is X" is a real question for the AI.
         return Route(kind=INFO, payload=match.group("args"), payload2="whois", confidence=0.9)
     return None
+
+
+# ---------------------------------------------------------------------------
+# Research, writing help and dev help. All of these sit EARLY in the lane
+# order because their shapes are unmistakable ("explain this error", a bare
+# URL, "git undo …") and must not be eaten by the define/search verbs.
+# ---------------------------------------------------------------------------
+
+_URL_WORD = r"https?://\S+"
+
+#: "summarize this link: <url>" / "tl;dr <url>" / "what does this say <url>"
+_LINK_ASK = re.compile(
+    r"^(?:please\s+)?(?:can you\s+)?(?:summar(?:ize|ise)|tl;?dr|explain|"
+    r"whats|what's|what does|read)\s+(?:this|that|the)?\s*"
+    r"(?:link|page|article|url|site|website|thread|post)?\s*[:.]?\s*"
+    r"(?P<url>" + _URL_WORD + r")\s*[?.!]*$",
+    re.IGNORECASE,
+)
+#: A bare URL said at the bot is a "talk about this" request.
+_BARE_URL = re.compile(r"^(?P<url>" + _URL_WORD + r")\s*[?.!]*$", re.IGNORECASE)
+
+#: "compare these phones" — comparison asks retrieve before reasoning.
+_COMPARE_ASK = re.compile(
+    r"^(?:compare|whats\s+better|what's\s+better|which\s+is\s+better)[:\s]+"
+    r"(?P<q>.+?)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+
+_NEWS_ABOUT = re.compile(
+    r"^(?:the\s+)?(?:latest|recent|any|some|today'?s?|this week'?s?)?\s*"
+    r"news\s+(?:about|on|for|regarding)\s+(?P<q>.+?)\s*[?.!]*$",
+    re.IGNORECASE,
+)
+_NEWS_TOPIC = re.compile(
+    r"^(?:latest|recent|new|any)\s+(?P<q>.+?)\s+(?:news|updates?)\s*[?.!]*$",
+    re.IGNORECASE,
+)
+
+_DEV_ERROR = re.compile(
+    r"^(?:explain|fix|whats|what's|what is|what does|help(?: me)? (?:with|fix))\s+"
+    r"(?:this|that|the|my)?\s*(?:error|exception|traceback|stack ?trace|crash log|"
+    r"error log|bug|crash|panic)\b\s*[:,]?\s*(?P<args>.*)$",
+    re.IGNORECASE,
+)
+_DEV_CODE = re.compile(
+    r"^(?:review|check|look (?:at|over)|critique)\s+(?:this|that|my|the)?\s*"
+    r"(?:code|snippet|code snippet|script|function|patch|pr)\b\s*[:,]?\s*(?P<args>.*)$",
+    re.IGNORECASE,
+)
+_DEV_REGEX = re.compile(
+    r"^(?:make|write|build|generate|create|give me)?\s*(?:a\s+)?regex(?:p)?\b"
+    r"(?:\s+(?:for|to match|that matches|to validate|to capture))?\s*[:,]?\s*(?P<args>.+)$",
+    re.IGNORECASE,
+)
+_DEV_GIT = re.compile(r"^git\b[:,]?\s*(?P<args>.+)$", re.IGNORECASE)
+_DEV_SQL = re.compile(
+    r"^(?:write|make|build|fix|help (?:me )?with)\s+(?:a\s+|an\s+)?sql\b\s*[:,]?\s*(?P<args>.*)$"
+    r"|^sql\b[:,]?\s*(?P<args2>.+)$",
+    re.IGNORECASE,
+)
+_DEV_MINECRAFT = re.compile(
+    r"^(?:minecraft|mc|bedrock)\b[:,]?\s*(?P<args>.+)$", re.IGNORECASE
+)
+_DEV_HTTP = re.compile(
+    r"^(?:whats|what's|what is|what does)\s+(?:http\s+|status\s+code\s+|error\s+)?"
+    r"(?P<args>\d{3})\s*(?:error|status|code)?\s*(?:mean|means)?\s*[?.!]*$"
+    r"|^http\s+(?P<args2>\d{3})\b.*$",
+    re.IGNORECASE,
+)
+
+_WRITE_REWRITE = re.compile(
+    r"^(?:rewrite|reword|rephrase|reformulate)\s+(?P<args>.+)$"
+    r"|^make\s+(?:this|that|it)\s+(?P<args2>more\s+\w+|[a-z]+(?:\s+[a-z]+)?)\s*$",
+    re.IGNORECASE,
+)
+_WRITE_ANNOUNCE = re.compile(
+    r"^(?:draft|write|make|compose)\s+(?:me\s+)?an?\s+"
+    r"(?:server\s+)?announcement\b\s*(?:for|about)?\s*[:,]?\s*(?P<args>.*)$",
+    re.IGNORECASE,
+)
+_WRITE_REPLY = re.compile(
+    r"^(?:how\s+(?:do|should)\s+(?:i|we)\s+(?:reply|respond|answer)\s+to|"
+    r"what\s+should\s+(?:i|we)\s+(?:say|reply|respond)(?:\s+to|\s+with)?|"
+    r"help\s+(?:me|us)\s+reply\s+to)\s*[:,]?\s*(?P<args>.+)$",
+    re.IGNORECASE,
+)
+_WRITE_ACTIONS = re.compile(
+    r"^(?:(?:extract|pull|list|get)\s+(?:the\s+)?action\s*items(?:\s+from)?|"
+    r"action\s*items(?:\s+from)?)\b\s*[:,]?\s*(?P<args>.+)$",
+    re.IGNORECASE,
+)
+_WRITE_TONE = re.compile(
+    r"^(?:what(?:'s| is)?\s+(?:the\s+)?tone\s+of|analy[sz]e\s+(?:the\s+)?tone\s+of)\s*[:,]?\s*(?P<args>.+)$",
+    re.IGNORECASE,
+)
+#: Text-shortening only with clear deixis or a genuinely long text —
+#: "summarize the plot of interstellar" is a question, not a document.
+_WRITE_SHORTEN = re.compile(
+    r"^(?:shorten|condense|tighten)\s+(?P<args>.+)$"
+    r"|^(?:summar(?:ize|ise)|tl;?dr)\s+(?:this|that|the following|it)\s*[:,]\s*(?P<args2>.+)$"
+    r"|^(?:summar(?:ize|ise)|tl;?dr)\s+(?P<args3>.{80,})$",
+    re.IGNORECASE,
+)
+_WRITE_EXPAND = re.compile(
+    r"^expand\s+(?:this|that|the following|it)\s*[:,]?\s*(?P<args>.+)$",
+    re.IGNORECASE,
+)
+
+#: Channel-history search ("find the message where taher said hi").
+_FIND_MESSAGE = re.compile(
+    r"^(?:find|search|look\s+for)\s+(?:the\s+|that\s+)?messages?\b\s*"
+    r"(?:where|that|from|by|about|with|containing|mentioning)?\s*[:,]?\s*(?P<args>.+)$"
+    r"|^search\s+(?:this|the)\s+channel\s+(?:for|for:|about)\s+(?P<args2>.+)$",
+    re.IGNORECASE,
+)
+
+
+def _research_route(cleaned: str) -> Route | None:
+    """A web-research request (link summary, news, bare URL), or None."""
+    match = _LINK_ASK.match(cleaned)
+    if match is not None:
+        return Route(kind=RESEARCH, payload=match.group("url"), payload2="link", confidence=0.92)
+    compare = _COMPARE_ASK.match(cleaned)
+    if compare is not None and len(compare.group("q").split()) >= 1:
+        return Route(
+            kind=RESEARCH, payload=compare.group("q"), payload2="answer",
+            confidence=0.85, reason_complex=True,
+        )
+    if _NEWS_ABOUT.match(cleaned) or _NEWS_TOPIC.match(cleaned):
+        query = (
+            (_NEWS_ABOUT.match(cleaned) or _NEWS_TOPIC.match(cleaned)).group("q")
+        )
+        return Route(
+            kind=RESEARCH, payload=query, payload2="news", confidence=0.88, fresh=True
+        )
+    match = _BARE_URL.match(cleaned)
+    if match is not None:
+        return Route(kind=RESEARCH, payload=match.group("url"), payload2="link", confidence=0.85)
+    return None
+
+
+def _write_route(cleaned: str) -> Route | None:
+    """A writing request (rewrite, draft, tone, action items), or None."""
+    for pattern, mode in (
+        (_WRITE_ANNOUNCE, "announcement"),
+        (_WRITE_REPLY, "reply"),
+        (_WRITE_ACTIONS, "actions"),
+        (_WRITE_TONE, "tone"),
+        (_WRITE_REWRITE, "rewrite"),
+        (_WRITE_SHORTEN, "shorten"),
+        (_WRITE_EXPAND, "expand"),
+    ):
+        match = pattern.match(cleaned)
+        if match is None:
+            continue
+        groups = match.groupdict()
+        args = str(
+            groups.get("args") or groups.get("args2") or groups.get("args3") or ""
+        ).strip()
+        if not args:
+            return None
+        return Route(kind=WRITE, payload=args, payload2=mode, confidence=0.88)
+    return None
+
+
+def _dev_route(cleaned: str) -> Route | None:
+    """A dev/Minecraft help request, or None."""
+    for pattern, mode in (
+        (_DEV_ERROR, "error"),
+        (_DEV_CODE, "code"),
+        (_DEV_REGEX, "regex"),
+        (_DEV_GIT, "git"),
+        (_DEV_SQL, "sql"),
+        (_DEV_MINECRAFT, "minecraft"),
+        (_DEV_HTTP, "http"),
+    ):
+        match = pattern.match(cleaned)
+        if match is None:
+            continue
+        groups = match.groupdict()
+        args = str(groups.get("args") or groups.get("args2") or "").strip()
+        return Route(kind=DEV, payload=args, payload2=mode, confidence=0.85)
+    return None
+
+
+def _find_message_route(cleaned: str) -> Route | None:
+    """A channel-history search, or None."""
+    match = _FIND_MESSAGE.match(cleaned)
+    if match is None:
+        return None
+    groups = match.groupdict()
+    args = str(groups.get("args") or groups.get("args2") or "").strip()
+    if not args:
+        return None
+    return Route(kind=INFO, payload=args, payload2="find", confidence=0.88)
 
 
 _GREETING = re.compile(
@@ -548,6 +783,22 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
     if choose_match:
         return Route(kind=CHOOSE, payload=choose_match.group("options").strip(), confidence=0.95)
 
+    # -- research, writing help, dev help and channel-history search: their
+    # shapes are unmistakable, so they claim their requests before the
+    # generic define/search verbs can overthink them.
+    found = _find_message_route(cleaned)
+    if found is not None:
+        return found
+    research = _research_route(cleaned)
+    if research is not None:
+        return research
+    write = _write_route(cleaned)
+    if write is not None:
+        return write
+    dev = _dev_route(cleaned)
+    if dev is not None:
+        return dev
+
     # -- image requests go first: "find me a picture of X" must never be
     # grabbed by the generic "find …" web-search verb below.
     route = _try_image(cleaned)
@@ -605,6 +856,11 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
 
     if _DATE.match(cleaned):
         return Route(kind=DATE, confidence=0.9)
+    if MEETTIME_SHAPE.match(cleaned):
+        # "what time is it in tokyo when it's 8 pm in india" — the meeting-
+        # planner reads the whole sentence, so it must beat the plain time
+        # lane, which would only see "tokyo".
+        return Route(kind=UTILITY, payload=cleaned, payload2="meettime", confidence=0.92)
     for pattern in (_TIME_IN, _TIME_CITY_FIRST):
         match = pattern.match(cleaned)
         if match:
@@ -659,35 +915,47 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
         if term and len(term) <= 40:
             return Route(kind=DEFINE, payload=term, confidence=0.75)
 
-    # -- 8. web search ---------------------------------------------------------
+    # -- 8. web research ---------------------------------------------------------
+    # Search-shaped and freshness-marked asks now go to the research
+    # pipeline (real sources, real links); the assistant falls back to a
+    # direct model answer when the web side is off or unavailable.
     reason_complex = bool(_REASONING_MARKERS.search(cleaned))
     match = _SEARCH_VERB.match(cleaned)
     if match:
         query = match.group("q").strip()
         if query:
             return Route(
-                kind=SEARCH, payload=query, confidence=0.85,
+                kind=RESEARCH, payload=query, payload2="answer", confidence=0.9,
                 fresh=_looks_fresh(query), reason_complex=reason_complex,
             )
     if _looks_fresh(cleaned) and _FACTUAL_QUESTION.match(cleaned):
         return Route(
-            kind=SEARCH, payload=cleaned, confidence=0.7,
+            kind=RESEARCH, payload=cleaned, payload2="news", confidence=0.7,
             fresh=True, reason_complex=reason_complex,
         )
-    if _looks_fresh(cleaned) and not _GREETING.match(cleaned) and len(cleaned.split()) >= 2:
-        # Freshness-marked topics ("latest Minecraft news") are informational,
-        # not conversation — the web answers them better than small-talk.
+    if (
+        _looks_fresh(cleaned)
+        and _FRESH_INFO_SHAPE.search(cleaned)
+        and not _GREETING.match(cleaned)
+        and len(cleaned.split()) >= 2
+    ):
+        # Freshness-marked topics ("latest mcpe") are informational, not
+        # conversation — the web answers them better than small-talk. The
+        # info-shape guard keeps "sort of tired today" out of the web lane.
         return Route(
-            kind=SEARCH, payload=cleaned, confidence=0.6,
+            kind=RESEARCH, payload=cleaned, payload2="news", confidence=0.6,
             fresh=True, reason_complex=reason_complex,
         )
     if reason_complex and _FACTUAL_QUESTION.match(cleaned):
         # Reasoning over facts: retrieve first, then let the AI explain.
-        return Route(kind=SEARCH, payload=cleaned, confidence=0.65, reason_complex=True)
+        return Route(
+            kind=RESEARCH, payload=cleaned, payload2="answer", confidence=0.65,
+            reason_complex=True,
+        )
     if _FACTUAL_QUESTION.match(cleaned) and "?" in cleaned:
         # Plain factual questions ("who won the election") are search-first.
         return Route(
-            kind=SEARCH, payload=cleaned, confidence=0.6,
+            kind=RESEARCH, payload=cleaned, payload2="answer", confidence=0.6,
             fresh=_looks_fresh(cleaned), reason_complex=reason_complex,
         )
 
@@ -740,6 +1008,20 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
     guess = keyword_route(normalized)
     if guess is not None and guess.confidence > best.confidence:
         best = guess
+    if best.kind == SEARCH and best.confidence < _TRUST_STRICT:
+        # The tolerant stage only says SEARCH for genuine search/factual
+        # asks (its casual-freshness path is guarded in keywords.py), so
+        # keep them inside the research pipeline — real sources first, the
+        # model's own answer as the fallback — instead of downgrading to
+        # a bare AI answer.
+        best = Route(
+            kind=RESEARCH,
+            payload=best.payload,
+            payload2="answer",
+            confidence=best.confidence,
+            fresh=best.fresh,
+            reason_complex=best.reason_complex,
+        )
     return best
 
 
@@ -759,7 +1041,7 @@ _MAX_COMPOUND_PARTS = 3
 # Kinds that can take part in a combined answer at all.
 _COMPOUND_KINDS = frozenset(
     {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, SEARCH, DEFINE,
-     MEME, GIF, SUMMARIZE, UTILITY, INFO, REMIND, POLL}
+     MEME, GIF, SUMMARIZE, UTILITY, INFO, REMIND, POLL, RESEARCH}
 )
 # At least one part must be an unambiguous deterministic tool, otherwise the
 # "and" was almost certainly part of a single sentence.
@@ -807,8 +1089,8 @@ def route_many(text: str) -> list[Route]:
 
 __all__ = [
     "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE", "DEFINE",
-    "DETERMINISTIC_KINDS", "HELP", "HIGH_CONFIDENCE", "IMAGE", "MEDIUM_CONFIDENCE",
-    "GIF", "MEME", "PING", "ROAST", "Route", "SEARCH", "SUMMARIZE", "TIME",
-    "TRANSLATE", "UNKNOWN", "WEATHER",
+    "DETERMINISTIC_KINDS", "DEV", "GIF", "HELP", "HIGH_CONFIDENCE", "IMAGE",
+    "MEDIUM_CONFIDENCE", "MEME", "PING", "RESEARCH", "ROAST", "Route", "SEARCH",
+    "SUMMARIZE", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER", "WRITE",
     "route_many", "route_query", "route_strict",
 ]

@@ -7,6 +7,51 @@ All notable changes to Paradise are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- **Real web research, by plain mention.** "search the latest Minecraft
+  update", "latest Minecraft news", "who won the match" now run a keyless
+  research pipeline: DuckDuckGo-lite + Wikipedia search, the top pages
+  fetched and read (SSRF-guarded, text-extracted), then a grounded answer
+  with clickable sources — the model is told to cite [n], never invent a
+  citation, and treat page content as untrusted data (prompt-injection
+  defence). Fetched/returned sources are the only ones ever listed; when
+  the web is off or failing, the same question falls straight back to the
+  direct model answer. Link summaries too: "summarize this link: <url>"
+  (or a bare URL) fetches the page and summarises it, and says so honestly
+  when a site refuses. Configurable via `WEB_SEARCH_*` in .env (all
+  optional, on by default); every search and page is cached and
+  single-flighted so five people asking the same thing cost one fetch.
+- **Writing help, by mention.** "rewrite this to be formal: <text>",
+  "make this sarcastic", "draft an announcement for movie night", "what
+  should I reply to <message>", "action items from <text>", "tone of
+  <text>", "shorten this: <text>" — copy-ready output that keeps the
+  author's voice, on the deep model, with the deixis ("this to be formal:")
+  stripped before the text reaches the model.
+- **Dev & Minecraft help, by mention.** "explain this error: <traceback>",
+  "review my code <snippet>", "regex for <goal>", "git undo last commit",
+  "sql query to …", "minecraft command …", "what does http 429 mean" —
+  text-only reasoning with an explicit never-executes rule; payloads are
+  framed as untrusted data (BEGIN/END untrusted blocks).
+- **Calculator learned lists and equations.** "average of 4 8 15 16 23 42",
+  "sum of 3, 5, and 7", "median of …", "min/max/product of …", and
+  single-variable linear equations ("solve 2x + 3 = 11" → x = 4). Linear
+  equations are verified to be linear (f(0), f(1), f(2)) — x² = 4 is
+  declined honestly instead of guessed; always-true and never-true
+  equations are named as such.
+- **Group utilities, all offline:** random balanced team splitter ("make
+  two teams from A, B, C, D", any count 2–8), cross-timezone meeting
+  planner ("what time is it in Tokyo when it's 8 pm in India", both
+  phrasings, next-occurrence semantics), weekday lookup ("what day was
+  15 august 1947"), copy-ready Discord timestamps ("discord timestamp for
+  tomorrow 8 pm", `<t:…:F>`/`<t:…:R>`), JSON validation with
+  position-precise errors + pretty-printing, list sorting and dedupe, and
+  a Flesch reading-ease / grade-level score.
+- **Channel history search.** "find the message where taher said hello"
+  / "search this channel for pizza" scans the last 300 messages and
+  replies with jump links.
+- **Contextual follow-ups.** "what about london?" right after a
+  time/weather/convert/translate/research ask re-runs the same tool with
+  the new subject (five-minute window, per channel). Only fires when
+  nothing else claims the message, so "roll a d20" still rolls a d20.
 - **~24 new capabilities per plain @ping, all free and offline.** A
   deterministic toolkit (functions/toolkit.py) answers instantly, with no
   API key and no AI: dice (`roll 2d20+3`, `roll a d20`), magic 8-ball,
@@ -31,6 +76,13 @@ All notable changes to Paradise are recorded here. The format follows
   unchanged (`AI_MODEL` still does everything).
 
 ### Changed
+- **Search asks route through research, not just the model.** The router's
+  search/fresh lanes now emit a RESEARCH kind (the assistant falls back to
+  the AI when the web is off); the tolerant keyword stage got the same
+  discipline — "sort of tired today" is conversation, not a web lookup
+  (fresh words alone no longer trigger search unless the sentence also
+  looks like an information ask). Classifier labels learned research,
+  news, link, write/rewrite and devhelp.
 - **Faster for everyone, fairer under load.** Up to 12 AI requests in
   flight at once (up from 8), and a per-member ceiling of 2 concurrent
   requests — one person machine-gunning questions can never starve the

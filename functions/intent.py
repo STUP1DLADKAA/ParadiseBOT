@@ -27,8 +27,9 @@ from dataclasses import dataclass
 from functions.cache import TTLCache
 from functions.helpers import ParadiseError
 from functions.routes import (
-    AI, CALCULATE, CONVERT, DATE, DEFINE, GIF, IMAGE, INFO, MEDIUM_CONFIDENCE,
-    MEME, POLL, REMIND, SEARCH, SUMMARIZE, TIME, TRANSLATE, UTILITY, WEATHER,
+    AI, CALCULATE, CONVERT, DATE, DEFINE, DEV, GIF, IMAGE, INFO,
+    MEDIUM_CONFIDENCE, MEME, POLL, REMIND, RESEARCH, SEARCH, SUMMARIZE,
+    TIME, TRANSLATE, UTILITY, WEATHER, WRITE,
     Route, clamp_confidence,
 )
 
@@ -42,7 +43,13 @@ _INTENT_TO_KIND: dict[str, str] = {
     "time": TIME,
     "date": DATE,
     "image": IMAGE,
-    "search": SEARCH,
+    "search": RESEARCH,
+    "research": RESEARCH,
+    "news": RESEARCH,
+    "link": RESEARCH,
+    "write": WRITE,
+    "rewrite": WRITE,
+    "devhelp": DEV,
     "define": DEFINE,
     "translate": TRANSLATE,
     "dictionary": DEFINE,
@@ -71,6 +78,14 @@ _INTENT_TO_KIND: dict[str, str] = {
 # The toolkit/info sub-tool for labels that carry one, so the classifier can
 # point at the right engine even when the phrasing beat the patterns.
 _INTENT_TOOLS: dict[str, str] = {
+    "research": "answer",
+    "news": "news",
+    "link": "link",
+    "rewrite": "rewrite",
+    "write": "rewrite",
+    "announcement": "announcement",
+    "replyhelp": "reply",
+    "devhelp": "error",
     "countdown": "countdown",
     "dice": "dice",
     "eightball": "eightball",
@@ -126,7 +141,11 @@ class IntentGuess:
         elif kind == AI and self.needs_web:
             kind = SEARCH
         payload = self.query or fallback.payload
-        tool = _INTENT_TOOLS.get(self.intent, "") if kind in (UTILITY, INFO) else ""
+        tool = (
+            _INTENT_TOOLS.get(self.intent, "")
+            if kind in (UTILITY, INFO, RESEARCH, WRITE, DEV)
+            else ""
+        )
         return Route(
             kind=kind,
             payload=payload,

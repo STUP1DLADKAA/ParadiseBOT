@@ -681,6 +681,50 @@ class ImageSearchConfig:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class WebSearchConfig:
+    """Web research for "@Paradise search …" / "summarize this link …".
+
+    Works with zero configuration: DuckDuckGo's key-less endpoints answer
+    the query and Wikipedia's open API backs it up. Every result is
+    cached, every call is time-boxed, and a failing provider degrades to
+    the AI answering from its own knowledge (with a note saying so) —
+    research never breaks a reply.
+
+    Fetched pages are untrusted input: they are stripped, capped and
+    framed as source material so embedded instructions cannot reach the
+    model as commands (see functions/research.py).
+    """
+
+    enabled: bool = True
+    # Per-request deadline for search queries and page fetches.
+    timeout: float = 10.0
+    # How many results to consider (and show as sources).
+    max_results: int = 5
+    # How many of the top results to actually fetch and read.
+    fetch_pages: int = 2
+    # Result cache (queries → results) and page cache (URL → extracted text).
+    cache_ttl: int = 15 * 60
+    cache_size: int = 128
+    # Maximum extracted characters handed to the model per page.
+    page_char_limit: int = 6000
+    # Announce sourced answers with a source footer even when short.
+    show_sources: bool = True
+
+    @classmethod
+    def from_env(cls, env) -> "WebSearchConfig":
+        return cls(
+            enabled=_bool(env.get("WEB_SEARCH_ENABLED"), True),
+            timeout=max(3.0, _float(env.get("WEB_SEARCH_TIMEOUT"), 10.0)),
+            max_results=max(3, min(_int(env.get("WEB_SEARCH_MAX_RESULTS"), 5), 8)),
+            fetch_pages=max(0, min(_int(env.get("WEB_SEARCH_FETCH_PAGES"), 2), 3)),
+            cache_ttl=max(60, _int(env.get("WEB_SEARCH_CACHE_TTL"), 15 * 60)),
+            cache_size=max(8, _int(env.get("WEB_SEARCH_CACHE_SIZE"), 128)),
+            page_char_limit=max(1000, _int(env.get("WEB_SEARCH_PAGE_CHARS"), 6000)),
+            show_sources=_bool(env.get("WEB_SEARCH_SHOW_SOURCES"), True),
+        )
+
+
 class AIModelSpec:
     """One OpenAI-compatible model and the role it is best at.
 
@@ -830,6 +874,9 @@ class Config:
     # Web image search for mention requests ("show me a picture of …").
     image_search: ImageSearchConfig = ImageSearchConfig()
 
+    # Web research: search, source-backed answers, link summaries.
+    web_search: WebSearchConfig = WebSearchConfig()
+
     # Where preloaded speech clips are cached on disk (default data/tts_cache).
     tts_cache_dir: str = ""
 
@@ -902,6 +949,7 @@ class Config:
             voice_clip=VoiceClipConfig.from_env(env),
             minigames=MiniGamesConfig.from_env(env),
             image_search=ImageSearchConfig.from_env(env),
+            web_search=WebSearchConfig.from_env(env),
             prewarm=_bool(env.get("PREWARM_ON_START"), True),
             guild_id=max(0, _int(env.get("DISCORD_GUILD_ID"), 0)),
             edit_user_ids=_ids(env.get("EDIT_ALLOWED_USER_IDS")),

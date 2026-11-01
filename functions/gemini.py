@@ -68,10 +68,16 @@ CLASSIFY_SYSTEM = (
     'Schema: {"intent":"calculate|convert|weather|time|date|image|search|'
     'define|translate|recipe|summarize|meme|gif|remind|poll|whois|avatar|'
     'serverinfo|countdown|dice|eightball|password|qr|rps|uuid|utility|'
+    'research|news|link|write|rewrite|devhelp|'
     'chat|unknown","query":"the cleaned request for that tool",'
     '"needs_web":true|false,"needs_image":true|false,"confidence":0.0-1.0}\n'
     "Guidance: 'image' means the user wants to SEE a real photo. 'search' "
-    "means it needs current or external facts. 'summarize' means a recap of "
+    "means it needs current or external facts. 'research' means a web lookup "
+    "with sources; 'news' means fresh updates about a topic; 'link' means "
+    "summarise a URL the user pasted. 'write'/'rewrite' means help drafting "
+    "or rewording text (announcements, replies, tone changes). 'devhelp' "
+    "means explain an error, review code, regex, git, SQL or Minecraft. "
+    "'summarize' means a recap of "
     "the recent conversation in this channel. 'meme' and 'gif' mean the user "
     "wants one sent. 'remind' means set a reminder later ('remind me in 20 "
     "minutes to X'). 'poll' means start a reaction poll. 'whois', 'avatar' "

@@ -12,15 +12,19 @@ import os
 import re
 import sys
 import unittest
+from datetime import date, datetime, timezone
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from functions.helpers import ParadiseError  # noqa: E402
 from functions.toolkit import (  # noqa: E402
-    ToolResult, base64_decode, base64_encode, caesar, color_card, count_text,
-    countdown, dice_roll, eightball, emojify, format_duration, hash_text,
-    lorem_ipsum, make_password, make_uuids, mock_text, morse_decode,
-    morse_encode, parse_duration, qr_png, random_number, reverse_text,
-    rock_paper_scissors, run_tool, spoiler_text,
+    MEETTIME_SHAPE, ToolResult, base64_decode, base64_encode, caesar,
+    color_card, count_text, countdown, dedupe_list, dice_roll, discord_timestamp,
+    eightball, emojify, format_duration, hash_text, json_tool, lorem_ipsum,
+    make_password, make_teams, make_uuids, meeting_time, mock_text,
+    morse_decode, morse_encode, parse_duration, qr_png, random_number,
+    readability_score, reverse_text, rock_paper_scissors, run_tool,
+    sort_list, spoiler_text, weekday_of,
 )
 
 
@@ -253,3 +257,175 @@ class TestRunToolNeverRaises(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Group utilities: teams, meeting times, weekdays, timestamps
+# ---------------------------------------------------------------------------
+
+
+class TestTeamGeneration(unittest.TestCase):
+    def test_two_teams_from_a_comma_list(self):
+        line = make_teams("make two teams from taher, stupid, ash, kabir")
+        self.assertIn("2 teams", line)
+        for name in ("taher", "stupid", "ash", "kabir"):
+            self.assertIn(name, line)
+        # every name appears exactly once (balanced split, no doubles)
+        for name in ("taher", "stupid", "ash", "kabir"):
+            self.assertEqual(line.count(name), 1)
+
+    def test_three_teams_from_a_space_list(self):
+        line = make_teams("split into 3 teams: taher stupid ash kabir ron zed")
+        self.assertIn("3 teams", line)
+        for name in ("taher", "stupid", "ash", "kabir", "ron", "zed"):
+            self.assertIn(name, line)
+
+    def test_lead_in_words_are_not_team_members(self):
+        line = make_teams("make two teams from taher, stupid, ash, kabir")
+        for junk in ("make", "from", "teams"):
+            self.assertNotIn(f"**{junk}", line)
+
+    def test_too_few_people_is_a_friendly_error(self):
+        with self.assertRaises(ParadiseError):
+            make_teams("make two teams from taher")
+
+
+class TestMeetingTime(unittest.TestCase):
+    NOW = datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc)  # 15:30 IST
+
+    def test_tokyo_when_8pm_india(self):
+        line = meeting_time(
+            "what time is it in tokyo when it's 8 pm in india", now=self.NOW
+        )
+        self.assertIn("11:30 PM", line)
+        self.assertIn("JST", line)
+
+    def test_reverse_phrasing(self):
+        line = meeting_time(
+            "if it's 9:30 am in london what's the time in new york", now=self.NOW
+        )
+        self.assertIn("4:30 AM", line)
+
+    def test_unknown_zone_is_a_friendly_error(self):
+        with self.assertRaises(ParadiseError):
+            meeting_time("what time is it in hogwarts when it's 8 pm in india")
+
+    def test_unparseable_shape_is_a_friendly_error(self):
+        with self.assertRaises(ParadiseError):
+            meeting_time("what time is pizza")
+
+    def test_shape_constant_covers_both_phrasings(self):
+        self.assertTrue(
+            MEETTIME_SHAPE.match("what time is it in tokyo when it's 8 pm in india")
+        )
+        self.assertTrue(
+            MEETTIME_SHAPE.match("if it's 8 pm in india what's the time in tokyo")
+        )
+        self.assertFalse(MEETTIME_SHAPE.match("what time is it in tokyo"))
+
+
+class TestWeekdayLookup(unittest.TestCase):
+    def test_famous_dates(self):
+        self.assertIn("Friday", weekday_of("15 aug 1947"))
+        self.assertIn("Sunday", weekday_of("2026-11-01"))
+
+    def test_month_day_forms(self):
+        self.assertIn("Friday", weekday_of("25 dec", today=date(2026, 11, 2)))
+
+    def test_relative_days(self):
+        self.assertIn("Tuesday", weekday_of("tomorrow", today=date(2026, 11, 2)))
+        self.assertIn("Monday", weekday_of("today", today=date(2026, 11, 2)))
+
+    def test_weekday_names(self):
+        self.assertIn("Friday", weekday_of("friday", today=date(2026, 11, 2)))
+
+
+class TestDiscordTimestamp(unittest.TestCase):
+    def test_tomorrow_evening(self):
+        line = discord_timestamp(
+            "tomorrow 8 pm", now=datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc)
+        )
+        self.assertIn("<t:1793629800:F>", line)
+        self.assertIn("<t:1793629800:R>", line)
+
+    def test_date_with_time_is_not_confused_by_day_numbers(self):
+        line = discord_timestamp(
+            "25 dec 2026 8 pm", now=datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc)
+        )
+        # 25 Dec 2026 20:00 IST
+        self.assertIn("<t:1798209000:F>", line)
+
+    def test_nothing_given_is_a_friendly_error(self):
+        with self.assertRaises(ParadiseError):
+            discord_timestamp("")
+
+
+# ---------------------------------------------------------------------------
+# Text utilities: json, sorting, dedupe, readability
+# ---------------------------------------------------------------------------
+
+
+class TestJsonTool(unittest.TestCase):
+    def test_valid_json_is_pretty_printed(self):
+        line = json_tool('{"b":2,"a":[1,2]}')
+        self.assertIn("valid JSON", line)
+        self.assertIn('"a"', line)
+
+    def test_validate_mode_skips_the_printout(self):
+        line = json_tool('validate {"a": 1}')
+        self.assertIn("valid JSON", line)
+        self.assertNotIn("```", line)
+
+    def test_invalid_json_reports_position_and_hint(self):
+        line = json_tool("{'a': 1}")
+        self.assertIn("not valid JSON", line)
+        self.assertIn("double quotes", line)
+
+    def test_empty_payload_is_a_friendly_error(self):
+        with self.assertRaises(ParadiseError):
+            json_tool("")
+
+
+class TestSortAndDedupe(unittest.TestCase):
+    def test_sort_words_and_numbers(self):
+        self.assertIn("apple, banana, cherry", sort_list("banana, apple, cherry"))
+        self.assertIn("3, 17, 42", sort_list("42, 17, 3"))
+
+    def test_sort_strips_list_prefixes(self):
+        self.assertIn("apple, banana", sort_list("these lines: banana, apple"))
+
+    def test_sort_needs_a_list(self):
+        with self.assertRaises(ParadiseError):
+            sort_list("banana")
+
+    def test_dedupe_preserves_order_and_counts_removals(self):
+        line = dedupe_list("pizza, pizza, burger, Pizza, tacos")
+        self.assertIn("2 duplicates gone", line)
+        self.assertIn("pizza, burger, tacos", line)
+
+    def test_dedupe_with_no_duplicates_says_so(self):
+        self.assertIn("already unique", dedupe_list("a, b, c"))
+
+
+class TestReadability(unittest.TestCase):
+    def test_simple_prose_scores_high(self):
+        line = readability_score(
+            "The cat sat on the mat. The dog ran in the park. We all had "
+            "fun that day. It was a good time for everyone."
+        )
+        self.assertIn("readability", line)
+        self.assertIn("grade level", line)
+
+    def test_dense_prose_scores_low(self):
+        dense = (
+            "Notwithstanding the aforementioned considerations, the "
+            "institutional framework necessitates comprehensive "
+            "operational realignment methodologies. Furthermore, the "
+            "aforementioned paradigms obviate unilateral determinations "
+            "heretofore undertaken."
+        )
+        self.assertIn("dense", readability_score(dense).casefold())
+
+    def test_too_short_is_a_friendly_error(self):
+        with self.assertRaises(ParadiseError):
+            readability_score("too short")

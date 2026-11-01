@@ -15,12 +15,23 @@ from __future__ import annotations
 import base64
 import hashlib
 import io
+import json
+import random
 import re
 import secrets
 import string
 from dataclasses import dataclass
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 
 from functions.helpers import ParadiseError
+from functions.time import resolve_timezone
+
+#: The friend group's home timezone — used to interpret bare clock times
+#: ("8 pm") when the asker doesn't name a zone. Discord renders every
+#: timestamp in each viewer's own zone anyway, so this only fixes what
+#: the *input* means.
+_HOME_ZONE = "Asia/Kolkata"
 
 # ---------------------------------------------------------------------------
 # Result type
@@ -49,6 +60,8 @@ TOOL_KEYS = frozenset(
         "reverse", "mock", "count", "cipher", "base64", "hash", "morse",
         "emojify", "spoiler", "uuid", "password", "rng", "dice",
         "eightball", "rps", "lorem", "qr", "color", "countdown",
+        "teams", "meettime", "weekday", "timestamp", "json", "sort", "dedupe",
+        "readability",
     }
 )
 
@@ -585,6 +598,409 @@ def format_duration(seconds: float) -> str:
     return f"{days}d" if hours == 0 else f"{days}d {hours}h"
 
 
+# ---------------------------------------------------------------------------
+# Group utilities: teams, meeting times, dates, timestamps
+# ---------------------------------------------------------------------------
+
+_TEAM_COUNT_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5, "six": 6}
+
+
+def make_teams(args: str) -> str:
+    """Split a list of names into random, evenly balanced teams."""
+    value = " ".join(str(args or "").split())
+    count = 2
+    match = re.search(
+        r"(?:(?P<num>\d+)|(?P<word>two|three|four|five|six))\s+teams",
+        value, re.IGNORECASE,
+    )
+    if match:
+        count = (
+            int(match.group("num")) if match.group("num")
+            else _TEAM_COUNT_WORDS[match.group("word").casefold()]
+        )
+    count = min(max(count, 2), 8)
+    # Everything up to and including the "teams" keyword is lead-in
+    # ("make two teams from …", "split into 3 teams: …") — drop it, then
+    # read the names that follow.
+    keyword = re.search(r"\bteams?\b[\s:,-]*", value, re.IGNORECASE)
+    cleaned = value[keyword.end():] if keyword else value
+    cleaned = re.sub(
+        r"^(?:from|of|out of|with|for)?[\s:,]+", "", cleaned, flags=re.IGNORECASE
+    )
+    names = [n.strip(" .") for n in re.split(r"[,;]+|\s+and\s+", cleaned) if n.strip(" .")]
+    if len(names) == 1 and " " in names[0]:
+        names = names[0].split()
+    names = [n for n in names if n and n.casefold() not in ("teams", "team")]
+    if len(names) < 2:
+        raise ParadiseError("give me the people — 'make two teams from taher, stupid, ash'.")
+    random.shuffle(names)
+    teams: list[list[str]] = [[] for _ in range(min(count, len(names)))]
+    for index, name in enumerate(names):
+        teams[index % len(teams)].append(name)
+    lines = [f"⚔️ **{len(teams)} teams**, randomised and balanced:"]
+    for number, team in enumerate(teams, 1):
+        lines.append(f"**Team {number}:** {', '.join(team)}")
+    lines.append("*(rerun to shuffle again — I take no responsibility for the result)*")
+    return "\n".join(lines)
+
+
+_MEETTIME_RE1 = re.compile(
+    r"^what(?:'s| is)? (?:the )?time (?:is it )?in (?P<target>.+?) "
+    r"(?:when|if) it(?:'?s| is) (?P<when>.+?) in (?P<source>.+?)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_MEETTIME_RE2 = re.compile(
+    r"^(?:if|when) it(?:'?s| is) (?P<when>.+?) in (?P<source>.+?)\s*"
+    r"what(?:'s| is)?\s+(?:the\s+)?time\s+(?:is\s+it\s+)?in\s+"
+    r"(?P<target>.+?)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+#: One compiled shape covering both meeting-time phrasings, for the router.
+#: Group names are stripped so the two alternatives can share one pattern.
+MEETTIME_SHAPE = re.compile(
+    "(?:%s)|(?:%s)" % (
+        re.sub(r"\(\?P<\w+>", "(?:", _MEETTIME_RE1.pattern),
+        re.sub(r"\(\?P<\w+>", "(?:", _MEETTIME_RE2.pattern),
+    ),
+    re.IGNORECASE,
+)
+
+_WALL_TIME = re.compile(
+    r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ampm>a\.?m\.?|p\.?m\.?)?",
+    re.IGNORECASE,
+)
+
+
+def _parse_wall_time(when: str) -> tuple[int, int]:
+    match = _WALL_TIME.search(when)
+    if match is None:
+        raise ParadiseError("what time exactly? try 'when it's 8 pm in india'.")
+    hour = int(match.group("h"))
+    minute = int(match.group("m") or 0)
+    ampm = (match.group("ampm") or "").replace(".", "")
+    if ampm:
+        if not 1 <= hour <= 12:
+            raise ParadiseError("that clock time doesn't exist.")
+        if ampm.casefold().startswith("p") and hour < 12:
+            hour += 12
+        elif ampm.casefold().startswith("a") and hour == 12:
+            hour = 0
+    elif not 0 <= hour <= 23:
+        raise ParadiseError("that clock time doesn't exist.")
+    if not 0 <= minute < 60:
+        raise ParadiseError("that clock time doesn't exist.")
+    return hour, minute
+
+
+def _zone_or_error(name: str) -> str:
+    zone = resolve_timezone(name.strip())
+    if zone is None:
+        raise ParadiseError(f"I don't know the timezone '{name.strip()}'.")
+    return zone
+
+
+def meeting_time(text: str, *, now: datetime | None = None) -> str:
+    """"what time is it in tokyo when it's 8 pm in india" → the answer."""
+    value = " ".join(str(text or "").split())
+    match = _MEETTIME_RE1.match(value) or _MEETTIME_RE2.match(value)
+    if match is None:
+        raise ParadiseError(
+            "try 'what time is it in tokyo when it's 8 pm in india'."
+        )
+    hour, minute = _parse_wall_time(match.group("when"))
+    source_zone = _zone_or_error(match.group("source"))
+    target_zone = _zone_or_error(match.group("target"))
+    now_source = (now or datetime.now(tz=ZoneInfo("UTC"))).astimezone(ZoneInfo(source_zone))
+    moment = now_source.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    if moment <= now_source:  # that time already passed today — take tomorrow's
+        moment += timedelta(days=1)
+    target_moment = moment.astimezone(ZoneInfo(target_zone))
+    clock = "%I:%M %p"
+    src_abbr = moment.tzname() or source_zone
+    tgt_abbr = target_moment.tzname() or target_zone
+    if moment.date() == target_moment.date():
+        day_note = "same day"
+    elif target_moment.date() > moment.date():
+        day_note = "next day over there"
+    else:
+        day_note = "previous day over there"
+    return (
+        f"🕒 {moment.strftime(clock).lstrip('0')} {src_abbr} in "
+        f"{match.group('source').strip().title()} = "
+        f"**{target_moment.strftime(clock).lstrip('0')} {tgt_abbr}** in "
+        f"{match.group('target').strip().title()} — {day_note}."
+    )
+
+
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+
+def _parse_date_value(value: str, *, today: date | None = None) -> date:
+    """'25 dec 2026' / 'dec 25 2026' / '2026-12-25' / '25/12/2026' / 'tomorrow'."""
+    clean = " ".join(str(value or "").strip().casefold().split())
+    if not clean:
+        raise ParadiseError("which date?")
+    today = today or date.today()
+    if clean in ("today",):
+        return today
+    if clean in ("tomorrow",):
+        return today + timedelta(days=1)
+    if clean in ("yesterday",):
+        return today - timedelta(days=1)
+    # ISO (2026-11-01) and day-first numeric (25/12/2026, 25.12) forms,
+    # where two bare numbers mean day and month.
+    match = re.fullmatch(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", clean)
+    if match:
+        year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+        try:
+            return date(year, month, day)
+        except ValueError:
+            raise ParadiseError(
+                "that date doesn't exist on any calendar I respect."
+            ) from None
+    match = re.fullmatch(r"(\d{1,2})[-/.](\d{1,2})(?:[-/.](\d{4}))?", clean)
+    if match:
+        day, month = int(match.group(1)), int(match.group(2))
+        year = int(match.group(3)) if match.group(3) else today.year
+        try:
+            parsed = date(year, month, day)
+        except ValueError:
+            raise ParadiseError(
+                "that date doesn't exist on any calendar I respect."
+            ) from None
+        if year == today.year and (parsed - today).days < -90:
+            try:
+                return date(year + 1, month, day)
+            except ValueError:
+                return parsed
+        return parsed
+
+    tokens = clean.replace("-", " ").replace("/", " ").replace(",", " ").split()
+    day = month = None
+    year = today.year
+    for token in tokens:
+        if _month_number(token):
+            month = _month_number(token)
+        elif len(token) == 4 and token.isdigit():
+            year = int(token)
+        elif token.isdigit() and day is None and 1 <= int(token) <= 31:
+            day = int(token)
+        elif token in _WEEKDAYS:
+            delta = (_WEEKDAYS[token] - today.weekday()) % 7 or 7
+            return today + timedelta(days=delta)
+    if day is None or month is None:
+        raise ParadiseError("try a full date — '25 dec 2026' or 'friday'.")
+    try:
+        parsed = date(year, month, day)
+    except ValueError:
+        raise ParadiseError("that date doesn't exist on any calendar I respect.") from None
+    if year == today.year and (parsed - today).days < -90:
+        # "1 jan" said in November clearly means the next one.
+        try:
+            return date(year + 1, month, day)
+        except ValueError:
+            return parsed
+    return parsed
+
+
+def weekday_of(args: str, *, today: date | None = None) -> str:
+    """'what day was 15 aug 1947' → the weekday of a date."""
+    today = today or date.today()
+    parsed = _parse_date_value(args, today=today)
+    when = "today" if parsed == today else (
+        "tomorrow" if parsed == today + timedelta(days=1) else parsed.strftime("%d %B %Y")
+    )
+    return f"📅 **{parsed.strftime('%A')}** — {when}."
+
+
+def discord_timestamp(args: str, *, now: datetime | None = None) -> str:
+    """A copy-ready `<t:…:F>` Discord timestamp for a date/time."""
+    value = " ".join(str(args or "").split())
+    if not value:
+        raise ParadiseError("timestamp for when? try 'discord timestamp tomorrow 8 pm'.")
+    # Optional explicit zone at the end ("… in tokyo", "… ist", "… america/new_york").
+    zone_name = None
+    zone_match = re.search(r"\b(?:in|at)\s+(?P<zone>[a-z_ /]+)$", value, re.IGNORECASE)
+    if zone_match:
+        candidate = resolve_timezone(zone_match.group("zone"))
+        if candidate:
+            zone_name = candidate
+            value = value[: zone_match.start()].strip()
+    # Clock time, if any. A bare number next to a month name ("25 dec") is a
+    # date, not a clock — only an explicit "8 pm" / "18:30" counts as time.
+    hour = minute = None
+    time_match = None
+    for candidate in _WALL_TIME.finditer(value):
+        has_ampm = bool((candidate.group("ampm") or "").strip())
+        has_colon = candidate.group("m") is not None
+        if has_ampm or has_colon:
+            time_match = candidate
+            break
+    if time_match is not None:
+        try:
+            hour, minute = _parse_wall_time(time_match.group(0))
+            value = (value[: time_match.start()] + " " + value[time_match.end():]).strip()
+        except ParadiseError:
+            hour = minute = None
+    # Remaining words are the day.
+    day = _parse_date_value(value or "today")
+    zone = ZoneInfo(zone_name or _HOME_ZONE)
+    moment = datetime(
+        day.year, day.month, day.day, hour if hour is not None else 0,
+        minute or 0, tzinfo=zone,
+    )
+    stamp = int(moment.timestamp())
+    human = moment.strftime("%a %d %b %Y, %I:%M %p").replace(" 0", " ")
+    zone_note = "" if zone_name else " *(read your input as India time)*"
+    return (
+        f"⏱️ {human}:\n"
+        f"full: `<t:{stamp}:F>` → <t:{stamp}:F>\n"
+        f"relative: `<t:{stamp}:R>` → <t:{stamp}:R>{zone_note}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Text utilities: json, sorting, dedupe, readability
+# ---------------------------------------------------------------------------
+
+
+def json_tool(args: str) -> str:
+    """Validate (and pretty-print) a JSON payload."""
+    payload = str(args or "").strip()
+    mode = "format"
+    verb = re.match(
+        r"(validate|check|verify|format|pretty\s?-?\s?print|prettify|beautify|fix)\s+",
+        payload, re.IGNORECASE,
+    )
+    if verb:
+        mode = "validate" if verb.group(1).casefold() in (
+            "validate", "check", "verify"
+        ) else "format"
+        payload = payload[verb.end():].strip()
+    if not payload:
+        raise ParadiseError("paste the JSON after it — 'validate json {\"a\": 1}'.")
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError as error:
+        hint = ""
+        if "Expecting" in error.msg and chr(39) in payload:
+            hint = " — JSON wants double quotes, not single ones"
+        elif "Expecting" in error.msg and re.search(r"[,{]\s*[a-z_]\s*:", payload):
+            hint = " — keys need quotes around them"
+        return f"not valid JSON: {error.msg} at position {error.pos}.{hint}"
+    if mode == "validate":
+        kind = type(parsed).__name__
+        if isinstance(parsed, dict):
+            kind = f"object with {len(parsed)} keys"
+        elif isinstance(parsed, list):
+            kind = f"array with {len(parsed)} items"
+        return f"✅ valid JSON — {kind}."
+    pretty = json.dumps(parsed, indent=2, ensure_ascii=False)
+    if len(pretty) > 1600:
+        pretty = pretty[:1600] + "\n… (trimmed — it's long)"
+    return f"✅ valid JSON:\n```json\n{pretty}\n```"
+
+
+def _split_list(args: str) -> list[str]:
+    cleaned = re.sub(
+        r"^(?:sort|dedupe|deduplicate|unique|remove\s+duplicates?)?\s*"
+        r"(?:these|this|that|the|my)?\s*"
+        r"(?:lines?|list|items?|numbers?|names?|values?|duplicates?)?"
+        r"\s*(?:from|in)?\s*[:,-]?\s*",
+        "", str(args or "").strip(), count=1, flags=re.IGNORECASE,
+    )
+    items = [t.strip() for t in re.split(r"[,;]+", cleaned) if t.strip()]
+    if len(items) < 2:
+        raise ParadiseError("give me a comma-separated list — 'sort b, c, a'.")
+    return items
+
+
+def _is_numberish(token: str) -> bool:
+    try:
+        float(token.strip().replace(",", ""))
+    except ValueError:
+        return False
+    return True
+
+
+def sort_list(args: str) -> str:
+    """Sort a comma-separated list (numbers or words)."""
+    items = _split_list(args)
+    if all(_is_numberish(t) for t in items):
+        ordered = [t for _, t in sorted(
+            ((float(t.replace(",", "")), t) for t in items), key=lambda pair: pair[0]
+        )]
+    else:
+        ordered = sorted(items, key=str.casefold)
+    return "🔢 " + ", ".join(ordered)
+
+
+def dedupe_list(args: str) -> str:
+    """Remove duplicates from a comma-separated list, keeping order."""
+    items = _split_list(args)
+    seen: set[str] = set()
+    unique: list[str] = []
+    for item in items:
+        key = item.casefold()
+        if key not in seen:
+            seen.add(key)
+            unique.append(item)
+    removed = len(items) - len(unique)
+    if removed == 0:
+        return f"🧹 no duplicates — all {len(unique)} were already unique."
+    plural = "s" if removed > 1 else ""
+    return f"🧹 {removed} duplicate{plural} gone:\n" + ", ".join(unique)
+
+
+def _count_syllables(word: str) -> int:
+    """Vowel-group heuristic; good enough for Flesch scoring."""
+    clean = re.sub(r"[^a-z]", "", word.casefold())
+    if not clean:
+        return 0
+    groups = re.findall(r"[aeiouy]+", clean)
+    if clean.endswith("e") and len(groups) > 1 and not clean.endswith(("le", "ee", "ye")):
+        groups = groups[:-1]
+    return max(1, len(groups))
+
+
+def readability_score(text: str) -> str:
+    """Flesch reading ease + Flesch–Kincaid grade for a passage."""
+    value = " ".join(str(text or "").split())
+    if len(value.split()) < 8:
+        raise ParadiseError("give me a proper paragraph — at least a sentence or two.")
+    sentences = [s for s in re.split(r"[.!?]+", value) if s.strip()]
+    words = re.findall(r"[\w'-]+", value)
+    syllables = sum(_count_syllables(w) for w in words)
+    if not sentences or not words:
+        raise ParadiseError("that doesn't look like prose.")
+    words_per_sentence = len(words) / len(sentences)
+    syllables_per_word = syllables / len(words)
+    ease = 206.835 - 1.015 * words_per_sentence - 84.6 * syllables_per_word
+    grade = 0.39 * words_per_sentence + 11.8 * syllables_per_word - 15.59
+    ease = max(0.0, min(100.0, ease))
+    if ease >= 90:
+        verdict = "very easy — a kid could read it"
+    elif ease >= 70:
+        verdict = "plain English — most people cruise through it"
+    elif ease >= 60:
+        verdict = "plain English, slightly dense"
+    elif ease >= 50:
+        verdict = "fairly dense — high-school territory"
+    elif ease >= 30:
+        verdict = "dense — university territory"
+    else:
+        verdict = "very dense — legalese vibes, nobody's reading this for fun"
+    return (
+        f"📖 readability: **{ease:.0f}/100** — {verdict}.\n"
+        f"grade level ~**{max(1, round(grade))}** • "
+        f"{len(words)} words • {len(sentences)} sentences • "
+        f"{words_per_sentence:.1f} words/sentence"
+    )
+
+
 def run_tool(key: str, args: str, *, author: str = "") -> ToolResult:
     """Run one toolkit tool. Returns a chat line; never raises for bad input."""
     args = " ".join(str(args or "").split())
@@ -633,6 +1049,22 @@ def run_tool(key: str, args: str, *, author: str = "") -> ToolResult:
             return ToolResult(line, image=png or None, filename="color.png")
         if key == "countdown":
             return ToolResult(countdown(args))
+        if key == "teams":
+            return ToolResult(make_teams(args))
+        if key == "meettime":
+            return ToolResult(meeting_time(args))
+        if key == "weekday":
+            return ToolResult(weekday_of(args))
+        if key == "timestamp":
+            return ToolResult(discord_timestamp(args))
+        if key == "json":
+            return ToolResult(json_tool(args))
+        if key == "sort":
+            return ToolResult(sort_list(args))
+        if key == "dedupe":
+            return ToolResult(dedupe_list(args))
+        if key == "readability":
+            return ToolResult(readability_score(args))
     except ParadiseError as error:
         return ToolResult(f"• {error}")
     return ToolResult(

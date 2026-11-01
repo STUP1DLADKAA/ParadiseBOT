@@ -14,9 +14,9 @@ import unittest
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from functions.router import (
-    AI, CALCULATE, CHOOSE, CONVERT, DATE, DEFINE, GIF, HELP, IMAGE, INFO,
-    MEME, POLL, REMIND, ROAST, SEARCH, SUMMARIZE, TIME, TRANSLATE, UTILITY,
-    WEATHER, route_many, route_query,
+    AI, CALCULATE, CHOOSE, CONVERT, DATE, DEFINE, DEV, GIF, HELP, IMAGE, INFO,
+    MEME, POLL, REMIND, RESEARCH, ROAST, SUMMARIZE, TIME, TRANSLATE, UTILITY,
+    WEATHER, WRITE, route_many, route_query,
 )
 
 
@@ -39,18 +39,21 @@ class TestRouter(unittest.TestCase):
             self.assertTrue(route.payload)
 
     def test_search(self):
+        # Search verbs now feed the research pipeline (real sources);
+        # the assistant falls back to a plain model answer when the web
+        # side is off or failing.
         route = self.route("search latest Minecraft update")
-        self.assertEqual(route.kind, SEARCH)
+        self.assertEqual(route.kind, RESEARCH)
         self.assertIn("minecraft", route.payload.casefold())
 
         route = self.route("search latest iPhone")
-        self.assertEqual(route.kind, SEARCH)
+        self.assertEqual(route.kind, RESEARCH)
         self.assertTrue(route.fresh)
 
     def test_fresh_questions(self):
         for text in ("who won the match", "what happened today", "latest Minecraft news"):
             route = self.route(text)
-            self.assertEqual(route.kind, SEARCH, text)
+            self.assertEqual(route.kind, RESEARCH, text)
             self.assertTrue(route.fresh, text)
 
     def test_currency_conversion(self):
@@ -138,8 +141,8 @@ class TestRouter(unittest.TestCase):
             ("weather in Delhi", WEATHER),
             ("time in Tokyo", TIME),
             ("translate hello into Japanese", TRANSLATE),
-            ("search latest Minecraft update", SEARCH),
-            ("latest Minecraft news", SEARCH),
+            ("search latest Minecraft update", RESEARCH),
+            ("latest Minecraft news", RESEARCH),
         ):
             route = route_query(text)
             self.assertEqual(route.kind, kind, f"{text} must route to {kind}, got {route.kind}")
@@ -291,7 +294,7 @@ class TestImageRouting(unittest.TestCase):
             ("what time is it in Tokyo", TIME),
             ("define photosynthesis", DEFINE),
             ("what does serendipity mean", DEFINE),
-            ("search the latest Minecraft Bedrock update", SEARCH),
+            ("search the latest Minecraft Bedrock update", RESEARCH),
         ):
             self.assertEqual(route_query(text).kind, kind, text)
 
@@ -456,7 +459,7 @@ class TestCompoundRouting(unittest.TestCase):
     def test_multi_tool_requests_are_split(self):
         for text, kinds in (
             ("search the latest Minecraft update and convert 500 USD to INR",
-             [SEARCH, CONVERT]),
+             [RESEARCH, CONVERT]),
             ("weather in Delhi and time in Tokyo", [WEATHER, TIME]),
             ("15 km in miles and 20 kg in lbs", [CONVERT, CONVERT]),
             ("what is 2+2 and 3+3", [CALCULATE, CALCULATE]),
@@ -620,12 +623,12 @@ class TestTolerantRouting(unittest.TestCase):
             "google rtx 4060 price",
         ):
             route = route_query(text)
-            self.assertEqual(route.kind, SEARCH, text)
+            self.assertEqual(route.kind, RESEARCH, text)
             self.assertTrue(route.payload, text)
 
     def test_comparison_requests_retrieve_before_reasoning(self):
         route = route_query("which is better RTX 4060 or 3060")
-        self.assertEqual(route.kind, SEARCH)
+        self.assertEqual(route.kind, RESEARCH)
         self.assertTrue(route.reason_complex)
 
     # -- AI stays the last resort -----------------------------------------
@@ -664,3 +667,135 @@ class TestTolerantRouting(unittest.TestCase):
         for text in ("asdkjh", "???", "idk man", "hmm", "ok"):
             route = route_query(text)
             self.assertTrue(route.routed, text)
+
+
+# ---------------------------------------------------------------------------
+# Intelligence & utility expansion: research, writing, dev help, new tools
+# ---------------------------------------------------------------------------
+
+
+class TestIntelligenceLanes(unittest.TestCase):
+    """Web research, writing help, dev help and the new deterministic tools."""
+
+    def test_link_summaries(self):
+        for text in (
+            "summarize this link: https://example.com/a",
+            "tl;dr https://example.com/a",
+            "https://example.com/a",
+            "explain this page https://example.com/a",
+        ):
+            route = route_query(text)
+            self.assertEqual(route.kind, RESEARCH, text)
+            self.assertEqual(route.payload2, "link", text)
+            self.assertTrue(route.payload.startswith("https://"), text)
+
+    def test_news_asks(self):
+        route = route_query("latest news about the minecraft movie")
+        self.assertEqual(route.kind, RESEARCH)
+        self.assertEqual(route.payload2, "news")
+        self.assertTrue(route.fresh)
+        route = route_query("find the latest Minecraft Bedrock updates")
+        self.assertEqual(route.kind, RESEARCH)
+        self.assertEqual(route.payload2, "answer")
+        self.assertTrue(route.fresh)
+
+    def test_casual_fresh_sentences_stay_chat(self):
+        # "today"/"now" in a sentence about the speaker is conversation,
+        # not an information request — no web lane for these.
+        for text in (
+            "sort of tired today",
+            "im bored now",
+            "feeling good today",
+            "i like pizza",
+        ):
+            self.assertEqual(route_query(text).kind, AI, text)
+
+    def test_dev_help_shapes(self):
+        for text, mode in (
+            ("explain this error: ValueError: bad value", "error"),
+            ("review my code def add(a, b): return a + b", "code"),
+            ("regex for matching emails", "regex"),
+            ("git undo last commit", "git"),
+            ("sql query to find duplicate emails", "sql"),
+            ("minecraft command to teleport to spawn", "minecraft"),
+            ("bedrock how do add-ons work", "minecraft"),
+            ("what does http 429 mean", "http"),
+        ):
+            route = route_query(text)
+            self.assertEqual(route.kind, DEV, text)
+            self.assertEqual(route.payload2, mode, text)
+            self.assertTrue(route.payload, text)
+
+    def test_writing_shapes(self):
+        for text, mode in (
+            ("rewrite this to be formal: hey can u send me the file", "rewrite"),
+            ("make this sarcastic", "rewrite"),
+            ("draft an announcement for movie night friday 8pm", "announcement"),
+            ("what should i reply to sorry i forgot", "reply"),
+            ("action items from this: taher will book the server", "actions"),
+            ("what's the tone of that sounds great, another meeting", "tone"),
+            ("shorten this: we are writing to inform you that it happened", "shorten"),
+        ):
+            route = route_query(text)
+            self.assertEqual(route.kind, WRITE, text)
+            self.assertEqual(route.payload2, mode, text)
+
+    def test_knowledge_summaries_stay_ai(self):
+        # "summarize the plot of interstellar" is a question about the
+        # world, not a document to compress.
+        for text in (
+            "summarize the plot of interstellar",
+            "summarize the cold war",
+            "explain quantum tunnelling",
+        ):
+            self.assertEqual(route_query(text).kind, AI, text)
+
+    def test_channel_history_search(self):
+        for text in (
+            "find the message where taher said hello",
+            "search this channel for pizza",
+        ):
+            route = route_query(text)
+            self.assertEqual(route.kind, INFO, text)
+            self.assertEqual(route.payload2, "find", text)
+            self.assertTrue(route.payload, text)
+
+    def test_comparison_asks_retrieve_before_reasoning(self):
+        for text in ("compare these phones", "compare iphone 17 and pixel 10",
+                     "which is better RTX 4060 or 3060"):
+            route = route_query(text)
+            self.assertEqual(route.kind, RESEARCH, text)
+            self.assertTrue(route.reason_complex, text)
+
+    def test_group_utilities(self):
+        for text, tool in (
+            ("make two teams from taher, stupid, ash, kabir", "teams"),
+            ("split us into 3 teams: taher stupid ash kabir ron zed", "teams"),
+            ("what time is it in tokyo when it's 8 pm in india", "meettime"),
+            ("what time is it in tokyo when its 8 pm in india", "meettime"),
+            ("if it's 9:30 am in london what's the time in new york", "meettime"),
+            ("what day was 15 august 1947", "weekday"),
+            ("discord timestamp for tomorrow 8pm", "timestamp"),
+            ('validate json {"a": 1}', "json"),
+            ("sort these lines: banana, apple, cherry", "sort"),
+            ("remove duplicates from pizza, pizza, burger, tacos", "dedupe"),
+            ("readability of the quick brown fox jumps and runs home", "readability"),
+        ):
+            route = route_query(text)
+            self.assertEqual(route.kind, UTILITY, text)
+            self.assertEqual(route.payload2, tool, text)
+
+    def test_weekday_tool_does_not_steal_plain_date_asks(self):
+        for text in ("what date is it", "what day is today", "what day is it",
+                     "today's date"):
+            self.assertEqual(route_query(text).kind, DATE, text)
+
+    def test_stats_and_equations_route_to_the_calculator(self):
+        for text in (
+            "average of 4 8 15 16 23 42",
+            "what is the average of 10 20 and 30",
+            "solve x + 2 = 5",
+            "whats 2x + 3 = 11",
+            "sum of 10 20 30",
+        ):
+            self.assertEqual(route_query(text).kind, CALCULATE, text)

@@ -272,12 +272,25 @@ def _detect_image(request: NormalizedRequest) -> Route | None:
     return Route(kind=IMAGE, payload=subject, confidence=0.9, count=count)
 
 
+#: Freshness words alone aren't search intent — "sort of tired today" says
+#: "today" but wants sympathy, not sources. A fresh-only match needs an
+#: information shape as well.
+_FRESH_INFO_SHAPE = re.compile(
+    r"\b(?:latest|newest|recent|update[sd]?|news|released?|version|patch|"
+    r"score|price[sd]?|rumou?rs?|leak[sd]?|dropped|announced|trailer|"
+    r"episode|chapter|season)\b|[?]",
+    re.IGNORECASE,
+)
+
+
 def _detect_search(request: NormalizedRequest) -> Route | None:
     tokens = request.token_set
     fresh = bool(FRESH_WORDS & tokens)
     explicit = bool(SEARCH_WORDS & tokens)
     if not (explicit or fresh):
         return None
+    if fresh and not explicit and not _FRESH_INFO_SHAPE.search(request.text):
+        return None  # casual sentence with a clock word, not an info ask
     query = _subject(request.tokens, frozenset({"search", "google", "lookup"}))
     if not query:
         query = request.text

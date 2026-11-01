@@ -40,6 +40,9 @@ UTILITY = "utility"    # deterministic toolkit tools (payload2 = tool key)
 REMIND = "remind"      # "remind me in 20 minutes to …"
 POLL = "poll"          # reaction polls
 INFO = "info"          # Discord-native info: whois / avatar / server
+RESEARCH = "research"  # web-backed answers, news briefs, link summaries
+WRITE = "write"        # rewriting, drafting, tone work (payload2 = style)
+DEV = "dev"            # code/error/regex/git/sql/minecraft help
 AI = "ai"
 UNKNOWN = "unknown"
 
@@ -48,7 +51,8 @@ KINDS = frozenset(
     {
         HELP, COMMAND_HELP, PING, COINFLIP, CHOOSE, ROAST, CALCULATE, DEFINE,
         CONVERT, IMAGE, WEATHER, TIME, DATE, TRANSLATE, SEARCH, SUMMARIZE,
-        MEME, GIF, UTILITY, REMIND, POLL, INFO, AI, UNKNOWN,
+        MEME, GIF, UTILITY, REMIND, POLL, INFO, RESEARCH, WRITE, DEV,
+        AI, UNKNOWN,
     }
 )
 
@@ -120,7 +124,7 @@ class Route:
 __all__ = [
     "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE",
     "DEFINE", "DETERMINISTIC_KINDS", "GIF", "HELP", "HIGH_CONFIDENCE", "IMAGE",
-    "INFO", "KINDS", "MEDIUM_CONFIDENCE", "MEME", "PING", "POLL", "REMIND",
-    "Route", "SEARCH", "SUMMARIZE", "TIME", "TRANSLATE", "UNKNOWN",
-    "UTILITY", "WEATHER", "clamp_confidence",
+    "DEV", "INFO", "KINDS", "MEDIUM_CONFIDENCE", "MEME", "PING", "POLL",
+    "REMIND", "RESEARCH", "Route", "SEARCH", "SUMMARIZE", "TIME",
+    "TRANSLATE", "UNKNOWN", "UTILITY", "WEATHER", "WRITE", "clamp_confidence",
 ]

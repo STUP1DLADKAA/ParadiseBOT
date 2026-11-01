@@ -41,7 +41,20 @@ cannot answer:
 | Where | What it is | Key required |
 | --- | --- | --- |
 | `@Paradise <complex question>` | the AI, in full character — OpenAI-compatible provider first, Gemini as the fallback | optional |
-| `@Paradise search <topic>` | forwarded straight to the AI (no web retrieval) and answered in character | optional |
+| `@Paradise search <topic>` / "latest Minecraft news" / "who won the match" | **web research**: DuckDuckGo-lite + Wikipedia (keyless), reads the top pages, answers with clickable sources — never an invented citation. Falls back to a direct model answer when the web is off or failing | keyless |
+| `@Paradise summarize this link: <url>` (or a bare URL) | the page is fetched (SSRF-guarded) and its text extracted keylessly, then summarised | optional |
+| `@Paradise rewrite this to be formal: <text>` / "make this sarcastic" / "draft an announcement" / "what should I reply to …" / "action items from …" / "tone of …" / "shorten this: …" | writing help — copy-ready output that keeps the author's voice | optional |
+| `@Paradise explain this error: …` / "review my code …" / "regex for …" / "git undo last commit" / "sql query to …" / "minecraft command …" / "http 429" | dev & Minecraft help — text-only reasoning, **never executes code** | optional |
+| `@Paradise average of 4 8 15` / "sum of …" / "median of …" / "solve 2x + 3 = 11" | list statistics and single-variable linear equations in the calculator | never |
+| `@Paradise make two teams from A, B, C, D` / "split us into 3 teams: …" | random, balanced team splitter | never |
+| `@Paradise what time is it in Tokyo when it's 8 pm in India` | meeting planner across timezones (both phrasings) | never |
+| `@Paradise what day was 15 aug 1947` | weekday lookup for any date | never |
+| `@Paradise discord timestamp for tomorrow 8 pm` | copy-ready `<t:…:F>` / `<t:…:R>` timestamps | never |
+| `@Paradise validate json {…}` / "format this json …" | JSON validation with position-precise errors and pretty-printing | never |
+| `@Paradise sort these lines: …` / "remove duplicates from …" | list sorting and deduplication | never |
+| `@Paradise readability of <paragraph>` | Flesch reading-ease score and grade level | never |
+| `@Paradise find the message where taher said hello` / "search this channel for pizza" | channel history search with jump links | never |
+| "what about london?" right after a time/weather/convert/research ask | contextual follow-up: the last tool answers with the new subject | never |
 | `@Paradise summarize` (or "recap", "tl;dr", "what did i miss") | AI recap of the recent conversation — no slash command needed | optional |
 | `@Paradise meme [about X]` | a real internet meme, or a locally drawn one about X | never |
 | `@Paradise gif [of X]` / "bruh gif" | a reaction GIF — keyless by default | never |
@@ -93,7 +106,7 @@ conversation, `/summarize` and the AI-shaped answers are unavailable.
 | **Silent presence** | Follows the crowd into the busiest voice channel and says nothing when it arrives. |
 | **Mini-games** | A recoverable SQLite scheduler, four modular games, aggregate-only leaderboard. |
 | **Self-updating** | Pulls the latest revision from GitHub on start-up and while online — validated, backed up, crash-loop guarded, and it never touches `.env` or `data/`. |
-| **No mandatory keys** | Dictionary, conversions, calculator, weather, time, translation, image search and the entire free toolkit (dice, QR codes, passwords, ciphers, countdowns, reminders, polls, info cards) work with zero configuration. Questions and "search …" asks need an AI key. |
+| **No mandatory keys** | Dictionary, conversions, calculator, weather, time, translation, image search, web research (DuckDuckGo-lite + Wikipedia) and the entire free toolkit (dice, QR codes, passwords, ciphers, countdowns, teams, meeting planner, timestamps, JSON/sort/dedupe/readability, reminders, polls, info cards) work with zero configuration. Questions, writing and dev help need an AI key. |
 
 ### Tool-first, AI-last
 
@@ -104,12 +117,14 @@ request normalizer (typos, slang, Hinglish, emoji, filler)
    ↓
 intent router (deterministic, microseconds)
    ↓
-can a native tool answer?   calculator · define · convert · image · weather · time · translate · meme · gif · recap
+can a native tool answer?   calculator (+ stats/equations) · define · convert · image · weather · time · translate · meme · gif · recap
                             · dice/qr/password/rot13/base64/hash/morse/colour/countdown
-                            · reminders · polls · whois/avatar/server info
+                            · teams · meeting planner · weekdays · discord timestamps · json · sort/dedupe · readability
+                            · reminders · polls · whois/avatar/server info · channel history search
    ├── YES → specialised tool, zero AI
    └── NO
-        search-shaped or factual?  → forwarded straight to the AI, no web retrieval
+        search-shaped or factual?  → web research (DDG-lite + Wikipedia, sources cited),
+                                   falling back to the AI when the web is off
         still ambiguous?           → one tiny AI JSON label, then re-route
         needs real reasoning?      → the AI, in full character
         └── everything else        → the AI, conversational
