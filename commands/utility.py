@@ -1,9 +1,10 @@
 """Useful commands: remind, poll, afk, translate, settimezone.
 
-This cog also owns the shared engines for search, weather and conversion.
-Those no longer have public slash commands — they are reached by mentioning
-Paradise — but the engines stay here so there is exactly one implementation
-of each and the assistant can reuse them.
+This cog also owns the shared engines for weather and conversion. Those no
+longer have public slash commands — they are reached by mentioning Paradise —
+but the engines stay here so there is exactly one implementation of each and
+the assistant can reuse them. (Search-shaped requests are no longer answered
+by a web engine at all: the assistant forwards them straight to the AI.)
 """
 
 from __future__ import annotations
@@ -20,7 +21,6 @@ from discord.ext import commands
 
 from functions.conversion import ConversionEngine
 from functions.helpers import parse_options, shorten
-from functions.search import AnswerEngine, SearchEngine
 from functions.time import (
     CITY_TIMEZONES,
     get_current_time_for_zone,
@@ -97,10 +97,6 @@ class Utility(commands.Cog):
         self.reminders: dict[int, asyncio.Task[None]] = {}
         self.reminder_owners: Counter[int] = Counter()
         self._next_reminder = 0
-        self.search_engine = SearchEngine()
-        # Search is a native feature. It builds a concise answer from its
-        # retrieved evidence and never makes an AI call or a second search.
-        self.answer_engine = AnswerEngine(self.search_engine)
         self.weather_service = OpenMeteoWeatherService()
         self.conversion_engine = ConversionEngine()
         self.db = VoiceDatabase()
@@ -108,11 +104,6 @@ class Utility(commands.Cog):
     async def cog_unload(self) -> None:
         for task in self.reminders.values():
             task.cancel()
-        # Release the shared search session so shutdown leaves no connector.
-        try:
-            await self.search_engine.close()
-        except Exception:  # noqa: BLE001 - shutdown is best effort
-            log.debug("Could not close the search session", exc_info=True)
 
     # -- retired public commands ------------------------------------------
     #
@@ -122,9 +113,10 @@ class Utility(commands.Cog):
     #   @Paradise search Minecraft 1.21      @Paradise weather in Delhi
     #   @Paradise 100 USD to INR             @Paradise time in Tokyo
     #
-    # The engines below are the single implementation of each capability and
-    # are used by the mention assistant (commands/assistant.py). Nothing was
-    # duplicated or deleted — only the slash-command surface was removed.
+    # "search …" (and any question shaped like one) is forwarded straight to
+    # the AI by the mention assistant — no web engine is contacted. The
+    # other engines below are the single implementation of each capability
+    # and are used by the assistant; only the slash-command surface is gone.
 
     # -- settimezone ------------------------------------------------------
 

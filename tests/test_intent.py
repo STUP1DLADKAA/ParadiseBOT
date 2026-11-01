@@ -46,7 +46,21 @@ class FakeGemini:
 
 
 def fake_ai(gemini=None):
-    return SimpleNamespace(gemini=gemini, available=gemini is not None)
+    """A minimal AIService stand-in.
+
+    ``classify`` mirrors the real provider chain: the fake Gemini below is
+    the only configured provider, so an unavailable one means the whole
+    service cannot classify.
+    """
+    if gemini is None:
+        return SimpleNamespace(gemini=None, available=False)
+
+    async def classify(request, max_tokens=120):
+        if not getattr(gemini, "available", False):
+            raise ParadiseError("Gemini isn't configured on this bot.")
+        return await gemini.classify(request, max_tokens=max_tokens)
+
+    return SimpleNamespace(gemini=gemini, available=True, classify=classify)
 
 
 class TestShouldClassify(unittest.TestCase):

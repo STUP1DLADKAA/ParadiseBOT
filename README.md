@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="assets/banner.png" alt="Paradise Bot — a Discord bot that answers with tools first and AI last" width="100%">
+<img src="assets/banner.png" alt="Paradise Bot — a Discord bot that answers with tools first and AI for everything language-shaped" width="100%">
 
 **A Discord bot for a real friend group.** Search, weather, conversions, a
 dictionary, mini-games, voice-activity leaderboards — and an AI layer that is
@@ -10,7 +10,7 @@ only ever the *last* resort.
 [![Python 3.11+](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![discord.py 2.6+](https://img.shields.io/badge/discord.py-2.6%2B-5865F2?logo=discord&logoColor=white)](https://github.com/Rapptz/discord.py)
 [![License: MIT](https://img.shields.io/badge/license-MIT-8B5CF6)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-845%20passing-2DD4BF)](#testing)
+[![Tests](https://img.shields.io/badge/tests-926%20passing-2DD4BF)](#testing)
 [![AI generated](https://img.shields.io/badge/parts%20of%20this%20project-AI%20generated-F472B6)](#built-with-ai)
 
 [Quick start](#quick-start) · [Features](#what-it-does) · [Screenshots](#screenshots) ·
@@ -40,8 +40,9 @@ cannot answer:
 
 | Where | What it is | Key required |
 | --- | --- | --- |
-| `@Paradise <complex question>` | Gemini reasoning (or an OpenAI-compatible fallback) | optional |
-| `/summarize` | Gemini summary of pasted text | optional |
+| `@Paradise <complex question>` | the AI, in full character — OpenAI-compatible provider first, Gemini as the fallback | optional |
+| `@Paradise search <topic>` | forwarded straight to the AI (no web retrieval) and answered in character | optional |
+| `/summarize` | AI summary of recent conversation | optional |
 | Personality & banter | canned reactions, replies, stickers, roasts, rendered memes and keyless internet memes — **no model** for any of it | never |
 
 **3. What is *not* AI.** Every image the bot produces — leaderboard cards,
@@ -50,10 +51,11 @@ Pillow. There is no image generation anywhere in this repository, and image
 search returns *real* photos from Wikipedia/Wikimedia/Openverse instead of
 made-up ones.
 
-**4. What leaves the machine.** One thing: a question, sent to Gemini when it
-actually needs a model. The bot does not listen to your voice: the only audio
-it touches is the `/clip` buffer, which lives in memory, is bounded, and is
-exported only when an operator asks for it. Cards, voice tracking, the
+**4. What leaves the machine.** One thing: a question, sent to the configured
+AI provider (OpenAI-compatible endpoint first, Gemini as the fallback) when a
+model is actually needed. The bot does not listen to your voice: the only
+audio it touches is the `/clip` buffer, which lives in memory, is bounded, and
+is exported only when an operator asks for it. Cards, voice tracking, the
 dictionary and every deterministic tool run locally too.
 
 With **no API key at all** the bot is fully functional: only free-form
@@ -73,7 +75,7 @@ conversation, `/summarize` and the AI-shaped answers are unavailable.
 | **Silent presence** | Follows the crowd into the busiest voice channel and says nothing when it arrives. |
 | **Mini-games** | A recoverable SQLite scheduler, four modular games, aggregate-only leaderboard. |
 | **Self-updating** | Pulls the latest revision from GitHub on start-up and while online — validated, backed up, crash-loop guarded, and it never touches `.env` or `data/`. |
-| **No mandatory keys** | Search, dictionary, conversions, calculator, weather, time and translation work with zero configuration. |
+| **No mandatory keys** | Dictionary, conversions, calculator, weather, time, translation and image search work with zero configuration. Questions and "search …" asks need an AI key. |
 
 ### Tool-first, AI-last
 
@@ -87,18 +89,17 @@ intent router (deterministic, microseconds)
 can a native tool answer?   calculator · define · convert · image · weather · time · translate
    ├── YES → specialised tool, zero AI
    └── NO
-        can web search answer?      → answer + key points + sources (never bare links)
-        ├── YES → native sourced answer (AI may explain the sources, never invent them)
-        └── NO
-             still ambiguous?       → one tiny Gemini JSON label, then re-route
-             needs real reasoning?  → Gemini (or the OpenAI-compatible fallback)
-             └── everything else    → asks what you meant
+        search-shaped or factual?  → forwarded straight to the AI, no web retrieval
+        still ambiguous?           → one tiny AI JSON label, then re-route
+        needs real reasoning?      → the AI, in full character
+        └── everything else        → the AI, conversational
 ```
 
 `"25% of 800"`, `"100 USD to INR"`, `"weather in Delhi"` and `"a picture of a
-red panda"` never touch a model. When AI *is* used over web results it only
-explains retrieved evidence — it never supplies facts of its own, and a failed
-lookup is reported honestly instead of being guessed.
+red panda"` never touch a model. Everything a model *does* answer goes to the
+OpenAI-compatible provider first and falls back to Gemini when that provider
+is unconfigured or failing — and a provider outage is reported honestly
+instead of being guessed around.
 
 ---
 
@@ -161,7 +162,7 @@ unless stopped.
 | The bot works at all | `DISCORD_TOKEN` | refuses to start with a clear message |
 | Instant slash commands | `DISCORD_GUILD_ID` | commands register globally (slow propagation) |
 | Voice leaderboards | `SUPABASE_URL`, `SUPABASE_SECRET_KEY` + [4 SQL migrations](supabase/README.md) | `/vc` explains what to set up; nothing else breaks |
-| AI answers | `GEMINI_API_KEY` (or `AI_BASE_URL`/`AI_MODEL`) | tool/mention replies still work, no free-form reasoning |
+| AI answers | `AI_BASE_URL`/`AI_MODEL` (or `GEMINI_API_KEY`) | deterministic tools still work, no free-form reasoning |
 | Word pronunciation in your voice | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID` | a free fallback voice, or text only |
 | Weather alerts & midnight board | `VOICE_ALERT_CHANNEL_ID` | those two posts are skipped |
 
@@ -176,7 +177,7 @@ ParadiseBOT/
 ├── bot.py                     entry point: intents, startup flow, message dispatch
 ├── config.py                  every environment setting, parsed and clamped in one place
 ├── commands/                  slash commands and cogs
-│   ├── assistant.py           mention router: "@Paradise <anything>" → tools first, AI last
+│   ├── assistant.py           mention router: "@Paradise <anything>" → tools first, AI for language
 │   ├── vc.py                  /vc leaderboard · /vc stats · /vc dmreports
 │   ├── voice_presence.py      silent crowd-following into voice channels
 │   ├── clip.py                rolling voice-clip capture and export
@@ -187,7 +188,6 @@ ParadiseBOT/
 ├── functions/                 the engines, framework-free and unit-testable
 │   ├── router.py · routes.py · normalize.py · keywords.py · intent.py
 │   ├── calculator.py          AST-whitelisted calculator (percent idioms, word operators)
-│   ├── search/                DuckDuckGo + Wikipedia + a sourced answer pipeline
 │   ├── weather/               Open-Meteo provider, fuzzy geocoding, 16:9 card
 │   ├── conversion/            units, currency, natural-language parser
 │   ├── time/                  IANA timezone resolver and city maps
@@ -198,7 +198,7 @@ ParadiseBOT/
 │   ├── minigames/             recoverable scheduler + four games
 │   ├── recipes/               recipe engine and bundled recipe book
 │   ├── tts.py                 ElevenLabs → OpenAI-compatible → free voice
-│   ├── gemini.py · ai.py      model cascade, provider chain, activation rules
+│   ├── gemini.py · ai.py      provider chain (openai-compatible → gemini), personality
 │   ├── perf.py                shared HTTP pools, render pool, start-up prewarm
 │   ├── autoupdate.py          validated, crash-loop-guarded self-update
 │   ├── startup.py             the single owner of command-tree writes
@@ -209,7 +209,7 @@ ParadiseBOT/
 ├── docs/                      setup guides and engineering write-ups
 │   └── engineering/           incident report and optimisation report
 ├── supabase/                  SQL migrations, local validator, schema docs
-├── tests/                     1,050 offline tests — no network, no credentials
+├── tests/                     926 offline tests — no network, no credentials
 ├── tools/                     review agent, asset generator
 │   └── repro/                 incident reproducers and the invariant fuzzer
 ├── .env.example · requirements.txt · pyproject.toml · LICENSE
@@ -229,7 +229,7 @@ ParadiseBOT/
 
 ```bash
 python -m pip install -r requirements-dev.txt
-python -m pytest -q                       # 845 passed
+python -m pytest -q                       # 926 passed
 python tools/review_agent.py --self-test  # static-review rules
 python benchmarks/voice_pipeline.py --label ci --latency 0 --users 4 --toggles 1
 ```
@@ -248,7 +248,7 @@ A trimmed view — see [`.env.example`](.env.example) for all ~120 settings.
 | Discord | `DISCORD_TOKEN`, `DISCORD_GUILD_ID` | token required; guild ID makes commands instant |
 | Operator access | `EDIT_ALLOWED_USER_IDS`, `CLIP_ALLOWED_USER_IDS`, `VOICE_DEAF_EXEMPT_USER_IDS` | comma-separated Discord user IDs |
 | Voice data | `SUPABASE_URL`, `SUPABASE_SECRET_KEY`, `VOICE_*` | service-role key only, server-side |
-| AI | `GEMINI_API_KEY`, `GEMINI_MODEL`, `AI_BASE_URL`, `AI_MODEL` | all optional |
+| AI | `AI_BASE_URL`, `AI_MODEL`, `AI_API_KEY`, `GEMINI_API_KEY`, `GEMINI_MODEL` | OpenAI-compatible first, Gemini fallback |
 | Your voice | `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`, `ELEVENLABS_MODEL` | default `eleven_flash_v2_5`; word pronunciation only |
 | Presence | `VOICE_PRESENCE_ENABLED`, `VOICE_ARRIVAL_ANNOUNCE` | silent joins by default |
 | Clips | `VOICE_CLIP_*` | 128 kbps AAC-LC at 48 kHz, one static gain, 180 s window |
@@ -288,9 +288,10 @@ single FFmpeg pass. A 60-second clip encodes in about a second.
 
 To restate the disclosure at the top of this file, because it matters:
 
-* **The bot includes AI features** — Gemini for open-ended reasoning, optional
-  ElevenLabs for speech. All are opt-in, key-gated and clearly separated from
-  the deterministic tool layer.
+* **The bot includes AI features** — an OpenAI-compatible provider (with
+  Gemini as the fallback) for open-ended reasoning, questions and search asks,
+  optional ElevenLabs for speech. All are opt-in, key-gated and clearly
+  separated from the deterministic tool layer.
 * **This repository was developed with AI assistance.** Treat the source as
   you would any contributor's work. The tests, the review agent and CI exist
   precisely so that no unverified change lands.

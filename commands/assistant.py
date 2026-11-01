@@ -5,22 +5,23 @@ the request with the deterministic router (functions/router.py) and sends
 it to the most specialised tool:
 
     calculator · define · convert · image search · weather · time/date
-    · translate → explicit web search (answer + sources)
-    → Gemini/OpenAI-compatible AI — strictly the last resort
+    · translate → the AI (openai-compatible first, gemini fallback)
+
+Search-shaped requests are no longer answered by retrieving the web: the
+request is forwarded straight to the AI and the AI replies, in character
+(``AIService.answer_question``). No search provider is contacted.
 
 Pipeline:
 
     mention → strip mention → empty? → deterministic route(s)
-            → ambiguous? one tiny Gemini label (functions/intent.py)
+            → ambiguous? one tiny AI label (functions/intent.py)
             → run tool(s), concurrently when the request asks for several
-            → optional grounded Gemini synthesis over retrieved sources
             → Discord-safe reply
 
 Everything here reuses the existing services owned by the other cogs, so
 there is exactly one implementation of each capability. Failures degrade
-gracefully: an unavailable source falls back to a friendly message, and
-no AI key ever breaks tool answers. Live data is never invented — when a
-provider is down Paradise says so rather than asking the AI to guess.
+gracefully: an unavailable provider falls back to a friendly message, and
+a missing AI key never breaks the deterministic tool answers.
 """
 
 from __future__ import annotations
@@ -42,7 +43,7 @@ from commands.system import HELP_BLURBS
 from functions.startup import RETIRED_COMMANDS
 from functions.calculator import calculate
 from functions.helpers import (
-    ParadiseError, parse_options, sanitize_untrusted, shorten, split_discord_text,
+    ParadiseError, parse_options, shorten, split_discord_text,
 )
 from functions.images import (
     NO_IMAGE_LINE, ImageSearchService, build_image_embeds,
@@ -54,7 +55,6 @@ from functions.router import (
     HELP, IMAGE, PING, ROAST, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
     Route, route_many,
 )
-from functions.search import SearchAnswerView, SearchResponse, build_answer_embed
 from functions.time import build_time_embed, get_current_time_for_zone, resolve_timezone
 from functions.translate import resolve_language, translate_text
 from functions.weather import build_weather_embed, render_weather_card
@@ -66,11 +66,9 @@ _CHANNEL_COOLDOWN = 2.0
 _HINT_COOLDOWN = 120.0
 _FALLBACK_NOTE_COOLDOWN = 15 * 60
 
-# Grounded synthesis budget: compact evidence in, a short answer out.
-_SYNTH_SOURCES = 4
-_SYNTH_SNIPPET = 220
-_SYNTH_TIMEOUT = 20.0
-_WEAK_SUMMARY_CHARS = 140
+# How long the AI may think before the placeholder is replaced with an
+# apology (the model itself gets its own, longer timeout).
+_AI_TIMEOUT = 60.0
 
 ASK_HINT = (
     "hey! just ask me things like:\n"
@@ -97,7 +95,7 @@ _RETIRED_EXAMPLES = {
 }
 
 SEARCH_FAIL_LINE = (
-    "⚠️ I couldn't reach the search service right now. Try again in a moment."
+    "⚠️ the AI isn't answering right now. give it a minute and try again."
 )
 
 # "convert 50" — a value with no units at all.
@@ -105,7 +103,8 @@ _BARE_NUMBER = re.compile(r"^[-+]?\d+(?:[.,]\d+)?$")
 
 
 class Assistant(commands.Cog):
-    """Routes mentions/replies to the right tool, AI last."""
+    """Routes mentions/replies to the right tool; everything language-shaped
+    (chat, questions, search asks) goes to the AI."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -234,9 +233,9 @@ class Assistant(commands.Cog):
         if kind == SEARCH:
             return await self._search(message, route)
         if kind in (AI, UNKNOWN):
-            # AI is a language/reasoning fallback, not an agent loop. In
-            # particular, never search first and then ask AI to rewrite the
-            # result; explicit search requests are handled by _search above.
+            # AI is the language/reasoning layer, not an agent loop. Search
+            # requests land in _search above, which forwards them to the
+            # same provider chain — there is no web retrieval either way.
             return await self._ai(message, text)
         return await self._ai(message, text)
 
@@ -291,8 +290,10 @@ class Assistant(commands.Cog):
         started = time.monotonic()
         # ``routes`` is capped at three by the router, so this is a bounded
         # fan-out, not an unbounded promise explosion.
+        asker = getattr(message.author, "display_name", None) or "someone"
         outcomes = await asyncio.gather(
-            *(self._compact(route) for route in routes), return_exceptions=True
+            *(self._compact(route, asker=asker) for route in routes),
+            return_exceptions=True,
         )
 
         lines: list[str] = []
@@ -323,7 +324,9 @@ class Assistant(commands.Cog):
         await self._quiet_reply(message, "\n".join(lines), **extras)
         return True
 
-    async def _compact(self, route: Route) -> tuple[str, list[discord.Embed]]:
+    async def _compact(
+        self, route: Route, *, asker: str = "someone"
+    ) -> tuple[str, list[discord.Embed]]:
         """One short, combinable answer for a single route. Never raises."""
         kind = route.kind
         try:
@@ -344,9 +347,10 @@ class Assistant(commands.Cog):
                 return await self._compact_translate(route)
             if kind == DEFINE:
                 return await self._compact_search(
-                    Route(kind=SEARCH, payload=f"what is {route.payload}")
+                    Route(kind=SEARCH, payload=f"what is {route.payload}"),
+                    asker=asker,
                 )
-            return await self._compact_search(route)
+            return await self._compact_search(route, asker=asker)
         except ParadiseError as error:
             return f"• {error}", []
         except asyncio.CancelledError:
@@ -417,37 +421,33 @@ class Assistant(commands.Cog):
             return NO_IMAGE_LINE, []
         return "", build_image_embeds(response, route.count)
 
-    async def _compact_search(self, route: Route) -> tuple[str, list[discord.Embed]]:
-        utility = self.bot.get_cog("Utility")
+    async def _compact_search(
+        self, route: Route, *, asker: str = "someone"
+    ) -> tuple[str, list[discord.Embed]]:
+        """One short, combinable AI answer for a search part. Never raises.
+
+        No web retrieval: the request is forwarded straight to the model
+        (``AIService.answer_question``) and the reply is trimmed to fit the
+        combined message.
+        """
         subject = route.payload.strip()
-        if utility is None or not subject:
+        if not subject:
             return "", []
+        ai = getattr(self.bot, "ai", None)
+        if ai is None or not getattr(ai, "available", False):
+            return "🔎 the AI isn't configured here, so that part went nowhere.", []
         try:
             answer = await asyncio.wait_for(
-                utility.answer_engine.answer(
-                    subject, fresh=route.fresh or None, reason_complex=route.reason_complex
-                ),
-                timeout=30,
+                ai.answer_question(subject, asker=asker), timeout=45
             )
+        except asyncio.CancelledError:
+            raise
         except Exception:  # noqa: BLE001 - CancelledError is a BaseException
-            log.debug("Combined search part failed", exc_info=True)
-            return "🔎 I couldn't reach the web search right now.", []
-
-        answer = await self._maybe_synthesize(answer, subject, route)
-        text = answer.direct_answer or answer.summary
-        if not text and answer.key_points:
-            text = answer.key_points[0]
-        if not text:
+            log.debug("Combined AI part failed", exc_info=True)
+            return "🔎 I couldn't answer that part right now.", []
+        if not answer:
             return f"🔎 nothing solid for **{shorten(subject, 60)}** right now.", []
-
-        line = f"🔎 **{shorten(subject, 60)}** — {shorten(text, 400)}"
-        names: list[str] = []
-        for item in answer.sources[:3]:
-            if item.source and item.source not in names:
-                names.append(item.source)
-        if names:
-            line += "\n-# sources: " + " · ".join(names)
-        return line, []
+        return f"🔎 **{shorten(subject, 60)}** — {shorten(answer, 400)}", []
 
     # -- command metadata --------------------------------------------------
 
@@ -538,7 +538,7 @@ class Assistant(commands.Cog):
             )
             return True
 
-        # Not a dictionary word (or not found): the web answers better.
+        # Not a dictionary word (or not found): the AI answers better.
         return await self._search(message, route, query=f"what is {route.payload}")
 
     # -- conversion ----------------------------------------------------------
@@ -582,10 +582,10 @@ class Assistant(commands.Cog):
         response = await self._find_images(subject, route.count)
         if response is None or not response.has_results:
             # No usable picture: say so once, then answer the question the
-            # only other way we can — a normal web search for the subject.
+            # only other way we can — by asking the AI about the subject.
             await self._quiet_reply(
                 message,
-                f"{NO_IMAGE_LINE} searching the web for **{shorten(subject, 60)}** instead…",
+                f"{NO_IMAGE_LINE} asking the AI about **{shorten(subject, 60)}** instead…",
             )
             return await self._search(
                 message, Route(kind=SEARCH, payload=subject, confidence=route.confidence)
@@ -716,139 +716,98 @@ class Assistant(commands.Cog):
         )
         return True
 
-    # -- web search ---------------------------------------------------------------------
+    # -- search (forwarded straight to the AI) --------------------------------------------
 
     async def _search(
         self, message: discord.Message, route: Route, *, query: str | None = None
     ) -> bool:
-        utility = self.bot.get_cog("Utility")
-        if utility is None:
-            return False
+        """Forward a search-shaped request straight to the AI.
+
+        There is no web retrieval on this path any more: the request goes to
+        the model (openai-compatible provider first, gemini fallback) and the
+        model replies in character. Genuine questions are never refused —
+        the system prompt forbids moralising non-answers.
+        """
         subject = (query or route.payload or "").strip()
         if not subject:
             await self._quiet_reply(message, "search what, exactly?")
             return True
+        return await self._answer_with_ai(message, subject)
+
+    async def _answer_with_ai(self, message: discord.Message, subject: str) -> bool:
+        """Ask the AI *subject* and deliver its answer, placeholder first."""
+        ai = self.bot.ai
+        if not getattr(ai, "available", False):
+            return await self._ai_unavailable_note(message)
 
         try:
             placeholder = await message.reply(
-                "🔎 searching the web…", mention_author=False
+                "🧠 thinking with my entire brain…", mention_author=False
             )
         except discord.DiscordException:
-            return False
+            placeholder = None
 
         try:
             answer = await asyncio.wait_for(
-                utility.answer_engine.answer(
-                    subject, fresh=route.fresh or None, reason_complex=route.reason_complex
+                ai.answer_question(
+                    subject,
+                    asker=getattr(message.author, "display_name", None) or "someone",
+                    channel_id=message.channel.id,
                 ),
-                timeout=30,
-            )
-        except Exception:  # noqa: BLE001
-            # The technical reason stays in the log; chat gets one short line.
-            log.warning("Mention search failed", exc_info=True)
-            await self._quiet_edit(placeholder, SEARCH_FAIL_LINE)
-            return True
-
-        if getattr(answer, "failed", False):
-            await self._quiet_edit(placeholder, SEARCH_FAIL_LINE)
-            return True
-        if not (answer.has_answer or answer.has_sources):
-            await self._quiet_edit(
-                placeholder,
-                f"🔎 I couldn't find anything solid for **{shorten(subject, 60)}**. "
-                "try rewording it?",
-            )
-            return True
-
-        # Optional grounded synthesis: the AI may *explain* what was
-        # retrieved, never add to it.
-        answer = await self._maybe_synthesize(answer, subject, route)
-
-        # AnswerEngine already performed the native retrieval and exposes the
-        # evidence needed by both the card and its browse view. Never repeat
-        # the same network search here.
-        response = SearchResponse(
-            query=answer.query,
-            results=list(answer.sources),
-            engine=answer.engine,
-            cached=answer.cached,
-        )
-        embed = build_answer_embed(answer)
-        view = SearchAnswerView(answer, response, author_id=message.author.id)
-        try:
-            await placeholder.edit(content=None, embed=embed, view=view)
-            view.message = placeholder
-        except (discord.DiscordException, AttributeError):
-            log.debug("Could not deliver search answer", exc_info=True)
-        return True
-
-    async def _maybe_synthesize(self, answer, question: str, route: Route):
-        """Let the AI write the answer *from the retrieved sources only*.
-
-        Used when the deterministic extractor produced something thin, or
-        when the question needs reasoning over the facts. Rules:
-
-        - no sources → no AI call at all (never fabricate live data);
-        - sources are untrusted web text, so they are sanitized and the
-          model is told to treat them strictly as data (see
-          ``functions/gemini.py``);
-        - any failure silently keeps the deterministic answer.
-        """
-        if not getattr(answer, "has_sources", False):
-            return answer
-        weak = not answer.direct_answer and len(answer.summary or "") < _WEAK_SUMMARY_CHARS
-        if not (route.reason_complex or weak):
-            return answer
-        ai = getattr(self.bot, "ai", None)
-        if ai is None or not getattr(ai, "available", False):
-            return answer
-
-        facts = [
-            f"{sanitize_untrusted(item.title, 120)} "
-            f"[{sanitize_untrusted(item.source, 60)}] "
-            f"{sanitize_untrusted(item.snippet, _SYNTH_SNIPPET)}".strip()
-            for item in answer.sources[:_SYNTH_SOURCES]
-            if (item.title or item.snippet)
-        ]
-        if not facts:
-            return answer
-
-        try:
-            written = await asyncio.wait_for(
-                ai.reason(question, facts, max_tokens=260), timeout=_SYNTH_TIMEOUT
+                timeout=_AI_TIMEOUT,
             )
         except asyncio.CancelledError:
             raise
-        except (ParadiseError, asyncio.TimeoutError):
-            log.debug("Grounded synthesis unavailable; keeping native answer")
-            return answer
-        except Exception:  # noqa: BLE001 - synthesis is an upgrade, not a need
-            log.warning("Grounded synthesis failed", exc_info=True)
-            return answer
+        except asyncio.TimeoutError:
+            log.warning("AI answer timed out")
+            await self._deliver_ai_answer(message, placeholder, SEARCH_FAIL_LINE)
+            return True
+        except ParadiseError as error:
+            await self._deliver_ai_answer(message, placeholder, str(error))
+            return True
+        except Exception:  # noqa: BLE001
+            log.exception("AI answer failed")
+            await self._deliver_ai_answer(message, placeholder, SEARCH_FAIL_LINE)
+            return True
 
-        written = (written or "").strip()
-        if written:
-            answer.summary = written
-            answer.generated_by = "gemini"
-        return answer
+        await self._deliver_ai_answer(
+            message, placeholder, answer or "I couldn't get a useful answer. try again."
+        )
+        return True
 
-    # -- AI (the last resort) ---------------------------------------------------------------
+    async def _deliver_ai_answer(
+        self, message: discord.Message, placeholder, text: str
+    ) -> None:
+        """Replace the placeholder with the full answer, split if needed."""
+        chunks = split_discord_text(text)
+        if placeholder is not None:
+            await self._quiet_edit(placeholder, chunks[0])
+        else:
+            await self._quiet_reply(message, chunks[0])
+        for chunk in chunks[1:]:
+            await self._quiet_reply(message, chunk)
+
+    # -- AI conversation ---------------------------------------------------------------
+
+    async def _ai_unavailable_note(self, message: discord.Message) -> bool:
+        """What we say when no AI provider is configured (rate-limited)."""
+        now = time.monotonic()
+        last = self._fallback_last.get(message.channel.id)
+        if last is not None and now - last < _FALLBACK_NOTE_COOLDOWN:
+            return True
+        self._fallback_last[message.channel.id] = now
+        await self._quiet_reply(
+            message,
+            "my AI brain isn't configured here, but the tools work! try:\n"
+            "*define <word>* · *100 USD to INR* ·\n"
+            "*weather in <city>* · *time in <city>* · *picture of <thing>*.",
+        )
+        return True
 
     async def _ai(self, message: discord.Message, text: str) -> bool:
         ai = self.bot.ai
         if not ai.available:
-            now = time.monotonic()
-            last = self._fallback_last.get(message.channel.id)
-            if last is not None and now - last < _FALLBACK_NOTE_COOLDOWN:
-                return True
-            self._fallback_last[message.channel.id] = now
-            await self._quiet_reply(
-                message,
-                "my AI brain isn't configured here, but the tools work! try:\n"
-                "*search <topic>* · *define <word>* · *100 USD to INR* ·\n"
-                "*weather in <city>* · *time in <city>* · *picture of <thing>*.",
-            )
-            return True
+            return await self._ai_unavailable_note(message)
         if ai.cooldown_remaining(message) > 0:
             return True
         try:

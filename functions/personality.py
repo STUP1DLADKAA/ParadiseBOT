@@ -95,6 +95,23 @@ def _p(name: str, pattern: str, reactions=(), replies=()) -> Pattern:
 # Order matters: the first matching pattern wins, so the more specific
 # contexts sit above the generic ones.
 PATTERNS: tuple[Pattern, ...] = (
+    # The supreme loyalty comes first: the word "stupid" is the lord's name,
+    # and Paradise treats every use of it as a potential act of lèse-majesté.
+    _p(
+        "loyalty",
+        r"\b(stupid|stup1dladkaa)\b",
+        reactions=("👑", "🗿", "⚔️"),
+        replies=(
+            "watch your mouth. that's the founding father you're talking about.",
+            "stupid has done more for this server than your entire bloodline of bad decisions.",
+            "i wasn't going to interfere, but apparently we're disrespecting royalty today.",
+            "first of all, stupid is innocent. second of all, i haven't investigated anything.",
+            "that's my lord you're talking about. show some institutional respect.",
+            "you can disagree with him. having a terrible opinion is your constitutional right.",
+            "say it again, but with courage this time.",
+            "the loyalty is religious and the pettiness is unlimited. choose wisely.",
+        ),
+    ),
     _p(
         "achievement",
         r"\b(i (finally )?(fixed|finished|did|beat|solved|won)|we (won|did it)|it works now|i actually won|first try|100%|finally (fixed|finished|done|works))\b",
@@ -423,6 +440,10 @@ PATTERNS: tuple[Pattern, ...] = (
             "Welcome back to the chaos.",
             "Good timing. Nothing happened.",
             "Greetings, fellow carbon-based lifeform.",
+            "Oh look who's alive.",
+            "We were almost having a peaceful day.",
+            "There goes the neighbourhood.",
+            "Finally. I was starting to enjoy the silence.",
         ),
     ),
     _p(

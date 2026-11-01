@@ -3,8 +3,8 @@
 Stage 1 is :mod:`functions.router` — pure pattern matching, zero cost,
 and it already handles the overwhelming majority of requests. This module
 is the narrow fallback for the rest: when the router is genuinely unsure
-("anything on the new pixel?"), Gemini is asked for a *label*, not an
-answer.
+("anything on the new pixel?"), the AI is asked for a *label*, not an
+answer (OpenAI-compatible provider first, Gemini as the fallback).
 
 Design constraints that keep this cheap and safe:
 
@@ -159,8 +159,7 @@ async def classify_request(text: str, ai) -> IntentGuess | None:
     query = " ".join(str(text or "").split()).strip()
     if not query or len(query) > 400 or ai is None:
         return None
-    gemini = getattr(ai, "gemini", None)
-    if gemini is None or not getattr(gemini, "available", False):
+    if not getattr(ai, "available", False):
         return None
 
     key = query.casefold()
@@ -169,7 +168,7 @@ async def classify_request(text: str, ai) -> IntentGuess | None:
         return parse_intent(cached)
 
     try:
-        raw = await asyncio.wait_for(gemini.classify(query), timeout=_CLASSIFY_TIMEOUT)
+        raw = await asyncio.wait_for(ai.classify(query), timeout=_CLASSIFY_TIMEOUT)
     except asyncio.CancelledError:
         raise
     except (asyncio.TimeoutError, ParadiseError):

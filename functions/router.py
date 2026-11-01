@@ -4,7 +4,7 @@ This is the brain of the ping-to-use system. A plain sentence addressed
 to the bot ("@Paradise convert 100 USD to INR") is classified into the
 most specialised tool that can answer it:
 
-    Native tools → deterministic processing → web search → Gemini AI fallback
+    Native tools → deterministic processing → AI (openai-compatible → gemini)
 
 Routing priority (first confident match wins):
 
@@ -16,11 +16,11 @@ Routing priority (first confident match wins):
     6. weather        "weather in Delhi", "how hot is it in Tokyo"
     7. time / date    "what time is it in Tokyo", "what day is it"
     8. translate      "translate hello into Japanese"
-    9. web search    explicit search requests and freshness-sensitive facts
-                      the native search feature can answer directly
-    10. AI (Gemini)   reasoning/comparison questions and anything genuinely
-                      ambiguous — always the last resort; it is never preceded
-                      by an automatic search-and-rewrite loop
+    9. search         explicit search requests and factual questions —
+                      forwarded straight to the AI, which answers in
+                      character (no web retrieval happens)
+    10. AI            reasoning/comparison questions and anything genuinely
+                      ambiguous
 
 :func:`route_many` additionally handles requests that ask for two things
 at once ("search the latest Minecraft update and convert 20 USD to INR")

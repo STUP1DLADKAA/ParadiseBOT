@@ -268,7 +268,7 @@ class TestAIProviderChain(unittest.IsolatedAsyncioTestCase):
         out = await ai.chat([{"role": "system", "content": "s"}, {"role": "user", "content": "hi"}])
         self.assertEqual(out, "gemini says hi")
 
-    async def test_chat_falls_back_to_openai_compatible(self):
+    async def test_openai_compatible_is_the_primary_provider(self):
         config = Config(
             gemini=GeminiConfig(api_key="supersecretkey-123"),
             ai_base_url="http://local.test/v1",
@@ -276,28 +276,118 @@ class TestAIProviderChain(unittest.IsolatedAsyncioTestCase):
             ai_model="llama",
         )
         ai = self.make_ai(config)
-        # Gemini rejects (403) → provider should fall back transparently.
-        ai.gemini._session = FakeSession(post_responses=[FakeResponse(403, text="bad")])
-        import aiohttp  # real session used for the openai-compat leg; patch its post.
-
-        class OpenAIFake(FakeSession):
-            pass
-
-        ai._session = OpenAIFake(post_responses=[
-            FakeResponse(200, {"choices": [{"message": {"content": "fallback hi"}}]})
+        self.assertEqual(ai.provider_name, "openai-compatible")
+        # No queued Gemini response: if the fallback were contacted the
+        # fake session would raise and fail this test.
+        ai.gemini._session = FakeSession(post_responses=[])
+        ai._session = FakeSession(post_responses=[
+            FakeResponse(200, {"choices": [{"message": {"content": "primary hi"}}]})
         ])
         out = await ai.chat([{"role": "user", "content": "hello"}])
-        self.assertEqual(out, "fallback hi")
+        self.assertEqual(out, "primary hi")
         request = ai._session.requests[0]
         self.assertEqual(request["url"], "http://local.test/v1/chat/completions")
         self.assertEqual(request["json"]["model"], "llama")
-        self.assertFalse(ai.gemini.available)
+        self.assertEqual(ai.gemini._session.requests, [])
+
+    async def test_chat_falls_back_to_gemini(self):
+        config = Config(
+            gemini=GeminiConfig(api_key="supersecretkey-123"),
+            ai_base_url="http://local.test/v1",
+            ai_api_key="",
+            ai_model="llama",
+        )
+        ai = self.make_ai(config)
+        # Primary provider returns 500 → Gemini answers transparently.
+        ai._session = FakeSession(post_responses=[FakeResponse(500, text="boom")])
+        ai.gemini._session = FakeSession(
+            post_responses=[FakeResponse(200, gemini_payload("gemini fallback hi"))]
+        )
+        out = await ai.chat([{"role": "user", "content": "hello"}])
+        self.assertEqual(out, "gemini fallback hi")
+        self.assertEqual(len(ai._session.requests), 1)
+        self.assertTrue(ai._session.requests[0]["url"].endswith("/chat/completions"))
+        self.assertIn(":generateContent", ai.gemini._session.requests[0]["url"])
+
+    async def test_answer_question_uses_the_primary_provider(self):
+        config = Config(
+            gemini=GeminiConfig(api_key="supersecretkey-123"),
+            ai_base_url="http://local.test/v1",
+            ai_model="llama",
+        )
+        ai = self.make_ai(config)
+        ai.gemini._session = FakeSession(post_responses=[])
+        ai._session = FakeSession(post_responses=[
+            FakeResponse(200, {"choices": [{"message": {"content": "an unhinged answer"}}]})
+        ])
+        out = await ai.answer_question("what is a black hole", asker="Tester")
+        self.assertEqual(out, "an unhinged answer")
+        messages = ai._session.requests[0]["json"]["messages"]
+        self.assertEqual(messages[0]["role"], "system")
+        self.assertIn("ParadiseBOT", messages[0]["content"])
+        self.assertIn("Tester asks you: what is a black hole", messages[1]["content"])
+        self.assertEqual(ai.gemini._session.requests, [])
+
+    async def test_answer_question_without_ai_raises(self):
+        ai = self.make_ai(Config())
+        with self.assertRaises(ParadiseError):
+            await ai.answer_question("anything")
 
     async def test_reason_uses_gemini_with_facts(self):
         ai = self.make_ai(make_config())
         ai.gemini._session = FakeSession(post_responses=[FakeResponse(200, gemini_payload("grounded"))])
         out = await ai.reason("what year?", ["it happened in 2024"])
         self.assertEqual(out, "grounded")
+
+    async def test_reason_prefers_the_primary_provider(self):
+        config = Config(
+            gemini=GeminiConfig(api_key="supersecretkey-123"),
+            ai_base_url="http://local.test/v1",
+            ai_model="llama",
+        )
+        ai = self.make_ai(config)
+        ai.gemini._session = FakeSession(post_responses=[])
+        ai._session = FakeSession(post_responses=[
+            FakeResponse(200, {"choices": [{"message": {"content": "from facts"}}]})
+        ])
+        out = await ai.reason("what year?", ["it happened in 2024"])
+        self.assertEqual(out, "from facts")
+        prompt = ai._session.requests[0]["json"]["messages"][0]["content"]
+        self.assertIn("VERIFIED FACTS", prompt)
+        self.assertEqual(ai.gemini._session.requests, [])
+
+    async def test_classify_prefers_the_primary_provider(self):
+        config = Config(
+            gemini=GeminiConfig(api_key="supersecretkey-123"),
+            ai_base_url="http://local.test/v1",
+            ai_model="llama",
+        )
+        ai = self.make_ai(config)
+        ai.gemini._session = FakeSession(post_responses=[])
+        ai._session = FakeSession(post_responses=[
+            FakeResponse(
+                200,
+                {"choices": [{"message": {"content": '{"intent":"chat"}'}}]},
+            )
+        ])
+        out = await ai.classify("got any red panda content")
+        self.assertIn("chat", out)
+        self.assertEqual(ai.gemini._session.requests, [])
+
+    async def test_classify_falls_back_to_gemini(self):
+        config = Config(
+            gemini=GeminiConfig(api_key="supersecretkey-123"),
+            ai_base_url="http://local.test/v1",
+            ai_model="llama",
+        )
+        ai = self.make_ai(config)
+        ai._session = FakeSession(post_responses=[FakeResponse(500, text="boom")])
+        ai.gemini._session = FakeSession(
+            post_responses=[FakeResponse(200, gemini_payload('{"intent":"chat"}'))]
+        )
+        out = await ai.classify("got any red panda content")
+        self.assertIn("chat", out)
+        self.assertIn(":generateContent", ai.gemini._session.requests[0]["url"])
 
     async def test_validate_startup_skips_without_key(self):
         ai = self.make_ai(Config())

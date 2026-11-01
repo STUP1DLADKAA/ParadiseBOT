@@ -603,11 +603,12 @@ class ImageSearchConfig:
 
 @dataclass(frozen=True, slots=True)
 class GeminiConfig:
-    """Google Gemini — the optional AI reasoning layer (see functions/gemini.py).
+    """Google Gemini — the optional AI fallback provider (see functions/gemini.py).
 
     Entirely optional: with no key the bot still answers definitions,
-    conversions, calculations, weather, time, search and
-    more — AI is strictly the last-resort reasoning layer.
+    conversions, calculations, weather, time and
+    more — the OpenAI-compatible provider answers first and Gemini is only
+    the fallback reasoning layer.
 
     The key is only ever sent to Gemini's API in a header. It is never
     logged in full, never shown in bot messages and never committed.
@@ -652,10 +653,10 @@ class Config:
 
     token: str = ""
 
-    # Gemini API key support (optional AI reasoning layer).
+    # Gemini API key support (optional AI fallback provider).
     gemini: GeminiConfig = GeminiConfig()
 
-    # OpenAI-compatible chat completion endpoint (optional fallback provider).
+    # OpenAI-compatible chat completion endpoint (the primary provider).
     ai_base_url: str = ""
     ai_api_key: str = ""
     ai_model: str = ""
@@ -708,9 +709,10 @@ class Config:
 
     @property
     def ai_configured(self) -> bool:
-        # Gemini is the primary provider; an OpenAI-compatible endpoint is a
-        # fallback (a base URL alone is enough for local providers e.g. Ollama).
-        return self.gemini.configured or bool(self.ai_base_url and self.ai_model)
+        # The OpenAI-compatible endpoint is the primary provider; Gemini is
+        # the fallback (a base URL alone is enough for local providers e.g.
+        # Ollama).
+        return bool(self.ai_base_url and self.ai_model) or self.gemini.configured
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Config":
