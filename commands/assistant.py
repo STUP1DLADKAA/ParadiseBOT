@@ -5,7 +5,8 @@ the request with the deterministic router (functions/router.py) and sends
 it to the most specialised tool:
 
     calculator · define · convert · image search · weather · time/date
-    · translate → the AI (openai-compatible first, gemini fallback)
+    · translate · meme · gif · recap → the AI (openai-compatible first,
+    gemini fallback)
 
 Search-shaped requests are no longer answered by retrieving the web: the
 request is forwarded straight to the AI and the AI replies, in character
@@ -38,6 +39,8 @@ from zoneinfo import ZoneInfo
 import discord
 from discord.ext import commands
 
+from commands.ai import MAX_SUMMARY_CHARS
+from commands.banter import _GIF_EMPTY, _MEME_EMPTY, meme_embed, render_topic_meme
 from commands.fun import build_ping_message, choose_option, flip_coin
 from commands.system import HELP_BLURBS
 from functions.startup import RETIRED_COMMANDS
@@ -57,7 +60,8 @@ from functions.roasts import (
 )
 from functions.router import (
     AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
-    HELP, IMAGE, PING, ROAST, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
+    GIF, HELP, IMAGE, MEME, PING, ROAST, SEARCH, SUMMARIZE, TIME, TRANSLATE,
+    UNKNOWN, WEATHER,
     Route, route_many,
 )
 from functions.time import build_time_embed, get_current_time_for_zone, resolve_timezone
@@ -89,7 +93,8 @@ ASK_HINT = (
     "• `@Paradise latest Minecraft news`\n"
     "• `@Paradise translate hello into Japanese`\n"
     "• `@Paradise flip a coin`  ·  `@Paradise choose pizza or burgers`\n"
-    "• `@Paradise roast me`  ·  `@Paradise meme`\n"
+    "• `@Paradise roast me`  ·  `@Paradise meme`  ·  `@Paradise bruh gif`\n"
+    "• `@Paradise summarize`  (recap of the recent chat)\n"
     "no commands to remember — just say it normally."
 )
 
@@ -242,6 +247,12 @@ class Assistant(commands.Cog):
             return await self._date(message)
         if kind == TRANSLATE:
             return await self._translate(message, route)
+        if kind == SUMMARIZE:
+            return await self._summarize(message)
+        if kind == MEME:
+            return await self._meme(message, route)
+        if kind == GIF:
+            return await self._gif(message, route)
         if kind == SEARCH:
             return await self._search(message, route)
         if kind in (AI, UNKNOWN):
@@ -424,6 +435,14 @@ class Assistant(commands.Cog):
                 return f"📅 today is **{now.strftime('%A, %d %B %Y')}** (UTC)", []
             if kind == TRANSLATE:
                 return await self._compact_translate(route)
+            if kind in (MEME, GIF):
+                return await self._compact_media(route)
+            if kind == SUMMARIZE:
+                return (
+                    "📋 the recap needs its own message — just say "
+                    "**@Paradise summarize** on its own.",
+                    [],
+                )
             if kind == DEFINE:
                 return await self._compact_search(
                     Route(kind=SEARCH, payload=f"what is {route.payload}"),
@@ -493,6 +512,34 @@ class Assistant(commands.Cog):
         if result is None:
             return "• the translation service isn't responding right now.", []
         return f"🗣️ {shorten(result.text, 300)}", []
+
+    async def _compact_media(self, route: Route) -> tuple[str, list[discord.Embed]]:
+        """One meme or GIF for a combined answer. Best effort, never raises."""
+        engine = getattr(self.bot, "personality", None)
+        if route.kind == GIF:
+            search = getattr(engine, "gif_search", None)
+            if search is not None and getattr(search, "available", False):
+                try:
+                    gif = await asyncio.wait_for(
+                        search.search(route.payload or "reaction"), timeout=8.0
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # noqa: BLE001
+                    gif = None
+                if gif is not None:
+                    return "", [meme_embed(gif)]
+        feed = getattr(engine, "meme_feed", None)
+        if feed is not None:
+            try:
+                meme = await asyncio.wait_for(feed.pick(), timeout=8.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                meme = None
+            if meme is not None:
+                return "", [meme_embed(meme)]
+        return f"• couldn't find a {route.kind} for that part right now.", []
 
     async def _compact_image(self, route: Route) -> tuple[str, list[discord.Embed]]:
         response = await self._find_images(route.payload, route.count)
@@ -812,6 +859,149 @@ class Assistant(commands.Cog):
             await self._quiet_reply(message, "search what, exactly?")
             return True
         return await self._answer_with_ai(message, subject)
+
+    # -- recap, memes and GIFs by mention ---------------------------------
+
+    async def _summarize(self, message: discord.Message) -> bool:
+        """``@Paradise summarize`` — the /summarize logic, no slash command.
+
+        Reads the recent human conversation in this channel (bounded, oldest
+        first) and asks the AI for the same recap /summarize produces.
+        """
+        ai = getattr(self.bot, "ai", None)
+        if ai is None or not getattr(ai, "available", False):
+            await self._quiet_reply(
+                message, "the AI isn't configured right now, so no recaps either."
+            )
+            return True
+        channel = message.channel
+        history = getattr(channel, "history", None)
+        if history is None:
+            await self._quiet_reply(message, "i need a normal text channel for that.")
+            return True
+
+        wanted = 40
+        picked = []
+        try:
+            async for past in channel.history(limit=wanted * 3):
+                if past.author.bot or not str(past.content).strip():
+                    continue
+                picked.append(past)
+                if len(picked) >= wanted:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - history is best-effort
+            log.debug("Could not read channel history", exc_info=True)
+            picked = []
+
+        if len(picked) < 3:
+            await self._quiet_reply(
+                message, "there isn't enough recent conversation here to recap."
+            )
+            return True
+
+        picked.reverse()  # oldest first
+        lines = []
+        total = 0
+        for past in picked:
+            line = f"{getattr(past.author, 'display_name', 'someone')}: {str(past.content)[:220]}"
+            if total + len(line) > MAX_SUMMARY_CHARS:
+                lines.append("(older messages trimmed)")
+                break
+            lines.append(line)
+            total += len(line) + 1
+
+        try:
+            summary = await asyncio.wait_for(
+                ai.summarize(lines, getattr(channel, "name", "this channel")),
+                timeout=_AI_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.exception("Mention summarize failed")
+            await self._quiet_reply(
+                message, "that broke on my end — it's been logged. try again in a moment."
+            )
+            return True
+
+        header = (
+            f"📋 **recap of the last {len(picked)} messages in "
+            f"#{getattr(channel, 'name', 'here')}:**"
+        )
+        parts = split_discord_text(summary, limit=1800)
+        await self._quiet_reply(message, f"{header}\n\n{parts[0]}")
+        for part in parts[1:]:
+            await self._quiet_reply(message, part)
+        return True
+
+    async def _meme(self, message: discord.Message, route: Route) -> bool:
+        """``@Paradise meme`` / ``@Paradise meme about exams`` — one meme.
+
+        Same pipeline as /meme: a real internet meme when the feed has one,
+        a locally drawn card about the topic otherwise. Never fails loudly.
+        """
+        topic = (route.payload or "").strip()
+        if await self._send_online_meme(message):
+            return True
+        author = clean_name(
+            getattr(message.author, "display_name", None), fallback="someone"
+        )
+        try:
+            png = render_topic_meme(topic or "the meme mines are closed today", author=author)
+        except Exception:  # noqa: BLE001 - rendering must never crash chat
+            log.debug("Topic meme render failed", exc_info=True)
+            await self._quiet_reply(message, _MEME_EMPTY)
+            return True
+        await self._quiet_reply(
+            message,
+            file=discord.File(io.BytesIO(png), filename="paradise_meme.png"),
+        )
+        return True
+
+    async def _gif(self, message: discord.Message, route: Route) -> bool:
+        """``@Paradise gif`` / ``@Paradise bruh gif`` — one reaction GIF.
+
+        Keyless by default (same tiers as /gif); when no GIF turns up the
+        meme pipeline answers instead, so the mention never dead-ends.
+        """
+        query = (route.payload or "").strip() or "reaction"
+        engine = getattr(self.bot, "personality", None)
+        search = getattr(engine, "gif_search", None)
+        if search is not None and getattr(search, "available", False):
+            try:
+                gif = await asyncio.wait_for(search.search(query), timeout=8.0)
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001
+                log.debug("GIF search failed", exc_info=True)
+                gif = None
+            if gif is not None:
+                await self._quiet_reply(message, embed=meme_embed(gif))
+                return True
+            await self._quiet_reply(message, _GIF_EMPTY)
+            return True
+        # No GIF tier available: a meme is the standing substitute.
+        return await self._meme(message, route)
+
+    async def _send_online_meme(self, message: discord.Message) -> bool:
+        """Post one internet meme from the personality's feed, if it has one."""
+        engine = getattr(self.bot, "personality", None)
+        feed = getattr(engine, "meme_feed", None)
+        if feed is None:
+            return False
+        try:
+            meme = await asyncio.wait_for(feed.pick(), timeout=8.0)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.debug("Meme fetch failed", exc_info=True)
+            return False
+        if meme is None:
+            return False
+        await self._quiet_reply(message, embed=meme_embed(meme))
+        return True
 
     async def _answer_with_ai(self, message: discord.Message, subject: str) -> bool:
         """Ask the AI *subject* and deliver its answer, placeholder first."""

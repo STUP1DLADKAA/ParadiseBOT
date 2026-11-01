@@ -33,6 +33,9 @@ TIME = "time"
 DATE = "date"
 TRANSLATE = "translate"
 SEARCH = "search"
+SUMMARIZE = "summarize"
+MEME = "meme"
+GIF = "gif"
 AI = "ai"
 UNKNOWN = "unknown"
 
@@ -40,7 +43,8 @@ UNKNOWN = "unknown"
 KINDS = frozenset(
     {
         HELP, COMMAND_HELP, PING, COINFLIP, CHOOSE, ROAST, CALCULATE, DEFINE,
-        CONVERT, IMAGE, WEATHER, TIME, DATE, TRANSLATE, SEARCH, AI, UNKNOWN,
+        CONVERT, IMAGE, WEATHER, TIME, DATE, TRANSLATE, SEARCH, SUMMARIZE,
+        MEME, GIF, AI, UNKNOWN,
     }
 )
 
@@ -110,7 +114,7 @@ class Route:
 
 __all__ = [
     "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE",
-    "DEFINE", "DETERMINISTIC_KINDS", "HELP", "HIGH_CONFIDENCE", "IMAGE",
-    "KINDS", "MEDIUM_CONFIDENCE", "PING", "Route", "SEARCH", "TIME",
-    "TRANSLATE", "UNKNOWN", "WEATHER", "clamp_confidence",
+    "DEFINE", "DETERMINISTIC_KINDS", "GIF", "HELP", "HIGH_CONFIDENCE", "IMAGE",
+    "KINDS", "MEDIUM_CONFIDENCE", "MEME", "PING", "Route", "SEARCH",
+    "SUMMARIZE", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER", "clamp_confidence",
 ]

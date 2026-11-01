@@ -45,7 +45,7 @@ from functions.keywords import keyword_route
 from functions.normalize import normalize_request
 from functions.routes import (
     AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
-    ROAST,
+    GIF, MEME, ROAST, SUMMARIZE,
     DETERMINISTIC_KINDS, HELP, HIGH_CONFIDENCE, IMAGE, MEDIUM_CONFIDENCE,
     PING, Route, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
 )
@@ -217,6 +217,100 @@ _REASONING_MARKERS = re.compile(
     r"what do you think)\b",
     re.IGNORECASE,
 )
+
+_SUMMARIZE = re.compile(
+    r"^(?:please\s+)?(?:summar(?:ize|ise|ising)?|recap?|tl;?dr|"
+    r"what did i miss(?: \S+)?|catch me up(?: on \S+)?|fill me in)"
+    r"(?: (?:the )?(?:last|recent|chat|conversation|channel|this))?\s*"
+    r"(?:\d+ messages?)?\s*(?:please|pls|thx|thanks)?\s*[?!.]*$",
+    re.IGNORECASE,
+)
+
+_MEME_DELIVERY = re.compile(
+    r"^(?:please\s+)?(?:send|give|show|make|drop|post|got|need|want|another|more)\s+"
+    r"(?:me\s+)?(?:a|some|the)?\s*memes?\b"
+    r"(?:\s+(?:about|of|for|on)\s+(?P<topic>.+?))?\s*"
+    r"(?:please|pls|thx|thanks)?\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_MEME_TOPIC_FIRST = re.compile(
+    r"^(?:a\s+)?(?P<topic>[\w' .\-]{2,40}?)\s+meme\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_MEME_BARE = re.compile(r"^(?:meme|memes)\s*[?!.]*$", re.IGNORECASE)
+
+_GIF_DELIVERY = re.compile(
+    r"^(?:please\s+)?(?:send|give|show|drop|post|got|need|want)\s+"
+    r"(?:me\s+)?(?:a|some|the)?\s*gifs?\b"
+    r"(?:\s+(?:of|about|for|on)\s+(?P<topic>.+?))?\s*"
+    r"(?:please|pls|thx|thanks)?\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_GIF_TOPIC_FIRST = re.compile(
+    r"^(?:a\s+)?(?P<topic>[\w' .\-]{2,40}?)\s+gif\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_GIF_BARE = re.compile(r"^(?:gif|gifs)\s*[?!.]*$", re.IGNORECASE)
+
+#: "<something> meme" only counts as a meme request when the something is a
+#: short topic — not half a question ("what is a meme" is a definition) and
+#: not a leftover clause ("summarize and then show me a gif").
+_QUESTION_WORDS = re.compile(
+    r"^(?:what|who|when|where|why|how|is|are|do|does|did|can|could|would|tell|explain)\b",
+    re.IGNORECASE,
+)
+#: Filler that means the words before "meme"/"gif" were not a topic.
+_TOPIC_FILLER = frozenset(
+    {"me", "a", "an", "the", "some", "then", "and", "also", "please", "pls",
+     "show", "send", "give", "drop", "post", "got", "need", "want", "make",
+     "just", "us", "one"}
+)
+
+
+def _clean_meme_topic(topic: str | None) -> str:
+    """Strip filler from a meme/gif topic ('a cat failing' → 'cat failing')."""
+    cleaned = _IMAGE_SUBJECT_TRIM.sub("", " ".join(str(topic or "").split()))
+    return cleaned[:60]
+
+
+def _topic_is_a_topic(topic: str) -> bool:
+    """True when a topic-first match reads like a topic ('valorant meme')."""
+    words = topic.casefold().split()
+    if not 1 <= len(words) <= 4:
+        return False
+    if _QUESTION_WORDS.match(topic):
+        return False
+    return not any(word in _TOPIC_FILLER for word in words)
+
+
+def _meme_route(cleaned: str) -> Route | None:
+    """A meme request, or None. Delivery verbs beat topic-first phrasing."""
+    delivery = _MEME_DELIVERY.match(cleaned)
+    if delivery is not None or _MEME_BARE.match(cleaned):
+        topic = delivery.group("topic") if delivery else ""
+        return Route(kind=MEME, payload=_clean_meme_topic(topic), confidence=0.9)
+    topical = _MEME_TOPIC_FIRST.match(cleaned)
+    if topical is not None and _topic_is_a_topic(topical.group("topic")):
+        return Route(
+            kind=MEME, payload=_clean_meme_topic(topical.group("topic")),
+            confidence=0.9,
+        )
+    return None
+
+
+def _gif_route(cleaned: str) -> Route | None:
+    """A reaction-GIF request, or None."""
+    delivery = _GIF_DELIVERY.match(cleaned)
+    if delivery is not None or _GIF_BARE.match(cleaned):
+        topic = delivery.group("topic") if delivery else ""
+        return Route(kind=GIF, payload=_clean_meme_topic(topic), confidence=0.9)
+    topical = _GIF_TOPIC_FIRST.match(cleaned)
+    if topical is not None and _topic_is_a_topic(topical.group("topic")):
+        return Route(
+            kind=GIF, payload=_clean_meme_topic(topical.group("topic")),
+            confidence=0.9,
+        )
+    return None
 
 _GREETING = re.compile(
     r"^(?:hey+|hi|hello|yo|hiya|howdy|sup|what's up|whats up|good (?:morning|evening|afternoon)|"
@@ -400,6 +494,19 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
             confidence=0.9,
         )
 
+    # -- media & recap fast lane: memes, reaction GIFs, and a channel recap.
+    # These sit after the definition/translation tools (so "what is a meme"
+    # stays a definition) and before the search verbs (so "show me a meme"
+    # never becomes a web lookup).
+    if _SUMMARIZE.match(cleaned):
+        return Route(kind=SUMMARIZE, confidence=0.92)
+    meme = _meme_route(cleaned)
+    if meme is not None:
+        return meme
+    gif = _gif_route(cleaned)
+    if gif is not None:
+        return gif
+
     # -- implicit "what is X" definitions come after the tools that could
     # claim the same shape ("what's the date", "what's the weather in …").
     match = _DEFINE_WHAT_IS.match(cleaned) or _DEFINE_WHAT_IS_ONE_WORD.match(cleaned)
@@ -507,11 +614,14 @@ _MAX_COMPOUND_PARTS = 3
 
 # Kinds that can take part in a combined answer at all.
 _COMPOUND_KINDS = frozenset(
-    {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, SEARCH, DEFINE}
+    {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, SEARCH, DEFINE,
+     MEME, GIF, SUMMARIZE}
 )
 # At least one part must be an unambiguous deterministic tool, otherwise the
 # "and" was almost certainly part of a single sentence.
-_STRONG_KINDS = frozenset({CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE})
+_STRONG_KINDS = frozenset(
+    {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, MEME, GIF}
+)
 
 
 def route_many(text: str) -> list[Route]:
@@ -553,6 +663,7 @@ def route_many(text: str) -> list[Route]:
 __all__ = [
     "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE", "DEFINE",
     "DETERMINISTIC_KINDS", "HELP", "HIGH_CONFIDENCE", "IMAGE", "MEDIUM_CONFIDENCE",
-    "PING", "ROAST", "Route", "SEARCH", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER",
+    "GIF", "MEME", "PING", "ROAST", "Route", "SEARCH", "SUMMARIZE", "TIME",
+    "TRANSLATE", "UNKNOWN", "WEATHER",
     "route_many", "route_query", "route_strict",
 ]

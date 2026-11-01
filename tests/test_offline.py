@@ -348,11 +348,14 @@ class TestAI(unittest.TestCase):
 
     def test_context_is_bounded(self):
         ai = self._service()
-        for i in range(30):
+        for i in range(60):
             ai._history[5].append((f"user{i}", f"message number {i}"))
         block = ai._context_block(5)
-        self.assertLessEqual(len(block), 2400)
-        self.assertIn("message number 29", block)
+        # The window is generous now (32 messages / 6000 chars) but still a
+        # window: the oldest messages fall off.
+        self.assertLessEqual(len(block), 6000)
+        self.assertIn("message number 59", block)
+        self.assertIn("message number 28", block)  # 32nd from the end
         self.assertNotIn("message number 0", block)
 
     def test_cooldown(self):
@@ -683,7 +686,13 @@ class TestPersonalityGuards(unittest.TestCase):
 
     def test_reply_channel_cooldown(self):
         personality = make_personality(
-            reaction_chance=0.0, reply_chance=1.0, reply_channel_cooldown=3600
+            reaction_chance=0.0,
+            reply_chance=1.0,
+            reply_channel_cooldown=3600,
+            # Two authors here, so the interjection layer is eligible; zero
+            # it so a slow machine (global cooldown lapsing between the two
+            # asyncio.run calls) can't let it answer instead.
+            interject_chance=0.0,
         )
         first = make_message("I'm so tired")
         second = make_message("who broke this", author_id=43)

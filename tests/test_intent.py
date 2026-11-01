@@ -24,7 +24,8 @@ from functions.intent import (  # noqa: E402
 )
 from functions.intent import _cache as intent_cache  # noqa: E402
 from functions.router import (  # noqa: E402
-    AI, CALCULATE, CONVERT, IMAGE, SEARCH, TIME, WEATHER, Route, route_query,
+    AI, CALCULATE, CONVERT, GIF, IMAGE, MEME, SEARCH, SUMMARIZE, TIME,
+    WEATHER, Route, route_query,
 )
 
 
@@ -125,6 +126,10 @@ class TestToRoute(unittest.TestCase):
             ("time", TIME),
             ("image", IMAGE),
             ("search", SEARCH),
+            ("summarize", SUMMARIZE),
+            ("recap", SUMMARIZE),
+            ("meme", MEME),
+            ("gif", GIF),
             ("chat", AI),
         ):
             route = IntentGuess(intent=intent, query="q").to_route(self.fallback)

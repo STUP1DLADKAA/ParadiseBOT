@@ -12,6 +12,7 @@ import os
 import sys
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 from unittest.mock import AsyncMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -93,6 +94,10 @@ class FakeAI:
     async def classify(self, request, max_tokens=120):
         self.classified.append(request)
         return ""
+
+    async def summarize(self, lines, channel_name):
+        self.summarized = (list(lines), channel_name)
+        return self._answer
 
     async def tease(self, name, text="", *, target_id=0, max_tokens=140):
         self.teased.append((name, text, target_id))
@@ -657,6 +662,158 @@ class TestAssistantSafety(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(assistant.images.calls, [])
         self.assertEqual(ai.questions, [])
         self.assertEqual(ai.responded_to, [])
+
+
+class TestMediaAndRecapByMention(unittest.IsolatedAsyncioTestCase):
+    """@Paradise meme / gif / summarize — no slash command needed."""
+
+    @staticmethod
+    def _history_channel(messages, *, name="general"):
+        class _HistoryChannel:
+            def __init__(self):
+                self.id = 55
+                self.name = name
+
+            def permissions_for(self, _member):
+                return FakePermissions()
+
+            def history(self, limit=None):
+                async def _gen():
+                    for message in messages:
+                        yield message
+
+                return _gen()
+
+        return _HistoryChannel()
+
+    @staticmethod
+    def _past(author, content):
+        return SimpleNamespace(
+            author=SimpleNamespace(bot=False, display_name=author),
+            content=content,
+        )
+
+    async def test_summarize_recaps_the_channel(self):
+        ai = FakeAI(available=True, answer="they argued about pizza for an hour")
+        assistant, _ = make_assistant(ai=ai)
+        message = mention("summarize")
+        message.channel = self._history_channel(
+            [self._past(f"User{index}", f"message {index}") for index in range(6)]
+        )
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        text = message.replies[0]["content"]
+        self.assertIn("recap of the last 6 messages", text)
+        self.assertIn("pizza", text)
+
+    async def test_summarize_without_enough_chat_says_so(self):
+        ai = FakeAI(available=True)
+        assistant, _ = make_assistant(ai=ai)
+        message = mention("what did i miss")
+        message.channel = self._history_channel(
+            [self._past("Ash", "hi"), self._past("Rohan", "hello")]
+        )
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        self.assertIn("enough recent conversation", message.replies[0]["content"])
+
+    async def test_summarize_without_ai_says_so(self):
+        assistant, _ = make_assistant(ai=FakeAI(available=False))
+        message = mention("tl;dr")
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        self.assertIn("isn't configured", message.replies[0]["content"])
+
+    async def test_a_meme_request_posts_the_feed_meme(self):
+        class FakeMeme:
+            pass
+
+        class FakeFeed:
+            async def pick(self):
+                return FakeMeme()
+
+        assistant, _ = make_assistant()
+        assistant.bot.personality = SimpleNamespace(meme_feed=FakeFeed())
+        with mock.patch(
+            "commands.assistant.meme_embed", return_value="MEME EMBED"
+        ) as embed:
+            message = mention("send me a meme")
+            handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        embed.assert_called_once()
+        self.assertEqual(message.replies[0].get("embed"), "MEME EMBED")
+
+    async def test_a_meme_request_without_the_feed_draws_one(self):
+        assistant, _ = make_assistant()
+        assistant.bot.personality = SimpleNamespace(
+            meme_feed=SimpleNamespace(pick=None)  # no usable feed
+        )
+        png = b"fake png bytes"
+        with mock.patch(
+            "commands.assistant.render_topic_meme", return_value=png
+        ) as render:
+            message = mention("give me a meme about exams")
+            handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        render.assert_called_once()
+        topic_arg = render.call_args.args[0]
+        self.assertEqual(topic_arg, "exams")
+        self.assertIsNotNone(message.replies[0].get("file"))
+
+    async def test_a_gif_request_searches_and_posts(self):
+        class FakeSearch:
+            available = True
+
+            def __init__(self):
+                self.queries = []
+
+            async def search(self, query):
+                self.queries.append(query)
+                return "A GIF"
+
+        search = FakeSearch()
+        assistant, _ = make_assistant()
+        assistant.bot.personality = SimpleNamespace(gif_search=search)
+        with mock.patch(
+            "commands.assistant.meme_embed", return_value="GIF EMBED"
+        ):
+            message = mention("show me a gif of a cat failing a jump")
+            handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        self.assertEqual(search.queries, ["cat failing a jump"])
+        self.assertEqual(message.replies[0].get("embed"), "GIF EMBED")
+
+    async def test_a_gif_request_with_no_result_says_so(self):
+        class FakeSearch:
+            available = True
+
+            async def search(self, _query):
+                return None
+
+        assistant, _ = make_assistant()
+        assistant.bot.personality = SimpleNamespace(gif_search=FakeSearch())
+        message = mention("bruh gif")
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        self.assertIn("came back empty", message.replies[0]["content"])
+
+    async def test_a_gif_request_without_a_key_falls_back_to_a_meme(self):
+        class FakeFeed:
+            async def pick(self):
+                return "ONLINE MEME"
+
+        assistant, _ = make_assistant()
+        assistant.bot.personality = SimpleNamespace(
+            gif_search=SimpleNamespace(available=False),
+            meme_feed=FakeFeed(),
+        )
+        with mock.patch(
+            "commands.assistant.meme_embed", return_value="MEME EMBED"
+        ):
+            message = mention("gif")
+            handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        self.assertEqual(message.replies[0].get("embed"), "MEME EMBED")
 
 
 class TestParallelRequests(unittest.IsolatedAsyncioTestCase):

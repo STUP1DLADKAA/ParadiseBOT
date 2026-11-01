@@ -27,8 +27,8 @@ from dataclasses import dataclass
 from functions.cache import TTLCache
 from functions.helpers import ParadiseError
 from functions.routes import (
-    AI, CALCULATE, CONVERT, DATE, DEFINE, IMAGE, MEDIUM_CONFIDENCE, SEARCH,
-    TIME, TRANSLATE, WEATHER, Route, clamp_confidence,
+    AI, CALCULATE, CONVERT, DATE, DEFINE, GIF, IMAGE, MEDIUM_CONFIDENCE, MEME,
+    SEARCH, SUMMARIZE, TIME, TRANSLATE, WEATHER, Route, clamp_confidence,
 )
 
 log = logging.getLogger(__name__)
@@ -46,6 +46,10 @@ _INTENT_TO_KIND: dict[str, str] = {
     "translate": TRANSLATE,
     "dictionary": DEFINE,
     "recipe": SEARCH,
+    "summarize": SUMMARIZE,
+    "recap": SUMMARIZE,
+    "meme": MEME,
+    "gif": GIF,
     "chat": AI,
     "unknown": AI,
 }

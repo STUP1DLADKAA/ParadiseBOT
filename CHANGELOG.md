@@ -6,7 +6,27 @@ All notable changes to Paradise are recorded here. The format follows
 
 ## [Unreleased]
 
+### Removed
+- **The "chat is silent" watcher is gone.** The aliveness feature — the
+  lines Paradise posted when nobody had typed for a while or everyone had
+  moved into a voice call — has been removed entirely, along with its
+  `ALIVENESS_*` knobs and the optional Presence Intent (which existed only
+  to count online members for those lines). The bot still follows everyone
+  into voice channels silently; it just no longer narrates a quiet server.
+
 ### Changed
+- **Way more context.** The AI now sees the last 32 messages of channel
+  context (up from 16; 6,000 characters, up from 3,200) and keeps an
+  80-message rolling history (up from 40), so answers track the actual
+  conversation.
+- **Faster and more parallel.** Up to 8 AI requests in flight at once
+  (up from 4), a shorter per-user cooldown (12 s → 8 s) and per-channel
+  cooldown (5 s → 3 s): a busy server no longer feels a queue.
+- **Memories are relevant or silent.** The memory lookup no longer pads an
+  unrelated question with the most recent stored facts — a memory now
+  reaches the prompt only when it is about someone in the conversation or
+  actually matches the words. No more dragging old business into random
+  replies.
 - **The bot never admits to remembering.** When a `/memory` fact surfaces —
   in an AI answer, a roast, or the personality's rare callback — it is framed
   as something Paradise *already knew*, not something it was taught: no "i
@@ -37,6 +57,14 @@ All notable changes to Paradise are recorded here. The format follows
   quips (0.12 → 0.14) — the bot is louder and more alive by default.
 
 ### Added
+- **More capabilities per plain @ping.** `@Paradise summarize` (also "recap",
+  "tl;dr", "what did i miss", "catch me up") recaps the recent conversation
+  with the same AI pipeline as /summarize; `@Paradise meme [about X]` and
+  `@Paradise gif [of X]` (or just "bruh gif") post a meme or reaction GIF
+  through the same tiers as the slash commands — keyless by default, with a
+  locally drawn card as the meme fallback. The AI intent classifier learned
+  the three new labels too, so loosely phrased asks ("drop something funny",
+  "gif me something") route to the right tool instead of a chat answer.
 - **Taher is a lord too.** User `1049231767585964032` (Taher) now stands at
   exactly the same level of authority as Stupid (`922359954025885737`): both
   are lords and masters of everyone, both addressed as "my lord", both

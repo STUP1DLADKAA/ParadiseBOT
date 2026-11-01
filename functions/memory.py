@@ -324,13 +324,15 @@ class MemoryStore:
         ]
 
     def relevant(self, question: str, *, limit: int = 6) -> list[MemoryEntry]:
-        """The memories most related to ``question``, best first.
+        """The memories actually related to ``question``, best first.
 
         Scoring is word overlap with the question's keywords; ties keep the
-        more recent memory. When nothing overlaps, the most recent memories
-        are returned instead — they are context even when they do not match,
-        and a question like "what do you remember about us" deserves an
-        answer too.
+        more recent memory. When nothing overlaps, **nothing is returned**:
+        an unrelated memory dropped into an unrelated reply reads as the bot
+        obsessively bringing up old business, so relevance is a hard filter,
+        not a ranking. (Memories *about the people in the conversation* are
+        selected separately by ``for_prompt`` and do not need to match the
+        words.)
         """
         wanted = min(10, max(1, int(limit)))
         entries = self.entries()
@@ -342,7 +344,7 @@ class MemoryStore:
             if word not in _STOP_WORDS and len(word) > 1
         }
         if not keywords:
-            return entries[:wanted]
+            return []
 
         def score(entry: MemoryEntry) -> int:
             words = set(_WORD_RE.findall(entry.text.lower()))
@@ -352,16 +354,7 @@ class MemoryStore:
             ((score(entry), index, entry) for index, entry in enumerate(entries)),
             key=lambda item: (-item[0], item[1]),
         )
-        hits = [entry for points, _, entry in ranked if points > 0]
-        if len(hits) < wanted:
-            chosen_ids = {entry.id for entry in hits}
-            for _, _, entry in ranked:
-                if entry.id not in chosen_ids:
-                    hits.append(entry)
-                    chosen_ids.add(entry.id)
-                if len(hits) >= wanted:
-                    break
-        return hits[:wanted]
+        return [entry for points, _, entry in ranked if points > 0][:wanted]
 
     def for_prompt(
         self,
@@ -374,8 +367,10 @@ class MemoryStore:
 
         Priority: memories **about the people involved** (the asker, anyone
         mentioned — these are the "roast him about the murder mystery year"
-        ammunition), then keyword-relevant memories, then the most recent
-        ones as general context. Deduplicated and capped.
+        ammunition), then keyword-relevant memories that actually match the
+        question. Deduplicated and capped. Anything else stays out: a memory
+        that matches neither the people nor the words is old business, and
+        old business is exactly what a reply should not drag in.
         """
         wanted = min(10, max(1, int(limit)))
         chosen: list[MemoryEntry] = []
