@@ -28,7 +28,7 @@ from commands.clip import VoiceClip  # noqa: E402
 from commands.voice_presence import VoicePresence  # noqa: E402
 from config import Config, VoiceClipConfig  # noqa: E402
 from functions.voice_clip import (  # noqa: E402
-    AUTHORIZED_CLIP_USER_ID,
+    AUTHORIZED_CLIP_USER_IDS,
     ClipAuthorizationError,
     ClipBusyError,
     ClipDeliveryError,
@@ -289,8 +289,12 @@ class TestClipAuthorizationAndValidation(unittest.IsolatedAsyncioTestCase):
         await self.cog.service.shutdown()
 
     def test_exact_authorized_id_and_type_checks(self) -> None:
-        self.assertEqual(AUTHORIZED_CLIP_USER_ID, 922359954025885737)
+        # Both lords are operators now — Stupid and Taher, same level.
+        self.assertEqual(
+            AUTHORIZED_CLIP_USER_IDS, (922359954025885737, 1049231767585964032)
+        )
         self.assertTrue(authorize_clip_user(922359954025885737))
+        self.assertTrue(authorize_clip_user(1049231767585964032))
         for bad in (
             922359954025885736,
             922359954025885738,
@@ -316,7 +320,7 @@ class TestClipAuthorizationAndValidation(unittest.IsolatedAsyncioTestCase):
         for requested in (1, 30, 60, 180):
             delivered: list[tuple[str, bytes, str]] = []
             interaction, _ = _make_interaction(
-                user_id=AUTHORIZED_CLIP_USER_ID,
+                user_id=AUTHORIZED_CLIP_USER_IDS[0],
                 guild=self.guild,
                 username=f"completely_renamed_{requested}",
                 captured_files=delivered,
@@ -347,7 +351,8 @@ class TestClipAuthorizationAndValidation(unittest.IsolatedAsyncioTestCase):
         call_kwargs = interaction.response.send_message.call_args.kwargs
         denial_text = interaction.response.send_message.call_args.args[0]
         self.assertTrue(call_kwargs.get("ephemeral"))
-        self.assertNotIn(str(AUTHORIZED_CLIP_USER_ID), denial_text)
+        for lord_id in AUTHORIZED_CLIP_USER_IDS:
+            self.assertNotIn(str(lord_id), denial_text)
         interaction.response.defer.assert_not_called()
         buf.snapshot.assert_not_called()
         self.cog.service.exporter.export.assert_not_called()
@@ -1039,7 +1044,7 @@ class TestLifecyclePrivacyAndReliability(unittest.IsolatedAsyncioTestCase):
 
         # Start a real export and append live packets concurrently while export runs
         export_coro = svc.export_clip_for_guild(
-            requester_user_id=AUTHORIZED_CLIP_USER_ID,
+            requester_user_id=AUTHORIZED_CLIP_USER_IDS[0],
             guild=guild,
             duration=1,
         )
@@ -1058,7 +1063,7 @@ class TestLifecyclePrivacyAndReliability(unittest.IsolatedAsyncioTestCase):
 
         # Subsequent clip contains both speakers!
         clip2, _ = await svc.export_clip_for_guild(
-            requester_user_id=AUTHORIZED_CLIP_USER_ID,
+            requester_user_id=AUTHORIZED_CLIP_USER_IDS[0],
             guild=guild,
             duration=2,
         )
@@ -1089,7 +1094,7 @@ class TestLifecyclePrivacyAndReliability(unittest.IsolatedAsyncioTestCase):
 
         forbidden = discord.Forbidden(MagicMock(status=403), "Cannot send messages to this user")
         interaction, _ = _make_interaction(
-            user_id=AUTHORIZED_CLIP_USER_ID,
+            user_id=AUTHORIZED_CLIP_USER_IDS[0],
             guild=guild,
             dm_exception=forbidden,
         )
@@ -1262,7 +1267,7 @@ class TestRealUDPClipVoiceClientIntegration(unittest.IsolatedAsyncioTestCase):
             # 4. Invoke /clip as authorized user 922359954025885737
             delivered: list[tuple[str, bytes, str]] = []
             interaction, _ = _make_interaction(
-                user_id=AUTHORIZED_CLIP_USER_ID,
+                user_id=AUTHORIZED_CLIP_USER_IDS[0],
                 guild=guild,
                 captured_files=delivered,
             )
@@ -1443,7 +1448,7 @@ class TestErrorHandlingAndTransportEdgeCases(unittest.IsolatedAsyncioTestCase):
         # 1. Bot not connected to any VC
         guild_disc, _, _ = _make_guild_with_vc(connected=False)
         interaction_disc, _ = _make_interaction(
-            user_id=AUTHORIZED_CLIP_USER_ID, guild=guild_disc
+            user_id=AUTHORIZED_CLIP_USER_IDS[0], guild=guild_disc
         )
         await cog.clip.callback(cog, interaction_disc, 10)
         interaction_disc.response.send_message.assert_awaited_once()
@@ -1487,7 +1492,7 @@ class TestErrorHandlingAndTransportEdgeCases(unittest.IsolatedAsyncioTestCase):
 
         # 4. Expired interaction during defer does not raise unhandled error
         expired_inter, dm_chan = _make_interaction(
-            user_id=AUTHORIZED_CLIP_USER_ID, guild=guild
+            user_id=AUTHORIZED_CLIP_USER_IDS[0], guild=guild
         )
         expired_inter.response.defer = AsyncMock(
             side_effect=discord.NotFound(MagicMock(status=404), "Unknown interaction")

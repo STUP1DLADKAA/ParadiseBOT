@@ -230,6 +230,16 @@ class TestSupremeLoyalty(unittest.IsolatedAsyncioTestCase):
         loyalty = next(p for p in PATTERNS if p.name == "loyalty")
         self.assertIn(sent, loyalty.replies)
 
+    async def test_disrespecting_taher_gets_a_defence(self):
+        """Taher's name is defended exactly like Stupid's."""
+        personality = self._personality()
+        msg = _make_msg("taher is so bad at this game lol")
+        await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        sent = msg.reply.call_args.args[0]
+        loyalty_taher = next(p for p in PATTERNS if p.name == "loyalty-taher")
+        self.assertIn(sent, loyalty_taher.replies)
+
     async def test_no_stupid_no_loyalty(self):
         personality = self._personality()
         msg = _make_msg("honestly i think cereal is technically cold soup")
@@ -407,7 +417,9 @@ class TestConversationsAndTheLord(unittest.IsolatedAsyncioTestCase):
         cfg = PersonalityConfig(**defaults)
         bot = SimpleNamespace(
             user=SimpleNamespace(id=999),
-            config=SimpleNamespace(lord_user_id=self.LORD_ID),
+            config=SimpleNamespace(
+                lord_user_ids=(self.LORD_ID, 1049231767585964032)
+            ),
         )
         return Personality(bot, cfg)
 
@@ -457,6 +469,37 @@ class TestConversationsAndTheLord(unittest.IsolatedAsyncioTestCase):
             await personality.handle(msg)
         msg.reply.assert_awaited_once()
         self.assertIn(msg.reply.call_args.args[0], LORD_LINES)
+
+    async def test_taher_is_treated_as_a_lord_too(self):
+        """Taher is a lord and master at the same level as Stupid."""
+        personality = self._personality(lord_reply_chance=1.0)
+        with patch("functions.personality.random.random", return_value=0.0):
+            msg = _make_msg("taher has entered the chat", author_id=1049231767585964032)
+            await personality.handle(msg)
+        msg.add_reaction.assert_awaited_once()
+        self.assertIn(msg.add_reaction.call_args.args[0], LORD_REACTIONS)
+
+        with patch("functions.personality.random.random", return_value=0.9):
+            msg = _make_msg("taher speaks again", author_id=1049231767585964032)
+            await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        self.assertIn(msg.reply.call_args.args[0], LORD_LINES)
+
+    async def test_taher_is_roasted_with_loyalty(self):
+        personality = self._personality(
+            roast_chance=1.0, lord_reply_chance=0.0, interject_chance=0.0
+        )
+        content = "i have decided the bot pays for discord nitro now"
+        msg = _make_msg(content, author_id=1049231767585964032)
+        await personality.handle(msg)
+        msg.reply.assert_awaited_once()
+        sent = msg.reply.call_args.args[0]
+        snippet = clean_snippet(content)
+        rendered = {
+            frame.format(name="Ash", snippet=snippet)
+            for frame in LORD_CONTEXT_FRAMES
+        }
+        self.assertIn(sent, rendered)
 
     async def test_everyone_else_is_not_the_lord(self):
         personality = self._personality(lord_reply_chance=1.0, interject_chance=0.0)
@@ -540,12 +583,26 @@ class TestConversationsAndTheLord(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cfg.personality.interject_cooldown, 120)
         self.assertEqual(cfg.personality.lord_reply_chance, 0.5)
         self.assertEqual(cfg.lord_user_id, 922359954025885737)
+        # A configured single lord replaces the shipped pair (old behaviour).
+        self.assertEqual(cfg.lord_user_ids, (922359954025885737,))
+        self.assertFalse(cfg.is_lord(1049231767585964032))
         self.assertTrue(cfg.presence_intent)
+        # the multi-lord form, and the two forms merging
+        many = Config.from_env(
+            {"PARADISE_LORD_USER_IDS": "111, 222", "PARADISE_LORD_USER_ID": "333"}
+        )
+        self.assertEqual(many.lord_user_ids, (111, 222, 333))
         # and the defaults match the shipped tuning
         defaults = Config.from_env({})
         self.assertEqual(defaults.personality.meme_chance, 0.16)
         self.assertEqual(defaults.personality.gif_chance, 0.10)
         self.assertFalse(defaults.presence_intent)
+        # Stupid and Taher, both lords by default, same level of authority.
+        self.assertEqual(
+            defaults.lord_user_ids, (922359954025885737, 1049231767585964032)
+        )
+        self.assertTrue(defaults.is_lord(1049231767585964032))
+        self.assertTrue(defaults.is_lord(922359954025885737))
 
 
 if __name__ == "__main__":

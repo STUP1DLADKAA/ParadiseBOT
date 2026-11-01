@@ -18,7 +18,7 @@ message in
    ├─ "roast me" / "1v1 me" → a roast, right now
    │
    └─ everything else (all gated by the channel cooldowns)
-        ├─ the lord himself spoke? → a "my lord 👑" line or a crown
+        ├─ a lord himself spoke?   → a "my lord 👑" line or a crown
         ├─ two people talking?     → a small chance of "hello!"
         └─ one of: reply · roast · meme · GIF · sticker · quip · reaction
 ```
@@ -37,7 +37,7 @@ message in
 | Quip | An unprompted 200-IQ / 2-IQ observation | `PERSONALITY_QUIP_CHANCE` | `0.14` |
 | Nerd | Grammar/spelling correction, English only | `PERSONALITY_GRAMMAR_CHANCE` | `0.70` |
 | Interjection | A "hello!" when two people are talking (10-minute window) | `PERSONALITY_INTERJECT_CHANCE` | `0.08` |
-| Lord | A loyal acknowledgement when the lord and master speaks | `PERSONALITY_LORD_REPLY_CHANCE` | `0.20` |
+| Lord | A loyal acknowledgement when a lord and master speaks | `PERSONALITY_LORD_REPLY_CHANCE` | `0.20` |
 | Memory callback | One remembered fact quoted back at the person it's about | `PERSONALITY_MEMORY_CALLBACK_CHANCE` | `0.05` |
 
 New layers:
@@ -47,12 +47,15 @@ New layers:
   short line of its own ("hello!", "continue, i'm invested now"). Its own
   cooldown (`PERSONALITY_INTERJECT_COOLDOWN`, default 240 s) keeps it a
   surprise rather than a photobombber.
-* **Lord** — user `922359954025885737` (configurable with
-  `PARADISE_LORD_USER_ID`) is the lord and master. When he speaks, Paradise
-  occasionally answers with a loyal, slightly cheeky line ("my lord has spoken
-  👑") or just drops a crown reaction on the message. He is also the only
-  person who can teach the bot long-term memories (`/memory`), and the AI
-  addresses him as "my lord" — while still teasing him, because he expects it.
+* **Lords** — Stupid (`922359954025885737`, the owner) and Taher
+  (`1049231767585964032`) are the lords and masters, at the same level of
+  authority (configurable with `PARADISE_LORD_USER_IDS`). When either speaks,
+  Paradise occasionally answers with a loyal, slightly cheeky line ("my lord
+  has spoken 👑") or just drops a crown reaction on the message. They are also
+  the only people who can teach the bot long-term memories (`/memory`), and
+  the AI addresses each of them as "my lord" — while still teasing them,
+  because they expect it. Each lord's *name* is defended too: disparage
+  "stupid" or "taher" in a sentence and Paradise takes it personally.
 * **Context roasts** — when the roast target's last words are long enough, the
   roast *quotes them back* ("bro woke up today and chose to say \"pineapple
   belongs on pizza\" out loud."). Roasting the lord uses the loyal-but-cheeky
@@ -203,7 +206,7 @@ so a restart can't produce a false alarm).
 | `/roast [member]` | Roast someone, or yourself |
 | `/meme [topic]` | A random internet meme, or a drawn card about `topic` |
 | `/gif <query>` | A reaction GIF (works keyless) |
-| `/memory add/list/remove/clear` | Teach the bot facts it remembers (the lord only) |
+| `/memory add/list/remove/clear` | Teach the bot facts it remembers (the lords only) |
 
 ## Quiet mode
 

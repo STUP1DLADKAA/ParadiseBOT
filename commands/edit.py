@@ -1,6 +1,7 @@
-"""Voice data editing command for the dedicated user.
+"""Voice data editing command for the dedicated users.
 
-This command allows the authorized user (922359954025885737) to adjust
+This command allows the authorized users (922359954025885737 and
+1049231767585964032 — the lords, Stupid and Taher) to adjust
 voice activity time for any user across all time periods (today, yesterday,
 week, month, all_time). Changes are applied directly to the voice_daily_stats
 table and reflected immediately in /vc leaderboard and /vc stats.
@@ -26,9 +27,13 @@ from functions.voice.store import VoiceStoreUnavailable
 
 log = logging.getLogger(__name__)
 
-#: Default operator ID for the deployment this bot grew up in.
-#: Override with ``EDIT_ALLOWED_USER_IDS`` (comma-separated Discord user IDs).
-AUTHORIZED_EDIT_USER_ID: int = 922359954025885737
+#: Default operator IDs for the deployment this bot grew up in (the lords,
+#: both at the same level of authority). Override with
+#: ``EDIT_ALLOWED_USER_IDS`` (comma-separated Discord user IDs).
+AUTHORIZED_EDIT_USER_IDS: tuple[int, ...] = (
+    922359954025885737,   # Stupid
+    1049231767585964032,  # Taher
+)
 EDIT_USERS_ENV = "EDIT_ALLOWED_USER_IDS"
 
 #: Vague error message for unauthorized users (looks like a technical issue)
@@ -41,11 +46,11 @@ UNAUTHORIZED_EDIT_MESSAGE: str = (
 def authorized_edit_user_ids() -> tuple[int, ...]:
     """IDs allowed to run /edit, from ``EDIT_ALLOWED_USER_IDS``.
 
-    Defaults to the historical single ID; an empty value disables /edit.
+    Defaults to the two lords; an empty value disables /edit.
     """
     raw = (os.environ.get(EDIT_USERS_ENV) or "").strip()
     if not raw:
-        return (AUTHORIZED_EDIT_USER_ID,)
+        return tuple(AUTHORIZED_EDIT_USER_IDS)
     ids: list[int] = []
     for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
         value = chunk.strip().strip("<>@!")

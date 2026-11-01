@@ -26,6 +26,16 @@ All notable changes to Paradise are recorded here. The format follows
   quips (0.12 → 0.14) — the bot is louder and more alive by default.
 
 ### Added
+- **Taher is a lord too.** User `1049231767585964032` (Taher) now stands at
+  exactly the same level of authority as Stupid (`922359954025885737`): both
+  are lords and masters of everyone, both addressed as "my lord", both
+  honoured (crown reactions, loyal lines, name defence — disparage "taher" in
+  a sentence and Paradise takes it personally) and both still teased, because
+  that is what lords are for. `/memory`, `/edit`, `/clip` and the
+  deafened-VC exemption now admit both of them. Configure the pair with
+  `PARADISE_LORD_USER_IDS` (comma-separated; the legacy single-id
+  `PARADISE_LORD_USER_ID` still works and merges in). `config.py`,
+  `functions/ai.py`, `functions/personality.py`.
 - **Long-term memory.** `/memory add|list|remove|clear` — the lord
   (`PARADISE_LORD_USER_ID`, default `922359954025885737`) teaches Paradise
   facts, preferences and server lore, stored in a tiny capped SQLite database

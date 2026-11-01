@@ -16,7 +16,6 @@ from config import VoiceClipConfig
 
 from .buffer import ClipIntervalSnapshot, RollingAudioBuffer
 from .constants import (
-    AUTHORIZED_CLIP_USER_ID,
     ClipAuthorizationError,
     ClipBusyError,
     ClipDeliveryError,
@@ -373,9 +372,14 @@ class VoiceClipService:
         guild_name: str,
         channel_name: str,
     ) -> None:
-        """Send validated clip file exclusively to AUTHORIZED_CLIP_USER_ID via DM."""
+        """Send a validated clip file to an authorized operator via DM.
+
+        Delivery is locked to the operator allow-list (the lords by default):
+        the recipient must be one of ``AUTHORIZED_CLIP_USER_IDS``, which is
+        what ``authorize_clip_user`` checks.
+        """
         recipient_id = getattr(recipient, "id", None)
-        if not authorize_clip_user(recipient_id) or recipient_id != AUTHORIZED_CLIP_USER_ID:
+        if not authorize_clip_user(recipient_id):
             raise ClipAuthorizationError(UNAUTHORIZED_CLIP_MESSAGE)
 
         if not os.path.isfile(clip.file_path):
