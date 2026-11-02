@@ -196,6 +196,13 @@ class PersonalityConfig:
     # Chance to say "hello!" when two people are having a conversation.
     # Low on purpose: unprompted chatter is the first thing that gets old.
     interject_chance: float = 0.04
+    # Chance to butt in when somebody talks ABOUT Paradise (his name or
+    # "the bot") without pinging him. The reply is written fresh by the AI
+    # every time — never a canned line.
+    about_chance: float = 0.35
+    # Seconds before Paradise butts in about himself in the same channel
+    # again. Being discussed is not an invitation to reply to every line.
+    about_cooldown: int = 180
     # Seconds before the bot may interject in the same channel again.
     interject_cooldown: int = 600
     # Chance the bot acknowledges its lord when he speaks (reply or 👑).
@@ -241,6 +248,8 @@ class PersonalityConfig:
             tenor_api_key=(env.get("TENOR_API_KEY") or "").strip(),
             giphy_api_key=(env.get("GIPHY_API_KEY") or "").strip(),
             interject_chance=_chance(env.get("PERSONALITY_INTERJECT_CHANCE"), 0.04),
+            about_chance=_chance(env.get("PERSONALITY_ABOUT_CHANCE"), 0.35),
+            about_cooldown=_int(env.get("PERSONALITY_ABOUT_COOLDOWN"), 180),
             interject_cooldown=_int(
                 env.get("PERSONALITY_INTERJECT_COOLDOWN"), 600
             ),

@@ -7,6 +7,29 @@ All notable changes to Paradise are recorded here. The format follows
 ## [Unreleased]
 
 ### Added
+- **A living personality — no two replies alike.** A new in-memory vibe
+  engine rides along on every AI reply: a rotating mood (deadpan, hyped,
+  Hinglish, villain arc, ... — never the same energy twice in a channel),
+  a guard that shows the model what Paradise just said so phrasings,
+  openers and punchlines never repeat, and a live lexicon of the words
+  this group actually types (picked up from chat, stopwords and URLs
+  excluded, decayed over two days — never a database, never mentioned as
+  memory). Roasts now consult a per-person ledger of recent jokes, so the
+  bot takes a fresh angle every time instead of holding the same grudge
+  about the same thing.
+- **He knows when he's the topic.** Messages that talk ABOUT him — his
+  name, "the bot", "this bot" — without pinging him now get a
+  freshly-written butt-in line (about a third of the time, cooled down
+  per channel, budgeted against his other unprompted chatter, silent on
+  any failure). Place collocations ("paradise hotel", "paradise city")
+  and plural "paradises" don't count.
+- **Hinglish and owner-sanctioned friendly-fire profanity.** The persona
+  now speaks Hindi/Hinglish natively and matches the room's language;
+  English and Hindi expletives (fuck, lund, madarchod, bhosdike) are
+  sanctioned as occasional spice among friends — never spammy, never
+  when someone's upset, never aimed at who someone is. Slurs stay
+  banned, full stop, and the existing test suite enforces it.
+- Bigger interjection and chaos-quip pools (now with Hinglish entries).
 - **Real web research, by plain mention.** "search the latest Minecraft
   update", "latest Minecraft news", "who won the match" now run a keyless
   research pipeline: DuckDuckGo-lite + Wikipedia search, the top pages
@@ -76,6 +99,9 @@ All notable changes to Paradise are recorded here. The format follows
   unchanged (`AI_MODEL` still does everything).
 
 ### Changed
+- `discord_timestamp` now honours its `now` argument when resolving
+  relative days ("tomorrow" no longer uses the real wall clock) — caught
+  by a date-rollover test failure.
 - **Search asks route through research, not just the model.** The router's
   search/fresh lanes now emit a RESEARCH kind (the assistant falls back to
   the AI when the web is off); the tolerant keyword stage got the same

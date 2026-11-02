@@ -96,6 +96,15 @@ INTERJECTION_LINES: tuple[str, ...] = (
     "i have no idea what you're on about but i agree",
     "someone say something dumb, i'm bored",
     "great conversation, honestly. anyway.",
+    "popcorn ready. proceed.",
+    "not me reading every word of this like it's news",
+    "arre carry on yaar, i'm just the walls of this server",
+    "bhai bhai bhai. ok continue",
+    "i live here, this is my house, keep going",
+    "finally some entertainment that isn't someone's rank",
+    "hm. noted. filed. continued.",
+    "you people are unwell and i mean that fondly",
+    "sitting backwards on my chair for this one",
 )
 
 #: Said when a lord and master himself speaks: loyalty with a wink.
@@ -126,6 +135,24 @@ _MEMORY_CALLBACK_FRAMES: tuple[str, ...] = (
     "i pay attention, {name}. \"{memory}\" for example.",
     "\"{memory}\". i've been watching this server a long time, {name}. i notice things.",
 )
+
+#: Somebody is talking ABOUT Paradise (his name, or "the bot") without
+#: pinging him. Word-boundary safe: "paradise", "paradisebot", "paradise's",
+#: "the bot", "this bot" — but never the middle of another word, never an
+#: @-mention render (<@123…>, which is the assistant's business anyway).
+_ABOUT_PARADISE_RE = re.compile(
+    r"(?<![\w@<])paradise(?:\s?bot)?(?:'s)?(?![\w])"
+    r"(?!\s+(?:hotel|city|lost|club|beach|island|bay|lake|park|resort|inn"
+    r"|cafe|café|lounge|point|lane))"
+    r"|\bthe\s+bot\b|\bthis\s+bot\b",
+    re.IGNORECASE,
+)
+
+
+def is_about_paradise(content: str) -> bool:
+    """True when the message discusses Paradise rather than addressing him."""
+    return _ABOUT_PARADISE_RE.search(str(content or "")) is not None
+
 
 _SERIOUS_TOPIC_RE = re.compile(
     r"\b(passed away|died|funeral|hospital|cancer|suicide|self[- ]harm|depressed|grief|condolences|rest in peace)\b",
@@ -589,6 +616,16 @@ CHAOS_QUIPS: tuple[str, ...] = (
     "Newton discovered gravity because an apple fell; what's your excuse?",
     "i'm not saying you're wrong, i'm just staring at the camera like The Office.",
     "brain scan complete: zero thoughts, immaculate confidence.",
+    "y'all type like the WiFi is free and the thoughts aren't.",
+    "somewhere a philosopher just felt a disturbance and muted this chat.",
+    "bhai maine 2022 se yahan baitha hoon, aisa kuch nahi dekha. kuch bhi nahi.",
+    "this chat has the energy of a group project nobody started.",
+    "genuinely asking: do we sleep, or are we just going to keep doing... this?",
+    "ek minute. ok minute over. continue with the nonsense.",
+    "i've seen this exact conversation before. we lost. it was 2-1.",
+    "somewhere, my creator is watching this and questioning everything.",
+    "consciousness is just vibes with extra steps. anyway carry on.",
+    "not a single day of peace in this server. i love it here.",
     "wait... if you clean a vacuum cleaner, do YOU become the vacuum cleaner?",
     "certified hood classic of a sentence right there.",
     "just checked the server constitution and surprisingly that's legal.",
@@ -670,6 +707,8 @@ class Personality:
         #: ``author_id -> when`` — the memory-callback clock (rare by design).
         self._last_memory_callback: dict[int, float] = {}
         self._last_interject_by_channel: dict[int, float] = {}
+        #: ``channel -> when`` — the "they're talking about me" clock.
+        self._last_about_by_channel: dict[int, float] = {}
         #: ``channel -> recent unprompted-action timestamps`` — the hourly
         #: ambient budget. Mentions and direct invitations never count;
         #: only the bot deciding to pipe up on its own does.
@@ -774,6 +813,13 @@ class Personality:
         #     call — just a quoted fact and a frame. Rare on purpose: the
         #     joke is the timing, not the volume.
         if await self._send_memory_callback(message, now):
+            self._record_ambient(channel_id, now)
+            return
+
+        # 2e. Somebody is talking about him. Not to him — ABOUT him. A
+        #     friend who's being discussed in his own home says something,
+        #     and the line is written fresh by the AI every single time.
+        if await self._send_about_reply(message, now):
             self._record_ambient(channel_id, now)
             return
 
@@ -1168,6 +1214,55 @@ class Personality:
         self._prune(now)
         return True
 
+    def _about_ready(self, channel_id: int, now: float) -> bool:
+        if self.config.about_chance <= 0:
+            return False
+        return now - self._last_about_by_channel.get(channel_id, float("-inf")) >= float(
+            self.config.about_cooldown
+        )
+
+    async def _send_about_reply(self, message: discord.Message, now: float) -> bool:
+        """They're discussing Paradise → he butts in, freshly written.
+
+        Every gate the other ambient lanes respect applies here too:
+        cooldowns, the hourly budget, spam and distress checks already ran.
+        A failure (or an unconfigured AI) is silence — being talked about
+        is not an emergency.
+        """
+        channel_id = message.channel.id
+        if not self._about_ready(channel_id, now):
+            return False
+        if not is_about_paradise(message.content):
+            return False
+        if _URL_ONLY_RE.match(message.content or ""):
+            return False
+        if random.random() >= float(self.config.about_chance):
+            return False
+        ai = getattr(self.bot, "ai", None)
+        butt_in = getattr(ai, "butt_in", None)
+        if not callable(butt_in) or not getattr(ai, "available", False):
+            return False
+        try:
+            line = await asyncio.wait_for(
+                butt_in(
+                    getattr(message.author, "display_name", None) or "someone",
+                    message.content,
+                    channel_id,
+                ),
+                timeout=20,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - butting in is optional
+            log.debug("About-reply failed", exc_info=True)
+            return False
+        if not line:
+            return False
+        self._last_about_by_channel[channel_id] = now
+        self._note_action("about", channel_id)
+        self._mark(channel_id, now)
+        return await self._deliver_text_reply(message, line)
+
     async def _send_interjection(self, message: discord.Message, now: float) -> bool:
         """Say hello to a conversation in progress."""
         line = self._pick(INTERJECTION_LINES, self._recent_interjections)
@@ -1483,6 +1578,7 @@ class Personality:
             self._last_roast_by_user,
             self._last_roast_by_channel,
             self._last_interject_by_channel,
+            self._last_about_by_channel,
             self._last_memory_callback,
         ):
             stale = [key for key, value in bucket.items() if value <= cutoff]

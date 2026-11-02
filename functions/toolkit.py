@@ -845,8 +845,10 @@ def discord_timestamp(args: str, *, now: datetime | None = None) -> str:
             value = (value[: time_match.start()] + " " + value[time_match.end():]).strip()
         except ParadiseError:
             hour = minute = None
-    # Remaining words are the day.
-    day = _parse_date_value(value or "today")
+    # Remaining words are the day. ``now`` (test clock included) decides
+    # what "tomorrow" means — never the real wall clock.
+    reference = now or datetime.now(tz=ZoneInfo("UTC"))
+    day = _parse_date_value(value or "today", today=reference.date())
     zone = ZoneInfo(zone_name or _HOME_ZONE)
     moment = datetime(
         day.year, day.month, day.day, hour if hour is not None else 0,
