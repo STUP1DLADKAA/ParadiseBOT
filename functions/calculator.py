@@ -259,6 +259,112 @@ def _eval_node(node: ast.AST) -> float:
 # ---------------------------------------------------------------------------
 
 
+_STATS_SHAPE = re.compile(
+    r"^(?:the\s+)?(?P<op>average|mean|sum|median|minimum|min|maximum|max|product)\s+of\s+(?P<rest>.+)$",
+    re.IGNORECASE,
+)
+
+_EQUATION_VARS = re.compile(r"(?<![a-z_])(?P<var>[a-z])(?![a-z_])", re.IGNORECASE)
+
+
+def _stats(op: str, rest: str) -> CalcResult | None:
+    """'average of 4 8 15' → the named statistic of a number list."""
+    numbers: list[float] = []
+    for token in re.split(r"[,;\s]+", rest.strip()):
+        if not token or token.casefold() in ("and", "&"):
+            continue
+        if not _looks_numeric(token):
+            return None  # not a pure number list — not our problem
+        numbers.append(float(token.replace(",", ".").rstrip(".,")
+                             if token.count(".") == 0 else token))
+    if len(numbers) < 2:
+        return None
+    op = op.casefold()
+    if op in ("average", "mean"):
+        value = sum(numbers) / len(numbers)
+    elif op == "sum":
+        value = sum(numbers)
+    elif op == "median":
+        ordered = sorted(numbers)
+        mid = len(ordered) // 2
+        value = (
+            ordered[mid] if len(ordered) % 2 else (ordered[mid - 1] + ordered[mid]) / 2
+        )
+    elif op in ("minimum", "min"):
+        value = min(numbers)
+    elif op in ("maximum", "max"):
+        value = max(numbers)
+    elif op == "product":
+        value = 1.0
+        for number in numbers:
+            value *= number
+    else:  # pragma: no cover - the regex only admits the above
+        return None
+    label = {"average": "mean", "mean": "mean"}.get(op, op)
+    return CalcResult(expression=f"{label} of {len(numbers)} numbers", result=value)
+
+
+def _looks_numeric(token: str) -> bool:
+    try:
+        float(token.replace(",", "."))
+    except ValueError:
+        return False
+    return True
+
+
+def _solve_equation(text: str) -> CalcResult | None:
+    """Solve a single-variable linear equation: '2x + 3 = 11' → x = 4.
+
+    Both sides are evaluated twice (variable → 0, then → 1) with the same
+    safe expression evaluator used everywhere else, which turns each side
+    into ``a·x + b`` without any new parsing risk. No solution, infinite
+    solutions and non-linear shapes are reported honestly.
+    """
+    if "=" not in text or len(text) > 200:
+        return None
+    left_raw, _, right_raw = text.partition("=")
+    if not left_raw.strip() or not right_raw.strip():
+        return None
+    variables = {match.group("var").casefold() for match in _EQUATION_VARS.finditer(text)}
+    if len(variables) != 1:
+        return None
+    var = variables.pop()
+
+    def _side(value: float, side: str) -> float | None:
+        substituted = _EQUATION_VARS.sub(
+            lambda m: f"({value})" if m.group("var").casefold() == var else m.group(0),
+            side,
+        )
+        # "2x" / "3(x+1)" style implicit multiplication → explicit.
+        substituted = re.sub(r"(\d)\s*([a-z(])", r"\1*\2", substituted, flags=re.IGNORECASE)
+        try:
+            normalised = _normalize_expression(substituted)
+            tree = ast.parse(_flatten_percent_of(normalised), mode="eval")
+            return _eval_node(tree)
+        except (SyntaxError, ParadiseError, ZeroDivisionError, ValueError):
+            return None
+
+    samples: list[tuple[float, float]] = []
+    for side in (left_raw, right_raw):
+        at_zero = _side(0, side)
+        at_one = _side(1, side)
+        at_two = _side(2, side)
+        if at_zero is None or at_one is None or at_two is None:
+            return None
+        # A straight line or not? f(2) - f(0) must equal 2·(f(1) - f(0)).
+        slope = at_one - at_zero
+        if abs((at_two - at_zero) - 2 * slope) > 1e-9 * max(1.0, abs(at_two)):
+            return None  # non-linear — not pretending we solved it
+        samples.append((slope, at_zero))
+    (a1, b1), (a2, b2) = samples
+    if abs(a1 - a2) < 1e-12:
+        if abs(b1 - b2) < 1e-12:
+            raise ParadiseError("that equation is true for *every* value — infinite solutions.")
+        raise ParadiseError("those two sides never meet — no solution.")
+    value = (b2 - b1) / (a1 - a2)
+    return CalcResult(expression=f"{text} → {var}", result=value)
+
+
 def calculate(raw: str) -> CalcResult:
     """Evaluate a math query, raising a friendly ``ParadiseError`` on failure."""
     text = raw.strip()
@@ -266,6 +372,15 @@ def calculate(raw: str) -> CalcResult:
         raise ParadiseError("give me something to compute, e.g. `25% of 800`.")
     if len(text) > 300:
         raise ParadiseError("that's a bit long for a calculator query.")
+
+    stats_match = _STATS_SHAPE.match(strip_question_words(text))
+    if stats_match is not None:
+        result = _stats(stats_match.group("op"), stats_match.group("rest"))
+        if result is not None:
+            return result
+    equation = _solve_equation(strip_question_words(text).rstrip("?!.").strip())
+    if equation is not None:
+        return equation
 
     normalised = _normalize_expression(text)
     flattened = _flatten_percent_of(normalised)
@@ -314,12 +429,48 @@ def strip_question_words(text: str) -> str:
     return _QUESTION_LEAD.sub("", text.strip()).strip()
 
 
+def _stats_list_shape(rest: str) -> bool:
+    """True when *rest* is a plain list of numbers ('4 8 15 16', '3, 5, and 7')."""
+    tokens = [t for t in re.split(r"[,;\s]+", rest.strip()) if t]
+    numbers = [t for t in tokens if t.casefold() not in ("and", "&")]
+    if len(numbers) < 2 or len(numbers) != len(tokens) - (len(tokens) - len(numbers)):
+        return False
+    return all(_looks_numeric(t) for t in numbers)
+
+
+def _equation_shape(probe: str) -> bool:
+    """True for single-variable linear shapes like '2x + 3 = 11'."""
+    if probe.count("=") != 1 or len(probe) > 100:
+        return False
+    variables = {m.group("var").casefold() for m in _EQUATION_VARS.finditer(probe)}
+    if len(variables) != 1:
+        return False
+    var = variables.pop()
+    sides = []
+    for side in probe.split("="):
+        if not side.strip() or not re.search(r"\d", side):
+            return False
+        substituted = _EQUATION_VARS.sub(
+            lambda m: "(1)" if m.group("var").casefold() == var else m.group(0), side
+        )
+        substituted = re.sub(r"(\d)\s*([a-z(])", r"\1*\2", substituted, flags=re.IGNORECASE)
+        if not re.fullmatch(r"[\d\s+\-*/%×÷^().,]+", substituted):
+            return False
+        sides.append(substituted)
+    return True
+
+
 def looks_like_math(text: str) -> bool:
     """True when the text is shaped like a calculation request."""
     probe = strip_question_words(text).rstrip("?!.").strip()
     if not probe or len(probe) > 200 or "\n" in probe:
         return False
     if _PERCENT_OF.search(probe) or _PERCENT_STANDALONE.match(probe):
+        return True
+    stats = _STATS_SHAPE.match(probe)
+    if stats is not None and _stats_list_shape(stats.group("rest")):
+        return True
+    if _equation_shape(probe):
         return True
     # Must contain a digit and an operator-ish character, and no letters
     # outside the known function/constant/word-op vocabulary.

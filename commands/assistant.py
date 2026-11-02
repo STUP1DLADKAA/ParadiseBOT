@@ -60,15 +60,18 @@ from functions.roasts import (
     clean_name,
     sanitize_intensity,
 )
+from functions.devhelp import DEV_MODES, run_devhelp
+from functions.research import ResearchService
 from functions.router import (
-    AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
-    GIF, HELP, IMAGE, INFO, MEME, PING, POLL, REMIND, ROAST, SEARCH, SUMMARIZE,
-    TIME, TRANSLATE, UNKNOWN, UTILITY, WEATHER,
+    AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE, DEV,
+    GIF, HELP, IMAGE, INFO, MEME, PING, POLL, REMIND, RESEARCH, ROAST, SEARCH,
+    SUMMARIZE, TIME, TRANSLATE, UNKNOWN, UTILITY, WEATHER, WRITE,
     Route, route_many,
 )
 from functions.toolkit import parse_duration, run_tool
 from functions.time import build_time_embed, get_current_time_for_zone, resolve_timezone
 from functions.translate import resolve_language, translate_text
+from functions.writing import WRITE_MODES, run_writing, strip_deixis
 from functions.weather import build_weather_embed, render_weather_card
 
 log = logging.getLogger(__name__)
@@ -122,6 +125,16 @@ SEARCH_FAIL_LINE = (
 # "convert 50" — a value with no units at all.
 _BARE_NUMBER = re.compile(r"^[-+]?\d+(?:[.,]\d+)?$")
 
+# Follow-ups: "what about london" right after a time/weather/convert ask.
+_FOLLOWUP_KINDS = frozenset({TIME, WEATHER, CONVERT, TRANSLATE, RESEARCH})
+_FOLLOWUP_WINDOW = 300.0  # five minutes of relevance
+_FOLLOWUP_SHAPE = re.compile(
+    r"^(?:what|how)\s+about\s+(?P<rest>.+?)\s*[?!.]*$"
+    r"|^(?:and|also|now)\s+(?P<rest2>.+?)\s*[?!.]*$"
+    r"|^in\s+(?P<rest3>[a-z][a-z\s]{1,40})$",
+    re.IGNORECASE,
+)
+
 
 class Assistant(commands.Cog):
     """Routes mentions/replies to the right tool; everything language-shaped
@@ -140,10 +153,62 @@ class Assistant(commands.Cog):
         self.images = ImageSearchService(
             getattr(getattr(bot, "config", None), "image_search", None)
         )
+        # Web research (DuckDuckGo-lite + Wikipedia, keyless). Off unless the
+        # config says otherwise, so a bare construction never hits the
+        # network. Every research failure falls back to a plain AI answer.
+        self.research = ResearchService(
+            getattr(getattr(bot, "config", None), "web_search", None)
+        )
+        # channel -> (when, last answered route): powers "what about <x>"
+        # follow-ups to the previous time/weather/convert/research ask.
+        self._last_route: dict[int, tuple[float, Route]] = {}
+        log.info("Web research: %s", self.research.describe())
 
     # ------------------------------------------------------------------
     # Entry point (called from bot.on_message)
     # ------------------------------------------------------------------
+
+    def _remember_route(self, channel_id: int, route: Route) -> None:
+        """Keep the last answered follow-up-capable route per channel."""
+        now = time.monotonic()
+        self._last_route[channel_id] = (now, route)
+        if len(self._last_route) > 128:
+            self._last_route = {
+                key: value for key, value in self._last_route.items()
+                if value[0] > now - _FOLLOWUP_WINDOW
+            }
+
+    def _apply_followup(
+        self, message: discord.Message, routes: list[Route], text: str
+    ) -> list[Route]:
+        """Turn 'what about <x>' into a repeat of the last tool ask."""
+        if routes and routes[0].kind not in (AI, UNKNOWN):
+            return routes  # something concrete claimed it — leave it alone
+        match = _FOLLOWUP_SHAPE.match(" ".join(str(text or "").split()))
+        if match is None:
+            return routes
+        entry = self._last_route.get(getattr(message.channel, "id", 0))
+        if entry is None:
+            return routes
+        when, previous = entry
+        if time.monotonic() - when > _FOLLOWUP_WINDOW:
+            return routes
+        rest = (
+            match.group("rest") or match.group("rest2") or match.group("rest3") or ""
+        ).strip()
+        if not rest:
+            return routes
+        # Keep the whole shape (mode flags, freshness) of the original ask,
+        # but swap in the new subject.
+        followup = Route(
+            kind=previous.kind,
+            payload=rest,
+            payload2=previous.payload2 if previous.kind != RESEARCH else "answer",
+            confidence=0.75,
+            fresh=previous.fresh,
+        )
+        log.info("Assistant follow-up: %s → %s", previous.kind, rest)
+        return [followup]
 
     async def handle_message(self, message: discord.Message) -> bool:
         """True when this message was addressed to Paradise and handled."""
@@ -169,6 +234,10 @@ class Assistant(commands.Cog):
         if not self._cooled(message):
             return True  # addressed correctly but rate-limited: stay quiet
 
+        # A bare "what about <x>" that nothing claims continues the previous
+        # time/weather/convert/translate/research ask in this channel.
+        routes = self._apply_followup(message, routes, text)
+
         try:
             if len(routes) > 1:
                 return await self._dispatch_many(message, routes)
@@ -178,6 +247,8 @@ class Assistant(commands.Cog):
             log.info("Assistant → %s (confidence %.2f)", route.kind, route.confidence)
             started = time.monotonic()
             handled = await self._dispatch(message, route, text)
+            if handled and route.kind in _FOLLOWUP_KINDS:
+                self._remember_route(message.channel.id, route)
             log.info(
                 "Assistant %s %s in %.2fs",
                 route.kind,
@@ -267,6 +338,12 @@ class Assistant(commands.Cog):
             return await self._poll(message, route)
         if kind == INFO:
             return await self._info(message, route)
+        if kind == RESEARCH:
+            return await self._research(message, route)
+        if kind == WRITE:
+            return await self._writing(message, route)
+        if kind == DEV:
+            return await self._dev(message, route)
         if kind == SEARCH:
             return await self._search(message, route)
         if kind in (AI, UNKNOWN):
@@ -478,6 +555,8 @@ class Assistant(commands.Cog):
                     "**@Paradise summarize** on its own.",
                     [],
                 )
+            if kind == RESEARCH:
+                return await self._compact_research(route, asker=asker)
             if kind == DEFINE:
                 return await self._compact_search(
                     Route(kind=SEARCH, payload=f"what is {route.payload}"),
@@ -491,6 +570,38 @@ class Assistant(commands.Cog):
         except Exception:  # noqa: BLE001 - one bad part never kills the reply
             log.warning("Compact %s failed", kind, exc_info=True)
             return f"• couldn't finish the *{kind}* part of that.", []
+
+    async def _compact_research(
+        self, route: Route, *, asker: str = "someone"
+    ) -> tuple[str, list[discord.Embed]]:
+        """A combined reply's web part: top hits, no model call."""
+        service = self.research
+        subject = (route.payload or "").strip()
+        if not service.enabled:
+            # Web off (or a bare test bot): the model answers this part,
+            # exactly like a standalone research ask would.
+            return await self._compact_search(
+                Route(kind=SEARCH, payload=subject, confidence=route.confidence),
+                asker=asker,
+            )
+        if not subject:
+            return ("🔍 search what, exactly?", [])
+        try:
+            results = await asyncio.wait_for(
+                service.search(subject), timeout=service.timeout + 5
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - one bad part never kills the reply
+            log.warning("Compact research failed", exc_info=True)
+            results = []
+        if not results:
+            return ("🔍 the web side came up empty — ask it on its own and I'll think instead.", [])
+        lines = [f"🔍 **{subject[:60]}** — top hits:"]
+        for index, result in enumerate(results[:3], 1):
+            title = (result.title or result.url)[:60]
+            lines.append(f"{index}. [{title}]({result.url})")
+        return ("\n".join(lines), [])
 
     async def _compact_convert(self, route: Route) -> tuple[str, list[discord.Embed]]:
         utility = self.bot.get_cog("Utility")
@@ -984,6 +1095,8 @@ class Assistant(commands.Cog):
     async def _info(self, message: discord.Message, route: Route) -> bool:
         """Discord-native info: whois, avatar, server card. No API calls."""
         tool = route.payload2 or "whois"
+        if tool == "find":
+            return await self._find_message(message, route.payload or "")
         guild = message.guild
         if tool == "server":
             if guild is None:
@@ -1068,20 +1181,257 @@ class Assistant(commands.Cog):
                     target = None
         return target or getattr(message, "author", None)
 
+    async def _research(self, message: discord.Message, route: Route) -> bool:
+        """Web research: real sources, real links, honest failure.
+
+        Every failure mode falls back to a plain model answer — the bot
+        never refuses a genuine question just because the web side is
+        having a bad day.
+        """
+        subject = (route.payload or "").strip()
+        if not subject:
+            await self._quiet_reply(message, "search what, exactly?")
+            return True
+        mode = route.payload2 or "answer"
+        service = self.research
+        if not service.enabled:
+            return await self._answer_with_ai(message, subject)
+        ai = self.bot.ai
+        asker = getattr(message.author, "display_name", None) or "someone"
+        budget = service.timeout * (2 + max(0, service.fetch_pages)) + _AI_TIMEOUT
+        try:
+            if mode == "link":
+                placeholder = await self._thinking_placeholder(
+                    message, "🔗 reading that page…"
+                )
+                summary = await asyncio.wait_for(
+                    service.summarize_page(subject, ai, asker=asker),
+                    timeout=budget,
+                )
+                if summary:
+                    await self._deliver_ai_answer(message, placeholder, summary)
+                    return True
+                await self._deliver_ai_answer(
+                    message, placeholder,
+                    "couldn't read that page — the site refused, or it isn't "
+                    "text I can parse (videos, raw files). want me to search "
+                    "the topic instead?",
+                )
+                return True
+
+            placeholder = await self._thinking_placeholder(
+                message, "🔍 checking the real world…"
+            )
+            answer = await asyncio.wait_for(
+                service.answer(
+                    subject, ai, asker=asker, asker_id=message.author.id,
+                    news=(mode == "news" or bool(route.fresh)),
+                ),
+                timeout=budget,
+            )
+        except asyncio.CancelledError:
+            raise
+        except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - fall back, never stall
+            log.warning("Web research failed for %r", subject, exc_info=True)
+            return await self._answer_with_ai(message, subject)
+
+        if answer.answer:
+            await self._deliver_ai_answer(
+                message, placeholder, self._format_research(answer)
+            )
+            return True
+        # Nothing usable came back — the model still gets a shot at it.
+        return await self._answer_with_ai(message, subject)
+
+    def _format_research(self, answer) -> str:
+        """Answer text plus a clickable source footer (real links only)."""
+        text = str(answer.answer or "").strip()
+        if not getattr(self.research, "show_sources", False):
+            return text
+        sources = getattr(answer, "sources", None) or []
+        if not sources:
+            return text + "\n\n*(couldn't verify this one against a source — grain of salt)*"
+        # Prefer the numbering the answer itself used ([n] markers), so the
+        # footer and the citations line up for the reader.
+        cited = list(getattr(answer, "cited", None) or [])
+        offset = int(getattr(answer, "pages_read", 0) or 0)
+        pairs = (
+            list(zip(cited, sources))
+            if cited and len(cited) == len(sources)
+            else [
+                (index, source)
+                for index, source in enumerate(sources[:5], start=offset + 1)
+            ]
+        )
+        lines = []
+        for index, source in pairs[:5]:
+            label = source.title.strip() or source.url
+            lines.append(f"[{index}] [{label}]({source.url})")
+        return f"{text}\n\n**sources**\n" + "\n".join(lines)
+
+    async def _thinking_placeholder(self, message: discord.Message, line: str):
+        """The 'working on it' message a long task edits in place."""
+        try:
+            return await message.reply(line, mention_author=False)
+        except discord.DiscordException:
+            return None
+
+    async def _writing(self, message: discord.Message, route: Route) -> bool:
+        """Writing help: rewrites, drafts, action items — copy-ready."""
+        mode = route.payload2 if route.payload2 in WRITE_MODES else "rewrite"
+        payload = (route.payload or "").strip()
+        if mode in ("rewrite", "actions", "shorten", "expand"):
+            # "rewrite this to be formal:" with nothing after the colon is
+            # a usage question, not a model call.
+            payload = strip_deixis(payload)
+        if not payload:
+            await self._quiet_reply(
+                message, "give me the text to work with — e.g. 'rewrite this: <text>'."
+            )
+            return True
+        ai = self.bot.ai
+        if not getattr(ai, "available", False):
+            return await self._ai_unavailable_note(message)
+        placeholder = await self._thinking_placeholder(message, "✍️ drafting…")
+        try:
+            result = await asyncio.wait_for(
+                run_writing(
+                    mode, payload, ai,
+                    asker=getattr(message.author, "display_name", None) or "someone",
+                    asker_id=message.author.id,
+                ),
+                timeout=_AI_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a writing failure is a bad answer, not a crash
+            log.warning("Writing help failed (%s)", mode, exc_info=True)
+            result = ""
+        if result:
+            await self._deliver_ai_answer(message, placeholder, result)
+        else:
+            await self._deliver_ai_answer(
+                message, placeholder, SEARCH_FAIL_LINE
+            )
+        return True
+
+    async def _dev(self, message: discord.Message, route: Route) -> bool:
+        """Dev/Minecraft help: explains, reviews, advises — never executes."""
+        payload = (route.payload or "").strip()
+        if not payload:
+            await self._quiet_reply(
+                message,
+                "paste it after — e.g. 'explain this error: <the error>'.",
+            )
+            return True
+        mode = route.payload2 if route.payload2 in DEV_MODES else "error"
+        ai = self.bot.ai
+        if not getattr(ai, "available", False):
+            return await self._ai_unavailable_note(message)
+        placeholder = await self._thinking_placeholder(message, "🛠️ digging in…")
+        try:
+            result = await asyncio.wait_for(
+                run_devhelp(
+                    mode, payload, ai,
+                    asker=getattr(message.author, "display_name", None) or "someone",
+                    asker_id=message.author.id,
+                ),
+                timeout=_AI_TIMEOUT,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            log.warning("Dev help failed (%s)", mode, exc_info=True)
+            result = ""
+        if result:
+            await self._deliver_ai_answer(message, placeholder, result)
+        else:
+            await self._deliver_ai_answer(message, placeholder, SEARCH_FAIL_LINE)
+        return True
+
+    async def _find_message(self, message: discord.Message, query: str) -> bool:
+        """Search this channel's recent history for a message."""
+        clean = " ".join(str(query or "").split()).strip()
+        if not clean:
+            await self._quiet_reply(
+                message, "find which message? try 'find the message where taher said hi'."
+            )
+            return True
+        # Optional "<name> said <text>" / "from <name>: <text>" shape.
+        author_hint = ""
+        text_hint = clean
+        match = re.match(
+            r"^(?P<who>[\w .-]{2,32}?)\s+(?:said|wrote|posted|typed)\s+(?P<what>.+)$",
+            clean, re.IGNORECASE,
+        )
+        if match:
+            author_hint = match.group("who").strip().casefold()
+            text_hint = match.group("what").strip().casefold()
+        else:
+            match = re.match(
+                r"^from\s+(?P<who>[\w .-]{2,32}?)\s*[:,]\s*(?P<what>.+)$",
+                clean, re.IGNORECASE,
+            )
+            if match:
+                author_hint = match.group("who").strip().casefold()
+                text_hint = match.group("what").strip().casefold()
+        needle = text_hint.casefold()
+        found = []
+        history = getattr(message.channel, "history", None)
+        if history is None:
+            await self._quiet_reply(message, "I can't read history in this channel.")
+            return True
+        try:
+            async for old in history(limit=300, before=message):
+                if old.author.bot or old.id == message.id:
+                    continue
+                if author_hint:
+                    author = f"{old.author.name} {getattr(old.author, 'display_name', '')}".casefold()
+                    if author_hint not in author:
+                        continue
+                if needle and needle not in str(old.content or "").casefold():
+                    continue
+                found.append(old)
+                if len(found) >= 3:
+                    break
+        except discord.DiscordException:
+            found = []
+        if not found:
+            await self._quiet_reply(
+                message, "nothing matching that in the last 300 messages here."
+            )
+            return True
+        guild_id = getattr(message.guild, "id", None) or 0
+        lines = ["🔎 found:"]
+        for old in found:
+            link = f"https://discord.com/channels/{guild_id}/{message.channel.id}/{old.id}"
+            author = getattr(old.author, "display_name", None) or "someone"
+            snippet = " ".join(str(old.content or "").split())[:80]
+            lines.append(f"• [{author}]({link}): {snippet}")
+        await self._quiet_reply(message, "\n".join(lines))
+        return True
+
     async def _search(
         self, message: discord.Message, route: Route, *, query: str | None = None
     ) -> bool:
-        """Forward a search-shaped request straight to the AI.
+        """Forward a search-shaped request to the AI (web off or gray zone).
 
-        There is no web retrieval on this path any more: the request goes to
-        the model (openai-compatible provider first, gemini fallback) and the
-        model replies in character. Genuine questions are never refused —
-        the system prompt forbids moralising non-answers.
+        Explicitly search-shaped asks (high confidence) go to the research
+        pipeline when the web side is on; everything else gets the model's
+        own answer, in character, with no moralising non-answers.
         """
         subject = (query or route.payload or "").strip()
         if not subject:
             await self._quiet_reply(message, "search what, exactly?")
             return True
+        if route.confidence >= 0.8 and self.research.enabled:
+            return await self._research(
+                message,
+                Route(
+                    kind=RESEARCH, payload=subject, payload2="answer",
+                    confidence=route.confidence, fresh=route.fresh,
+                ),
+            )
         return await self._answer_with_ai(message, subject)
 
     # -- recap, memes and GIFs by mention ---------------------------------

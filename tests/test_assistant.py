@@ -22,7 +22,7 @@ from functions.conversion.models import ConversionCategory, ConversionResult  # 
 from functions.helpers import ParadiseError  # noqa: E402
 from functions.images import ImageResponse, ImageResult  # noqa: E402
 from functions.intent import IntentGuess  # noqa: E402
-from functions.router import AI, CALCULATE, IMAGE, SEARCH, Route  # noqa: E402
+from functions.router import AI, CALCULATE, IMAGE, RESEARCH, SEARCH, TIME, UTILITY, Route  # noqa: E402
 from functions.weather.models import LocationInfo, WeatherData  # noqa: E402
 
 
@@ -566,7 +566,11 @@ class TestSearchForwardsToAI(unittest.IsolatedAsyncioTestCase):
         assistant, _ = make_assistant(ai=ai)
         message = mention("search latest Minecraft news")
         edits = []
-        assistant._quiet_edit = lambda target, content="", **kwargs: edits.append(content)
+
+        async def record(target, content="", **kwargs):
+            edits.append(content)
+
+        assistant._quiet_edit = record
         self.assertTrue(await assistant.handle_message(message))
         self.assertTrue(edits)
         self.assertIn("isn't responding", edits[0])
@@ -581,7 +585,11 @@ class TestSearchForwardsToAI(unittest.IsolatedAsyncioTestCase):
         assistant, _ = make_assistant(ai=ai)
         message = mention("search latest Minecraft news")
         edits = []
-        assistant._quiet_edit = lambda target, content="", **kwargs: edits.append(content)
+
+        async def record(target, content="", **kwargs):
+            edits.append(content)
+
+        assistant._quiet_edit = record
         self.assertTrue(await assistant.handle_message(message))
         self.assertTrue(edits)
         self.assertIn("isn't answering", edits[0])
@@ -1195,7 +1203,11 @@ class TestSearchReliability(unittest.IsolatedAsyncioTestCase):
         assistant, _ = make_assistant(ai=DownAI(available=True))
         message = mention("search latest Minecraft update")
         edits = []
-        assistant._quiet_edit = lambda target, content="", **kwargs: edits.append(content)
+
+        async def record(target, content="", **kwargs):
+            edits.append(content)
+
+        assistant._quiet_edit = record
         await assistant.handle_message(message)
         self.assertTrue(edits)
         self.assertIn("isn't answering", edits[0])
@@ -1330,3 +1342,296 @@ class TestRetiredCommandQuestions(unittest.IsolatedAsyncioTestCase):
         content = message.replies[0]["content"]
         self.assertIn("isn't a command any more", content)
         self.assertIn("weather in Delhi", content)
+
+
+# ---------------------------------------------------------------------------
+# Intelligence expansion: web research, writing, dev help, history search,
+# follow-ups
+# ---------------------------------------------------------------------------
+
+
+class ChatAI(FakeAI):
+    """FakeAI plus the chat() slice the research/writing/dev paths use."""
+
+    def __init__(self, *, available=True, answer="model answer", chat_reply=None):
+        super().__init__(available=available, answer=answer)
+        self.chat_reply = chat_reply if chat_reply is not None else answer
+        self.chats = []
+
+    async def chat(self, messages, *, max_tokens=0, role="deep", caller_id=None):
+        self.chats.append({"messages": messages, "role": role,
+                           "max_tokens": max_tokens})
+        return self.chat_reply
+
+
+class FakeResearchService:
+    """Stands in for functions.research.ResearchService."""
+
+    def __init__(self, *, answer=None, summary="", error=False, results=None):
+        from functions.research import SearchResult
+        self.enabled = True
+        self.timeout = 5.0
+        self.fetch_pages = 1
+        self.show_sources = True
+        self._answer = answer
+        self._summary = summary
+        self._error = error
+        self._results = results if results is not None else [
+            SearchResult("Minecraft update", "https://minecraft.example")
+        ]
+        self.answer_calls = []
+        self.summarize_calls = []
+        self.search_calls = []
+
+    async def answer(self, query, ai, *, asker="someone", asker_id=0, news=False):
+        self.answer_calls.append((query, news))
+        if self._error:
+            raise RuntimeError("web down")
+        return self._answer
+
+    async def summarize_page(self, url, ai, *, asker="someone"):
+        self.summarize_calls.append(url)
+        if self._error:
+            raise RuntimeError("web down")
+        return self._summary
+
+    async def search(self, query):
+        self.search_calls.append(query)
+        return self._results
+
+
+class TestResearchDispatch(unittest.IsolatedAsyncioTestCase):
+    async def test_web_disabled_falls_back_to_the_model(self):
+        ai = FakeAI(available=True, answer="the model knows this one")
+        assistant, _ = make_assistant(ai=ai)
+        self.assertFalse(assistant.research.enabled)
+        message = mention("search latest Minecraft update")
+        self.assertTrue(await assistant.handle_message(message))
+        # placeholder first, then the AI's answer replaces it
+        self.assertIn("thinking", message.replies[0]["content"].casefold())
+        self.assertEqual(ai.questions, ["latest Minecraft update"])
+
+    async def test_sourced_answer_is_delivered_with_links(self):
+        from functions.research import ResearchAnswer, SearchResult
+        ai = ChatAI(available=True)
+        assistant, _ = make_assistant(ai=ai)
+        answer = ResearchAnswer(
+            answer="the update dropped yesterday [2]",
+            sources=[SearchResult("Patch notes", "https://notes.example")],
+            pages_read=1,
+        )
+        assistant.research = FakeResearchService(answer=answer)
+        edits = []
+
+        async def record(target, content="", **kwargs):
+            edits.append(content)
+
+        assistant._quiet_edit = record
+
+        message = mention("search latest Minecraft update")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertTrue(edits)
+        combined = "\n".join(edits)
+        self.assertIn("the update dropped yesterday", combined)
+        self.assertIn("https://notes.example", combined)
+        self.assertIn("sources", combined.casefold())
+
+    async def test_no_sources_gets_the_honest_salt_note(self):
+        from functions.research import ResearchAnswer
+        assistant, _ = make_assistant(ai=ChatAI(available=True))
+        assistant.research = FakeResearchService(
+            answer=ResearchAnswer(answer="an answer with nothing to cite")
+        )
+        edits = []
+
+        async def record(target, content="", **kwargs):
+            edits.append(content)
+
+        assistant._quiet_edit = record
+        message = mention("search latest Minecraft update")
+        self.assertTrue(await assistant.handle_message(message))
+        combined = "\n".join(edits)
+        self.assertIn("couldn't verify", combined)
+
+    async def test_web_failure_falls_back_to_the_model(self):
+        ai = ChatAI(available=True, answer="the model's own answer")
+        assistant, _ = make_assistant(ai=ai)
+        assistant.research = FakeResearchService(error=True)
+        message = mention("search latest Minecraft update")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertEqual(ai.questions, ["latest Minecraft update"])
+
+    async def test_link_summary_happy_path(self):
+        ai = ChatAI(available=True)
+        assistant, _ = make_assistant(ai=ai)
+        assistant.research = FakeResearchService(summary="a tidy page summary")
+        edits = []
+
+        async def record(target, content="", **kwargs):
+            edits.append(content)
+
+        assistant._quiet_edit = record
+        message = mention("summarize this link: https://example.com/a")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertTrue(edits)
+        self.assertIn("a tidy page summary", "\n".join(edits))
+        self.assertEqual(
+            assistant.research.summarize_calls, ["https://example.com/a"]
+        )
+
+    async def test_link_summary_failure_is_honest(self):
+        ai = ChatAI(available=True)
+        assistant, _ = make_assistant(ai=ai)
+        assistant.research = FakeResearchService(summary="")
+        edits = []
+
+        async def record(target, content="", **kwargs):
+            edits.append(content)
+
+        assistant._quiet_edit = record
+        message = mention("summarize this link: https://example.com/a")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertIn("couldn't read that page", "\n".join(edits))
+
+    async def test_compact_research_lists_top_hits_without_a_model_call(self):
+        ai = ChatAI(available=True)
+        assistant, _ = make_assistant(ai=ai)
+        assistant.research = FakeResearchService()
+        text, embeds = await assistant._compact(
+            Route(kind=RESEARCH, payload="minecraft update", payload2="answer")
+        )
+        self.assertIn("minecraft.example", text)
+        self.assertEqual(ai.chats, [])  # no model call for the compact lane
+
+    async def test_compact_research_falls_back_when_web_is_off(self):
+        ai = ChatAI(available=True, answer="compact model answer")
+        assistant, _ = make_assistant(ai=ai)
+        text, embeds = await assistant._compact(
+            Route(kind=RESEARCH, payload="minecraft update", payload2="answer")
+        )
+        self.assertIn("compact model answer", text)
+
+
+class TestWritingAndDevDispatch(unittest.IsolatedAsyncioTestCase):
+    async def test_rewrite_uses_the_deep_role_and_delivers_the_line(self):
+        ai = ChatAI(available=True, chat_reply="here is the formal version")
+        assistant, _ = make_assistant(ai=ai)
+        edits = []
+
+        async def record(target, content="", **kwargs):
+            edits.append(content)
+
+        assistant._quiet_edit = record
+        message = mention("rewrite this to be formal: hey can u send the file")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertIn("formal version", "\n".join(edits))
+        self.assertEqual(len(ai.chats), 1)
+        self.assertEqual(ai.chats[0]["role"], "deep")
+        # the deixis was stripped; the payload is the user's text
+        self.assertIn("hey can u send the file", ai.chats[0]["messages"][1]["content"])
+
+    async def test_error_explanation_answers_without_executing(self):
+        ai = ChatAI(available=True, chat_reply="you never awaited it")
+        assistant, _ = make_assistant(ai=ai)
+        edits = []
+
+        async def record(target, content="", **kwargs):
+            edits.append(content)
+
+        assistant._quiet_edit = record
+        message = mention("explain this error: ValueError: bad value")
+        self.assertTrue(await assistant.handle_message(message))
+        self.assertIn("you never awaited it", "\n".join(edits))
+        self.assertEqual(len(ai.chats), 1)
+        self.assertIn("ValueError", ai.chats[0]["messages"][1]["content"])
+
+    async def test_empty_payload_gets_a_usage_line_not_a_model_call(self):
+        ai = ChatAI(available=True)
+        assistant, _ = make_assistant(ai=ai)
+        message = mention("rewrite this to be formal:")  # nothing after the colon
+        handled = await assistant.handle_message(message)
+        self.assertTrue(handled)
+        # whatever happened, the model was not asked to rewrite nothing
+        self.assertNotIn(
+            "drafting", str(message.replies[0]["content"]).casefold()
+        )
+
+
+class TestHistorySearch(unittest.IsolatedAsyncioTestCase):
+    def make_history_message(self, contents):
+        import types
+
+        class HistoryChannel(FakeChannel):
+            def history(self, *, limit, before):
+                async def walker():
+                    for author_name, content in contents:
+                        yield types.SimpleNamespace(
+                            id=hash((author_name, content)) & 0xFFFFFF,
+                            author=types.SimpleNamespace(
+                                bot=False, name=author_name.lower(),
+                                display_name=author_name,
+                            ),
+                            content=content,
+                        )
+
+                return walker()
+
+        message = mention("find the message where taher said hello")
+        message.channel = HistoryChannel()
+        return message
+
+    async def test_find_message_by_author_and_text(self):
+        assistant, _ = make_assistant()
+        message = self.make_history_message([
+            ("Stupid", "hello everyone"),
+            ("Taher", "hello from taher"),
+            ("Ash", "nothing relevant"),
+        ])
+        self.assertTrue(await assistant.handle_message(message))
+        content = message.replies[-1]["content"]
+        self.assertIn("found", content.casefold())
+        self.assertIn("hello from taher", content)
+
+    async def test_find_message_no_hits_is_honest(self):
+        assistant, _ = make_assistant()
+        message = self.make_history_message([("Ash", "nothing here")])
+        self.assertTrue(await assistant.handle_message(message))
+        content = message.replies[-1]["content"]
+        self.assertIn("nothing matching", content.casefold())
+
+
+class TestFollowUps(unittest.IsolatedAsyncioTestCase):
+    async def test_what_about_continues_the_last_tool_ask(self):
+        assistant, _ = make_assistant()
+        first = mention("what time is it in tokyo")
+        self.assertTrue(await assistant.handle_message(first))
+        self.assertTrue(first.replies)  # the time was answered
+
+        # same asker again — beat the per-user cooldown deliberately
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+
+        second = mention("what about london")
+        self.assertTrue(await assistant.handle_message(second))
+        self.assertTrue(second.replies)
+        # the follow-up produced a *time* answer (embed), not an AI ramble
+        self.assertIsNotNone(second.replies[0].get("embed"))
+
+    async def test_follow_ups_expire_quickly(self):
+        import time as time_module
+        assistant, _ = make_assistant()
+        assistant._last_route[55] = (time_module.monotonic() - 400.0, Route(kind=TIME, payload="tokyo"))
+        routes = assistant._apply_followup(
+            mention("what about london"), [Route(kind=AI, payload="x")], "what about london"
+        )
+        self.assertEqual(routes[0].kind, AI)
+
+    async def test_concrete_requests_never_become_followups(self):
+        assistant, _ = make_assistant()
+        assistant._last_route[55] = (0.0, Route(kind=TIME, payload="tokyo"))
+        routes = assistant._apply_followup(
+            mention("roll a d20"),
+            [Route(kind=UTILITY, payload="d20", payload2="dice")],
+            "roll a d20",
+        )
+        self.assertEqual(routes[0].kind, UTILITY)

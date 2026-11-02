@@ -24,8 +24,8 @@ from functions.intent import (  # noqa: E402
 )
 from functions.intent import _cache as intent_cache  # noqa: E402
 from functions.router import (  # noqa: E402
-    AI, CALCULATE, CONVERT, GIF, IMAGE, INFO, MEME, POLL, REMIND, SEARCH,
-    SUMMARIZE, TIME, UTILITY, WEATHER, Route, route_query,
+    AI, CALCULATE, CONVERT, GIF, IMAGE, INFO, MEME, POLL, REMIND, RESEARCH,
+    SEARCH, SUMMARIZE, TIME, UTILITY, WEATHER, Route, route_query,
 )
 
 
@@ -125,7 +125,7 @@ class TestToRoute(unittest.TestCase):
             ("weather", WEATHER),
             ("time", TIME),
             ("image", IMAGE),
-            ("search", SEARCH),
+            ("search", RESEARCH),  # search labels feed the research pipeline
             ("summarize", SUMMARIZE),
             ("recap", SUMMARIZE),
             ("meme", MEME),

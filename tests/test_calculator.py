@@ -122,3 +122,66 @@ class TestLooksLikeMath(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# Statistics over number lists and single-variable linear equations
+# ---------------------------------------------------------------------------
+
+
+class TestStatsRequests(unittest.TestCase):
+    def test_average(self):
+        self.assertEqual(calculate("average of 4 8 15 16 23 42").result, 18.0)
+        self.assertEqual(calculate("what is the average of 10 20 and 30").result, 20.0)
+
+    def test_sum_median_min_max_product(self):
+        self.assertEqual(calculate("sum of 10 20 30").result, 60.0)
+        self.assertEqual(calculate("sum of 3, 5, and 7").result, 15.0)
+        self.assertEqual(calculate("median of 1 9 2").result, 2.0)
+        self.assertEqual(calculate("median of 4 8 15 16").result, 11.5)
+        self.assertEqual(calculate("min of 5 3 8").result, 3.0)
+        self.assertEqual(calculate("max of 5 3 8").result, 8.0)
+        self.assertEqual(calculate("product of 2 3 4").result, 24.0)
+
+    def test_non_numeric_lists_are_rejected(self):
+        with self.assertRaises(ParadiseError):
+            calculate("average of pizza burgers")
+
+    def test_stats_shape_routes_as_math(self):
+        for text in ("average of 4 8 15", "the average of 3, 5 and 7",
+                     "sum of 10 20 30"):
+            self.assertTrue(looks_like_math(text), text)
+
+
+class TestEquationSolving(unittest.TestCase):
+    def test_simple_linear_equations(self):
+        self.assertEqual(calculate("x + 2 = 5").result, 3.0)
+        self.assertEqual(calculate("2x + 3 = 11").result, 4.0)
+        self.assertEqual(calculate("solve 5x - 10 = 0").result, 2.0)
+        self.assertEqual(calculate("10 = 2x").result, 5.0)
+        self.assertEqual(calculate("3(x + 1) = 12").result, 3.0)
+
+    def test_infinite_and_no_solutions_are_reported_honestly(self):
+        with self.assertRaises(ParadiseError):
+            calculate("x + 1 = x + 1")  # always true
+        try:
+            calculate("x + 1 = x + 2")
+        except ParadiseError as error:
+            self.assertIn("no solution", str(error).casefold())
+        else:
+            self.fail("expected a no-solution error")
+
+    def test_non_linear_equations_are_refused_not_guessed(self):
+        # x^2 = 4 has two solutions; pretending a linear solve answers it
+        # would be fabrication, so the calculator declines.
+        for text in ("x**2 = 4", "x^2 = 4"):
+            with self.assertRaises(ParadiseError):
+                calculate(text)
+
+    def test_equation_shape_routes_as_math(self):
+        for text in ("x + 2 = 5", "whats 2x + 3 = 11", "10 = 2x"):
+            self.assertTrue(looks_like_math(text), text)
+
+    def test_equations_with_two_variables_are_not_ours(self):
+        with self.assertRaises(ParadiseError):
+            calculate("x + y = 5")
