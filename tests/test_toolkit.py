@@ -345,8 +345,8 @@ class TestDiscordTimestamp(unittest.TestCase):
         line = discord_timestamp(
             "tomorrow 8 pm", now=datetime(2026, 11, 2, 10, 0, tzinfo=timezone.utc)
         )
-        self.assertIn("<t:1793629800:F>", line)
-        self.assertIn("<t:1793629800:R>", line)
+        self.assertIn("<t:1793716200:F>", line)
+        self.assertIn("<t:1793716200:R>", line)
 
     def test_date_with_time_is_not_confused_by_day_numbers(self):
         line = discord_timestamp(

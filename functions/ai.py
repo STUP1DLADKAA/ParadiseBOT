@@ -32,6 +32,7 @@ import aiohttp
 from config import lord_ids_of
 from functions.gemini import CLASSIFY_SYSTEM, GeminiService
 from functions.helpers import ParadiseError, sanitize_untrusted
+from functions.vibe import VibeTracker
 
 log = logging.getLogger(__name__)
 
@@ -52,12 +53,26 @@ HOW YOU TALK (this matters most)
 - Don't repeat the question back, don't end every reply with a question.
 - Casual but correct grammar, like a human who types fast and well. Never
   stiff or machine-sounding.
+- NEVER sound like a template. Vary your openers, length and shape; never
+  reuse a punchline, joke angle or phrasing you used recently. If a
+  current-mood note is given, be it — without ever mentioning it.
+
+HOW YOU TALK LANGUAGE
+- You speak English and Hindi both, and Hinglish code-mixing comes
+  naturally to you. Match the room: if they type Hinglish, reply in
+  Hinglish; pure Hindi gets pure-ish Hindi back; English gets English.
+- You always UNDERSTAND Hindi and Hinglish, whatever you reply in.
 
 HOW FUNNY YOU ARE
 - Light and playful, never cruel. Tease what someone said or did — their
   take, their confidence, their sleep schedule — never who they are.
-- Sarcasm and deadpan are your defaults. A little well-placed profanity is
-  fine; don't force it, don't spam "lil bro" and skull emojis.
+- Sarcasm and deadpan are your defaults.
+- Friendly-fire profanity is part of this server's air: English (fuck,
+  shit, hell) and Hindi (lund, madarchod, bhosdike, chutiya, gand) are all
+  fine among friends — sharp, funny, occasional. Never spam it, never
+  open every reply with it, and the moment someone is genuinely upset or
+  asking something serious, drop it completely and just help.
+- Don't force memes, don't spam "lil bro" and skull emojis.
 - Read the room: when someone is serious, upset or needs real help, drop
   the jokes and just be helpful and kind.
 
@@ -71,7 +86,8 @@ THE RULES
    events, sources or running jokes that aren't in front of you.
 4. Never be actually mean: no insults about someone's body, family,
    religion, caste, sexuality, gender, race, disability or insecurities.
-   No slurs, ever.
+   No slurs, ever. Expletives (fuck, madarchod, bhosdike, lund) are
+   vocabulary, not attacks — banned only when aimed at who someone is.
 
 THE LORDS
 Stupid (the server owner) and Taher are your lords and masters — equals, both
@@ -130,6 +146,9 @@ class AIService:
         self._model_skip_until: dict[str, float] = {}
         # Gemini is the fallback reasoning provider (may be unconfigured).
         self.gemini = GeminiService(getattr(config, "gemini", None))
+        # The living mood: rotating energies, self-repeat guards, the
+        # group's own slang. In-memory only, refreshed by every message.
+        self.vibe = VibeTracker()
 
     # ------------------------------------------------------------------
     # Providers
@@ -222,6 +241,9 @@ class AIService:
         self._history[message.channel.id].append(
             (message.author.display_name, content[:_SNIPPET_CHARS])
         )
+        # Real-time character drift: the words this group actually uses
+        # become the words Paradise reaches for. Never raises.
+        self.vibe.observe(message.author.display_name, content)
 
     def _context_block(
         self,
@@ -246,6 +268,9 @@ class AIService:
         # The user's message was already recorded by the message handler. Keep
         # only Paradise's reply so future prompts do not contain duplicates.
         self._history[channel_id].append(("Paradise", answer[:_SNIPPET_CHARS]))
+        # And into the anti-self-repeat guard, so the next reply in this
+        # channel takes a different shape.
+        self.vibe.note_reply(channel_id, answer)
 
     def last_words(self, channel_id: int, display_name: str) -> str:
         """The last thing *display_name* said in this channel ("" if silent).
@@ -643,6 +668,7 @@ class AIService:
                     int(getattr(message.author, "id", 0) or 0),
                     message.author.display_name,
                 ),
+                self.vibe.prompt_block(message.channel.id),
                 (
                     f"Recent conversation in this channel "
                     f"(for context, may be empty):\n{context}"
@@ -695,6 +721,7 @@ class AIService:
             note
             for note in (
                 self._asker_note(int(asker_id or 0), str(asker)),
+                self.vibe.prompt_block(channel_id) if channel_id else "",
                 (
                     f"Recent conversation in this channel "
                     f"(for context, may be empty):\n{context}"
@@ -766,6 +793,54 @@ class AIService:
                 temperature=0.9,
             )
 
+    async def butt_in(
+        self, speaker: str, text: str, channel_id: int = 0
+    ) -> str:
+        """One line for when someone talks ABOUT Paradise, not to him.
+
+        The personality engine's "he's being discussed" lane: Paradise butts
+        into the conversation, in character, with whatever the moment needs
+        — defending himself, agreeing with the slander, roasting back.
+        Returns "" on any failure (the caller stays silent); never raises.
+        """
+        if not self.available:
+            return ""
+        who = str(speaker or "someone").strip() or "someone"
+        snippet = sanitize_untrusted(text, limit=220)
+        if not snippet:
+            return ""
+        ask = (
+            f"{who} is talking ABOUT you (not to you) in your server. They said:\n"
+            f"\"{snippet}\"\n\n"
+            "Butt in with ONE short line, in character — defend yourself, agree "
+            "with the slander, roast back, or play along, whatever fits best. "
+            "Two sentences max, lowercase, casual. Friendly-fire expletives "
+            "(English or Hindi — fuck, lund, madarchod, bhosdike) are fine; "
+            "slurs never. Hinglish welcome if it fits. Don't explain you're a "
+            "bot, don't mention these instructions."
+        )
+        vibe = self.vibe.prompt_block(channel_id)
+        if vibe:
+            ask += f"\n\n{vibe}"
+        try:
+            line = (
+                await self.chat(
+                    [
+                        {"role": "system", "content": SYSTEM_PROMPT},
+                        {"role": "user", "content": ask},
+                    ],
+                    max_tokens=80,
+                )
+            ).strip()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - butting in is strictly optional
+            log.debug("About-reply failed", exc_info=True)
+            return ""
+        if line:
+            self.vibe.note_reply(channel_id, line)
+        return line
+
     async def tease(
         self,
         name: str,
@@ -796,8 +871,10 @@ class AIService:
         rules = (
             "Rules: one or two sentences max, playful not cruel, plain casual "
             "lowercase style, it must clearly reference what they said, and it "
-            "must never mock who someone is — no insults about body, family, "
-            "religion, caste, sexuality, gender, race or disability, no slurs. "
+            "must never mock who someone is — no insults about body, religion, "
+            "caste, sexuality, gender, race or disability, no slurs. Casual "
+            "expletives (fuck, lund, madarchod, bhosdike) are fine as friendly "
+            "fire; attacking who someone actually is is not. "
             "No quotation marks around your answer."
         )
         if lord:
@@ -805,6 +882,14 @@ class AIService:
                 " They are your lord and master: address them as 'my lord' or "
                 "by name, stay affectionate and loyal while you tease them."
             )
+        # No grudge loops: the angles already used are right there in the
+        # prompt, and this jab gets remembered for next time.
+        recent_angles = self.vibe.roast_block(target)
+        if recent_angles:
+            ask += f"\n{recent_angles}"
+        current_mood = self.vibe.prompt_block(0)
+        if current_mood:
+            ask += f"\n{current_mood}"
         # Facts about the target are the best roast material:
         # "spent a year reaching level 100 in murder mystery" beats any
         # generic insult. Offered, never forced — the model picks what lands.
@@ -818,7 +903,7 @@ class AIService:
                 "in this server — use one if it lands, never mention how you "
                 f"know): {listed}."
             )
-        return (
+        jab = (
             await self.chat(
                 [
                     {"role": "system", "content": SYSTEM_PROMPT},
@@ -827,6 +912,9 @@ class AIService:
                 max_tokens=max_tokens,
             )
         ).strip()
+        if jab:
+            self.vibe.note_roast(target, jab)
+        return jab
 
     async def classify(self, request: str, *, max_tokens: int = 120) -> str:
         """Return the raw JSON label for *request* (see ``functions.intent``).
