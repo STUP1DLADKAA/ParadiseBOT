@@ -14,7 +14,7 @@ import discord
 
 from config import VoiceClipConfig
 
-from .buffer import ClipIntervalSnapshot, RollingAudioBuffer
+from .buffer import ClipIntervalSnapshot, NoUsableAudioError, RollingAudioBuffer
 from .constants import (
     ClipAuthorizationError,
     ClipBusyError,
@@ -234,6 +234,78 @@ class VoiceClipService:
             "dave_errors": int(router.dave_errors),
         }
 
+    def diagnose_capture(self, guild_id: int) -> str:
+        """Classify *why* a guild's rolling buffer has no usable audio.
+
+        Returns a short, actionable, privacy-safe reason (counts only — never
+        audio) for the ``/clip`` error message and the debug log.
+        """
+        gid = int(guild_id)
+        stats = self.receiver_stats(gid)
+        buf = self.get_buffer(gid)
+        if buf is None or not buf.is_recording:
+            return "capture_inactive"
+        if stats["received"] == 0:
+            return (
+                "no UDP packets at all — Discord is not sending voice to me "
+                "(I may still be server-deafened, or the voice connection is "
+                "not fully established)"
+            )
+        if stats["transport_errors"] > 0 and stats["buffered"] == 0:
+            return (
+                f"{stats['received']} packets arrived but transport decryption "
+                f"failed {stats['transport_errors']} times (encryption-mode "
+                "mismatch)"
+            )
+        if stats["dave_errors"] > 0 and stats["buffered"] == 0:
+            return (
+                f"{stats['received']} packets arrived but end-to-end (DAVE) "
+                f"decryption failed {stats['dave_errors']} times — the E2EE "
+                "key exchange did not complete for this connection"
+            )
+        if stats["buffered"] == 0:
+            return (
+                f"{stats['received']} packets arrived but none were Opus voice "
+                "frames for a mapped speaker yet"
+            )
+        return "ok"
+
+    def _empty_capture_error(self, guild_id: int) -> NoUsableAudioError:
+        """The accurate ``/clip`` error for an empty buffer, with its reason."""
+        reason = self.diagnose_capture(guild_id)
+        if reason == "ok":
+            return NoUsableAudioError(
+                "No audible speech has been captured in this channel yet — "
+                "someone needs to talk for a couple of seconds first."
+            )
+        if reason == "capture_inactive":
+            return NoUsableAudioError(
+                "Voice recording is not currently active in this voice channel."
+            )
+        return NoUsableAudioError(
+            f"No incoming voice audio has been captured yet ({reason})."
+        )
+
+    def capture_recovery_candidates(self) -> list[int]:
+        """Guild ids whose receiver is receiving packets but can never decrypt.
+
+        A long DAVE failure streak with zero successes means this voice
+        connection's E2EE key exchange never completed; the only cure is a
+        fresh connection.  The caller (the ``/clip`` cog's periodic sweep)
+        decides when and how to reconnect, and caps the attempts.
+        """
+        with self._lock:
+            routers = list(self._routers.items())
+        broken: list[int] = []
+        for gid, router in routers:
+            if (
+                router.packets_received >= 250
+                and not router.dave_ever_succeeded
+                and router.dave_fail_streak >= 250
+            ):
+                broken.append(gid)
+        return broken
+
     def evict_all_expired(self) -> int:
         with self._lock:
             buffers = list(self._buffers.values())
@@ -277,9 +349,10 @@ class VoiceClipService:
                 getattr(me_voice, "self_deaf", False) or getattr(me_voice, "deaf", False)
             ):
                 raise ClipUnavailableError(
-                    "voice capture is unavailable while i'm deafened — Discord "
-                    "doesn't send audio to a deafened client, and i can't "
-                    "override a moderator's deafen. Un-deafen me and try again."
+                    "voice capture is unavailable while I'm deafened — Discord "
+                    "doesn't send audio to a deafened client. I lift deafens "
+                    "automatically when I have the Mute Members permission; "
+                    "give it a few seconds and try again."
                 )
 
         buf = self.get_buffer(guild.id)
@@ -313,7 +386,11 @@ class VoiceClipService:
         if buf is None:
             raise ClipUnavailableError("Voice recording is not active in this server.")
 
-        snapshot: ClipIntervalSnapshot = buf.snapshot(valid_duration)
+        snapshot: ClipIntervalSnapshot | None = None
+        try:
+            snapshot = buf.snapshot(valid_duration)
+        except NoUsableAudioError:
+            raise self._empty_capture_error(guild.id) from None
         exported = await self.exporter.export(snapshot)
         return exported, channel
 
@@ -342,7 +419,10 @@ class VoiceClipService:
         if buf is None:
             raise ClipUnavailableError("Voice recording is not active in this server.")
 
-        snapshot = buf.snapshot(valid_duration)
+        try:
+            snapshot = buf.snapshot(valid_duration)
+        except NoUsableAudioError:
+            raise self._empty_capture_error(guild.id) from None
         clip = await self.exporter.export(snapshot)
         try:
             await self._deliver_dm(

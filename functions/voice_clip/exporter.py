@@ -10,8 +10,6 @@ import os
 import shutil
 import tempfile
 
-from functions.dictionary.playback import resolve_ffmpeg_executable
-
 from .buffer import ClipIntervalSnapshot
 from .constants import (
     ClipBusyError,
@@ -140,12 +138,21 @@ class ClipExportPipeline:
         return self._active_temp_bytes
 
     def _resolve_ffmpeg(self) -> str:
-        exe = self._explicit_ffmpeg or resolve_ffmpeg_executable()
+        exe = self._explicit_ffmpeg or self._lookup_ffmpeg()
         if not exe:
             raise ClipUnavailableError(
                 "Audio encoder (FFmpeg) is not available on this host."
             )
         return exe
+
+    @staticmethod
+    def _lookup_ffmpeg() -> str | None:
+        # Imported lazily: dictionary.playback sits in a different feature
+        # package that (transitively) imports this one, so a module-level
+        # import would create a cycle.
+        from functions.dictionary.playback import resolve_ffmpeg_executable
+
+        return resolve_ffmpeg_executable()
 
     async def export(self, snapshot: ClipIntervalSnapshot) -> ExportedClip:
         """Decode, mix and encode ``snapshot`` into a validated temporary M4A file."""

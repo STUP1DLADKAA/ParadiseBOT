@@ -30,6 +30,7 @@ EXTENSIONS = (
     "commands.vc",
     "commands.clip",
     "commands.voice_presence",
+    "commands.voice_enforcement",
     "commands.minigames",
     "commands.dictionary",
     "commands.recipe",

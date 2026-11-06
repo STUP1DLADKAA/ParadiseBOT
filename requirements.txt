@@ -1,4 +1,11 @@
 discord.py[voice]>=2.6,<3.0
+# DAVE E2EE voice library. discord.py[voice] already requires davey>=0.1.0,
+# but the voice stack must be pinned consciously: davey 0.2 (Nov 2026) moved
+# key installation from process_commit/process_welcome into an explicit
+# prepare/execute transition state machine that discord.py 2.7.1 does not
+# drive yet. ParadiseBOT bridges that itself (functions/voice_clip/
+# dave_compat.py), so both lines work — but never let this float silently.
+davey>=0.1.6,<0.3
 # Bundled static ffmpeg binary so Discord voice Opus playback works out of
 # the box even when ffmpeg is not pre-installed on the host PATH.
 imageio-ffmpeg>=0.5,<1.0

@@ -36,6 +36,7 @@ from .mixer import (
     plan_speaker_timeline,
 )
 from .opus_codec import SpeakerOpusDecoder, ensure_opus_loaded
+from .join_policy import voice_client_class_for
 from .receiver import (
     ClipVoiceClient,
     ParsedRTPPacket,
@@ -85,4 +86,5 @@ __all__ = [
     "plan_speaker_timeline",
     "require_clip_authorization",
     "validate_clip_duration",
+    "voice_client_class_for",
 ]

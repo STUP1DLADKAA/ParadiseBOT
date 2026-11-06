@@ -6,7 +6,59 @@ All notable changes to Paradise are recorded here. The format follows
 
 ## [Unreleased]
 
+### Fixed
+- **`/clip` hears again — the DAVE E2EE key bridge.** davey 0.2.0 (released
+  2026-11-02) moved key installation out of `process_commit`/`process_welcome`
+  into an explicit transition state machine (voice gateway ops 21/22 →
+  `prepare_transition`/`execute_transition`), and discord.py 2.7.1 does not
+  drive it yet (Rapptz/discord.py#10548 is still open). Every incoming voice
+  packet therefore failed end-to-end decryption and was dropped, so `/clip`
+  always reported "No incoming voice audio has been received in this channel
+  yet" while the connection otherwise looked perfectly healthy. ParadiseBOT
+  now applies DAVE transitions itself from its voice-websocket hook
+  (`functions/voice_clip/dave_compat.py`) — a no-op on davey 0.1.x and on any
+  future discord.py that does this natively. The receiver's DAVE decrypt path
+  also gained failure-streak diagnostics and a bounded self-heal (a voice
+  reconnect re-runs the key exchange when decryption has never succeeded),
+  and the davey dependency is pinned (`>=0.1.6,<0.3`) so the voice stack
+  cannot float across that boundary silently again.
+- **No join path can silently disable recording any more.** Pronunciation
+  playback used to connect with `self_deaf=True` and the plain
+  `discord.VoiceClient` — a deafened client receives no RTP at all and a
+  plain client decrypts nothing, so any pronunciation before the presence cog
+  re-joined left the clip buffer blind. Every join now goes through one
+  shared policy (`voice_client_class_for`): never deafened, always the
+  receive-capable client while `VOICE_CLIP_ENABLED` is on. `ClipVoiceClient`
+  also binds its receiver on the first voice-websocket message instead of at
+  construction (no more pause-looping `SocketReader` before the UDP socket
+  exists), and re-binds idempotently after deafen recovery or reconnects.
+- **`/clip` failures now say why.** An empty buffer produces a specific,
+  actionable message — Discord not sending (server-deafened / not
+  connected), transport decryption failures, DAVE key-exchange failures, or
+  genuinely no speech yet — derived from privacy-safe receiver counters,
+  both in the reply and in the log line.
+
 ### Added
+- **Permanent voice-state enforcement (`commands/voice_enforcement.py`).**
+  Paradise now always stays **server-muted** (it is an eavesdropping clip bot;
+  nobody should hear it) and **server-undeafened** (a server-deafened client
+  receives no audio, which would silently kill `/clip`). Any server unmute or
+  server deafen is detected on the voice-state event and reversed within a
+  second via `Member.edit`, with identical-event deduplication, per-guild
+  coalescing, an in-flight guard, exponential backoff, a once-per-guild
+  log when the `Mute Members` permission is missing, and a 60 s sweep as a
+  safety net for missed events and reconnects. Self mute/deafen flags are
+  untouched; the enforcement never toggles them.
+
+### Changed
+- The voice receiver continues to capture while the bot is server-muted
+  (mute gates *transmit* only); the old behaviour of dropping the whole
+  recording session on a server deafen now first tries to lift the deafen
+  itself (via enforcement) and resumes capture as soon as the healthy state
+  arrives, instead of requiring a moderator.
+
+### Added
+
 - **A living personality — no two replies alike.** A new in-memory vibe
   engine rides along on every AI reply: a rotating mood (deadpan, hyped,
   Hinglish, villain arc, ... — never the same energy twice in a channel),

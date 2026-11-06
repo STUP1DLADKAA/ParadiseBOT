@@ -29,6 +29,7 @@ from dataclasses import dataclass
 import discord
 
 from functions.helpers import ParadiseError
+from functions.voice_clip.join_policy import voice_client_class_for
 
 from .models import Clip
 
@@ -151,11 +152,7 @@ class VoicePlayback:
             connected_here = False
             try:
                 if client is None or not client.is_connected():
-                    client = await asyncio.wait_for(
-                        channel.connect(reconnect=False, self_deaf=True),
-                        timeout=CONNECT_TIMEOUT,
-                    )
-                    connected_here = True
+                    client, connected_here = await self._join_channel(guild, channel)
                 elif client.channel != channel:
                     if client.is_playing():
                         raise PlaybackUnavailable("I'm busy in another channel")
@@ -178,6 +175,9 @@ class VoicePlayback:
                 raise PlaybackUnavailable("voice playback isn't working right now") from error
             finally:
                 if connected_here:
+                    # Give an in-flight mute-enforcement edit a moment to land
+                    # so the disconnect never races a member-state mutation.
+                    await self._await_enforcement_quiet(guild)
                     await self._disconnect(guild)
 
     async def _render(self, client: discord.VoiceClient, clip: Clip) -> None:
@@ -210,6 +210,46 @@ class VoicePlayback:
                 source.cleanup()
             except Exception:  # noqa: BLE001
                 log.debug("FFmpeg cleanup failed", exc_info=True)
+
+    async def _join_channel(
+        self, guild: discord.Guild, channel
+    ) -> tuple[discord.VoiceClient, bool]:
+        """Join ``channel`` and return ``(client, created_new_connection)``.
+
+        Never joins deafened: a deafened client receives no audio at all,
+        which would silently disable voice clipping.  Uses the shared
+        receive-capable client class so this join cannot silently swap the
+        recording receiver out for a plain client.
+        """
+        join_class = discord.VoiceClient
+        bot = getattr(getattr(guild, "_state", None), "client", None)
+        if bot is not None:
+            join_class = voice_client_class_for(bot)
+        client: discord.VoiceClient = await asyncio.wait_for(
+            channel.connect(reconnect=False, self_deaf=False, cls=join_class),
+            timeout=CONNECT_TIMEOUT,
+        )
+        return client, True
+
+    @staticmethod
+    async def _await_enforcement_quiet(guild: discord.Guild, timeout: float = 5.0) -> None:
+        """Wait briefly for an in-flight voice-state enforcement edit to finish.
+
+        Best effort only: when the enforcement cog is not loaded (or this is
+        not a commands.Bot) this returns immediately.
+        """
+        client = getattr(getattr(guild, "_state", None), "client", None)
+        get_cog = getattr(client, "get_cog", None)
+        cog = get_cog("VoiceEnforcement") if callable(get_cog) else None
+        wait_for_idle = getattr(cog, "wait_for_idle", None)
+        if not callable(wait_for_idle):
+            return
+        try:
+            await asyncio.wait_for(wait_for_idle(guild.id), timeout=timeout)
+        except asyncio.TimeoutError:
+            log.debug("Timed out waiting for voice enforcement to settle")
+        except Exception:  # noqa: BLE001 - playback must never fail on this
+            log.debug("Enforcement wait skipped", exc_info=True)
 
     @staticmethod
     async def _disconnect(guild: discord.Guild) -> None:

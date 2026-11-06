@@ -27,7 +27,7 @@ from functions.dictionary.playback import (
     resolve_ffmpeg_executable,
 )
 from functions.dictionary.pronounce import NeuralSpeechProvider, WebVoiceProvider
-from functions.voice_clip import ClipVoiceClient
+from functions.voice_clip import voice_client_class_for
 
 log = logging.getLogger(__name__)
 
@@ -268,6 +268,8 @@ class VoicePresence(commands.Cog):
                 return
             if before_id != after_id:
                 self._spawn(self._handle_bot_arrival(guild, after.channel))
+            # The permanent server mute/undeafen state is asserted by the
+            # VoiceEnforcement cog's own on_voice_state_update listener.
             return
 
         # 2. A human joined or switched voice channels — follow promptly
@@ -386,14 +388,11 @@ class VoicePresence(commands.Cog):
     def _voice_client_class(self):
         """The receive-capable client only when the clip buffer needs audio.
 
-        With ``VOICE_CLIP_ENABLED=false`` the plain client is used: nothing
-        decrypts, nothing buffers, and the bot stays as light as a music-free
-        voice client can be.
+        Shared with every other join path (dictionary playback) via
+        :func:`voice_client_class_for`, so a re-join can never silently swap
+        the recording receiver out for a plain client.
         """
-        clip_cfg = getattr(getattr(self.bot, "config", None), "voice_clip", None)
-        if bool(getattr(clip_cfg, "enabled", False)):
-            return ClipVoiceClient
-        return discord.VoiceClient
+        return voice_client_class_for(self.bot)
 
     async def ensure_connected(
         self,
