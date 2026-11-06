@@ -110,6 +110,13 @@ class RollingAudioBuffer:
         self._received_any_audio: bool = False
         self._evicted_packets: int = 0
         self._dropped_budget_packets: int = 0
+        # Per-session capture accounting (reset on every session start/clear):
+        # the difference between "this session has heard speech" and "a router
+        # has buffered packets at some point in its life" is exactly the
+        # difference between a working and a silently-dead capture.
+        self._session_packets: int = 0
+        self._session_non_silence: int = 0
+        self._last_packet_mono: float | None = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -157,6 +164,9 @@ class RollingAudioBuffer:
         self._total_bytes = 0
         self._total_packets = 0
         self._received_any_audio = False
+        self._session_packets = 0
+        self._session_non_silence = 0
+        self._last_packet_mono = None
 
     # ------------------------------------------------------------------
     # Capture & Eviction
@@ -242,8 +252,11 @@ class RollingAudioBuffer:
             stream.last_mono = pkt_mono
             self._total_bytes += pkt_bytes
             self._total_packets += 1
+            self._session_packets += 1
+            self._last_packet_mono = pkt_mono
             if not is_silence:
                 self._received_any_audio = True
+                self._session_non_silence += 1
             return True
 
     def epoch_for(self, user_id: int) -> int:
@@ -439,6 +452,13 @@ class RollingAudioBuffer:
                 "buffered_bytes": self._total_bytes,
                 "oldest_packet_age_seconds": oldest_age,
                 "session_elapsed_seconds": elapsed,
+                "session_packets": self._session_packets,
+                "session_non_silence_packets": self._session_non_silence,
+                "last_packet_age_seconds": (
+                    max(0.0, now - self._last_packet_mono)
+                    if self._last_packet_mono is not None
+                    else None
+                ),
                 "evicted_packets": self._evicted_packets,
                 "dropped_budget_packets": self._dropped_budget_packets,
             }
