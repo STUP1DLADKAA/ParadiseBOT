@@ -20,6 +20,7 @@ from discord.voice_state import VoiceConnectionState
 import nacl.secret
 from nacl.exceptions import CryptoError
 
+from . import dave_compat
 from .buffer import RollingAudioBuffer
 from .constants import MAX_OPUS_PACKET_BYTES, OPUS_SILENCE
 
@@ -29,9 +30,18 @@ DISCORD_OPUS_PAYLOAD_TYPE: int = 120  # 0x78
 VOICE_OP_READY: int = 2
 VOICE_OP_SESSION_DESCRIPTION: int = 4
 VOICE_OP_SPEAKING: int = 5
+# Op 11 ("clients_connect") only carries the roster (``user_ids``) — SSRC
+# mappings arrive on op 5 (SPEAKING).  Op 12 does not exist in the current
+# voice gateway protocol; the handler below stays as harmless defence.
 VOICE_OP_CLIENT_CONNECT: int = 11
 VOICE_OP_VIDEO: int = 12
 VOICE_OP_CLIENT_DISCONNECT: int = 13
+VOICE_OP_DAVE_PREPARE_TRANSITION: int = dave_compat.DAVE_PREPARE_TRANSITION_OP
+VOICE_OP_DAVE_EXECUTE_TRANSITION: int = dave_compat.DAVE_EXECUTE_TRANSITION_OP
+
+# Log the DAVE-decryption failure streak at these packet counts (≈1s of active
+# speech per 50) instead of spamming on every dropped packet.
+DAVE_FAILURE_LOG_STREAKS: tuple[int, ...] = (50, 500, 5_000)
 
 MAX_SSRC_MAPPINGS: int = 256
 MAX_STAGED_SSRCS: int = 16
@@ -211,6 +221,12 @@ class VoiceReceiveRouter:
         self.packets_buffered: int = 0
         self.transport_errors: int = 0
         self.dave_errors: int = 0
+        # Consecutive DAVE E2EE decryption failures without a success.  A large
+        # streak that never resets means the DAVE session never received its
+        # key ratchets (missing transition application) — actionable signal.
+        self.dave_fail_streak: int = 0
+        self.dave_ever_succeeded: bool = False
+        self._first_packet_logged: bool = False
 
     def configure_transport(
         self,
@@ -224,6 +240,11 @@ class VoiceReceiveRouter:
             self._decryptor = decryptor
             if own_ssrc is not None:
                 self._own_ssrc = int(own_ssrc)
+        log.info(
+            "Voice receiver transport ready for guild %s (mode=%s)",
+            self.guild_id,
+            mode,
+        )
 
     def set_own_ssrc(self, ssrc: int) -> None:
         with self._lock:
@@ -294,6 +315,12 @@ class VoiceReceiveRouter:
         """Non-blocking callback invoked on ``SocketReader`` thread per UDP packet."""
         arrival_mono = self._clock()
         self.packets_received += 1
+        if not self._first_packet_logged:
+            self._first_packet_logged = True
+            log.info(
+                "Voice UDP packets are arriving for guild %s (receiver is live)",
+                self.guild_id,
+            )
 
         with self._lock:
             decryptor = self._decryptor
@@ -374,7 +401,13 @@ class VoiceReceiveRouter:
         )
 
     def _unwrap_dave(self, user_id: int, transport_payload: bytes) -> bytes | None:
-        """Unwrap Discord DAVE E2EE audio payload when active on the voice session."""
+        """Unwrap Discord DAVE E2EE audio payload when active on the voice session.
+
+        Every incoming packet in a DAVE session passes through here, so this is
+        also the place where a broken key exchange becomes visible: a failure
+        streak that never resets means the session never received its key
+        ratchets (see :mod:`functions.voice_clip.dave_compat`).
+        """
         if transport_payload == OPUS_SILENCE:
             return OPUS_SILENCE
 
@@ -384,6 +417,8 @@ class VoiceReceiveRouter:
 
         if dave_version > 0:
             if not dave_session.ready:
+                # MLS group not established yet: only unencrypted (passthrough)
+                # frames can be handled at all.
                 try:
                     if dave_session.can_passthrough(user_id):
                         return dave_session.decrypt(
@@ -396,10 +431,44 @@ class VoiceReceiveRouter:
                 decrypted = dave_session.decrypt(
                     user_id, davey.MediaType.audio, transport_payload
                 )
-                return decrypted if decrypted else None
-            except Exception:  # noqa: BLE001
+            except Exception as err:  # noqa: BLE001
                 self.dave_errors += 1
+                self.dave_fail_streak += 1
+                streak = self.dave_fail_streak
+                if streak in DAVE_FAILURE_LOG_STREAKS:
+                    log.warning(
+                        "DAVE E2EE decryption has failed for %d packets in a row "
+                        "in guild %s (last error: %s). Voice capture cannot hear "
+                        "anyone until the E2EE keys are applied — the receiver "
+                        "applies DAVE transitions automatically, so this usually "
+                        "means the key exchange never completed and the voice "
+                        "connection needs to be re-established.",
+                        streak,
+                        self.guild_id,
+                        err.__class__.__name__,
+                    )
+                # Last resort: davey returns the raw frame itself when this
+                # user's decryptor is in passthrough mode.
+                try:
+                    if dave_session.can_passthrough(user_id):
+                        out = dave_session.decrypt(
+                            user_id, davey.MediaType.audio, transport_payload
+                        )
+                        if out:
+                            return out
+                except Exception:  # noqa: BLE001
+                    pass
                 return None
+            if self.dave_fail_streak > 0:
+                log.info(
+                    "DAVE E2EE decryption recovered in guild %s after %d "
+                    "consecutive failure(s)",
+                    self.guild_id,
+                    self.dave_fail_streak,
+                )
+            self.dave_fail_streak = 0
+            self.dave_ever_succeeded = True
+            return decrypted if decrypted else None
 
         # Protocol version 0 (downgraded / passthrough): if a session still has
         # active passthrough decryptors, run through it, else pass raw Opus.
@@ -424,7 +493,12 @@ class ClipVoiceClient(discord.VoiceClient):
         self._silence_task: asyncio.Task[None] | None = None
         self._keepalive_counter: int = 0
         super().__init__(client, channel)
-        self._bind_clip_service(getattr(channel, "id", None))
+        # NOTE: the rolling-capture session is intentionally *not* attached
+        # here.  At construction time there is no voice websocket and no UDP
+        # socket yet; registering the socket listener now would leave the
+        # shared SocketReader thread spinning hot on a non-socket.  The first
+        # voice websocket message (READY) binds the service instead — still
+        # long before any RTP can flow.
 
     def create_connection_state(self) -> VoiceConnectionState:
         return VoiceConnectionState(self, hook=self._on_voice_ws_message)
@@ -438,12 +512,29 @@ class ClipVoiceClient(discord.VoiceClient):
         # needs audio any more). False means this client decrypts nothing.
         if not getattr(service, "receiving_wanted", service.enabled):
             return
+        already_bound = self._receive_router is not None
         self._receive_router = service.attach_voice_client(
             guild=guild,
             channel_id=int(channel_id),
             voice_client=self,
         )
         self._ensure_socket_listener()
+        if not already_bound:
+            log.info(
+                "Voice receiver attached for guild %s in channel %s",
+                guild.id,
+                channel_id,
+            )
+
+    def rebind_recording(self) -> None:
+        """Re-attach the rolling capture after a service-side detach.
+
+        Used when capture had to be dropped (e.g. while the bot was deafened)
+        and later recovered: ``attach_voice_client`` is idempotent for the same
+        channel, so calling this on every recovery path is safe and cannot
+        duplicate recording sessions.
+        """
+        self._bind_clip_service(getattr(self.channel, "id", None))
 
     def _ensure_socket_listener(self) -> None:
         if self._receive_router is None:
@@ -495,6 +586,37 @@ class ClipVoiceClient(discord.VoiceClient):
         if self._receive_router is None:
             self._bind_clip_service(getattr(self.channel, "id", None))
         router = self._receive_router
+
+        # DAVE E2EE key transitions (voice gateway ops 21/22).  These must be
+        # applied even when the clip receiver is not bound: without
+        # prepare_transition the session never installs decryption key
+        # ratchets, and without execute_transition it never switches its
+        # encryption key — i.e. the bot can neither hear nor be heard.
+        # discord.py 2.7.1 tracks the transition ids but never forwards them
+        # to the davey session (Rapptz/discord.py#10548), so the bridge does.
+        if op == VOICE_OP_DAVE_PREPARE_TRANSITION:
+            session = getattr(self._connection, "dave_session", None)
+            tid = data.get("transition_id")
+            version = data.get("protocol_version")
+            if session is not None and isinstance(tid, int) and isinstance(version, int):
+                if dave_compat.prepare_dave_transition(session, tid, version):
+                    guild = getattr(self.channel, "guild", None)
+                    log.info(
+                        "DAVE transition %s (protocol v%s) prepared — E2EE keys "
+                        "installed for guild %s",
+                        tid,
+                        version,
+                        getattr(guild, "id", "?"),
+                    )
+            return
+
+        if op == VOICE_OP_DAVE_EXECUTE_TRANSITION:
+            session = getattr(self._connection, "dave_session", None)
+            tid = data.get("transition_id")
+            if session is not None and isinstance(tid, int):
+                dave_compat.execute_dave_transition(session, tid)
+            return
+
         if router is None:
             return
 
@@ -643,3 +765,8 @@ class ClipVoiceClient(discord.VoiceClient):
     def cleanup(self) -> None:
         self._teardown_recording()
         super().cleanup()
+
+
+# NOTE: ``voice_client_class_for`` lives in ``join_policy.py``, a
+# dependency-free leaf module, so other join paths (voice presence,
+# dictionary playback) can share it without import cycles.

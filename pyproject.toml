@@ -20,6 +20,10 @@ classifiers = [
 ]
 dependencies = [
     "discord.py[voice]>=2.6,<3.0",
+    # Pinned explicitly: davey 0.2 changed the DAVE transition API; the bot
+    # bridges it (functions/voice_clip/dave_compat.py) but the voice stack
+    # must never float silently across that boundary.
+    "davey>=0.1.6,<0.3",
     "imageio-ffmpeg>=0.5,<1.0",
     "av>=14.0,<19.0",
     "numpy>=1.26,<3.0",
