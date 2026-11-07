@@ -7,6 +7,40 @@ All notable changes to Paradise are recorded here. The format follows
 ## [Unreleased]
 
 ### Fixed
+- **`/clip` stayed silent after channel moves, deafen recovery and rebinds.**
+  Any rebind of the rolling capture (the presence cog moves the bot between
+  voice channels routinely; deafen recovery re-attaches capture) created a
+  fresh receive router without a transport decryptor — and Discord never
+  re-sends SESSION_DESCRIPTION on a live connection, so **every** UDP packet
+  was silently dropped until a full reconnect. Routers now inherit the live
+  state (decryptor, own SSRC, SSRC↔user mappings, staged packets, counters)
+  across rebinds, the receiver re-arms itself from the connection's stored
+  handshake state (`mode`/`secret_key`/`ssrc`) whenever it binds without one,
+  a voice-websocket RESUMED re-arms it too, and a channel move no longer
+  wipes the mappings at all. Speech from someone already talking across a
+  move keeps flowing; staged-frame retention grew from 2 s to 8 s so a user
+  who was mid-sentence at join/move is captured at their next breath pause.
+- **`/clip` no longer hides WHY a capture is empty.** The previous release
+  collapsed every empty capture into "someone needs to talk for a couple of
+  seconds", even when the receiver was actually broken — lifetime router
+  counters (which survive buffer clears) were mistaken for current-session
+  health. Diagnosis is now session-accurate (packets, speech frames and the
+  last-packet age *of this recording session*), the precise pipeline state is
+  logged at WARNING on every empty capture, and the user message names the
+  real stage: restarted-and-waiting, packets-arriving-but-nothing-decrypting,
+  only-silence-captured (speech failing to decrypt), genuinely-quiet-window,
+  or no-UDP-at-all.
+- **A receiver that worked and then went dark now self-heals.** The E2EE
+  recovery sweep only caught connections whose key exchange had *never*
+  succeeded; stale keys after an MLS group change (someone join/leave) or a
+  disarmed rebind ran forever with zero recovery. Recovery now also triggers
+  on failures-since-last-success (≥600 packets and ≥30 s dark) and on a fully
+  dark pipeline (packets in, nothing out), with the per-guild attempt budget
+  resetting once speech decodes again.
+- **Server-deafen recovery no longer discards receiver state.** While
+  server-deafened, Discord sends no RTP at all, so capture now just clears
+  the unreadable buffer and *keeps* the receiver; when enforcement lifts the
+  deafen, capture resumes instantly with keys and mappings intact.
 - **`/clip` hears again — the DAVE E2EE key bridge.** davey 0.2.0 (released
   2026-11-02) moved key installation out of `process_commit`/`process_welcome`
   into an explicit transition state machine (voice gateway ops 21/22 →
@@ -32,13 +66,12 @@ All notable changes to Paradise are recorded here. The format follows
   also binds its receiver on the first voice-websocket message instead of at
   construction (no more pause-looping `SocketReader` before the UDP socket
   exists), and re-binds idempotently after deafen recovery or reconnects.
-- **`/clip` failures now say why.** An empty buffer produces a specific,
-  actionable message — Discord not sending (server-deafened / not
-  connected), transport decryption failures, DAVE key-exchange failures, or
-  genuinely no speech yet — derived from privacy-safe receiver counters,
-  both in the reply and in the log line.
 
 ### Added
+- `VOICE_CLIP_DEBUG=true` — temporary capture-health instrumentation: one
+  privacy-safe pipeline line per guild every 15 s (connection, receiver
+  armed, received/buffered/speech counters, session age, last packet age,
+  DAVE failure streak). Never audio; turn off after debugging.
 - **Permanent voice-state enforcement (`commands/voice_enforcement.py`).**
   Paradise now always stays **server-muted** (it is an eavesdropping clip bot;
   nobody should hear it) and **server-undeafened** (a server-deafened client
@@ -49,16 +82,6 @@ All notable changes to Paradise are recorded here. The format follows
   log when the `Mute Members` permission is missing, and a 60 s sweep as a
   safety net for missed events and reconnects. Self mute/deafen flags are
   untouched; the enforcement never toggles them.
-
-### Changed
-- The voice receiver continues to capture while the bot is server-muted
-  (mute gates *transmit* only); the old behaviour of dropping the whole
-  recording session on a server deafen now first tries to lift the deafen
-  itself (via enforcement) and resumes capture as soon as the healthy state
-  arrives, instead of requiring a moderator.
-
-### Added
-
 - **A living personality — no two replies alike.** A new in-memory vibe
   engine rides along on every AI reply: a rotating mood (deadpan, hyped,
   Hinglish, villain arc, ... — never the same energy twice in a channel),
@@ -492,6 +515,19 @@ All notable changes to Paradise are recorded here. The format follows
 - ElevenLabs `422` on optional voice settings no longer burns the whole model
   chain — the same model is retried with the safe payload.
 - A flaky voice-clip end-to-end test now waits for observable buffer state.
+
+
+
+### Changed
+- The voice receiver continues to capture while the bot is server-muted
+  (mute gates *transmit* only); the old behaviour of dropping the whole
+  recording session on a server deafen now first tries to lift the deafen
+  itself (via enforcement) and resumes capture as soon as the healthy state
+  arrives, instead of requiring a moderator.
+  (mute gates *transmit* only); the old behaviour of dropping the whole
+  recording session on a server deafen now first tries to lift the deafen
+  itself (via enforcement) and resumes capture as soon as the healthy state
+  arrives, instead of requiring a moderator.
 
 ## [2.0.0]
 

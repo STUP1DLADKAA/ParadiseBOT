@@ -36,6 +36,7 @@ VOICE_OP_SPEAKING: int = 5
 VOICE_OP_CLIENT_CONNECT: int = 11
 VOICE_OP_VIDEO: int = 12
 VOICE_OP_CLIENT_DISCONNECT: int = 13
+VOICE_OP_RESUMED: int = 9
 VOICE_OP_DAVE_PREPARE_TRANSITION: int = dave_compat.DAVE_PREPARE_TRANSITION_OP
 VOICE_OP_DAVE_EXECUTE_TRANSITION: int = dave_compat.DAVE_EXECUTE_TRANSITION_OP
 
@@ -46,7 +47,13 @@ DAVE_FAILURE_LOG_STREAKS: tuple[int, ...] = (50, 500, 5_000)
 MAX_SSRC_MAPPINGS: int = 256
 MAX_STAGED_SSRCS: int = 16
 MAX_STAGED_PACKETS_PER_SSRC: int = 25
-STAGED_TTL_SECONDS: float = 2.0
+# How long packets from a not-yet-mapped SSRC are kept so they can be
+# decrypted retroactively once a SPEAKING event maps it to a user.  Discord
+# only sends SPEAKING when a user *starts* talking, so someone who was
+# already speaking when the bot joined/moved keeps talking well past a 2s
+# window; 8s covers a normal breath pause without meaningful memory cost
+# (25 packets x 16 SSRCs max).
+STAGED_TTL_SECONDS: float = 8.0
 UDP_KEEPALIVE_INTERVAL_SECONDS: float = 15.0
 
 _RTP_FIXED_STRUCT = struct.Struct(">HII")
@@ -221,10 +228,21 @@ class VoiceReceiveRouter:
         self.packets_buffered: int = 0
         self.transport_errors: int = 0
         self.dave_errors: int = 0
+        # Non-silence frames actually buffered — the "real speech heard"
+        # counter.  Silence frames bypass the DAVE gate, so a receiver whose
+        # speech decryption broke keeps buffering silence: without this
+        # counter that state masquerades as healthy.
+        self.non_silence_buffered: int = 0
         # Consecutive DAVE E2EE decryption failures without a success.  A large
         # streak that never resets means the DAVE session never received its
         # key ratchets (missing transition application) — actionable signal.
         self.dave_fail_streak: int = 0
+        # Failures since the LAST successful decryption, plus when that
+        # success was.  These catch the "worked, then broke mid-connection"
+        # case (stale keys after an MLS group change) which
+        # ``dave_ever_succeeded`` alone can never see.
+        self.dave_fail_since_success: int = 0
+        self.last_dave_success_mono: float | None = None
         self.dave_ever_succeeded: bool = False
         self._first_packet_logged: bool = False
 
@@ -244,6 +262,48 @@ class VoiceReceiveRouter:
             "Voice receiver transport ready for guild %s (mode=%s)",
             self.guild_id,
             mode,
+        )
+
+    def has_transport(self) -> bool:
+        with self._lock:
+            return self._decryptor is not None
+
+    def inherit_from(self, old: "VoiceReceiveRouter | None") -> None:
+        """Carry live capture state over from a previous router.
+
+        Rebinds happen on channel moves and recoveries **without** a new voice
+        handshake, so the new router must NOT start from zero: Discord does not
+        re-send SESSION_DESCRIPTION (op 4) on a live connection, and SPEAKING
+        events only arrive when users *start* talking.  Inheriting the
+        transport decryptor, the bot's own SSRC, the SSRC→user mappings and
+        the staged packets keeps capture seamless across the rebind.
+        """
+        if old is None or old is self:
+            return
+        with self._lock:
+            with old._lock:
+                self._decryptor = old._decryptor
+                self._own_ssrc = old._own_ssrc
+                self._ssrc_to_user = OrderedDict(old._ssrc_to_user)
+                self._user_to_ssrc = dict(old._user_to_ssrc)
+                self._staged_by_ssrc = OrderedDict(
+                    (ssrc, deque(q, maxlen=MAX_STAGED_PACKETS_PER_SSRC))
+                    for ssrc, q in old._staged_by_ssrc.items()
+                )
+                # Keep the diagnostic story continuous across the rebind.
+                self.packets_received = old.packets_received
+                self.packets_buffered = old.packets_buffered
+                self.transport_errors = old.transport_errors
+                self.dave_errors = old.dave_errors
+                self.non_silence_buffered = old.non_silence_buffered
+                self.dave_fail_streak = old.dave_fail_streak
+                self.dave_fail_since_success = old.dave_fail_since_success
+                self.last_dave_success_mono = old.last_dave_success_mono
+                self.dave_ever_succeeded = old.dave_ever_succeeded
+        log.info(
+            "Voice receiver state inherited for guild %s (%d SSRC mappings)",
+            self.guild_id,
+            len(self._ssrc_to_user),
         )
 
     def set_own_ssrc(self, ssrc: int) -> None:
@@ -293,6 +353,11 @@ class VoiceReceiveRouter:
                     mono_time=frame.mono_time,
                 ):
                     self.packets_buffered += 1
+                    if opus_bytes != OPUS_SILENCE:
+                        self.non_silence_buffered += 1
+                        self.dave_fail_since_success = 0
+                        self.last_dave_success_mono = frame.mono_time
+                        self.dave_ever_succeeded = True
 
     def remove_user(self, user_id: int) -> None:
         uid = int(user_id)
@@ -367,6 +432,18 @@ class VoiceReceiveRouter:
             mono_time=arrival_mono,
         ):
             self.packets_buffered += 1
+            if opus_bytes != OPUS_SILENCE:
+                self.non_silence_buffered += 1
+                if self.dave_fail_since_success > 0:
+                    log.info(
+                        "Voice capture recovered in guild %s after %d failed "
+                        "packet(s) since the last decoded speech frame",
+                        self.guild_id,
+                        self.dave_fail_since_success,
+                    )
+                self.dave_fail_since_success = 0
+                self.last_dave_success_mono = arrival_mono
+                self.dave_ever_succeeded = True
 
     def _stage_unknown_ssrc_unlocked(
         self,
@@ -434,6 +511,7 @@ class VoiceReceiveRouter:
             except Exception as err:  # noqa: BLE001
                 self.dave_errors += 1
                 self.dave_fail_streak += 1
+                self.dave_fail_since_success += 1
                 streak = self.dave_fail_streak
                 if streak in DAVE_FAILURE_LOG_STREAKS:
                     log.warning(
@@ -467,6 +545,8 @@ class VoiceReceiveRouter:
                     self.dave_fail_streak,
                 )
             self.dave_fail_streak = 0
+            self.dave_fail_since_success = 0
+            self.last_dave_success_mono = self._clock()
             self.dave_ever_succeeded = True
             return decrypted if decrypted else None
 
@@ -513,18 +593,59 @@ class ClipVoiceClient(discord.VoiceClient):
         if not getattr(service, "receiving_wanted", service.enabled):
             return
         already_bound = self._receive_router is not None
+        old_router = self._receive_router
         self._receive_router = service.attach_voice_client(
             guild=guild,
             channel_id=int(channel_id),
             voice_client=self,
+            previous_router=None if old_router is None else old_router,
         )
         self._ensure_socket_listener()
+        # Re-arm transport from the live connection state: on any rebind
+        # without a fresh handshake there is no SESSION_DESCRIPTION coming,
+        # and without a decryptor every packet is dropped silently.
+        self._arm_receiver()
         if not already_bound:
             log.info(
                 "Voice receiver attached for guild %s in channel %s",
                 guild.id,
                 channel_id,
             )
+
+    def _arm_receiver(self) -> None:
+        """Configure the router's transport decryptor from connection state.
+
+        ``VoiceConnectionState`` keeps ``mode``/``secret_key``/``ssrc`` for the
+        lifetime of the voice connection, so this restores full packet
+        processing after any rebind — no voice-gateway op 4 required.  A no-op
+        when the handshake has not completed yet (op 4 configures later).
+        """
+        router = self._receive_router
+        if router is None or router.has_transport():
+            return
+        conn = self._connection
+        mode = getattr(conn, "mode", None)
+        secret_key = getattr(conn, "secret_key", None)
+        if mode is discord.utils.MISSING or secret_key is discord.utils.MISSING:
+            return
+        if not isinstance(mode, str) or not isinstance(secret_key, (list, bytes, bytearray)):
+            return
+        if len(secret_key) != 32:
+            return
+        try:
+            ssrc = getattr(conn, "ssrc", None)
+            router.configure_transport(
+                mode,
+                bytes(secret_key) if not isinstance(secret_key, bytes) else secret_key,
+                own_ssrc=ssrc if isinstance(ssrc, int) else None,
+            )
+            log.info(
+                "Voice receiver transport re-armed from connection state for "
+                "guild %s",
+                getattr(getattr(self.channel, "guild", None), "id", "?"),
+            )
+        except (ValueError, TypeError):
+            log.debug("Could not re-arm the voice receiver transport", exc_info=True)
 
     def rebind_recording(self) -> None:
         """Re-attach the rolling capture after a service-side detach.
@@ -569,8 +690,13 @@ class ClipVoiceClient(discord.VoiceClient):
             return
         new_channel_id = int(raw_cid)
         if new_channel_id != old_channel_id:
-            if self._receive_router is not None:
-                self._receive_router.reset()
+            # NOTE: no ``router.reset()`` here.  A channel move does NOT
+            # re-run the voice handshake: the UDP socket, encryption keys and
+            # RTP SSRCs all stay the same.  Resetting used to leave the fresh
+            # router without a transport decryptor — and SESSION_DESCRIPTION
+            # (op 4) never re-arrives on a live connection, so every packet
+            # was dropped until a full reconnect.  ``attach_voice_client``
+            # inherits the live state instead, so capture continues silently.
             self._bind_clip_service(new_channel_id)
 
     async def _on_voice_ws_message(
@@ -594,6 +720,13 @@ class ClipVoiceClient(discord.VoiceClient):
         # encryption key — i.e. the bot can neither hear nor be heard.
         # discord.py 2.7.1 tracks the transition ids but never forwards them
         # to the davey session (Rapptz/discord.py#10548), so the bridge does.
+        if op == VOICE_OP_RESUMED:
+            # After a voice-websocket resume, make sure the receiver is
+            # still fully armed; SESSION_DESCRIPTION usually follows and
+            # reconfigures anyway, but this closes any gap.
+            self._arm_receiver()
+            return
+
         if op == VOICE_OP_DAVE_PREPARE_TRANSITION:
             session = getattr(self._connection, "dave_session", None)
             tid = data.get("transition_id")
@@ -627,8 +760,12 @@ class ClipVoiceClient(discord.VoiceClient):
 
         elif op == VOICE_OP_SESSION_DESCRIPTION:
             mode = data.get("mode") or self._connection.mode
-            secret_key = ws.secret_key or self._connection.secret_key
-            if isinstance(mode, str) and secret_key:
+            secret_key = getattr(ws, "secret_key", None) or self._connection.secret_key
+            if (
+                isinstance(mode, str)
+                and isinstance(secret_key, (list, bytes, bytearray))
+                and len(secret_key) == 32
+            ):
                 try:
                     router.configure_transport(
                         mode,

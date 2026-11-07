@@ -605,6 +605,9 @@ class VoiceClipConfig:
     bitrate_kbps: int = 128
     # Mastering chain applied while encoding the mixed clip (empty = default).
     audio_filter: str = ""
+    # Temporary capture-health diagnostics: log a one-line pipeline summary
+    # per guild every sweep (connection, receiver, counters). Off by default.
+    debug_logging: bool = False
 
     @classmethod
     def from_env(cls, env) -> "VoiceClipConfig":
@@ -612,6 +615,7 @@ class VoiceClipConfig:
         temp_mb = max(4, min(512, _int(env.get("VOICE_CLIP_MAX_TEMP_MB"), 64)))
         return cls(
             enabled=_bool(env.get("VOICE_CLIP_ENABLED"), True),
+            debug_logging=_bool(env.get("VOICE_CLIP_DEBUG"), False),
             max_buffer_seconds=max(
                 1, min(180, _int(env.get("VOICE_CLIP_MAX_SECONDS"), 180))
             ),

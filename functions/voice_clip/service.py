@@ -155,8 +155,17 @@ class VoiceClipService:
         guild: discord.Guild,
         channel_id: int,
         voice_client: discord.VoiceClient,
+        previous_router: VoiceReceiveRouter | None = None,
     ) -> VoiceReceiveRouter:
-        """Start/switch rolling capture for ``guild`` on ``channel_id``."""
+        """Start/switch rolling capture for ``guild`` on ``channel_id``.
+
+        ``previous_router`` (the router bound before a rebind) has its live
+        state — transport decryptor, SSRC mappings, staged packets, counters —
+        inherited by the new router, because a channel move or recovery does
+        **not** re-run the voice handshake: there is no new SESSION_DESCRIPTION
+        and SPEAKING events only arrive when users start talking again.  A
+        fresh router would silently drop every packet until a full reconnect.
+        """
         gid = int(guild.id)
         cid = int(channel_id)
         buf = self.get_or_create_buffer(gid)
@@ -180,8 +189,6 @@ class VoiceClipService:
 
         with self._lock:
             old_router = self._routers.pop(gid, None)
-            if old_router is not None:
-                old_router.reset()
             router = VoiceReceiveRouter(
                 guild_id=gid,
                 buffer=buf,
@@ -189,6 +196,13 @@ class VoiceClipService:
                 dave_state_getter=_dave_state,
                 clock=self._clock,
             )
+            # Inherit from the caller-supplied router first (same live voice
+            # connection), else from whatever was registered for this guild.
+            inherit_source = previous_router or old_router
+            if inherit_source is not None and inherit_source is not router:
+                router.inherit_from(inherit_source)
+            if old_router is not None and old_router is not inherit_source:
+                old_router.reset()
             self._routers[gid] = router
         return router
 
@@ -202,6 +216,26 @@ class VoiceClipService:
             router.reset()
         if buf is not None:
             buf.clear()
+
+    def clear_guild_buffer(self, guild_id: int) -> None:
+        """Wipe buffered audio but KEEP the receiver and its live state.
+
+        Used when capture must pause (e.g. while the bot is server-deafened
+        and Discord sends no RTP at all) but the voice connection — and with
+        it the transport decryptor and SSRC mappings — continues afterwards.
+        A full ``detach_guild`` here would throw away state that takes a new
+        voice handshake to rebuild, leaving capture dead after recovery.
+        """
+        gid = int(guild_id)
+        with self._lock:
+            buf = self._buffers.get(gid)
+        if buf is not None:
+            buf.clear()
+
+    def buffered_guild_ids(self) -> list[int]:
+        """Guilds that currently have a rolling buffer (diagnostics/sweeps)."""
+        with self._lock:
+            return list(self._buffers.keys())
 
     def handle_speaker_leave(self, guild_id: int, user_id: int) -> None:
         """Mark speaker stream discontinuity when a member leaves or switches VC."""
@@ -234,75 +268,182 @@ class VoiceClipService:
             "dave_errors": int(router.dave_errors),
         }
 
+    def capture_health(self, guild_id: int) -> dict[str, int | float | bool | None]:
+        """Everything the diagnosis needs for one guild — counts only.
+
+        Deliberately splits *session* truth (what this recording session has
+        actually captured, from the buffer) from *receiver* truth (what the
+        UDP/decryption pipeline has seen in its lifetime, from the router).
+        A router that buffered packets an hour ago is not "ok" now.
+        """
+        gid = int(guild_id)
+        buf_stats = self.get_buffer(gid).stats() if self.get_buffer(gid) is not None else {}
+        router_stats = self.receiver_stats(gid)
+        with self._lock:
+            router = self._routers.get(gid)
+        health: dict[str, int | float | bool | None] = dict(buf_stats)
+        health.update(router_stats)
+        health["non_silence_buffered"] = (
+            int(router.non_silence_buffered) if router is not None else 0
+        )
+        health["dave_fail_since_success"] = (
+            int(router.dave_fail_since_success) if router is not None else 0
+        )
+        health["last_dave_success_age"] = (
+            max(0.0, self._clock() - router.last_dave_success_mono)
+            if router is not None and router.last_dave_success_mono is not None
+            else None
+        )
+        health["receiver_armed"] = router.has_transport() if router is not None else False
+        return health
+
     def diagnose_capture(self, guild_id: int) -> str:
         """Classify *why* a guild's rolling buffer has no usable audio.
 
         Returns a short, actionable, privacy-safe reason (counts only — never
-        audio) for the ``/clip`` error message and the debug log.
+        audio) for the ``/clip`` error message and the debug log.  Judged on
+        the CURRENT session, not on lifetime receiver counters: "audio worked
+        once" must never read as "audio works".
         """
         gid = int(guild_id)
-        stats = self.receiver_stats(gid)
-        buf = self.get_buffer(gid)
-        if buf is None or not buf.is_recording:
+        h = self.capture_health(gid)
+        if not h.get("recording", False):
             return "capture_inactive"
-        if stats["received"] == 0:
+        if not h.get("received"):
             return (
                 "no UDP packets at all — Discord is not sending voice to me "
-                "(I may still be server-deafened, or the voice connection is "
-                "not fully established)"
+                "(I may be server-deafened, or the voice handshake is not "
+                "complete)"
             )
-        if stats["transport_errors"] > 0 and stats["buffered"] == 0:
+        if not h.get("receiver_armed", False):
             return (
-                f"{stats['received']} packets arrived but transport decryption "
-                f"failed {stats['transport_errors']} times (encryption-mode "
-                "mismatch)"
+                "voice packets are arriving but the transport decryptor is "
+                "not configured — the receiver was rebound without a voice "
+                "handshake"
             )
-        if stats["dave_errors"] > 0 and stats["buffered"] == 0:
+        session_packets = int(h.get("session_packets") or 0)
+        session_non_silence = int(h.get("session_non_silence_packets") or 0)
+        session_elapsed = float(h.get("session_elapsed_seconds") or 0.0)
+        if session_packets == 0 and session_elapsed < 2.0:
+            return "session_just_started"
+        if session_packets == 0:
+            if h.get("buffered", 0) or h.get("non_silence_buffered", 0):
+                last_age = h.get("last_packet_age_seconds")
+                if last_age is None:
+                    return (
+                        "this capture session has not received a single audio "
+                        "packet yet (the previous session did) — the receiver "
+                        "went dark after a rebind"
+                    )
+                return (
+                    f"no audio has arrived for the last {last_age:.0f}s — "
+                    "the connection may have gone silent or capture is "
+                    "degraded"
+                )
             return (
-                f"{stats['received']} packets arrived but end-to-end (DAVE) "
-                f"decryption failed {stats['dave_errors']} times — the E2EE "
-                "key exchange did not complete for this connection"
+                f"{h.get('received')} packets arrived but none decrypted into "
+                "a mapped speaker's voice yet (waiting for users to start "
+                "speaking)"
             )
-        if stats["buffered"] == 0:
+        if session_non_silence == 0:
             return (
-                f"{stats['received']} packets arrived but none were Opus voice "
-                "frames for a mapped speaker yet"
+                f"only silence frames captured in this session "
+                f"({session_packets} packets) — speech frames are failing to "
+                "decrypt or nobody has spoken yet"
             )
         return "ok"
 
-    def _empty_capture_error(self, guild_id: int) -> NoUsableAudioError:
-        """The accurate ``/clip`` error for an empty buffer, with its reason."""
+    def _empty_capture_error(
+        self, guild_id: int, original: NoUsableAudioError | None = None
+    ) -> NoUsableAudioError:
+        """The accurate ``/clip`` error for an empty capture.
+
+        Logs the precise pipeline state (WARNING) and returns a user message
+        that matches the actual failing stage — never a generic "nobody
+        talked" when the receiver is actually broken.
+        """
         reason = self.diagnose_capture(guild_id)
-        if reason == "ok":
-            return NoUsableAudioError(
-                "No audible speech has been captured in this channel yet — "
-                "someone needs to talk for a couple of seconds first."
-            )
+        h = self.capture_health(guild_id)
+        log.warning(
+            "Empty /clip in guild %s: %s | pipeline=%s",
+            guild_id,
+            getattr(original, "args", (None,))[0] if original is not None else "n/a",
+            {
+                k: h.get(k)
+                for k in (
+                    "recording",
+                    "session_elapsed_seconds",
+                    "session_packets",
+                    "session_non_silence_packets",
+                    "buffered_packets",
+                    "last_packet_age_seconds",
+                    "received",
+                    "buffered",
+                    "non_silence_buffered",
+                    "transport_errors",
+                    "dave_errors",
+                    "dave_fail_since_success",
+                    "receiver_armed",
+                )
+            },
+        )
         if reason == "capture_inactive":
             return NoUsableAudioError(
                 "Voice recording is not currently active in this voice channel."
             )
-        return NoUsableAudioError(
-            f"No incoming voice audio has been captured yet ({reason})."
-        )
+        if reason == "session_just_started":
+            return NoUsableAudioError(
+                "Recording just restarted and hasn't captured any audio yet — "
+                "give it a couple of seconds and try again."
+            )
+        if reason == "ok":
+            # The session HAS captured speech — the requested window itself
+            # was silent.  This is the genuine "try longer / speak now" case.
+            return NoUsableAudioError(
+                "No audible speech was captured — someone needs to speak in "
+                "the channel right before you run /clip (or request a longer "
+                "duration)."
+            )
+        return NoUsableAudioError(f"Voice capture is not receiving speech ({reason}).")
 
     def capture_recovery_candidates(self) -> list[int]:
-        """Guild ids whose receiver is receiving packets but can never decrypt.
+        """Guild ids whose voice receiver is too broken to capture speech.
 
-        A long DAVE failure streak with zero successes means this voice
-        connection's E2EE key exchange never completed; the only cure is a
-        fresh connection.  The caller (the ``/clip`` cog's periodic sweep)
-        decides when and how to reconnect, and caps the attempts.
+        Two failure shapes are recognised:
+
+        * **never worked**: packets arrive, DAVE decryption has *never*
+          succeeded (the E2EE key exchange failed on this connection);
+        * **worked, then went dark**: speech used to decode but a long run of
+          packets has failed since the last success (stale keys after an MLS
+          group change) — the case a "never succeeded" check can never see.
+
+        The only cure for either is a fresh voice connection.  The caller
+        (the ``/clip`` cog's periodic sweep) decides when to reconnect and
+        caps the attempts.
         """
         with self._lock:
             routers = list(self._routers.items())
         broken: list[int] = []
         for gid, router in routers:
-            if (
-                router.packets_received >= 250
-                and not router.dave_ever_succeeded
-                and router.dave_fail_streak >= 250
-            ):
+            if router.packets_received < 250:
+                continue
+            never_worked = (
+                not router.dave_ever_succeeded and router.dave_fail_streak >= 250
+            )
+            went_dark = (
+                router.dave_ever_succeeded
+                and router.dave_fail_since_success >= 600
+                and router.last_dave_success_mono is not None
+                and (self._clock() - router.last_dave_success_mono) >= 30.0
+            )
+            # A receiver that gets packets but decodes nothing AT ALL
+            # (no decryptor, or everything dropped pre-buffer) is equally dead.
+            dark_pipe = (
+                router.packets_received >= 500
+                and router.packets_buffered == 0
+                and router.transport_errors < router.packets_received // 2
+            )
+            if never_worked or went_dark or dark_pipe:
                 broken.append(gid)
         return broken
 
@@ -389,8 +530,8 @@ class VoiceClipService:
         snapshot: ClipIntervalSnapshot | None = None
         try:
             snapshot = buf.snapshot(valid_duration)
-        except NoUsableAudioError:
-            raise self._empty_capture_error(guild.id) from None
+        except NoUsableAudioError as err:
+            raise self._empty_capture_error(guild.id, err) from None
         exported = await self.exporter.export(snapshot)
         return exported, channel
 
@@ -421,8 +562,8 @@ class VoiceClipService:
 
         try:
             snapshot = buf.snapshot(valid_duration)
-        except NoUsableAudioError:
-            raise self._empty_capture_error(guild.id) from None
+        except NoUsableAudioError as err:
+            raise self._empty_capture_error(guild.id, err) from None
         clip = await self.exporter.export(snapshot)
         try:
             await self._deliver_dm(

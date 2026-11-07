@@ -76,27 +76,20 @@ class VoiceClip(commands.Cog):
 
         The counters are integers only — never audio. The diagnosis tells the
         operator which stage lost the audio: Discord not sending at all,
-        transport decryption, E2EE (DAVE) decryption, or speaker mapping.
+        transport decryption, E2EE (DAVE) decryption, a dark receiver, or a
+        genuinely silent window.
         """
         guild_id = getattr(guild, "id", None)
         if guild_id is None:
             return
         try:
-            stats = self.service.receiver_stats(int(guild_id))
             reason = self.service.diagnose_capture(int(guild_id))
         except Exception:  # noqa: BLE001
-            log.debug("Could not read receiver statistics", exc_info=True)
+            log.debug("Could not read capture diagnosis", exc_info=True)
             return
-        log.info(
-            "Empty /clip in guild %s — received=%s buffered=%s transport_errors=%s "
-            "dave_errors=%s diagnosis=%s",
-            guild_id,
-            stats.get("received"),
-            stats.get("buffered"),
-            stats.get("transport_errors"),
-            stats.get("dave_errors"),
-            reason,
-        )
+        # The full counter dump is logged by service._empty_capture_error at
+        # WARNING; here we add the classified reason for quick scanning.
+        log.info("Empty /clip in guild %s — diagnosis=%s", guild_id, reason)
 
     @tasks.loop(seconds=15.0)
     async def _expiry_sweep(self) -> None:
@@ -105,23 +98,76 @@ class VoiceClip(commands.Cog):
             self.service.evict_all_expired()
         except Exception:  # noqa: BLE001
             log.debug("Periodic voice buffer expiry sweep error", exc_info=True)
-        await self._recover_broken_e2ee()
+        self._log_capture_health()
+        await self._recover_broken_capture()
 
-    async def _recover_broken_e2ee(self) -> None:
-        """Re-voice a connection whose E2EE keys never arrived (bounded).
+    def _log_capture_health(self) -> None:
+        """One-line pipeline health per guild — only when VOICE_CLIP_DEBUG is on.
 
-        If the receiver keeps getting packets but DAVE decryption has never
-        succeeded once, this connection's key exchange is unrecoverable — a
-        fresh voice session re-runs it from scratch.  Capped per guild so a
-        persistently broken environment cannot reconnect-loop.
+        Temporary diagnostic instrumentation for live debugging; counts and
+        flags only, never audio. Disable the env var after debugging.
+        """
+        cfg = getattr(self, "service", None)
+        if cfg is None or not getattr(cfg.config, "debug_logging", False):
+            return
+        for gid in self.service.buffered_guild_ids():
+            try:
+                h = self.service.capture_health(gid)
+            except Exception:  # noqa: BLE001
+                continue
+            log.info(
+                "CAPTURE guild=%s recording=%s armed=%s recv=%s buffered=%s "
+                "speech=%s session=%.0fs sess_pkts=%s sess_speech=%s "
+                "last_pkt=%s dave_fail=%s",
+                gid,
+                h.get("recording"),
+                h.get("receiver_armed"),
+                h.get("received"),
+                h.get("buffered"),
+                h.get("non_silence_buffered"),
+                float(h.get("session_elapsed_seconds") or 0.0),
+                h.get("session_packets"),
+                h.get("session_non_silence_packets"),
+                (
+                    f"{h.get('last_packet_age_seconds'):.0f}s"
+                    if h.get("last_packet_age_seconds") is not None
+                    else "never"
+                ),
+                h.get("dave_fail_since_success"),
+            )
+
+    async def _recover_broken_capture(self) -> None:
+        """Re-voice connections whose capture is unrecoverably dark (bounded).
+
+        Covers both failure shapes: an E2EE key exchange that never completed,
+        and a receiver that worked but went dark afterwards (stale keys after
+        an MLS group change, or a rebind that lost its decryptor).  A fresh
+        voice session re-runs the whole handshake.  Capped per guild, and the
+        cap resets once capture demonstrably works again.
         """
         if not self.service.enabled:
             return
         try:
             candidates = self.service.capture_recovery_candidates()
         except Exception:  # noqa: BLE001
-            log.debug("E2EE recovery scan failed", exc_info=True)
+            log.debug("Capture recovery scan failed", exc_info=True)
             return
+        healthy = set(self.service.buffered_guild_ids()) - set(candidates)
+        for gid in healthy:
+            try:
+                h = self.service.capture_health(gid)
+            except Exception:  # noqa: BLE001
+                continue
+            if h.get("non_silence_buffered", 0) and h.get("receiver_armed"):
+                # Speech is being decoded again — give future breakages a
+                # fresh budget of recovery attempts.
+                if self._e2ee_reconnects.pop(gid, None) is not None:
+                    log.info(
+                        "Voice capture in guild %s is decoding speech again; "
+                        "recovery budget reset",
+                        gid,
+                    )
+
         for gid in candidates:
             attempts = self._e2ee_reconnects.get(gid, 0)
             if attempts >= 2:
@@ -132,9 +178,10 @@ class VoiceClip(commands.Cog):
                 continue
             self._e2ee_reconnects[gid] = attempts + 1
             log.warning(
-                "E2EE (DAVE) decryption has never succeeded in guild %s — the "
-                "voice key exchange failed on this connection. Reconnecting "
-                "voice to re-run it (attempt %d/2).",
+                "Voice capture in guild %s is receiving packets but has not "
+                "decoded speech (E2EE keys stale or receiver disarmed). "
+                "Reconnecting voice to re-run the key exchange "
+                "(attempt %d/2).",
                 gid,
                 attempts + 1,
             )
@@ -142,7 +189,7 @@ class VoiceClip(commands.Cog):
             try:
                 await vc.disconnect(force=True)
             except Exception:  # noqa: BLE001
-                log.debug("E2EE recovery reconnect failed", exc_info=True)
+                log.debug("Capture recovery reconnect failed", exc_info=True)
             # Voice presence re-joins automatically on the next voice-state
             # event or follow-crowd tick.
 
@@ -182,17 +229,18 @@ class VoiceClip(commands.Cog):
             if getattr(after, "deaf", False):
                 # Server deafen. Discord does not send audio to a
                 # server-deafened client at all, so capture is impossible
-                # until it is lifted. Drop the unreadable buffer, then lift
-                # the deafen ourselves (enforcement) and resume capture as
-                # soon as the healthy state arrives.
-                self.service.detach_guild(guild.id)
+                # until it is lifted. Drop the unreadable audio but KEEP the
+                # receiver state (the voice connection continues), lift the
+                # deafen via enforcement, and resume capture on the healthy
+                # voice-state update.
+                self.service.clear_guild_buffer(guild.id)
                 self._schedule_undeafen(guild, after.channel, server_deaf=True)
                 return
 
             if getattr(after, "self_deaf", False):
                 # Our own deafen flag (e.g. joined by older code). Drop buffered
                 # audio, then clear the flag so capture can resume.
-                self.service.detach_guild(guild.id)
+                self.service.clear_guild_buffer(guild.id)
                 self._schedule_undeafen(guild, after.channel)
                 return
 
