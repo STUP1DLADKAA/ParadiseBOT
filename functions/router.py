@@ -45,7 +45,7 @@ from functions.helpers import ParadiseError
 from functions.keywords import keyword_route
 from functions.normalize import normalize_request
 from functions.routes import (
-    AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
+    AI, BUILD, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
     DEV, GIF, INFO, MEME, POLL, REMIND, RESEARCH, ROAST, SUMMARIZE, UTILITY,
     WRITE,
     DETERMINISTIC_KINDS, HELP, HIGH_CONFIDENCE, IMAGE, MEDIUM_CONFIDENCE,
@@ -515,6 +515,32 @@ _NEWS_TOPIC = re.compile(
     re.IGNORECASE,
 )
 
+# ---------------------------------------------------------------------------
+# AI Build Mode patterns
+# ---------------------------------------------------------------------------
+_BUILD_TRIGGER = re.compile(
+    r"^(?:please\s+)?(?:build|make|create|code|develop|generate|spin\s+up)\s+(?:me\s+)?"
+    r"(?:a|an)\s+(?P<desc>.+?\b(?:website|web\s+app|webpage|page|app|dashboard|ui|calculator|portfolio|player|landing\s+page|game|tool|viewer|clone|tracker|board|generator|editor|shop|store|blog|counter|clock|widget|component|todo|to-do|timer)\b.*)$",
+    re.IGNORECASE,
+)
+_BUILD_EXPLICIT = re.compile(
+    r"^(?:please\s+)?(?:build|code|develop)\s+(?:me\s+)?(?P<desc>.+?)(?:\s+website|\s+web\s+app|\s+app|\s+ui|\s+page|\s+frontend)?\s*$",
+    re.IGNORECASE,
+)
+_BUILD_EDIT = re.compile(
+    r"^(?:please\s+)?(?:"
+    r"make\s+(?:the|this|that|it|our)\s+(?:background|color|button|text|header|footer|font|theme|layout|ui|page|app)\s+.+|"
+    r"add\s+(?:a|an|the|some)\s+.+|"
+    r"improve\s+(?:the|this|our)\s+.+|"
+    r"change\s+(?:the|this|that)\s+.+|"
+    r"update\s+(?:the|this|that)\s+.+|"
+    r"make\s+(?:the\s+)?(?:entire\s+)?(?:ui|app|page|site|website)\s+(?:more\s+)?(?:dark|light|premium|clean|modern|vibrant|minimalist|responsive|compact|colorful)\s*|"
+    r"style\s+(?:the|this)\s+.+|"
+    r"fix\s+(?:the|this)\s+(?:layout|alignment|button|styling|color|bug)\b.*"
+    r")\s*[?!.]*$",
+    re.IGNORECASE,
+)
+
 _DEV_ERROR = re.compile(
     r"^(?:explain|fix|whats|what's|what is|what does|help(?: me)? (?:with|fix))\s+"
     r"(?:this|that|the|my)?\s*(?:error|exception|traceback|stack ?trace|crash log|"
@@ -639,6 +665,31 @@ def _write_route(cleaned: str) -> Route | None:
         if not args:
             return None
         return Route(kind=WRITE, payload=args, payload2=mode, confidence=0.88)
+    return None
+
+
+def _build_route(cleaned: str) -> Route | None:
+    """An AI Build Mode request (new project or iterative modification), or None."""
+    # Check new project triggers first
+    match = _BUILD_TRIGGER.match(cleaned)
+    if match is not None:
+        desc = match.group("desc").strip()
+        if desc:
+            return Route(kind=BUILD, payload=cleaned, payload2="new", confidence=0.92)
+
+    # Check explicit build requests (e.g. "build a portfolio website", "code a calculator")
+    match = _BUILD_EXPLICIT.match(cleaned)
+    if match is not None:
+        desc = match.group("desc").strip()
+        # Avoid stealing simple questions like "build quality of macbook"
+        if len(desc) >= 3 and not desc.startswith(("quality", "spec", "number")):
+            return Route(kind=BUILD, payload=cleaned, payload2="new", confidence=0.90)
+
+    # Check iterative edit requests
+    match = _BUILD_EDIT.match(cleaned)
+    if match is not None:
+        return Route(kind=BUILD, payload=cleaned, payload2="edit", confidence=0.88)
+
     return None
 
 
@@ -782,6 +833,11 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
     choose_match = _CHOOSE.match(cleaned)
     if choose_match:
         return Route(kind=CHOOSE, payload=choose_match.group("options").strip(), confidence=0.95)
+
+    # -- AI Build Mode: users creating or updating websites and web apps
+    build = _build_route(cleaned)
+    if build is not None:
+        return build
 
     # -- research, writing help, dev help and channel-history search: their
     # shapes are unmistakable, so they claim their requests before the
@@ -1088,7 +1144,7 @@ def route_many(text: str) -> list[Route]:
 
 
 __all__ = [
-    "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE", "DEFINE",
+    "AI", "BUILD", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE", "DEFINE",
     "DETERMINISTIC_KINDS", "DEV", "GIF", "HELP", "HIGH_CONFIDENCE", "IMAGE",
     "MEDIUM_CONFIDENCE", "MEME", "PING", "RESEARCH", "ROAST", "Route", "SEARCH",
     "SUMMARIZE", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER", "WRITE",

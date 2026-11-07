@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
+from typing import Any
 
 
 def _bool(raw: str | None, default: bool) -> bool:
@@ -741,9 +742,10 @@ class WebSearchConfig:
 class AIModelSpec:
     """One OpenAI-compatible model and the role it is best at.
 
-    Roles: ``fast`` (labels, quips, anything latency-sensitive) and
-    ``deep`` (long answers, recaps, roasts). A model registered without a
-    role serves both.
+    Roles: ``fast`` (labels, quips, anything latency-sensitive),
+    ``deep`` (long answers, recaps, roasts), and ``coder`` (code generation,
+    file synthesis, software engineering). A model registered without a
+    role serves all.
     """
 
     __slots__ = ("name", "role")
@@ -754,7 +756,7 @@ class AIModelSpec:
 
     @property
     def valid(self) -> bool:
-        return bool(self.name) and self.role in ("", "fast", "deep")
+        return bool(self.name) and self.role in ("", "fast", "deep", "coder")
 
     def __repr__(self) -> str:  # pragma: no cover - debug aid
         return f"AIModelSpec({self.name!r}, {self.role!r})"
@@ -890,6 +892,9 @@ class Config:
     # Web research: search, source-backed answers, link summaries.
     web_search: WebSearchConfig = WebSearchConfig()
 
+    # AI Build Mode & Live Preview sandbox configuration.
+    build: Any = None
+
     # Where preloaded speech clips are cached on disk (default data/tts_cache).
     tts_cache_dir: str = ""
 
@@ -945,6 +950,7 @@ class Config:
 
     @classmethod
     def from_env(cls, environ: dict[str, str] | None = None) -> "Config":
+        from functions.build.config import BuildConfig
         env = os.environ if environ is None else environ
         return cls(
             token=env.get("DISCORD_TOKEN", "").strip(),
@@ -998,6 +1004,7 @@ class Config:
                     "tts_cache",
                 )
             ),
+            build=BuildConfig.from_env(env),
         )
 
 
