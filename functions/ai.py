@@ -179,7 +179,7 @@ class AIService:
         keep their first position. Unset → just ``AI_MODEL``.
         """
         specs = list(getattr(self.config, "ai_models", None) or [])
-        role = role if role in ("fast", "deep") else "deep"
+        role = role if role in ("fast", "deep", "coder") else "deep"
         names: list[str] = []
         for spec in specs:
             if spec.role == role and spec.name not in names:

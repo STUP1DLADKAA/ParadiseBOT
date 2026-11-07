@@ -43,6 +43,7 @@ INFO = "info"          # Discord-native info: whois / avatar / server
 RESEARCH = "research"  # web-backed answers, news briefs, link summaries
 WRITE = "write"        # rewriting, drafting, tone work (payload2 = style)
 DEV = "dev"            # code/error/regex/git/sql/minecraft help
+BUILD = "build"        # AI Build Mode (payload = prompt, payload2 = edit|new)
 AI = "ai"
 UNKNOWN = "unknown"
 
@@ -51,7 +52,7 @@ KINDS = frozenset(
     {
         HELP, COMMAND_HELP, PING, COINFLIP, CHOOSE, ROAST, CALCULATE, DEFINE,
         CONVERT, IMAGE, WEATHER, TIME, DATE, TRANSLATE, SEARCH, SUMMARIZE,
-        MEME, GIF, UTILITY, REMIND, POLL, INFO, RESEARCH, WRITE, DEV,
+        MEME, GIF, UTILITY, REMIND, POLL, INFO, RESEARCH, WRITE, DEV, BUILD,
         AI, UNKNOWN,
     }
 )
@@ -122,7 +123,7 @@ class Route:
 
 
 __all__ = [
-    "AI", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE",
+    "AI", "BUILD", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE",
     "DEFINE", "DETERMINISTIC_KINDS", "GIF", "HELP", "HIGH_CONFIDENCE", "IMAGE",
     "DEV", "INFO", "KINDS", "MEDIUM_CONFIDENCE", "MEME", "PING", "POLL",
     "REMIND", "RESEARCH", "Route", "SEARCH", "SUMMARIZE", "TIME",

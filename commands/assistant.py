@@ -60,10 +60,11 @@ from functions.roasts import (
     clean_name,
     sanitize_intensity,
 )
+from functions.build import BuildOrchestrator
 from functions.devhelp import DEV_MODES, run_devhelp
 from functions.research import ResearchService
 from functions.router import (
-    AI, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE, DEV,
+    AI, BUILD, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE, DEV,
     GIF, HELP, IMAGE, INFO, MEME, PING, POLL, REMIND, RESEARCH, ROAST, SEARCH,
     SUMMARIZE, TIME, TRANSLATE, UNKNOWN, UTILITY, WEATHER, WRITE,
     Route, route_many,
@@ -163,6 +164,10 @@ class Assistant(commands.Cog):
         # follow-ups to the previous time/weather/convert/research ask.
         self._last_route: dict[int, tuple[float, Route]] = {}
         log.info("Web research: %s", self.research.describe())
+
+        # AI Build Mode orchestrator
+        build_cfg = getattr(getattr(bot, "config", None), "build", None)
+        self.build_orchestrator = BuildOrchestrator(bot, bot.ai, build_cfg) if build_cfg else None
 
     # ------------------------------------------------------------------
     # Entry point (called from bot.on_message)
@@ -344,6 +349,8 @@ class Assistant(commands.Cog):
             return await self._writing(message, route)
         if kind == DEV:
             return await self._dev(message, route)
+        if kind == BUILD:
+            return await self._build(message, route)
         if kind == SEARCH:
             return await self._search(message, route)
         if kind in (AI, UNKNOWN):
@@ -1349,6 +1356,30 @@ class Assistant(commands.Cog):
             await self._deliver_ai_answer(message, placeholder, SEARCH_FAIL_LINE)
         return True
 
+    async def _build(self, message: discord.Message, route: Route) -> bool:
+        """Handle AI Build Mode: create or edit web applications with live previews."""
+        if not self.build_orchestrator:
+            await self._quiet_reply(message, "AI Build Mode is not configured on this instance.")
+            return True
+
+        payload = (route.payload or "").strip()
+        is_edit = route.payload2 == "edit"
+
+        if is_edit:
+            # Check for existing project owned by the user
+            active_project = self.build_orchestrator.store.get_active_user_project(
+                message.author.id, message.channel.id
+            )
+            if active_project:
+                return await self.build_orchestrator.handle_edit_build(
+                    message, active_project, payload
+                )
+            # If no active project found, fallback to treating as a new build or prompt hint
+            log.info("Edit requested but no active project found for user %d; starting new build", message.author.id)
+
+        # Start new build
+        return await self.build_orchestrator.handle_new_build(message, payload)
+
     async def _find_message(self, message: discord.Message, query: str) -> bool:
         """Search this channel's recent history for a message."""
         clean = " ".join(str(query or "").split()).strip()
@@ -1720,6 +1751,22 @@ class Assistant(commands.Cog):
                 k: v for k, v in self._channel_last.items() if v[0] > cutoff
             }
         return True
+
+    async def cog_load(self) -> None:
+        """Start background services."""
+        if self.build_orchestrator:
+            try:
+                await self.build_orchestrator.start()
+            except Exception:
+                log.exception("Failed to start BuildOrchestrator preview server")
+
+    async def cog_unload(self) -> None:
+        """Stop background services."""
+        if self.build_orchestrator:
+            try:
+                await self.build_orchestrator.stop()
+            except Exception:
+                log.exception("Failed to stop BuildOrchestrator")
 
     async def _quiet_reply(self, message: discord.Message, content: str = "", **kwargs) -> None:
         """Reply safely without truncating a complete answer.
