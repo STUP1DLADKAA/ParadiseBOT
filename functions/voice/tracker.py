@@ -36,6 +36,7 @@ import io
 import logging
 import os
 import time
+import types
 from collections import OrderedDict
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Callable, Iterable
@@ -102,6 +103,25 @@ def excluded_from_credit(member, channel, state) -> bool:
         and channel.id == member.guild.afk_channel.id
         or member.id not in deaf_exempt_user_ids()
         and state is not None and (state.self_deaf or state.deaf)
+    )
+
+
+def _member_from_voice_state(guild: Any, user_id: int, voice_state: Any) -> Any:
+    """Build a minimal member-like object from a guild voice state.
+
+    Used when the member cache is cold (``channel.members`` is empty) but
+    ``guild.voice_states`` still knows the user is in a voice channel. The
+    object carries just enough attributes for the tracking loop: ``id``,
+    ``guild``, ``voice`` (for mute/deaf flags), and ``bot``.
+    """
+    return types.SimpleNamespace(
+        id=user_id,
+        guild=guild,
+        voice=voice_state,
+        bot=False,
+        display_name=None,
+        name=None,
+        display_avatar=types.SimpleNamespace(url=None),
     )
 
 
@@ -945,6 +965,7 @@ class VoiceTracker:
         # Phase 2: in-memory scan (no I/O, so events never queue behind it).
         async with self._state_lock:
             for guild in self.bot.guilds:
+                # --- 2a. cached members via channel.members -----------------
                 for channel in guild.voice_channels + getattr(guild, "stage_channels", []):
                     for member in channel.members:
                         if member.bot:
@@ -957,15 +978,6 @@ class VoiceTracker:
 
                         session = self.active_sessions.get(key)
                         if session is None:
-                            if not self._recovered:
-                                # Recovery has not run yet, so the durable row
-                                # for this member has not been consulted. Skip
-                                # them for this cycle rather than starting the
-                                # clock from "now" and throwing away the time
-                                # the row already knows about. A user who joins
-                                # from now on is handled by the voice-state
-                                # event and is unaffected.
-                                continue
                             self.active_sessions[key] = ActiveVoiceSession(
                                 guild_id=guild.id,
                                 user_id=member.id,
@@ -994,6 +1006,55 @@ class VoiceTracker:
                             session.is_afk = is_afk
 
                         self._sync_deaf_warning(member, channel, member.voice)
+
+                # --- 2b. voice_states fallback for cold member caches -------
+                # channel.members can be empty after a restart or in large
+                # guilds even when users are actively in voice. guild.voice_states
+                # is populated by voice-state events regardless of member cache,
+                # so it catches users that channel.members misses.
+                voice_states = getattr(guild, "voice_states", None)
+                if voice_states:
+                    for user_id, voice_state in voice_states.items():
+                        if voice_state.channel is None:
+                            continue
+                        key = (guild.id, user_id)
+                        if key in connected:
+                            continue  # already seen via channel.members
+                        connected.add(key)
+                        vc = voice_state.channel
+                        is_afk = excluded_from_credit(
+                            _member_from_voice_state(guild, user_id, voice_state), vc, voice_state
+                        )
+
+                        # Queue a profile if the member happens to be cached.
+                        member = guild.get_member(user_id)
+                        if member is not None:
+                            self._queue_member_profile(member)
+
+                        session = self.active_sessions.get(key)
+                        if session is None:
+                            self.active_sessions[key] = ActiveVoiceSession(
+                                guild_id=guild.id,
+                                user_id=user_id,
+                                channel_id=vc.id,
+                                started_at=now,
+                                is_muted=bool(voice_state.self_mute or voice_state.mute),
+                                is_deaf=bool(voice_state.self_deaf or voice_state.deaf),
+                                is_afk=is_afk,
+                            )
+                        else:
+                            session.channel_id = vc.id
+                            session.is_muted = bool(voice_state.self_mute or voice_state.mute)
+                            session.is_deaf = bool(voice_state.self_deaf or voice_state.deaf)
+                            session.is_afk = is_afk
+
+                        # Use the real member when available, otherwise the
+                        # voice-state-only object (deaf warning resolves the
+                        # recipient via bot.get_user/fetch_user as a fallback).
+                        warn_member = member if member is not None else _member_from_voice_state(
+                            guild, user_id, voice_state
+                        )
+                        self._sync_deaf_warning(warn_member, vc, voice_state)
 
             # Fans queued in memory; closed once, below, under the write lock.
             for key in list(self.active_sessions.keys()):
@@ -1134,6 +1195,23 @@ class VoiceTracker:
                         connected_channel_id = channel.id
                         currently_afk = excluded_from_credit(found, channel, found.voice)
                         break
+
+                # Fall back to guild.voice_states when the member cache is cold:
+                # channel.members can be empty after a restart even though
+                # guild.voice_states (populated by voice-state events) still
+                # knows the user is in a voice channel.
+                if connected_member is None:
+                    voice_states = getattr(guild, "voice_states", None)
+                    if voice_states:
+                        vs = voice_states.get(row.user_id)
+                        if vs is not None and vs.channel is not None:
+                            connected_member = _member_from_voice_state(
+                                guild, row.user_id, vs
+                            )
+                            connected_channel_id = vs.channel.id
+                            currently_afk = excluded_from_credit(
+                                connected_member, vs.channel, vs
+                            )
 
             ended_at = min(row.last_seen_at, now)
 

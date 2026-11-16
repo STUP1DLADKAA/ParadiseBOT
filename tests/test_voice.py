@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
+import types
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -482,6 +483,261 @@ class TestVoiceTracker(unittest.IsolatedAsyncioTestCase):
 
         # Verify marked as sent so no duplicate
         self.assertTrue(self.db.has_dm_report_sent(date_str, guild_id, user_id))
+
+
+
+
+# ---------------------------------------------------------------------------
+# Root-cause regression tests: cold member cache & concurrent VCs
+# ---------------------------------------------------------------------------
+
+
+class _VCTestMember:
+    """Minimal member stub for cold-cache reconciliation tests."""
+
+    def __init__(self, guild, user_id, name="Alex", bot=False):
+        self.id = user_id
+        self.name = name
+        self.display_name = name
+        self.bot = bot
+        self.guild = guild
+        self.voice = types.SimpleNamespace(
+            self_mute=False, mute=False, self_deaf=False, deaf=False
+        )
+        self.display_avatar = types.SimpleNamespace(
+            url=f"https://cdn/{user_id}/x.png"
+        )
+
+
+class _VCTestVoiceState:
+    """Minimal voice-state stub for guild.voice_states fallback tests."""
+
+    def __init__(self, channel, self_mute=False, self_deaf=False, deaf=False, mute=False):
+        self.channel = channel
+        self.self_mute = self_mute
+        self.mute = mute
+        self.self_deaf = self_deaf
+        self.deaf = deaf
+
+
+class TestColdMemberCache(unittest.IsolatedAsyncioTestCase):
+    """Reconciliation must find users in voice even when channel.members is
+    empty (cold member cache after restart, large guild, etc.)."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "test_paradise.db")
+        self.db = VoiceDatabase(self.db_path)
+        self.store = LocalVoiceStore(self.db)
+        self.mock_bot = MagicMock()
+        self.tracker = VoiceTracker(self.mock_bot, self.store)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    def _make_guild(self, guild_id=12345):
+        guild = MagicMock()
+        guild.id = guild_id
+        guild.name = "Cold Cache Server"
+        guild.afk_channel = None
+        channel = MagicMock()
+        channel.id = 888
+        channel.members = []  # cold cache: no members cached
+        guild.voice_channels = [channel]
+        guild.stage_channels = []
+        guild.get_member.return_value = None  # member not cached
+        self.mock_bot.guilds = [guild]
+        self.mock_bot.get_guild = MagicMock(return_value=guild)
+        return guild, channel
+
+    async def test_reconcile_finds_user_via_voice_states_when_channel_members_empty(self):
+        """A user in VC whose member isn't cached must still be tracked via guild.voice_states."""
+        guild, channel = self._make_guild()
+        user_id = 777
+
+        # voice_states knows the user is in the channel even though channel.members is empty
+        vs = _VCTestVoiceState(channel)
+        guild.voice_states = {user_id: vs}
+
+        t0 = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+        with patch("functions.voice.tracker.datetime") as mock_dt:
+            mock_dt.now.return_value = t0
+            await self.tracker.reconcile_guilds()
+
+        key = (guild.id, user_id)
+        self.assertIn(key, self.tracker.active_sessions)
+        self.assertEqual(self.tracker.active_sessions[key].channel_id, 888)
+        self.assertEqual(self.tracker.active_sessions[key].started_at, t0)
+
+    async def test_reconcile_does_not_double_count_user_in_both_sources(self):
+        """A user found via both channel.members and voice_states gets one session."""
+        guild, channel = self._make_guild()
+        user_id = 777
+
+        member = _VCTestMember(guild, user_id)
+        channel.members = [member]
+        guild.get_member.return_value = member
+
+        vs = _VCTestVoiceState(channel)
+        guild.voice_states = {user_id: vs}
+
+        t0 = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = t0 + timedelta(minutes=5)
+        with patch("functions.voice.tracker.datetime") as mock_dt:
+            mock_dt.now.return_value = t0
+            await self.tracker.reconcile_guilds()
+            mock_dt.now.return_value = t1
+            await self.tracker.reconcile_guilds()
+
+        key = (guild.id, user_id)
+        self.assertIn(key, self.tracker.active_sessions)
+        self.assertEqual(self.tracker.active_sessions[key].channel_id, 888)
+        self.assertEqual(self.tracker.active_sessions[key].started_at, t0)
+
+    async def test_reconcile_handles_multiple_concurrent_vcs_independently(self):
+        """Multiple users in separate voice channels are tracked independently."""
+        guild = MagicMock()
+        guild.id = 12345
+        guild.name = "Multi VC Server"
+        guild.afk_channel = None
+        self.mock_bot.guilds = [guild]
+        self.mock_bot.get_guild = MagicMock(return_value=guild)
+
+        channels = []
+        members = []
+        for i in range(3):
+            ch = MagicMock()
+            ch.id = 1000 + i
+            ch.members = []  # cold cache
+            channels.append(ch)
+
+        guild.voice_channels = channels
+        guild.stage_channels = []
+
+        t0 = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+        with patch("functions.voice.tracker.datetime") as mock_dt:
+            mock_dt.now.return_value = t0
+            for i, ch in enumerate(channels):
+                user_id = 7000 + i
+                vs = _VCTestVoiceState(ch)
+                guild.voice_states = {**guild.voice_states, user_id: vs} if guild.voice_states else {user_id: vs}
+            await self.tracker.reconcile_guilds()
+
+        self.assertEqual(len(self.tracker.active_sessions), 3)
+        for i, ch in enumerate(channels):
+            key = (12345, 7000 + i)
+            self.assertIn(key, self.tracker.active_sessions)
+            self.assertEqual(self.tracker.active_sessions[key].channel_id, ch.id)
+
+    async def test_reconcile_tracks_user_before_recovery_completes(self):
+        """Users in voice are tracked even before _recovered is True."""
+        guild, channel = self._make_guild()
+        user_id = 777
+
+        vs = _VCTestVoiceState(channel)
+        guild.voice_states = {user_id: vs}
+
+        # _recovered is False (recovery hasn't run)
+        self.assertFalse(self.tracker._recovered)
+
+        t0 = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+        with patch("functions.voice.tracker.datetime") as mock_dt:
+            mock_dt.now.return_value = t0
+            await self.tracker.reconcile_guilds()
+
+        key = (guild.id, user_id)
+        self.assertIn(key, self.tracker.active_sessions)
+        self.assertEqual(self.tracker.active_sessions[key].started_at, t0)
+
+    async def test_reconcile_channel_switch_updates_existing_session(self):
+        """A user moving channels during reconcile keeps their session."""
+        guild, channel_a = self._make_guild()
+        channel_b = MagicMock()
+        channel_b.id = 999
+        channel_b.members = []
+        guild.voice_channels = [channel_a, channel_b]
+        user_id = 777
+
+        vs_a = _VCTestVoiceState(channel_a)
+        guild.voice_states = {user_id: vs_a}
+
+        t0 = datetime(2026, 10, 1, 12, 0, 0, tzinfo=timezone.utc)
+        t1 = t0 + timedelta(minutes=10)
+        with patch("functions.voice.tracker.datetime") as mock_dt:
+            mock_dt.now.return_value = t0
+            await self.tracker.reconcile_guilds()
+            key = (guild.id, user_id)
+            self.assertEqual(self.tracker.active_sessions[key].channel_id, 888)
+
+            # User switches channels between reconcile cycles
+            vs_b = _VCTestVoiceState(channel_b)
+            guild.voice_states = {user_id: vs_b}
+            mock_dt.now.return_value = t1
+            await self.tracker.reconcile_guilds()
+
+        self.assertEqual(self.tracker.active_sessions[key].channel_id, 999)
+        self.assertEqual(self.tracker.active_sessions[key].started_at, t0)
+
+
+class TestMissingUserRootCause(unittest.IsolatedAsyncioTestCase):
+    """The specific incident: users in VC whose members aren't cached were
+    never found by reconciliation, so their persisted sessions were closed
+    at last heartbeat and all subsequent time was lost."""
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.db_path = os.path.join(self.temp_dir.name, "test_paradise.db")
+        self.db = VoiceDatabase(self.db_path)
+        self.store = LocalVoiceStore(self.db)
+        self.mock_bot = MagicMock()
+        self.tracker = VoiceTracker(self.mock_bot, self.store)
+
+    def tearDown(self):
+        self.temp_dir.cleanup()
+
+    async def test_persisted_session_resumed_via_voice_states_after_restart(self):
+        """A user whose member isn't cached but whose persisted row exists must
+        have their session resumed from the original start time via voice_states."""
+        guild = MagicMock()
+        guild.id = 12345
+        guild.name = "Restart Server"
+        guild.afk_channel = None
+        channel = MagicMock()
+        channel.id = 888
+        channel.members = []  # cold cache after restart
+        guild.voice_channels = [channel]
+        guild.stage_channels = []
+        guild.get_member.return_value = None
+        self.mock_bot.guilds = [guild]
+        self.mock_bot.get_guild = MagicMock(return_value=guild)
+
+        guild_id, user_id, channel_id = 12345, 777, 888
+        t0 = datetime(2026, 10, 1, 10, 0, 0, tzinfo=timezone.utc)
+        t_now = t0 + timedelta(hours=3)
+
+        # Manually seed a persisted active session (as if from before a restart)
+        self.db.upsert_active_session(
+            guild_id, user_id, channel_id, t0, t0 + timedelta(minutes=30)
+        )
+
+        vs = _VCTestVoiceState(channel)
+        guild.voice_states = {user_id: vs}
+
+        with patch("functions.voice.tracker.datetime") as mock_dt:
+            mock_dt.now.return_value = t_now
+            await self.tracker.reconcile_guilds()
+
+        key = (guild_id, user_id)
+        self.assertIn(key, self.tracker.active_sessions)
+        self.assertEqual(
+            self.tracker.active_sessions[key].started_at,
+            t0,
+            "Recovery must restore the original start time, not restart the clock",
+        )
+        # The session should NOT be closed — the user is still in voice
+        active_rows = self.db.get_active_sessions()
+        self.assertEqual(len(active_rows), 1)
+        self.assertEqual(active_rows[0].user_id, user_id)
 
 
 if __name__ == "__main__":
