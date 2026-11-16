@@ -17,6 +17,7 @@ from config import Config, load_config
 from functions import autoupdate, perf
 from functions.ai import AIService
 from functions.memory import MemoryMirror, MemoryStore
+from functions.mal import MalCallbackServer, MalEncryption, MalService, MalStore
 from functions.personality import Personality
 from functions.presence import PresenceManager
 from functions.startup import PRIMARY_GUILD_ID, CommandSynchronizer
@@ -38,6 +39,7 @@ EXTENSIONS = (
     "commands.assistant",
     "commands.edit",
     "commands.memory",
+    "commands.mal",
 )
 
 
@@ -119,6 +121,27 @@ class ParadiseBot(commands.Bot):
             request_timeout=config.memory_supabase_timeout,
         )
         self.memory_mirror_task: asyncio.Task | None = None
+        self.mal_service = None
+        self.mal_callback_server = None
+        if config.mal.configured and config.voice.supabase_configured:
+            try:
+                mal_encryption = MalEncryption(config.mal.encryption_key)
+                mal_store = MalStore(
+                    config.voice.supabase_url,
+                    config.voice.supabase_secret_key,
+                    mal_encryption,
+                )
+                self.mal_service = MalService(
+                    client_id=config.mal.client_id,
+                    client_secret=config.mal.client_secret,
+                    callback_url=config.mal.callback_url,
+                    encryption=mal_encryption,
+                    store=mal_store,
+                )
+                self.mal_callback_server = MalCallbackServer(self.mal_service)
+                log.info("MAL integration initialized")
+            except Exception:  # noqa: BLE001 - MAL must never block startup
+                log.exception("Failed to initialize MAL integration")
         self.afk_states: dict = {}
         self._afk_notice_last: dict[tuple[int, int], float] = {}
         self._ready_logged = False
@@ -189,6 +212,13 @@ class ParadiseBot(commands.Bot):
                 self.memory_mirror.run_forever(), name="paradise-memory-mirror"
             )
 
+        # Start the MAL OAuth callback server (if MAL is configured).
+        if self.mal_callback_server is not None:
+            try:
+                await self.mal_callback_server.start()
+            except Exception:  # noqa: BLE001 - callback server must not block startup
+                log.exception("Failed to start MAL OAuth callback server")
+
         # Keep the checkout fresh while online (the start-up check already
         # ran before login; this one handles long-lived processes).
         self.autoupdate_task = asyncio.create_task(
@@ -244,6 +274,12 @@ class ParadiseBot(commands.Bot):
             self.memory.close()
         except Exception:
             log.debug("Memory store shutdown failed", exc_info=True)
+        callback_server = getattr(self, "mal_callback_server", None)
+        if callback_server is not None:
+            try:
+                await callback_server.stop()
+            except Exception:
+                log.debug("MAL callback server shutdown failed", exc_info=True)
         try:
             await perf.close_shared_sessions()
             await perf.shutdown_render_pool()

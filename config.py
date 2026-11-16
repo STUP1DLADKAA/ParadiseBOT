@@ -768,6 +768,50 @@ class GeminiConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class MALConfig:
+    """MyAnimeList OAuth 2.0 integration configuration.
+
+    Tokens are encrypted at rest with ``encryption_key`` (a base64-encoded
+    32-byte value from MAL_ENCRYPTION_KEY) and stored in Supabase — the same
+    project and credentials as the voice tracker (SUPABASE_URL /
+    SUPABASE_SECRET_KEY). Never hardcode secrets.
+    """
+
+    enabled: bool = True
+    client_id: str = ""
+    client_secret: str = ""
+    callback_url: str = ""
+    encryption_key: str = ""
+
+    @property
+    def configured(self) -> bool:
+        return bool(
+            self.enabled
+            and self.client_id.strip()
+            and self.client_secret.strip()
+            and self.callback_url.strip()
+            and self.encryption_key.strip()
+        )
+
+    @property
+    def masked_client_secret(self) -> str:
+        key = self.client_secret.strip()
+        if len(key) <= 8:
+            return "…" if key else ""
+        return f"{key[:2]}…{key[-2:]}"
+
+    @classmethod
+    def from_env(cls, env) -> "MALConfig":
+        return cls(
+            enabled=_bool(env.get("MAL_ENABLED"), True),
+            client_id=env.get("MAL_CLIENT_ID", "").strip(),
+            client_secret=env.get("MAL_CLIENT_SECRET", "").strip(),
+            callback_url=env.get("MAL_CALLBACK_URL", "").strip().rstrip("/"),
+            encryption_key=env.get("MAL_ENCRYPTION_KEY", "").strip(),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class Config:
     """Everything Paradise reads from the environment."""
 
@@ -820,6 +864,9 @@ class Config:
 
     # Web research: search, source-backed answers, link summaries.
     web_search: WebSearchConfig = WebSearchConfig()
+
+    # MyAnimeList OAuth 2.0 integration.
+    mal: MALConfig = MALConfig()
 
     # AI Build Mode & Live Preview sandbox configuration.
     build: Any = None
@@ -897,6 +944,7 @@ class Config:
             voice_clip=VoiceClipConfig.from_env(env),
             image_search=ImageSearchConfig.from_env(env),
             web_search=WebSearchConfig.from_env(env),
+            mal=MALConfig.from_env(env),
             prewarm=_bool(env.get("PREWARM_ON_START"), True),
             guild_id=max(0, _int(env.get("DISCORD_GUILD_ID"), 0)),
             edit_user_ids=_ids(env.get("EDIT_ALLOWED_USER_IDS")),
