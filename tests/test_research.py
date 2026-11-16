@@ -441,6 +441,53 @@ class TestResearchService(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(results[0]), 1)
         self.assertEqual(len(results[1]), 1)
 
+    async def test_fetch_page_blocks_redirect_to_loopback(self):
+        service = self.make_service()
+
+        class _FakeContent:
+            async def iter_chunked(self, _n):
+                yield b"<html><body>secret</body></html>"
+
+        class _FakeResp:
+            status = 200
+            url = "http://127.0.0.1:8080/admin"
+            headers = {"Content-Type": "text/html"}
+            content = _FakeContent()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_a):
+                return False
+
+        class _FakeSession:
+            def get(self, _url):
+                return _FakeResp()
+
+        service._http = lambda: _FakeSession()
+        page = await service._fetch_page("https://public.example/redirect")
+        self.assertTrue(page.failed)
+
+    async def test_summarize_page_forwards_caller_id(self):
+        service = self.make_service()
+        service.fetch_page = lambda url: _ready_page(url)
+        captured = {}
+
+        class _RecordingAI:
+            async def chat(self, messages, **kwargs):
+                captured.update(kwargs)
+                return "concise summary"
+
+        out = await service.summarize_page(
+            "https://example.com/post", _RecordingAI(), asker="Ash", asker_id=4242
+        )
+        self.assertEqual(out, "concise summary")
+        self.assertEqual(captured.get("caller_id"), 4242)
+
+
+async def _ready_page(url: str) -> PageText:
+    return PageText(url=url, title="Example", text="Useful article text here.")
+
 
 if __name__ == "__main__":
     unittest.main()

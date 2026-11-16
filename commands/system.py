@@ -29,7 +29,6 @@ HELP_BLURBS = {
     "vc": "voice activity tracking and leaderboard card",
     "clip": "save a recent voice clip via DM",
     "edit": "adjust voice activity time for a user (authorized user only)",
-    "minigames": "automated Paradise games and leaderboard",
     "recipe": "recipes from ingredients you have",
     "summarize": "recap recent chat in this channel",
     "memory": "teach me things to remember (my lords only)",
@@ -40,7 +39,6 @@ HELP_GROUPS = {
     "🎲 fun": ("ping", "coinflip", "choose", "roast", "meme", "gif"),
     "🧰 useful": ("remind", "poll", "afk", "translate", "settimezone", "recipe"),
     "🎙️ voice": ("vc", "clip", "edit"),
-    "🎲 community": ("minigames",),
     "🤖 ai": ("summarize", "memory"),
 }
 
@@ -99,7 +97,7 @@ class System(commands.Cog):
             if group == "🤖 ai":
                 value += "\nmention me to talk naturally (needs an AI key set by the owner)."
             embed.add_field(name=group, value=value, inline=False)
-        embed.set_footer(text="it reads everything · it comments constantly")
+        embed.set_footer(text="speaks when spoken to · occasional emoji reactions")
         await interaction.response.send_message(embed=embed)
 
 

@@ -1635,3 +1635,268 @@ class TestFollowUps(unittest.IsolatedAsyncioTestCase):
             "roll a d20",
         )
         self.assertEqual(routes[0].kind, UTILITY)
+
+
+class TestContextAwareToolPipeline(unittest.IsolatedAsyncioTestCase):
+    """End-to-end tests for smart follow-ups, reply context, recipes, timezones & reliability."""
+
+    @staticmethod
+    def _as_user(content: str, user_id: int, channel_id: int = 55):
+        msg = FakeMessage(content)
+        msg.author.id = user_id
+        msg.channel.id = channel_id
+        return msg
+
+    @staticmethod
+    def _with_reply(msg, content: str, *, author_name: str = "Rohan", author_id: int = 888):
+        ref_author = SimpleNamespace(
+            id=author_id, name=author_name, display_name=author_name, bot=False
+        )
+        resolved = SimpleNamespace(content=content, author=ref_author, embeds=[])
+        msg.reference = SimpleNamespace(resolved=resolved, cached_message=resolved)
+        return msg
+
+    async def test_retired_minigames_command_help_reports_removed_cleanly(self):
+        assistant, _ = make_assistant()
+        msg = mention("what does /minigames do?")
+        self.assertTrue(await assistant.handle_message(msg))
+        reply = msg.replies[0]["content"]
+        self.assertIn("removed", reply)
+        self.assertNotIn("@Paradise minigames", reply)
+
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        msg2 = mention("what does /weather do?")
+        self.assertTrue(await assistant.handle_message(msg2))
+        self.assertIn("@Paradise weather in Delhi", msg2.replies[0]["content"])
+
+    async def test_unaddressed_message_is_never_answered_by_assistant(self):
+        assistant, _ = make_assistant(ai=FakeAI(available=True))
+        msg = FakeMessage("weather in Delhi", addressed=False)
+        self.assertFalse(await assistant.handle_message(msg))
+        self.assertEqual(msg.replies, [])
+
+    async def test_offline_recipe_dispatch_and_followup(self):
+        assistant, _ = make_assistant()
+        msg = mention("what can I cook with eggs, onion and bread?")
+        self.assertTrue(await assistant.handle_message(msg))
+        embed = msg.replies[0]["embed"]
+        self.assertIn("🍳", embed.title)
+
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        follow = mention("and with cheese?")
+        self.assertTrue(await assistant.handle_message(follow))
+        self.assertIn("🍳", follow.replies[0]["embed"].title)
+
+    async def test_per_user_followup_isolation_and_smart_convert_followups(self):
+        assistant, bot = make_assistant()
+        utility = bot.get_cog("Utility")
+        converted = []
+
+        async def record_convert(query):
+            converted.append(query)
+            return SimpleNamespace(
+                from_value=100.0, from_unit="USD", to_value=8350.0, to_unit="INR",
+                category=SimpleNamespace(value="Currency"),
+                display_text=f"converted {query}", rate_timestamp="Live", formula=None,
+            )
+
+        utility.conversion_engine.convert_query = record_convert
+
+        # User 101 asks weather in Delhi; User 202 asks $100 to INR in the SAME channel.
+        m_alice = self._as_user("weather in Delhi", 101)
+        m_bob = self._as_user("$100 to INR", 202)
+        self.assertTrue(await assistant.handle_message(m_alice))
+        self.assertTrue(await assistant.handle_message(m_bob))
+        self.assertEqual(converted, ["$100 to INR"])
+
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+
+        # Alice says "what about Tokyo" -> continues HER weather ask, not Bob's conversion!
+        m_alice2 = self._as_user("what about Tokyo?", 101)
+        self.assertTrue(await assistant.handle_message(m_alice2))
+        self.assertEqual(utility.weather_service.calls[-1], "Tokyo")
+
+        # Alice asks "what time is it there?" -> resolves "there" to Tokyo!
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        m_alice3 = self._as_user("what time is it there?", 101)
+        self.assertTrue(await assistant.handle_message(m_alice3))
+        self.assertIn("Tokyo", m_alice3.replies[0]["embed"].title)
+
+        # Bob says "in EUR" -> converts 100 $ to EUR; then "what about 250" -> 250 $ to EUR; then "reverse"!
+        m_bob2 = self._as_user("in EUR", 202)
+        self.assertTrue(await assistant.handle_message(m_bob2))
+        self.assertEqual(converted[-1], "100 $ to EUR")
+
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        m_bob3 = self._as_user("what about 250", 202)
+        self.assertTrue(await assistant.handle_message(m_bob3))
+        self.assertEqual(converted[-1], "250 $ to EUR")
+
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        m_bob4 = self._as_user("reverse", 202)
+        self.assertTrue(await assistant.handle_message(m_bob4))
+        self.assertEqual(converted[-1], "250 EUR to $")
+
+    async def test_math_numeric_chaining_and_translate_language_swap(self):
+        from unittest.mock import AsyncMock, patch
+        from functions.translate import Translation
+
+        assistant, _ = make_assistant()
+        m1 = mention("25% of 800")
+        self.assertTrue(await assistant.handle_message(m1))
+        self.assertIn("200", m1.replies[0]["content"])
+
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        m2 = mention("+ 50")
+        self.assertTrue(await assistant.handle_message(m2))
+        self.assertIn("250", m2.replies[0]["content"])
+
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        m3 = mention("ans * 2")
+        self.assertTrue(await assistant.handle_message(m3))
+        self.assertIn("500", m3.replies[0]["content"])
+
+        # Translate follow-up swaps TARGET language while preserving the source phrase.
+        calls = []
+
+        async def fake_tr(text, target, *_a, **_kw):
+            calls.append((text, target))
+            return Translation(text=f"[{target}:{text}]", source="en", target=target)
+
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        with patch("commands.assistant.translate_text", side_effect=AsyncMock(side_effect=fake_tr)):
+            t1 = mention("translate good morning into Japanese")
+            self.assertTrue(await assistant.handle_message(t1))
+            assistant._user_last.clear()
+            assistant._channel_last.clear()
+            t2 = mention("in French")
+            self.assertTrue(await assistant.handle_message(t2))
+
+        self.assertEqual(calls, [("good morning", "ja"), ("good morning", "fr")])
+
+    async def test_reply_target_hydrates_translate_link_json_dev_and_roast(self):
+        from unittest.mock import AsyncMock, patch
+        from functions.translate import Translation
+
+        ai = ChatAI(available=True, answer="handled cleanly")
+        assistant, _ = make_assistant(ai=ai)
+        assistant.research = FakeResearchService(summary="article tl;dr")
+
+        # 1. Reply + "translate to English"
+        seen_tr = []
+
+        async def fake_tr(text, target, *_a, **_kw):
+            seen_tr.append((text, target))
+            return Translation(text="hello friend", source="es", target=target)
+
+        with patch("commands.assistant.translate_text", side_effect=AsyncMock(side_effect=fake_tr)):
+            m_tr = self._with_reply(mention("translate to English"), "hola amigo")
+            self.assertTrue(await assistant.handle_message(m_tr))
+        self.assertEqual(seen_tr, [("hola amigo", "en")])
+
+        # 2. Reply to link + "summarize this link"
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        m_link = self._with_reply(
+            mention("summarize this link"),
+            "check this out https://example.com/blog/post!",
+        )
+        self.assertTrue(await assistant.handle_message(m_link))
+        self.assertEqual(assistant.research.summarize_calls, ["https://example.com/blog/post"])
+
+        # 3. Reply to JSON + "format json"
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        m_json = self._with_reply(mention("format json"), '{"ok":true,"count":3}')
+        self.assertTrue(await assistant.handle_message(m_json))
+        self.assertIn("✅ valid JSON", m_json.replies[0]["content"])
+
+        # 4. Reply to message + "roast this" targets reply author with reply quote
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        m_roast = self._with_reply(
+            mention("roast this"), "i use light mode at 3am", author_name="Kabir", author_id=777
+        )
+        self.assertTrue(await assistant.handle_message(m_roast))
+        self.assertEqual(ai.teased[-1], ("Kabir", "i use light mode at 3am", 777))
+
+    async def test_member_timezone_and_bare_weather_from_saved_timezone(self):
+        assistant, bot = make_assistant()
+        utility = bot.get_cog("Utility")
+        zones = {101: "Asia/Kolkata", 303: "Asia/Tokyo"}
+        utility.db.get_user_timezone = lambda uid: zones.get(uid)
+
+        # Bare "weather" uses caller 101's IANA zone city ("Kolkata").
+        m_w = self._as_user("weather", 101)
+        self.assertTrue(await assistant.handle_message(m_w))
+        self.assertEqual(utility.weather_service.calls[-1], "Kolkata")
+
+        # "time for <@303>" uses member 303's saved timezone; unset member gets helpful prompt.
+        m_t = self._as_user("what time is it for <@303>?", 202)
+        m_t.guild.get_member = lambda uid: SimpleNamespace(id=uid, display_name="Aoi", name="aoi")
+        self.assertTrue(await assistant.handle_message(m_t))
+        self.assertIn("Aoi", m_t.replies[0]["embed"].title)
+
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        m_unset = self._as_user("what time is it for <@999>?", 202)
+        m_unset.guild.get_member = lambda uid: SimpleNamespace(id=uid, display_name="Zed", name="zed")
+        self.assertTrue(await assistant.handle_message(m_unset))
+        self.assertIn("/settimezone", m_unset.replies[0]["content"])
+
+    async def test_build_edit_without_project_falls_back_to_ai(self):
+        ai = FakeAI(available=True, answer="here are better rules")
+        assistant, _ = make_assistant(ai=ai)
+        msg = mention("improve the server welcome message")
+        self.assertTrue(await assistant.handle_message(msg))
+        self.assertEqual(msg.replies[0]["content"], "here are better rules")
+
+    async def test_research_surviving_sources_placeholder_reuse_and_edit_recovery(self):
+        from functions.research import ResearchAnswer, SearchResult
+
+        # 1. Surviving sources surfaced when model synthesis returns empty.
+        ai = ChatAI(available=True)
+        assistant, _ = make_assistant(ai=ai)
+        assistant.research = FakeResearchService(
+            answer=ResearchAnswer(
+                answer="",
+                sources=[SearchResult("Official Notes", "https://example.com/notes", "v1.2 out")],
+            )
+        )
+        edits = []
+
+        async def record_edit(_target, content="", **_kw):
+            edits.append(content)
+            return True
+
+        assistant._quiet_edit = record_edit
+        m1 = mention("search latest patch")
+        self.assertTrue(await assistant.handle_message(m1))
+        self.assertIn("https://example.com/notes", edits[-1])
+
+        # 2. On web error, only ONE placeholder reply is posted (reused for AI fallback).
+        assistant._user_last.clear()
+        assistant._channel_last.clear()
+        assistant.research = FakeResearchService(error=True)
+        m2 = mention("search latest patch")
+        self.assertTrue(await assistant.handle_message(m2))
+        self.assertEqual(len(m2.replies), 1)
+
+        # 3. If editing a placeholder fails (deleted), answer falls back to message.reply.
+        async def fail_edit(_target, content="", **_kw):
+            return False
+
+        assistant._quiet_edit = fail_edit
+        m3 = mention("x")
+        await assistant._deliver_ai_answer(m3, object(), "recovered answer")
+        self.assertEqual(m3.replies[0]["content"], "recovered answer")
+

@@ -24,13 +24,13 @@ import re
 
 from functions.calculator import extract_expression, looks_like_math
 from functions.conversion import parse_conversion_query
-from functions.conversion.currency import resolve_currency
+from functions.conversion.currency import BASE_USD_RATES, CURRENCY_ALIASES, CURRENCY_SYMBOLS
 from functions.conversion.units import TEMP_UNITS, resolve_unit
 from functions.helpers import ParadiseError
 from functions.normalize import NormalizedRequest, normalize_request
 from functions.routes import (
-    CALCULATE, CONVERT, DATE, DEFINE, IMAGE, SEARCH, TIME, TRANSLATE, WEATHER,
-    Route,
+    CALCULATE, CONVERT, DATE, DEFINE, IMAGE, RECIPE, SEARCH, TIME, TRANSLATE,
+    WEATHER, Route,
 )
 from functions.translate import resolve_language
 
@@ -72,6 +72,10 @@ MATH_WORDS = frozenset(
      "multiplied", "multiply", "plus", "minus", "times"}
 )
 CONVERT_WORDS = frozenset({"convert", "conversion", "exchange", "rate"})
+RECIPE_WORDS = frozenset({"recipe", "recipes", "recipie"})
+_KNOWN_CURRENCIES = frozenset(
+    set(BASE_USD_RATES) | set(CURRENCY_SYMBOLS) | set(CURRENCY_ALIASES)
+)
 
 # Tokens that are scaffolding rather than content in any extracted subject.
 _STOPWORDS = frozenset(
@@ -114,8 +118,9 @@ def _is_unit_like(token: str) -> bool:
     bare = token.strip("°º∘.,")
     if not bare:
         return False
+    low = bare.lower()
     return bool(
-        resolve_unit(bare) or resolve_currency(bare) or bare.lower() in TEMP_UNITS
+        resolve_unit(bare) or low in _KNOWN_CURRENCIES or low in TEMP_UNITS
     )
 
 
@@ -157,10 +162,15 @@ def _detect_conversion(request: NormalizedRequest) -> Route | None:
         value_token = token
         attached_unit = ""
         if not _NUMBER.match(value_token):
-            match = re.match(r"^([-+]?\d+(?:[.,]\d+)?)([a-z°$€£¥₹/]+)$", token)
-            if match is None:
-                continue
-            value_token, attached_unit = match.group(1), match.group(2)
+            prefix = re.match(r"^([-+]?)([$€£¥₹₩])(\d+(?:[.,]\d+)?)([kmb]?)$", token)
+            if prefix is not None:
+                value_token = f"{prefix.group(1)}{prefix.group(3)}{prefix.group(4)}"
+                attached_unit = prefix.group(2)
+            else:
+                match = re.match(r"^([-+]?\d+(?:[.,]\d+)?)([a-z°$€£¥₹₩/]+)$", token)
+                if match is None:
+                    continue
+                value_token, attached_unit = match.group(1), match.group(2)
         tail = tokens[index + 1 :]
         head = tokens[:index]
         units: list[str] = []
@@ -322,6 +332,18 @@ def _detect_factual(request: NormalizedRequest) -> Route | None:
 
 # Tool-first order, exactly as specified: deterministic tools get first
 # refusal and search/AI only see what is left.
+def _detect_recipe(request: NormalizedRequest) -> Route | None:
+    if not (RECIPE_WORDS & request.token_set):
+        return None
+    if not any(w in request.token_set for w in ("with", "using", "from")):
+        return None
+    drop = RECIPE_WORDS | frozenset({"with", "using", "from", "cook", "make", "quick", "easy"})
+    subject = _subject(request.tokens, drop)
+    if not subject:
+        return None
+    return Route(kind=RECIPE, payload=", ".join(subject.split()), confidence=0.8)
+
+
 _DETECTORS = (
     _detect_math,
     _detect_conversion,
@@ -329,6 +351,7 @@ _DETECTORS = (
     _detect_time,
     _detect_define,
     _detect_translate,
+    _detect_recipe,
     _detect_image,
     _detect_search,
     _detect_factual,

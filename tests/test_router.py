@@ -799,3 +799,111 @@ class TestIntelligenceLanes(unittest.TestCase):
             "sum of 10 20 30",
         ):
             self.assertEqual(route_query(text).kind, CALCULATE, text)
+
+
+class TestSmartPipelineUpgrades(unittest.TestCase):
+    """Regression suite for the upgraded context-aware & precision router."""
+
+    def test_recipe_natural_language_routing(self):
+        from functions.routes import RECIPE
+
+        for text in (
+            "recipe with chicken, rice and onion",
+            "what can I cook with eggs and bread?",
+            "vegetarian recipe with paneer under 20 mins",
+            "vegan recipe using chickpeas and tomato",
+            "i have eggs, onion, tomato, what can i cook?",
+            "recipie with eggs rice",
+        ):
+            routes = route_many(text)
+            self.assertEqual(len(routes), 1, text)
+            self.assertEqual(routes[0].kind, RECIPE, text)
+            self.assertTrue(routes[0].payload, text)
+
+        filtered = route_query("vegetarian recipe with paneer and spinach under 25 mins")
+        self.assertEqual(filtered.payload2, "vegetarian|25")
+
+    def test_rich_conversions_and_no_false_three_letter_hijack(self):
+        for text in (
+            "$100 to INR",
+            "₹5,000 in USD",
+            "€75 to GBP",
+            "$2.5k to INR",
+            "1,250,000 INR to USD",
+            "5'11 in cm",
+            "5 ft 11 in to m",
+            "change $50 to EUR",
+            "10 min to sec",
+        ):
+            r = route_query(text)
+            self.assertEqual(r.kind, CONVERT, text)
+
+        # Casual sentences with numbers + 3-letter words must never be hijacked as currency.
+        for casual in (
+            "i slept 3 hrs ago bro",
+            "got 2 cat and dog pics yesterday",
+        ):
+            self.assertNotEqual(route_query(casual).kind, CONVERT, casual)
+
+    def test_build_mode_never_hijacks_dev_remind_or_convert(self):
+        from functions.routes import BUILD, DEV, REMIND
+
+        self.assertEqual(route_query("build a regex for email addresses").kind, DEV)
+        self.assertEqual(route_query("build a sql query to count users").kind, DEV)
+        self.assertEqual(route_query("add a reminder in 10 minutes to drink water").kind, REMIND)
+        self.assertEqual(route_query("change $100 to INR").kind, CONVERT)
+        self.assertEqual(route_query("build a portfolio website").kind, BUILD)
+        self.assertEqual(route_query("build a portfolio website").payload2, "new")
+        self.assertEqual(route_query("make the background dark").payload2, "edit")
+
+    def test_reply_deictic_url_cleanup_time_user_and_summarize_count(self):
+        tr = route_query("translate to Hindi")
+        self.assertEqual(tr.kind, TRANSLATE)
+        self.assertEqual(tr.payload, "")
+        self.assertEqual(tr.payload2, "Hindi")
+
+        tr_cn = route_query("translate hello world into simplified chinese")
+        self.assertEqual(tr_cn.kind, TRANSLATE)
+        self.assertEqual(tr_cn.payload2.casefold(), "simplified chinese")
+
+        link_reply = route_query("summarize this link")
+        self.assertEqual((link_reply.kind, link_reply.payload2, link_reply.payload), (RESEARCH, "link", ""))
+
+        angled = route_query("tl;dr <https://example.com/article>.")
+        self.assertEqual((angled.kind, angled.payload), (RESEARCH, "https://example.com/article"))
+
+        user_time = route_query("what time is it for <@123456789>?")
+        self.assertEqual((user_time.kind, user_time.payload), (TIME, "<@123456789>"))
+        self.assertEqual(route_query("what's my local time?").kind, TIME)
+        self.assertEqual(route_query("what time is it there?").payload.casefold(), "there")
+
+        recap = route_query("summarize the last 15 messages")
+        self.assertEqual((recap.kind, recap.payload), (SUMMARIZE, "15"))
+
+    def test_multiline_payloads_preserved_for_dev_and_utility(self):
+        from functions.routes import DEV
+        from functions.toolkit import run_tool
+
+        sort_route = route_query("sort:\ncherry\napple\nbanana")
+        self.assertEqual((sort_route.kind, sort_route.payload2), (UTILITY, "sort"))
+        self.assertIn("\n", sort_route.payload)
+        self.assertEqual(run_tool("sort", sort_route.payload).text, "🔢 apple, banana, cherry")
+
+        json_out = run_tool("json", '```json\n{"a":1,"b":2}\n```').text
+        self.assertIn("✅ valid JSON", json_out)
+
+        err_route = route_query("explain this error:\nTraceback (most recent call last):\nValueError: boom")
+        self.assertEqual((err_route.kind, err_route.payload2), (DEV, "error"))
+        self.assertIn("\nValueError: boom", err_route.payload)
+
+    def test_shared_verb_compound_fanout_and_compound_place_safety(self):
+        cities = route_many("weather in Delhi and Mumbai")
+        self.assertEqual([(r.kind, r.payload) for r in cities], [(WEATHER, "Delhi"), (WEATHER, "Mumbai")])
+
+        clocks = route_many("time in Tokyo and London")
+        self.assertEqual([(r.kind, r.payload) for r in clocks], [(TIME, "Tokyo"), (TIME, "London")])
+
+        # Compound state/country names stay intact as a single query.
+        self.assertEqual(len(route_many("weather in Jammu and Kashmir")), 1)
+        self.assertEqual(len(route_many("weather in Trinidad and Tobago")), 1)
+

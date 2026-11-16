@@ -46,8 +46,6 @@ body:
         - Conversions / calculator / time
         - Voice leaderboard (/vc)
         - Voice clips (/clip)
-        - Wake word / speech
-        - Mini-games
         - Auto-update
         - Cards / rendering
     validations:

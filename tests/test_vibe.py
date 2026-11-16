@@ -19,7 +19,6 @@ from config import Config, GeminiConfig, PersonalityConfig
 from functions.ai import AIService
 from functions.personality import (
     Personality,
-    INTERJECTION_LINES,
     is_about_paradise,
 )
 from functions.vibe import (
@@ -465,28 +464,21 @@ class TestAboutDetection(unittest.TestCase):
 
 
 class TestAboutLane(unittest.IsolatedAsyncioTestCase):
+    """Talking *about* Paradise without pinging never triggers automatic replies."""
+
     LORD_ID = 922359954025885737
 
     def _personality(self, **overrides):
         defaults = dict(
             enabled=True,
-            reaction_chance=0.0,
-            reply_chance=0.0,
-            sticker_chance=0.0,
-            meme_chance=0.0,
-            gif_chance=0.0,
-            random_quip_chance=0.0,
-            roast_chance=0.0,
-            ambient_reaction_chance=0.0,
-            grammar_chance=0.0,
+            reaction_chance=1.0,
+            ambient_reaction_chance=1.0,
+            lord_reaction_chance=0.0,
             global_cooldown=0,
             channel_cooldown=0,
-            reply_channel_cooldown=0,
-            humour_cooldown=0,
-            roast_user_cooldown=0,
-            interject_cooldown=0,
-            interject_chance=0.0,
-            lord_reply_chance=0.0,
+            user_cooldown=0,
+            lord_cooldown=0,
+            ambient_hourly_cap=4,
         )
         defaults.update(overrides)
         cfg = PersonalityConfig(**defaults)
@@ -498,148 +490,74 @@ class TestAboutLane(unittest.IsolatedAsyncioTestCase):
         )
         return Personality(bot, cfg), bot
 
-    def _with_ai(self, personality, bot, line="excuse me i am RIGHT here"):
+    def _with_ai(self, bot, line="excuse me i am RIGHT here"):
         bot.ai = SimpleNamespace(
             available=True,
             butt_in=AsyncMock(return_value=line),
         )
         return bot.ai
 
-    async def test_being_discussed_gets_a_fresh_line(self):
-        personality, bot = self._personality(about_chance=1.0, about_cooldown=0)
-        ai = self._with_ai(personality, bot)
+    async def test_being_discussed_never_sends_automatic_butt_in_reply(self):
+        personality, bot = self._personality()
+        ai = self._with_ai(bot)
         with patch("functions.personality.random.random", return_value=0.0):
             msg = make_msg("paradise has been yapping all day", channel_id=10)
             await personality.handle(msg)
-        ai.butt_in.assert_awaited_once()
-        msg.reply.assert_awaited_once()
-        self.assertEqual(msg.reply.call_args.args[0], "excuse me i am RIGHT here")
+        ai.butt_in.assert_not_awaited()
+        msg.reply.assert_not_awaited()
 
     async def test_mentions_still_belong_to_the_assistant(self):
-        # A real ping goes to the assistant and personality stays out —
-        # even though the text contains his name.
-        personality, bot = self._personality(about_chance=1.0, about_cooldown=0)
-        ai = self._with_ai(personality, bot)
+        personality, bot = self._personality()
+        ai = self._with_ai(bot)
         with patch("functions.personality.random.random", return_value=0.0):
             msg = make_msg("<@999> wake up", channel_id=10)
             msg.mentions = [SimpleNamespace(id=999)]
             await personality.handle(msg)
         ai.butt_in.assert_not_awaited()
         msg.reply.assert_not_awaited()
+        msg.add_reaction.assert_not_awaited()
 
-    async def test_the_chance_gate(self):
-        personality, bot = self._personality(about_chance=0.35, about_cooldown=0)
-        ai = self._with_ai(personality, bot)
-        with patch("functions.personality.random.random", return_value=0.9):
-            msg = make_msg("paradise is asleep", channel_id=10)
-            await personality.handle(msg)
-        ai.butt_in.assert_not_awaited()
-        msg.reply.assert_not_awaited()
-
-    async def test_chance_zero_disables_the_lane(self):
-        personality, bot = self._personality(about_chance=0.0)
-        ai = self._with_ai(personality, bot)
-        with patch("functions.personality.random.random", return_value=0.0):
-            msg = make_msg("paradise who", channel_id=10)
-            await personality.handle(msg)
-        ai.butt_in.assert_not_awaited()
-
-    async def test_the_cooldown_holds(self):
-        personality, bot = self._personality(
-            about_chance=1.0, about_cooldown=240
-        )
-        ai = self._with_ai(personality, bot)
-        with patch("functions.personality.random.random", return_value=0.0):
-            first = make_msg("paradise hello", channel_id=10)
-            await personality.handle(first)
-            first.reply.assert_awaited_once()
-
-            second = make_msg("paradise still listening?", author_id=7)
-            await personality.handle(second)
-        second.reply.assert_not_awaited()  # the lane is cooling down
-        self.assertEqual(ai.butt_in.await_count, 1)
-
-    async def test_an_ai_failure_is_silence(self):
-        personality, bot = self._personality(about_chance=1.0, about_cooldown=0)
-        bot.ai = SimpleNamespace(
-            available=True,
-            butt_in=AsyncMock(side_effect=RuntimeError("provider down")),
-        )
-        with patch("functions.personality.random.random", return_value=0.0):
-            msg = make_msg("paradise broke again", channel_id=10)
-            await personality.handle(msg)  # must not raise
-        msg.reply.assert_not_awaited()
-
-    async def test_an_empty_line_is_silence(self):
-        personality, bot = self._personality(about_chance=1.0, about_cooldown=0)
-        self._with_ai(personality, bot, line="")
-        with patch("functions.personality.random.random", return_value=0.0):
-            msg = make_msg("paradise is quiet", channel_id=10)
-            await personality.handle(msg)
-        msg.reply.assert_not_awaited()
-
-    async def test_without_an_ai_the_lane_sleeps(self):
-        # No bot.ai at all (the standard personality test setup).
-        personality, _ = self._personality(about_chance=1.0, about_cooldown=0)
-        with patch("functions.personality.random.random", return_value=0.0):
-            msg = make_msg("paradise you there", channel_id=10)
-            await personality.handle(msg)
-        msg.reply.assert_not_awaited()
-
-    async def test_url_only_slander_is_ignored(self):
-        personality, bot = self._personality(about_chance=1.0, about_cooldown=0)
-        ai = self._with_ai(personality, bot)
+    async def test_url_only_messages_are_completely_ignored(self):
+        personality, bot = self._personality()
+        ai = self._with_ai(bot)
         with patch("functions.personality.random.random", return_value=0.0):
             msg = make_msg("https://paradise.example.com", channel_id=10)
             await personality.handle(msg)
         ai.butt_in.assert_not_awaited()
+        msg.reply.assert_not_awaited()
+        msg.add_reaction.assert_not_awaited()
 
-    async def test_being_discussed_counts_against_the_ambient_budget(self):
-        personality, bot = self._personality(about_chance=1.0, about_cooldown=0)
-        self._with_ai(personality, bot)
-        with patch("functions.personality.random.random", return_value=0.0):
-            await personality.handle(make_msg("paradise hi", channel_id=10))
-        self.assertEqual(len(personality._ambient_log[10]), 1)
-
-    async def test_ambient_budget_caps_the_butting_in(self):
-        # Six unprompted actions in an hour is the ceiling; a seventh
-        # about-reply must wait even with every other gate wide open.
-        personality, bot = self._personality(about_chance=1.0, about_cooldown=0)
-        ai = self._with_ai(personality, bot)
+    async def test_ambient_budget_caps_passive_reactions(self):
+        personality, bot = self._personality(ambient_hourly_cap=4)
+        ai = self._with_ai(bot)
         now = time.monotonic()
         personality._ambient_log[10] = __import__("collections").deque(
-            [now - 60] * 6, maxlen=12
+            [now - 60] * 4, maxlen=12
         )
         with patch("functions.personality.random.random", return_value=0.0):
-            msg = make_msg("paradise, buddy", channel_id=10)
+            msg = make_msg("paradise is resting quietly", channel_id=10)
             await personality.handle(msg)
         ai.butt_in.assert_not_awaited()
         msg.reply.assert_not_awaited()
-
-
-# ---------------------------------------------------------------------------
-# Persona and pools
-# ---------------------------------------------------------------------------
+        msg.add_reaction.assert_not_awaited()
 
 
 class TestPersona(unittest.TestCase):
-    def test_interjection_pool_grew_some_variety(self):
-        self.assertGreaterEqual(len(INTERJECTION_LINES), 18)
-
-    def test_personality_config_knows_the_about_lane(self):
+    def test_personality_config_drops_legacy_auto_reply_fields(self):
         cfg = PersonalityConfig.from_env(
             {
                 "PERSONALITY_ABOUT_CHANCE": "0.5",
                 "PERSONALITY_ABOUT_COOLDOWN": "90",
             }
         )
-        self.assertEqual(cfg.about_chance, 0.5)
-        self.assertEqual(cfg.about_cooldown, 90)
+        self.assertFalse(hasattr(cfg, "about_chance"))
+        self.assertFalse(hasattr(cfg, "about_cooldown"))
 
-    def test_defaults_stay_documented(self):
+    def test_defaults_stay_quiet_and_documented(self):
         cfg = PersonalityConfig()
-        self.assertEqual(cfg.about_chance, 0.35)
-        self.assertEqual(cfg.about_cooldown, 180)
+        self.assertEqual(cfg.reaction_chance, 0.06)
+        self.assertEqual(cfg.ambient_reaction_chance, 0.015)
+        self.assertEqual(cfg.ambient_hourly_cap, 4)
 
 
 if __name__ == "__main__":

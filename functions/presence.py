@@ -4,7 +4,6 @@ Two things live here, and nowhere else calls ``bot.change_presence``:
 
 1. **Status priority** (highest wins):
 
-   - ``dnd``    — a scheduled community mini-game is currently running.
    - ``idle``   — overnight in India (20:00 → 08:00 ``Asia/Kolkata``).
    - ``online`` — daytime default (08:00 → 20:00 ``Asia/Kolkata``).
 
@@ -200,7 +199,6 @@ class PresenceManager:
     ) -> None:
         self.bot = bot
         self._clock = clock or (lambda: datetime.now(IST))
-        self._game_active = False
         self._recent_notes: deque[str] = deque(maxlen=20)
         self._recent_typed: deque[tuple[discord.ActivityType, str]] = deque(maxlen=6)
         self.current_note: str = ""
@@ -219,9 +217,7 @@ class PresenceManager:
         return now.astimezone(IST) if now.tzinfo else now.replace(tzinfo=IST)
 
     def desired_status(self, now: datetime | None = None) -> discord.Status:
-        """Priority: active mini-game (DND) → IST overnight (idle) → online."""
-        if self._game_active:
-            return discord.Status.dnd
+        """Return IST overnight (idle) or daytime (online) status."""
         hour = (now or self.now_ist()).astimezone(IST).hour
         if hour >= OVERNIGHT_START_HOUR or hour < OVERNIGHT_END_HOUR:
             return discord.Status.idle
@@ -285,11 +281,6 @@ class PresenceManager:
                 await task
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
-
-    async def set_game_active(self, active: bool) -> None:
-        """Flip the mini-game DND flag and push the resulting status now."""
-        self._game_active = bool(active)
-        await self.apply_current()
 
     async def rotate(self) -> None:
         """Pick a fresh random status activity and push status + activity."""

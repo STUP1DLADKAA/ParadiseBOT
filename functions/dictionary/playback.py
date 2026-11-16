@@ -153,7 +153,7 @@ class VoicePlayback:
             try:
                 if client is None or not client.is_connected():
                     client, connected_here = await self._join_channel(guild, channel)
-                elif client.channel != channel:
+                elif getattr(client.channel, "id", None) != getattr(channel, "id", None):
                     if client.is_playing():
                         raise PlaybackUnavailable("I'm busy in another channel")
                     await client.move_to(channel)

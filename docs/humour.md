@@ -1,117 +1,56 @@
-# It talks back: the personality engine
+# Passive reactions & on-demand banter
 
-Paradise is not a silent helper. In a friends-only server it is supposed to be
-one of the funniest people in the channel — it reacts, it replies, it roasts, it
-posts memes, and it never needs an API key to do any of it.
-
-Everything on this page is one layer of `functions/personality.py`. Every layer
-is a `PERSONALITY_*` setting, so a server that wants a quieter bot can turn any
-of it down without touching code.
+Paradise stays out of unprompted conversation: ordinary messages never trigger
+automatic text, GIF, image, meme or sticker replies. The passive engine in
+`functions/personality.py` adds only rare, context-fitting emoji reactions,
+while roasts, memes and reaction GIFs remain available on demand through
+`/roast`, `/meme`, `/gif` and `@Paradise` pings.
 
 ```text
-message in
+unaddressed message in
    │
-   ├─ is it from a bot / a command / about something serious? → silence
-   ├─ did they say "stop roasting me"?                        → silence, remembered
+   ├─ bot / command / bare URL / spam burst / serious topic? → silence
+   ├─ user opted out ("stop roasting me" / "leave me alone")? → silence
+   ├─ global, channel, per-user or hourly cap active?        → silence
    │
-   ├─ English typo?      → 🤓 nerd correction
-   ├─ "roast me" / "1v1 me" → a roast, right now
-   │
-   └─ everything else (all gated by the channel cooldowns)
-        ├─ a lord himself spoke?   → a "my lord 👑" line or a crown
-        ├─ two people talking?     → a small chance of "hello!"
-        └─ one of: reply · roast · meme · GIF · sticker · quip · reaction
+   └─ at most one rare emoji reaction (never a text/GIF/image/sticker reply)
+        ├─ a lord spoke (cooldown-gated)? → 👑 / 🗿 / 🫡
+        ├─ matched a known context?       → one contextual emoji
+        └─ unmatched casual chat?         → very rare ambient emoji
 ```
 
-## The layers
+## Passive reaction settings
 
 | Layer | What it does | Setting | Default |
 | --- | --- | --- | --- |
-| Reaction | Emoji on a message that matched a known context (34 contexts) | `PERSONALITY_REACTION_CHANCE` | `0.18` |
-| Ambient reaction | Emoji on a message that matched *nothing* — presence without words | `PERSONALITY_AMBIENT_REACTION_CHANCE` | `0.06` |
-| Reply | A one-liner chosen for that context | `PERSONALITY_REPLY_CHANCE` | `0.08` |
-| Roast | A jab aimed at whoever just spoke — quoting their own words when there are enough to quote | `PERSONALITY_ROAST_CHANCE` | `0.08` |
-| Meme | A real meme from the internet, or a card drawn locally | `PERSONALITY_MEME_CHANCE` | `0.10` |
-| GIF | A reaction GIF — keyless by default | `PERSONALITY_GIF_CHANCE` | `0.06` |
-| Sticker | A native Discord sticker, or a drawn one | `PERSONALITY_STICKER_CHANCE` | `0.04` |
-| Quip | An unprompted 200-IQ / 2-IQ observation | `PERSONALITY_QUIP_CHANCE` | `0.08` |
-| Nerd | Grammar/spelling correction, English only | `PERSONALITY_GRAMMAR_CHANCE` | `0.70` |
-| Interjection | A "hello!" when two people are talking (10-minute window) | `PERSONALITY_INTERJECT_CHANCE` | `0.04` |
-| Lord | A loyal acknowledgement when a lord and master speaks | `PERSONALITY_LORD_REPLY_CHANCE` | `0.20` |
-| Memory callback | One fact the bot "already knew" quoted back at the person it's about | `PERSONALITY_MEMORY_CALLBACK_CHANCE` | `0.05` |
-| **Ambient budget** | Hard ceiling on *unprompted* chatter per channel per rolling hour — mentions, invited roasts and grammar bait never count | `PERSONALITY_AMBIENT_HOURLY_CAP` | `6` |
+| Contextual reaction | Emoji on a message matching a known context | `PERSONALITY_REACTION_CHANCE` | `0.06` |
+| Ambient reaction | Subtle emoji on casual chat matching no pattern | `PERSONALITY_AMBIENT_REACTION_CHANCE` | `0.015` |
+| Lord reaction | Loyalty emoji when a lord speaks | `PERSONALITY_LORD_REACTION_CHANCE` | `0.06` |
+| Global cooldown | Minimum seconds between any two passive reactions | `PERSONALITY_GLOBAL_COOLDOWN` | `45` |
+| Channel cooldown | Minimum seconds between reactions in the same channel | `PERSONALITY_CHANNEL_COOLDOWN` | `240` |
+| User cooldown | Minimum seconds before reacting to the same user again | `PERSONALITY_USER_COOLDOWN` | `300` |
+| Lord cooldown | Minimum seconds between lord reactions in one channel | `PERSONALITY_LORD_COOLDOWN` | `600` |
+| **Hourly budget** | Hard ceiling on passive reactions per channel per rolling hour (`0` disables) | `PERSONALITY_AMBIENT_HOURLY_CAP` | `4` |
 
-Alive, but controlled: every ambient chance above is now noticeably lower, the
-interjection cooldown is 10 minutes, and the ambient budget is a hard ceiling
-on how often Paradise pipes up on its own. The joke was never the volume —
-it's the timing.
+Set `PERSONALITY_ENABLED=false` to disable passive emoji reactions completely.
 
-New layers:
+## On-demand roasts
 
-* **Interjection** — when two or more distinct humans have spoken in a channel
-  within ten minutes, the conversation is "live" and Paradise may drop one
-  short line of its own ("hello!", "continue, i'm invested now"). Its own
-  cooldown (`PERSONALITY_INTERJECT_COOLDOWN`, default 240 s) keeps it a
-  surprise rather than a photobombber.
-* **Lords** — Stupid (`922359954025885737`, the owner) and Taher
-  (`1049231767585964032`) are the lords and masters, at the same level of
-  authority (configurable with `PARADISE_LORD_USER_IDS`). When either speaks,
-  Paradise occasionally answers with a loyal, slightly cheeky line ("my lord
-  has spoken 👑") or just drops a crown reaction on the message. They are also
-  the only people who can teach the bot long-term memories (`/memory`), and
-  the AI addresses each of them as "my lord" — while still teasing them,
-  because they expect it. Each lord's *name* is defended too: disparage
-  "stupid" or "taher" in a sentence and Paradise takes it personally.
-* **Context roasts** — when the roast target's last words are long enough, the
-  roast *quotes them back* ("bro woke up today and chose to say \"pineapple
-  belongs on pizza\" out loud."). Roasting the lord uses the loyal-but-cheeky
-  frames instead. Short messages fall back to the classic book.
-* **Memory callback** — the long memory has a life outside the AI, too. When
-  somebody the bot has a fact on (`/memory add … user: @them`) speaks, there
-  is a rare chance (`PERSONALITY_MEMORY_CALLBACK_CHANCE`, default 0.05 —
-  roughly once every few hours per person) that Paradise just *quotes the
-  fact back at them*: `"spent a year reaching level 100 in murder mystery"
-  — i know everything about you people, Ash. everything.` No AI call, no
-  rewriting — the fact is quoted verbatim (cleaned, capped at 90 characters)
-  and only the frame around it is chosen. And the frame **never admits to
-  remembering**: no "i remember", no "you told me", no mention of memory —
-  Paradise knew already, because it pays attention to everyone in this
-  server. The same person is safe for half an hour afterwards
-  (`PERSONALITY_MEMORY_CALLBACK_COOLDOWN`, default 1800 s). The joke is the
-  timing, not the volume: it works precisely because it is rare.
-
-At most **one** of these happens per message, and only when the channel is not
-already firing (`PERSONALITY_CHANNEL_COOLDOWN`, default 35 s) and the bot has
-not done anything recently anywhere (`PERSONALITY_GLOBAL_COOLDOWN`, default
-10 s). Fast, flooded channels are left alone entirely — a bot that replies to a
-burst is not funny, it is a wall.
-
-## Roasts
-
-`functions/roasts.py` is the book: three intensities, each with its own pool of
-lines, plus comebacks for people being cocky and lines for the bot roasting
-itself.
+`functions/roasts.py` backs explicit `/roast` and `@Paradise roast …` requests
+with three intensities:
 
 ```env
 PERSONALITY_ROAST_INTENSITY=spicy   # mild · spicy · nuclear
-PERSONALITY_ROAST_CHANCE=0.12
-PERSONALITY_ROAST_USER_COOLDOWN=600
 ```
 
 * **mild** — friendly teasing.
-* **spicy** — the default. Mean about what someone said or did.
-* **nuclear** — for a server that asked for it.
+* **spicy** — the default. Aimed at what someone said or did.
+* **nuclear** — sharper, still keeping the same safety rules.
 
-Somebody can also just ask:
+How to invoke:
 
-* `@Paradise roast me` or `/roast` — the bot roasts whoever asked.
-* `/roast @friend` or `@Paradise roast @friend` — passed on to them.
-* Anything cocky ("i'm him", "1v1 me", "no diff", "skill issue") gets a
-  comeback aimed at *what they said*.
-
-`PERSONALITY_ROAST_USER_COOLDOWN` is the anti-bullying valve: the same person
-cannot be roasted twice inside that window. Nobody gets farmed by a bot, no
-matter how much they deserve it.
+* `@Paradise roast me` or `/roast` — roasts whoever asked.
+* `/roast @friend` or `@Paradise roast @friend` (or reply to a message with `@Paradise roast this`) — roasts the target.
 
 ### The line that never moves
 

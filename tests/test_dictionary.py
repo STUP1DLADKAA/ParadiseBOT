@@ -1566,8 +1566,15 @@ class TestLookupFlow(unittest.TestCase):
 
 
 class TestChatTriggerFlow(unittest.TestCase):
-    def test_plain_request_is_answered(self):
+    def test_default_config_does_not_auto_reply_to_unmentioned_chat(self):
         cog = make_cog()
+        message = FakeMessage('Define "promise"')
+        self.assertFalse(run(cog.handle_message(message)))
+        self.assertEqual(message.replies, [])
+        run(cog.cog_unload())
+
+    def test_plain_request_is_answered_when_opted_in(self):
+        cog = make_cog(settings=DictionaryConfig(text_triggers=True))
         message = FakeMessage('Define "promise"')
         self.assertTrue(run(cog.handle_message(message)))
         self.assertIsInstance(message.replies[0]["view"], LoadingView)
@@ -1576,7 +1583,7 @@ class TestChatTriggerFlow(unittest.TestCase):
         run(cog.cog_unload())
 
     def test_ordinary_chat_is_left_alone(self):
-        cog = make_cog()
+        cog = make_cog(settings=DictionaryConfig(text_triggers=True))
         for content in ("hello everyone", "I need to define a function", "what does it mean"):
             message = FakeMessage(content)
             self.assertFalse(run(cog.handle_message(message)), content)
@@ -1584,7 +1591,7 @@ class TestChatTriggerFlow(unittest.TestCase):
         run(cog.cog_unload())
 
     def test_bots_and_mentions_are_ignored(self):
-        cog = make_cog()
+        cog = make_cog(settings=DictionaryConfig(text_triggers=True))
         self.assertFalse(run(cog.handle_message(FakeMessage("define promise", bot=True))))
         mentioned = FakeMessage("define promise", mentions=[SimpleNamespace(id=1)])
         self.assertFalse(run(cog.handle_message(mentioned)))
@@ -1596,7 +1603,7 @@ class TestChatTriggerFlow(unittest.TestCase):
         run(cog.cog_unload())
 
     def test_repeat_requests_are_rate_limited(self):
-        cog = make_cog()
+        cog = make_cog(settings=DictionaryConfig(text_triggers=True))
         first = FakeMessage("define promise", author_id=7)
         second = FakeMessage("define pledge", author_id=7)
         self.assertTrue(run(cog.handle_message(first)))
@@ -1604,7 +1611,7 @@ class TestChatTriggerFlow(unittest.TestCase):
         run(cog.cog_unload())
 
     def test_missing_send_permission_is_respected(self):
-        cog = make_cog()
+        cog = make_cog(settings=DictionaryConfig(text_triggers=True))
         message = FakeMessage("define promise")
         message.channel = SimpleNamespace(
             id=11, permissions_for=lambda _m: discord.Permissions.none()

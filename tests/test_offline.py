@@ -38,12 +38,14 @@ from functions.presence import IST, NOTES, ROTATE_SECONDS, PresenceManager  # no
 EXPECTED_COMMANDS = {
     "ping", "coinflip", "choose", "roast", "meme", "gif",
     "remind", "poll", "afk", "translate", "settimezone", "vc", "clip",
-    "minigames", "recipe",
+    "recipe",
     "summarize", "help", "edit", "memory",
 }
 
 # Names that must never come back at the top level.
 REMOVED_COMMANDS = {
+    # minigames was removed entirely (commands, engine, scheduler, config)
+    "minigames",
     # music was removed entirely (commands, engine, yt-dlp dependency)
     "music", "cmd",
     "play", "pause", "resume", "skip", "previous", "stop", "queue",
@@ -117,6 +119,21 @@ class TestCommandSet(unittest.TestCase):
             )
         with open(os.path.join(root, "requirements.txt"), encoding="utf-8") as handle:
             self.assertNotIn("yt-dlp", handle.read())
+
+    def test_minigames_are_gone_and_stay_gone(self):
+        from functions.startup import RETIRED_COMMANDS
+
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        for path in ("commands/minigames.py", "functions/minigames", "tests/test_minigames.py"):
+            self.assertFalse(
+                os.path.exists(os.path.join(root, path)), f"{path} should be gone"
+            )
+        self.assertNotIn("commands.minigames", EXTENSIONS)
+        self.assertFalse(hasattr(Config(), "minigames"))
+        self.assertIn("minigames", RETIRED_COMMANDS)
+        self.assertNotIn("minigames", HELP_BLURBS)
+        for names in HELP_GROUPS.values():
+            self.assertNotIn("minigames", names)
         for path in ("commands/voice.py", "functions/lyrics.py",
                      "functions/settings.py", "lavalink", "node_modules"):
             self.assertFalse(
@@ -266,10 +283,10 @@ class TestConfig(unittest.TestCase):
                 "AI_MODEL": "llama-3.3-70b-versatile",
                 "PERSONALITY_ENABLED": "false",
                 "PERSONALITY_REACTION_CHANCE": "0.1",
-                "PERSONALITY_REPLY_CHANCE": "0.02",
+                "PERSONALITY_REPLY_CHANCE": "0.9",  # legacy auto-reply key ignored
                 "PERSONALITY_GLOBAL_COOLDOWN": "60",
                 "PERSONALITY_CHANNEL_COOLDOWN": "200",
-                "PERSONALITY_REPLY_CHANNEL_COOLDOWN": "900",
+                "PERSONALITY_USER_COOLDOWN": "400",
             }
         )
         self.assertEqual(config.token, "tok")
@@ -277,27 +294,34 @@ class TestConfig(unittest.TestCase):
         self.assertTrue(config.ai_configured)
         self.assertFalse(config.personality.enabled)
         self.assertEqual(config.personality.reaction_chance, 0.1)
-        self.assertEqual(config.personality.reply_chance, 0.02)
         self.assertEqual(config.personality.global_cooldown, 60)
         self.assertEqual(config.personality.channel_cooldown, 200)
-        self.assertEqual(config.personality.reply_channel_cooldown, 900)
+        self.assertEqual(config.personality.user_cooldown, 400)
+        self.assertFalse(hasattr(config.personality, "reply_chance"))
 
     def test_empty_env_is_safe(self):
         config = Config.from_env({})
         self.assertFalse(config.ai_configured)
         self.assertTrue(config.personality.enabled)
-        # Lively, but never a certainty: no action is ever forced.
-        self.assertLessEqual(config.personality.reaction_chance, 0.3)
-        self.assertLessEqual(config.personality.reply_chance, 0.2)
-        self.assertLessEqual(config.personality.roast_chance, 0.3)
+        # Rare emoji reactions only; unaddressed dictionary triggers off.
+        self.assertLessEqual(config.personality.reaction_chance, 0.08)
+        self.assertLessEqual(config.personality.ambient_reaction_chance, 0.03)
+        self.assertLessEqual(config.personality.lord_reaction_chance, 0.08)
+        self.assertGreaterEqual(config.personality.global_cooldown, 30)
+        self.assertGreaterEqual(config.personality.channel_cooldown, 180)
+        self.assertGreaterEqual(config.personality.user_cooldown, 180)
+        self.assertFalse(config.dictionary.text_triggers)
         self.assertEqual(config.personality.roast_intensity, "spicy")
 
     def test_bad_chances_snap_to_defaults(self):
         config = Config.from_env(
-            {"PERSONALITY_REACTION_CHANCE": "5", "PERSONALITY_REPLY_CHANCE": "banana"}
+            {
+                "PERSONALITY_REACTION_CHANCE": "5",
+                "PERSONALITY_AMBIENT_REACTION_CHANCE": "banana",
+            }
         )
-        self.assertEqual(config.personality.reaction_chance, 0.18)
-        self.assertEqual(config.personality.reply_chance, 0.08)
+        self.assertEqual(config.personality.reaction_chance, 0.06)
+        self.assertEqual(config.personality.ambient_reaction_chance, 0.015)
 
     def test_template_has_no_music_or_consent_settings(self):
         path = os.path.join(
@@ -312,6 +336,7 @@ class TestConfig(unittest.TestCase):
             self.assertNotIn(needle, content, f".env.example still mentions {needle}")
         # …and no music block, and no recording-consent switches.
         self.assertNotIn("music_", content)
+        self.assertNotIn("minigames_", content)
         self.assertNotIn("voice_clip_consent_mode", content)
         self.assertNotIn("voice_clip_notice_enabled", content)
         self.assertIn("elevenlabs_voice_id=", content)
@@ -408,15 +433,13 @@ class TestPresence(unittest.TestCase):
     def test_rotation_interval_is_twenty_minutes(self):
         self.assertEqual(ROTATE_SECONDS, 20 * 60)
 
-    def test_game_priority_and_ist_overnight_status(self):
+    def test_ist_overnight_status(self):
         manager = PresenceManager(SimpleNamespace())
         day = datetime(2026, 10, 8, 12, 0, tzinfo=IST)
         night = datetime(2026, 10, 8, 22, 0, tzinfo=IST)
         self.assertEqual(manager.desired_status(day), discord.Status.online)
         self.assertEqual(manager.desired_status(night), discord.Status.idle)
-        manager._game_active = True
-        self.assertEqual(manager.desired_status(day), discord.Status.dnd)
-        self.assertEqual(manager.desired_status(night), discord.Status.dnd)
+        self.assertFalse(hasattr(manager, "set_game_active"))
 
     def test_overnight_boundaries_are_08_and_20_ist(self):
         manager = PresenceManager(SimpleNamespace())
@@ -455,7 +478,7 @@ class TestPresence(unittest.TestCase):
 
         asyncio.run(run())
 
-    def test_presence_publishes_random_activity_and_reconnect_restores_priority(self):
+    def test_presence_publishes_random_activity_and_reconnect_restores_status(self):
         async def run():
             moment = datetime(2026, 10, 8, 22, 0, tzinfo=IST)
             bot = SimpleNamespace(
@@ -463,18 +486,7 @@ class TestPresence(unittest.TestCase):
                 is_ready=lambda: True,
             )
             manager = PresenceManager(bot, clock=lambda: moment)
-            await manager.set_game_active(True)
-            self.assertEqual(bot.change_presence.call_args.kwargs["status"], discord.Status.dnd)
-            first_activity = bot.change_presence.call_args.kwargs["activity"]
-            self.assertIsInstance(first_activity, discord.BaseActivity)
-
-            await manager.apply_current(force=True)  # on_ready/reconnect reapplies DND
-            self.assertEqual(bot.change_presence.call_args.kwargs["status"], discord.Status.dnd)
-            self.assertIsInstance(
-                bot.change_presence.call_args.kwargs["activity"], discord.BaseActivity
-            )
-
-            await manager.set_game_active(False)  # game end restores the overnight status
+            await manager.apply_current(force=True)
             self.assertEqual(bot.change_presence.call_args.kwargs["status"], discord.Status.idle)
             self.assertIsInstance(
                 bot.change_presence.call_args.kwargs["activity"], discord.BaseActivity
@@ -520,20 +532,13 @@ def make_personality(**overrides):
     defaults = dict(
         enabled=True,
         reaction_chance=1.0,
-        reply_chance=0.0,
-        sticker_chance=0.0,
-        meme_chance=0.0,
-        online_meme_chance=0.0,
-        gif_chance=0.0,
-        random_quip_chance=0.0,
-        roast_chance=0.0,
         ambient_reaction_chance=0.0,
-        grammar_chance=0.0,
+        lord_reaction_chance=0.0,
         global_cooldown=0,
         channel_cooldown=0,
-        reply_channel_cooldown=0,
-        humour_cooldown=0,
-        grammar_cooldown=0,
+        user_cooldown=0,
+        lord_cooldown=0,
+        ambient_hourly_cap=0,
     )
     defaults.update(overrides)
     config = PersonalityConfig(**defaults)
@@ -577,14 +582,16 @@ class TestPersonalityMatching(unittest.TestCase):
         ):
             self.assertIsNone(Personality.match(content), f"{content!r} matched")
 
-    def test_every_pattern_offers_something(self):
+    def test_every_pattern_offers_reactions_only(self):
         for pattern in PATTERNS:
             self.assertTrue(
-                pattern.reactions or pattern.replies,
-                f"pattern {pattern.name} has neither reactions nor replies",
+                pattern.reactions,
+                f"pattern {pattern.name} has no reactions",
             )
-            for reply in pattern.replies:
-                self.assertLess(len(reply), 120, f"reply too long: {reply!r}")
+            self.assertFalse(
+                hasattr(pattern, "replies"),
+                f"pattern {pattern.name} must not define automatic replies",
+            )
 
 
 class TestPersonalityGuards(unittest.TestCase):
@@ -592,7 +599,12 @@ class TestPersonalityGuards(unittest.TestCase):
         asyncio.run(personality.handle(message))
 
     def assert_silent(self, message, **overrides):
-        personality = make_personality(reaction_chance=1.0, reply_chance=1.0, **overrides)
+        personality = make_personality(
+            reaction_chance=1.0,
+            ambient_reaction_chance=1.0,
+            lord_reaction_chance=1.0,
+            **overrides,
+        )
         self._run(personality, message)
         message.add_reaction.assert_not_called()
         message.reply.assert_not_called()
@@ -606,14 +618,24 @@ class TestPersonalityGuards(unittest.TestCase):
         self.assertIn(emoji, Personality.match("this is so cursed").reactions)
         message.reply.assert_not_called()
 
-    def test_replies_when_chance_hits_and_never_reacts_too(self):
-        personality = make_personality(reaction_chance=1.0, reply_chance=1.0)
-        message = make_message("bro I'm so tired")
-        self._run(personality, message)
-        message.reply.assert_called_once()
-        reply = message.reply.call_args.args[0]
-        self.assertIn(reply, Personality.match("bro I'm so tired").replies)
-        message.add_reaction.assert_not_called()  # never both
+    def test_never_sends_automatic_text_gif_or_image_replies(self):
+        personality = make_personality(
+            reaction_chance=1.0,
+            ambient_reaction_chance=1.0,
+            lord_reaction_chance=1.0,
+        )
+        for index, line in enumerate(
+            (
+                "bro I'm so tired",
+                "roast me right now",
+                "your welcome bro definately",
+                "paradise is plotting something",
+                "just planning dinner for tonight",
+            )
+        ):
+            message = make_message(line, author_id=100 + index)
+            self._run(personality, message)
+            message.reply.assert_not_called()
 
     def test_disabled_config_means_silence(self):
         self.assert_silent(make_message(), enabled=False)
@@ -684,39 +706,46 @@ class TestPersonalityGuards(unittest.TestCase):
         blocked.add_reaction.assert_not_called()
         other.add_reaction.assert_called_once()
 
-    def test_reply_channel_cooldown(self):
-        personality = make_personality(
-            reaction_chance=0.0,
-            reply_chance=1.0,
-            reply_channel_cooldown=3600,
-            # Two authors here, so the interjection layer is eligible; zero
-            # it so a slow machine (global cooldown lapsing between the two
-            # asyncio.run calls) can't let it answer instead.
-            interject_chance=0.0,
-        )
-        first = make_message("I'm so tired")
-        second = make_message("who broke this", author_id=43)
+    def test_user_cooldown_blocks_same_user_across_channels(self):
+        personality = make_personality(reaction_chance=1.0, user_cooldown=3600)
+        first = make_message("I'm so tired", channel_id=1, author_id=42)
+        same_user = make_message("who broke this", channel_id=2, author_id=42)
+        other_user = make_message("who broke this", channel_id=2, author_id=43)
         asyncio.run(personality.handle(first))
-        asyncio.run(personality.handle(second))
-        first.reply.assert_called_once()
-        second.reply.assert_not_called()
+        asyncio.run(personality.handle(same_user))
+        asyncio.run(personality.handle(other_user))
+        first.add_reaction.assert_called_once()
+        same_user.add_reaction.assert_not_called()
+        other_user.add_reaction.assert_called_once()
+        first.reply.assert_not_called()
+        same_user.reply.assert_not_called()
+        other_user.reply.assert_not_called()
 
-    def test_replies_do_not_repeat_immediately(self):
-        personality = make_personality(reaction_chance=0.0, reply_chance=1.0)
+    def test_reactions_do_not_repeat_immediately(self):
+        personality = make_personality(reaction_chance=1.0)
         seen = []
         for index in range(3):
-            message = make_message("bro I'm so tired", author_id=50 + index)
-            message.content = f"bro I'm so tired {'!' * index}"  # dodge repeat guard
+            message = make_message(
+                f"this is so cursed {'!' * index}",
+                author_id=50 + index,
+                channel_id=10 + index,
+            )
             asyncio.run(personality.handle(message))
-            seen.append(message.reply.call_args.args[0])
-        self.assertEqual(len(seen), len(set(seen)), f"reply repeated: {seen}")
+            seen.append(message.add_reaction.call_args.args[0])
+            message.reply.assert_not_called()
+        self.assertEqual(len(seen), len(set(seen)), f"reaction repeated: {seen}")
 
-    def test_replies_never_ping(self):
-        personality = make_personality(reaction_chance=0.0, reply_chance=1.0)
-        message = make_message("who broke this")
-        asyncio.run(personality.handle(message))
-        kwargs = message.reply.call_args.kwargs
-        self.assertFalse(kwargs.get("mention_author", True))
+    def test_hourly_reaction_cap_limits_frequency(self):
+        personality = make_personality(reaction_chance=1.0, ambient_hourly_cap=2)
+        m1 = make_message("I'm so tired", channel_id=9, author_id=1)
+        m2 = make_message("who broke this", channel_id=9, author_id=2)
+        m3 = make_message("this is so cursed", channel_id=9, author_id=3)
+        for msg in (m1, m2, m3):
+            asyncio.run(personality.handle(msg))
+            msg.reply.assert_not_called()
+        m1.add_reaction.assert_called_once()
+        m2.add_reaction.assert_called_once()
+        m3.add_reaction.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

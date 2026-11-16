@@ -34,9 +34,10 @@ import io
 import logging
 import re
 import time
+from dataclasses import dataclass
 from datetime import datetime
 from types import SimpleNamespace
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import discord
 from discord.ext import commands
@@ -46,14 +47,21 @@ from commands.banter import _GIF_EMPTY, _MEME_EMPTY, meme_embed, render_topic_me
 from commands.fun import build_ping_message, choose_option, flip_coin
 from commands.system import HELP_BLURBS
 from functions.startup import RETIRED_COMMANDS
-from functions.calculator import calculate
+from functions.calculator import calculate, extract_expression
+from functions.conversion import parse_conversion_query
+from functions.conversion.currency import resolve_currency
+from functions.conversion.units import TEMP_UNITS, resolve_unit
 from functions.helpers import (
-    ParadiseError, parse_options, shorten, split_discord_text,
+    Colour, ParadiseError, parse_options, shorten, split_discord_text,
 )
 from functions.images import (
     NO_IMAGE_LINE, ImageSearchService, build_image_embeds,
 )
-from functions.intent import classify_request, should_classify
+from functions.intent import classify_request, should_classify, validate_refined_route
+from functions.recipes import (
+    RecipeFilters, near_misses, normalize_input, prettify, rank_recipes,
+    suggest_substitution,
+)
 from functions.roasts import (
     build_context_roast,
     build_roast,
@@ -62,11 +70,11 @@ from functions.roasts import (
 )
 from functions.build import BuildOrchestrator
 from functions.devhelp import DEV_MODES, run_devhelp
-from functions.research import ResearchService
+from functions.research import ResearchService, is_fetchable_url
 from functions.router import (
-    AI, BUILD, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE, DEV,
-    GIF, HELP, IMAGE, INFO, MEME, PING, POLL, REMIND, RESEARCH, ROAST, SEARCH,
-    SUMMARIZE, TIME, TRANSLATE, UNKNOWN, UTILITY, WEATHER, WRITE,
+    AI, BUILD, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
+    DEV, GIF, HELP, IMAGE, INFO, MEME, PING, POLL, RECIPE, REMIND, RESEARCH,
+    ROAST, SEARCH, SUMMARIZE, TIME, TRANSLATE, UNKNOWN, UTILITY, WEATHER, WRITE,
     Route, route_many,
 )
 from functions.toolkit import parse_duration, run_tool
@@ -96,6 +104,7 @@ ASK_HINT = (
     "• `@Paradise define photosynthesis`\n"
     "• `@Paradise 25% of 800`  ·  `@Paradise 100 USD to INR`\n"
     "• `@Paradise weather in Delhi`  ·  `@Paradise time in Tokyo`\n"
+    "• `@Paradise recipe with eggs, onion, bread`\n"
     "• `@Paradise show me a picture of a red panda`\n"
     "• `@Paradise latest Minecraft news`\n"
     "• `@Paradise translate hello into Japanese`\n"
@@ -126,15 +135,74 @@ SEARCH_FAIL_LINE = (
 # "convert 50" — a value with no units at all.
 _BARE_NUMBER = re.compile(r"^[-+]?\d+(?:[.,]\d+)?$")
 
-# Follow-ups: "what about london" right after a time/weather/convert ask.
-_FOLLOWUP_KINDS = frozenset({TIME, WEATHER, CONVERT, TRANSLATE, RESEARCH})
+# Follow-ups: "what about london", "in EUR", "and 250?", "+ 50", "reverse",
+# "time there", etc. — tracked per (channel, user) with channel fallback.
+_FOLLOWUP_KINDS = frozenset(
+    {TIME, WEATHER, CONVERT, TRANSLATE, CALCULATE, DEFINE, IMAGE, RECIPE, RESEARCH}
+)
 _FOLLOWUP_WINDOW = 300.0  # five minutes of relevance
+_TOOL_TIMEOUT = 20.0
 _FOLLOWUP_SHAPE = re.compile(
     r"^(?:what|how)\s+about\s+(?P<rest>.+?)\s*[?!.]*$"
-    r"|^(?:and|also|now)\s+(?P<rest2>.+?)\s*[?!.]*$"
-    r"|^in\s+(?P<rest3>[a-z][a-z\s]{1,40})$",
+    r"|^(?:and|also|now)\s+(?:in\s+|to\s+|into\s+|for\s+|with\s+)?(?P<rest2>.+?)\s*[?!.]*$"
+    r"|^(?:in|to|into)\s+(?P<rest3>[a-z$€£¥₹₩][a-z\s$€£¥₹₩°/]{0,40})\s*[?!.]*$",
     re.IGNORECASE,
 )
+_REVERSE_FOLLOWUP = re.compile(
+    r"^(?:reverse(?:\s+(?:it|that))?|the\s+other\s+way(?:\s+around)?|"
+    r"flip\s+(?:it|that)|vice\s+versa|swap(?:\s+units|\s+them)?)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_MATH_CHAIN_OP = re.compile(
+    r"^(?P<op>[+\-*/%^]|plus|minus|times|divided\s+by|multiplied\s+by)\s+"
+    r"(?P<rhs>[-+]?(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?)\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_MATH_ANS_TOKEN = re.compile(r"\b(?:ans|that|last\s+answer)\b", re.IGNORECASE)
+_PLACE_DEIXIS = frozenset({"there", "over there", "that place", "that city", "same place"})
+_SELF_TIME_DEIXIS = frozenset({"me", "myself", "my zone", "my timezone", "here"})
+_REPLY_URL_RE = re.compile(r"https?://[^\s<>]+", re.IGNORECASE)
+_PRONOUN_TARGET = frozenset(
+    {"this", "that", "it", "him", "her", "them", "this guy", "this message", "above"}
+)
+
+
+@dataclass(slots=True)
+class _TurnContext:
+    when: float
+    route: Route
+    user_id: int = 0
+    location: str = ""
+    numeric: float | None = None
+    conversion: tuple[float, str, str] | None = None
+
+
+@dataclass(slots=True)
+class _ReplyContext:
+    text: str
+    author_name: str
+    author_id: int
+    author: object | None
+    urls: tuple[str, ...]
+
+
+def _format_number_token(value: float) -> str:
+    if value == int(value) and abs(value) < 10**15:
+        return str(int(value))
+    return f"{value:.8g}"
+
+
+def _city_from_iana(tz_name: str | None) -> str:
+    """Derive a weather-queryable city from an IANA zone ('Asia/Kolkata' -> 'Kolkata')."""
+    if not tz_name or "/" not in tz_name:
+        return ""
+    head, _, tail = tz_name.rpartition("/")
+    if head.lower().startswith("etc") or not tail:
+        return ""
+    city = tail.replace("_", " ").strip()
+    if not city or city.upper() in ("UTC", "GMT", "LOCAL"):
+        return ""
+    return city
 
 
 class Assistant(commands.Cog):
@@ -161,8 +229,14 @@ class Assistant(commands.Cog):
             getattr(getattr(bot, "config", None), "web_search", None)
         )
         # channel -> (when, last answered route): powers "what about <x>"
-        # follow-ups to the previous time/weather/convert/research ask.
+        # follow-ups; complemented by per-(channel, user) turn state so two
+        # members talking at once don't overwrite each other's context.
         self._last_route: dict[int, tuple[float, Route]] = {}
+        self._user_turns: dict[tuple[int, int], _TurnContext] = {}
+        self._channel_turns: dict[int, _TurnContext] = {}
+        self._staged_numeric: dict[tuple[int, int], float] = {}
+        self._staged_conversion: dict[tuple[int, int], tuple[float, str, str]] = {}
+        self._staged_location: dict[tuple[int, int], str] = {}
         log.info("Web research: %s", self.research.describe())
 
         # AI Build Mode orchestrator
@@ -170,41 +244,424 @@ class Assistant(commands.Cog):
         self.build_orchestrator = BuildOrchestrator(bot, bot.ai, build_cfg) if build_cfg else None
 
     # ------------------------------------------------------------------
-    # Entry point (called from bot.on_message)
+    # Entry point & conversational context (called from bot.on_message)
     # ------------------------------------------------------------------
 
-    def _remember_route(self, channel_id: int, route: Route) -> None:
-        """Keep the last answered follow-up-capable route per channel."""
+    def _note_turn_detail(
+        self,
+        message: discord.Message,
+        *,
+        numeric: float | None = None,
+        conversion: tuple[float, str, str] | None = None,
+        location: str = "",
+    ) -> None:
+        key = (
+            int(getattr(getattr(message, "channel", None), "id", 0) or 0),
+            int(getattr(getattr(message, "author", None), "id", 0) or 0),
+        )
+        if numeric is not None:
+            self._staged_numeric[key] = numeric
+        if conversion is not None:
+            self._staged_conversion[key] = conversion
+        if location:
+            self._staged_location[key] = location
+
+    def _remember_route(
+        self, channel_id: int, route: Route, *, user_id: int = 0
+    ) -> None:
+        """Keep recent follow-up state per (channel, user) and per channel."""
         now = time.monotonic()
+        key = (int(channel_id or 0), int(user_id or 0))
+        numeric = self._staged_numeric.pop(key, None)
+        conversion = self._staged_conversion.pop(key, None)
+        location = self._staged_location.pop(key, "")
+        if not location and route.kind in (WEATHER, TIME) and route.payload:
+            if route.payload.strip().casefold() not in (_PLACE_DEIXIS | _SELF_TIME_DEIXIS):
+                location = route.payload.strip()
+        if location == "":
+            prev = self._user_turns.get(key) or self._channel_turns.get(channel_id)
+            if prev is not None and now - prev.when <= _FOLLOWUP_WINDOW:
+                location = prev.location
+
+        turn = _TurnContext(
+            when=now,
+            route=route,
+            user_id=user_id,
+            location=location,
+            numeric=numeric,
+            conversion=conversion,
+        )
         self._last_route[channel_id] = (now, route)
-        if len(self._last_route) > 128:
+        self._channel_turns[channel_id] = turn
+        if user_id:
+            self._user_turns[key] = turn
+
+        if len(self._last_route) > 128 or len(self._user_turns) > 256:
+            cutoff = now - _FOLLOWUP_WINDOW
             self._last_route = {
-                key: value for key, value in self._last_route.items()
-                if value[0] > now - _FOLLOWUP_WINDOW
+                k: v for k, v in self._last_route.items() if v[0] > cutoff
             }
+            self._channel_turns = {
+                k: v for k, v in self._channel_turns.items() if v.when > cutoff
+            }
+            self._user_turns = {
+                k: v for k, v in self._user_turns.items() if v.when > cutoff
+            }
+
+    def _lookup_turn(self, message: discord.Message) -> _TurnContext | None:
+        """Prefer this author's recent turn in the channel, else channel last."""
+        now = time.monotonic()
+        channel_id = int(getattr(getattr(message, "channel", None), "id", 0) or 0)
+        user_id = int(getattr(getattr(message, "author", None), "id", 0) or 0)
+
+        # Honour direct _last_route inspection/overrides (e.g. expiry checks).
+        legacy = self._last_route.get(channel_id)
+        if legacy is not None:
+            leg_when, leg_route = legacy
+            ch_turn = self._channel_turns.get(channel_id)
+            if ch_turn is None or ch_turn.when != leg_when or ch_turn.route is not leg_route:
+                if now - leg_when > _FOLLOWUP_WINDOW:
+                    return None
+                return _TurnContext(when=leg_when, route=leg_route)
+
+        if user_id:
+            own = self._user_turns.get((channel_id, user_id))
+            if own is not None and now - own.when <= _FOLLOWUP_WINDOW:
+                return own
+        shared = self._channel_turns.get(channel_id)
+        if shared is not None and now - shared.when <= _FOLLOWUP_WINDOW:
+            return shared
+        return None
+
+    @staticmethod
+    def _extract_reply_context(message: discord.Message) -> _ReplyContext | None:
+        """Inspect a Discord reply reference if the caller replied to a message."""
+        ref = getattr(message, "reference", None)
+        if ref is None:
+            return None
+        target = getattr(ref, "resolved", None) or getattr(ref, "cached_message", None)
+        if target is None or isinstance(target, discord.DeletedReferencedMessage):
+            return None
+        raw_content = getattr(target, "content", None)
+        if not isinstance(raw_content, str):
+            raw_content = ""
+        text = raw_content.strip()
+        # Fall back to embed description/title when replying to a bot/link embed.
+        if not text:
+            embeds = getattr(target, "embeds", None)
+            if isinstance(embeds, (list, tuple)) and embeds:
+                first = embeds[0]
+                desc = getattr(first, "description", None)
+                title = getattr(first, "title", None)
+                parts = [p.strip() for p in (title, desc) if isinstance(p, str) and p.strip()]
+                text = "\n".join(parts)
+        author = getattr(target, "author", None)
+        author_name = ""
+        author_id = 0
+        if author is not None:
+            raw_name = getattr(author, "display_name", None) or getattr(author, "name", None)
+            if isinstance(raw_name, str):
+                author_name = raw_name.strip()
+            raw_id = getattr(author, "id", 0)
+            if isinstance(raw_id, int):
+                author_id = raw_id
+        urls = tuple(
+            cleaned
+            for m in _REPLY_URL_RE.findall(text)
+            if (cleaned := m.rstrip(".,?!;:>'\")")) and is_fetchable_url(cleaned)
+        )
+        if not text and not author_id and not urls:
+            return None
+        return _ReplyContext(
+            text=text,
+            author_name=author_name,
+            author_id=author_id,
+            author=author,
+            urls=urls,
+        )
+
+    def _hydrate_from_reply(
+        self, route: Route, raw_text: str, reply: _ReplyContext | None
+    ) -> Route:
+        """Fill missing/deictic tool inputs from the replied-to message."""
+        if reply is None:
+            return route
+        kind = route.kind
+        payload = (route.payload or "").strip()
+        lowered = payload.casefold()
+
+        if kind == TRANSLATE and (not payload or lowered in _PRONOUN_TARGET) and reply.text:
+            return Route(
+                kind=TRANSLATE,
+                payload=reply.text[:380],
+                payload2=route.payload2,
+                confidence=route.confidence,
+            )
+
+        if kind == RESEARCH and route.payload2 == "link" and not payload and reply.urls:
+            return Route(
+                kind=RESEARCH,
+                payload=reply.urls[0],
+                payload2="link",
+                confidence=route.confidence,
+            )
+
+        if kind == SUMMARIZE and reply.urls and re.search(
+            r"\b(?:this|that|it|link|article|page)\b", raw_text, re.IGNORECASE
+        ):
+            return Route(
+                kind=RESEARCH,
+                payload=reply.urls[0],
+                payload2="link",
+                confidence=0.9,
+            )
+        if kind == SUMMARIZE and len(reply.text) >= 60 and re.match(
+            r"^(?:please\s+)?(?:summar(?:ize|ise)|tl;?dr)(?:\s+(?:this|that|it))?\s*[?!.]*$",
+            raw_text.strip(),
+            re.IGNORECASE,
+        ):
+            return Route(
+                kind=WRITE,
+                payload=reply.text[:1400],
+                payload2="shorten",
+                confidence=0.9,
+            )
+
+        if kind == DEV and reply.text:
+            if not payload or lowered in _PRONOUN_TARGET:
+                return Route(
+                    kind=DEV,
+                    payload=reply.text[:1400],
+                    payload2=route.payload2,
+                    confidence=route.confidence,
+                )
+
+        if kind == WRITE and reply.text:
+            stripped = strip_deixis(payload)
+            if not stripped or stripped.casefold() in _PRONOUN_TARGET:
+                return Route(
+                    kind=WRITE,
+                    payload=reply.text[:1400],
+                    payload2=route.payload2,
+                    confidence=route.confidence,
+                )
+            # "make this more polite" / "rewrite this to be formal" on a reply:
+            # combine the style instruction with the replied-to text.
+            if route.payload2 == "rewrite" and len(stripped.split()) <= 5 and ":" not in payload:
+                return Route(
+                    kind=WRITE,
+                    payload=f"({stripped}): {reply.text[:1300]}",
+                    payload2="rewrite",
+                    confidence=route.confidence,
+                )
+
+        if kind == UTILITY and reply.text:
+            json_mode_only = route.payload2 == "json" and lowered in (
+                "format", "validate", "check", "verify", "prettify",
+                "pretty print", "pretty-print", "beautify", "fix",
+            )
+            if json_mode_only:
+                return Route(
+                    kind=UTILITY,
+                    payload=f"{lowered} {reply.text[:1200]}",
+                    payload2="json",
+                    confidence=route.confidence,
+                )
+            if (not payload or lowered in _PRONOUN_TARGET) and route.payload2 in (
+                "json", "sort", "dedupe", "count", "base64", "url", "hash",
+                "rot13", "reverse", "case", "mock", "aesthetic", "qr",
+            ):
+                return Route(
+                    kind=UTILITY,
+                    payload=reply.text[:1200],
+                    payload2=route.payload2,
+                    confidence=route.confidence,
+                )
+
+        if kind == DEFINE and lowered in _PRONOUN_TARGET and reply.text:
+            word = reply.text.strip().strip("\"'.,?!")
+            if 1 <= len(word.split()) <= 3 and len(word) <= 40:
+                return Route(kind=DEFINE, payload=word, confidence=route.confidence)
+
+        if kind == CALCULATE and not extract_expression(payload) and reply.text:
+            expr = extract_expression(reply.text)
+            if expr:
+                return Route(kind=CALCULATE, payload=expr, confidence=route.confidence)
+
+        return route
+
+    def _build_convert_followup(
+        self, turn: _TurnContext, rest: str
+    ) -> Route | None:
+        """Resolve 'in EUR', 'what about 250', or '50 EUR to JPY' after CONVERT."""
+        # Full standalone conversion always wins directly.
+        try:
+            parse_conversion_query(rest)
+            return Route(kind=CONVERT, payload=rest, confidence=0.85)
+        except (ParadiseError, ValueError):
+            pass
+
+        conv = turn.conversion
+        if conv is None:
+            try:
+                conv = parse_conversion_query(turn.route.payload)
+            except (ParadiseError, ValueError):
+                return None
+        prev_val, prev_from, prev_to = conv
+        token = rest.strip(" ?!.")
+
+        # New amount with same units ("what about 250" / "and 1,500?").
+        num_candidate = token.replace(",", "")
+        if re.fullmatch(r"[-+]?\d+(?:\.\d+)?", num_candidate):
+            return Route(
+                kind=CONVERT,
+                payload=f"{num_candidate} {prev_from} to {prev_to}",
+                confidence=0.85,
+            )
+
+        # New target unit/currency ("what about EUR" / "in miles" / "to fahrenheit").
+        unit_clean = re.sub(r"^(?:in|to|into|as)\s+", "", token, flags=re.IGNORECASE).strip()
+        if (
+            resolve_unit(unit_clean)
+            or resolve_currency(unit_clean)
+            or unit_clean.lower().strip("°º∘") in TEMP_UNITS
+        ):
+            return Route(
+                kind=CONVERT,
+                payload=f"{_format_number_token(prev_val)} {prev_from} to {unit_clean}",
+                confidence=0.85,
+            )
+        return None
 
     def _apply_followup(
         self, message: discord.Message, routes: list[Route], text: str
     ) -> list[Route]:
-        """Turn 'what about <x>' into a repeat of the last tool ask."""
-        if routes and routes[0].kind not in (AI, UNKNOWN):
-            return routes  # something concrete claimed it — leave it alone
-        match = _FOLLOWUP_SHAPE.match(" ".join(str(text or "").split()))
+        """Resolve conversational follow-ups, pronoun locations & math chains."""
+        cleaned = " ".join(str(text or "").split()).strip()
+        turn = self._lookup_turn(message)
+        if turn is None:
+            return routes
+
+        # 1. Cross-tool location deixis: "what time is it there?" / "weather there"
+        if len(routes) == 1 and routes[0].kind in (WEATHER, TIME) and turn.location:
+            if routes[0].payload.strip().casefold() in _PLACE_DEIXIS:
+                return [
+                    Route(
+                        kind=routes[0].kind,
+                        payload=turn.location,
+                        confidence=0.9,
+                    )
+                ]
+
+        # 2. Numeric chaining after CALCULATE or CONVERT: "+ 50", "* 1.18", "ans / 2"
+        if turn.numeric is not None and len(routes) == 1:
+            num_str = _format_number_token(turn.numeric)
+            chain = _MATH_CHAIN_OP.match(cleaned)
+            if chain is not None:
+                op_map = {
+                    "plus": "+", "minus": "-", "times": "*",
+                    "multiplied by": "*", "divided by": "/",
+                }
+                raw_op = " ".join(chain.group("op").lower().split())
+                op = op_map.get(raw_op, raw_op)
+                rhs = chain.group("rhs").replace(",", "")
+                return [Route(kind=CALCULATE, payload=f"{num_str} {op} {rhs}", confidence=0.9)]
+            if _MATH_ANS_TOKEN.search(cleaned) and any(
+                sym in cleaned for sym in ("+", "-", "*", "/", "%", "^")
+            ):
+                substituted = _MATH_ANS_TOKEN.sub(num_str, cleaned)
+                expr = extract_expression(substituted)
+                if expr:
+                    return [Route(kind=CALCULATE, payload=expr, confidence=0.9)]
+
+        # 3. "reverse" / "the other way" after a conversion.
+        if (
+            turn.route.kind == CONVERT
+            and _REVERSE_FOLLOWUP.match(cleaned)
+            and routes
+            and routes[0].kind in (AI, UNKNOWN, SEARCH)
+        ):
+            conv = turn.conversion
+            if conv is None:
+                try:
+                    conv = parse_conversion_query(turn.route.payload)
+                except (ParadiseError, ValueError):
+                    conv = None
+            if conv is not None:
+                val, from_u, to_u = conv
+                return [
+                    Route(
+                        kind=CONVERT,
+                        payload=f"{_format_number_token(val)} {to_u} to {from_u}",
+                        confidence=0.88,
+                    )
+                ]
+
+        # 4. Concrete tool asks are never overwritten by generic follow-up glue;
+        # however "what about Tokyo?" gets a weak 0.6 factual-question route due
+        # to the trailing "?", which IS a follow-up when a recent turn exists.
+        is_what_about = cleaned.casefold().startswith(("what about ", "how about "))
+        if routes and not (
+            routes[0].kind in (AI, UNKNOWN)
+            or (is_what_about and routes[0].kind in (RESEARCH, SEARCH) and routes[0].confidence <= 0.65)
+        ):
+            return routes
+
+        match = _FOLLOWUP_SHAPE.match(cleaned)
         if match is None:
-            return routes
-        entry = self._last_route.get(getattr(message.channel, "id", 0))
-        if entry is None:
-            return routes
-        when, previous = entry
-        if time.monotonic() - when > _FOLLOWUP_WINDOW:
             return routes
         rest = (
             match.group("rest") or match.group("rest2") or match.group("rest3") or ""
-        ).strip()
+        ).strip(" ?!.")
         if not rest:
             return routes
-        # Keep the whole shape (mode flags, freshness) of the original ask,
-        # but swap in the new subject.
+
+        previous = turn.route
+        if previous.kind == CONVERT:
+            built = self._build_convert_followup(turn, rest)
+            if built is not None:
+                log.info("Assistant convert follow-up: %s", built.payload)
+                return [built]
+            return routes
+
+        if previous.kind == TRANSLATE:
+            # "in French" / "what about Spanish" swaps the TARGET language while
+            # keeping the original phrase; a non-language phrase translates into
+            # the same target language.
+            if resolve_language(rest) and previous.payload:
+                followup = Route(
+                    kind=TRANSLATE,
+                    payload=previous.payload,
+                    payload2=rest,
+                    confidence=0.85,
+                )
+            else:
+                followup = Route(
+                    kind=TRANSLATE,
+                    payload=rest,
+                    payload2=previous.payload2,
+                    confidence=0.8,
+                )
+            log.info("Assistant translate follow-up → %s", followup.payload2)
+            return [followup]
+
+        if previous.kind == RECIPE:
+            merged = f"{previous.payload}, {rest}" if previous.payload else rest
+            return [
+                Route(
+                    kind=RECIPE,
+                    payload=merged,
+                    payload2=previous.payload2,
+                    confidence=0.82,
+                )
+            ]
+
+        if previous.kind == CALCULATE:
+            expr = extract_expression(rest)
+            if not expr:
+                return routes
+            return [Route(kind=CALCULATE, payload=expr, confidence=0.82)]
+
         followup = Route(
             kind=previous.kind,
             payload=rest,
@@ -239,21 +696,47 @@ class Assistant(commands.Cog):
         if not self._cooled(message):
             return True  # addressed correctly but rate-limited: stay quiet
 
-        # A bare "what about <x>" that nothing claims continues the previous
-        # time/weather/convert/translate/research ask in this channel.
+        # A bare "what about <x>", "+ 50", "reverse", or "weather there"
+        # continues the asker's (or channel's) recent tool turn.
         routes = self._apply_followup(message, routes, text)
+
+        reply_ctx = self._extract_reply_context(message)
 
         try:
             if len(routes) > 1:
-                return await self._dispatch_many(message, routes)
-            route = await self._refine(routes[0], text)
+                hydrated = [self._hydrate_from_reply(r, text, reply_ctx) for r in routes]
+                handled = await self._dispatch_many(message, hydrated)
+                if handled:
+                    for item in hydrated:
+                        if item.kind in _FOLLOWUP_KINDS:
+                            self._remember_route(
+                                message.channel.id,
+                                item,
+                                user_id=int(getattr(message.author, "id", 0) or 0),
+                            )
+                return handled
+            route = self._hydrate_from_reply(routes[0], text, reply_ctx)
+            route = await self._refine(route, text, reply=reply_ctx)
+            route = self._hydrate_from_reply(route, text, reply_ctx)
             # Observability: the tool chosen and how long it took — never
             # the message content, the user, or any credential.
             log.info("Assistant → %s (confidence %.2f)", route.kind, route.confidence)
             started = time.monotonic()
-            handled = await self._dispatch(message, route, text)
+            handled = await self._dispatch(message, route, text, reply=reply_ctx)
+            turn_key = (
+                int(getattr(message.channel, "id", 0) or 0),
+                int(getattr(message.author, "id", 0) or 0),
+            )
             if handled and route.kind in _FOLLOWUP_KINDS:
-                self._remember_route(message.channel.id, route)
+                self._remember_route(
+                    message.channel.id,
+                    route,
+                    user_id=turn_key[1],
+                )
+            else:
+                self._staged_numeric.pop(turn_key, None)
+                self._staged_conversion.pop(turn_key, None)
+                self._staged_location.pop(turn_key, None)
             log.info(
                 "Assistant %s %s in %.2fs",
                 route.kind,
@@ -275,15 +758,24 @@ class Assistant(commands.Cog):
     # Stage 2: one tiny AI label, only when stage 1 was unsure
     # ------------------------------------------------------------------
 
-    async def _refine(self, route: Route, text: str) -> Route:
-        """Upgrade a low-confidence route with a compact AI classification."""
+    async def _refine(
+        self, route: Route, text: str, *, reply: _ReplyContext | None = None
+    ) -> Route:
+        """Upgrade a low-confidence route with a compact validated AI label."""
         if not should_classify(route):
             return route
-        guess = await classify_request(text, getattr(self.bot, "ai", None))
+        context_hint = reply.text[:140] if (reply and reply.text) else ""
+        guess = (
+            await classify_request(
+                text, getattr(self.bot, "ai", None), context=context_hint
+            )
+            if context_hint
+            else await classify_request(text, getattr(self.bot, "ai", None))
+        )
         if guess is None:
             return route
-        refined = guess.to_route(route)
-        if refined.kind == route.kind:
+        refined = validate_refined_route(guess.to_route(route), route)
+        if refined.kind == route.kind and refined.payload == route.payload:
             return route
         log.info("Intent refined by classifier: %s → %s", route.kind, refined.kind)
         return refined
@@ -292,7 +784,14 @@ class Assistant(commands.Cog):
     # Dispatch
     # ------------------------------------------------------------------
 
-    async def _dispatch(self, message: discord.Message, route: Route, text: str) -> bool:
+    async def _dispatch(
+        self,
+        message: discord.Message,
+        route: Route,
+        text: str,
+        *,
+        reply: _ReplyContext | None = None,
+    ) -> bool:
         kind = route.kind
 
         if kind == HELP:
@@ -312,7 +811,7 @@ class Assistant(commands.Cog):
         if kind == CHOOSE:
             return await self._choose(message, route)
         if kind == ROAST:
-            return await self._roast(message, route)
+            return await self._roast(message, route, reply=reply)
         if kind == CALCULATE:
             return await self._calculate(message, route)
         if kind == DEFINE:
@@ -329,8 +828,10 @@ class Assistant(commands.Cog):
             return await self._date(message)
         if kind == TRANSLATE:
             return await self._translate(message, route)
+        if kind == RECIPE:
+            return await self._recipe(message, route)
         if kind == SUMMARIZE:
-            return await self._summarize(message)
+            return await self._summarize(message, route)
         if kind == MEME:
             return await self._meme(message, route)
         if kind == GIF:
@@ -342,7 +843,7 @@ class Assistant(commands.Cog):
         if kind == POLL:
             return await self._poll(message, route)
         if kind == INFO:
-            return await self._info(message, route)
+            return await self._info(message, route, reply=reply)
         if kind == RESEARCH:
             return await self._research(message, route)
         if kind == WRITE:
@@ -350,24 +851,27 @@ class Assistant(commands.Cog):
         if kind == DEV:
             return await self._dev(message, route)
         if kind == BUILD:
-            return await self._build(message, route)
+            return await self._build(message, route, text)
         if kind == SEARCH:
             return await self._search(message, route)
         if kind in (AI, UNKNOWN):
-            # AI is the language/reasoning layer, not an agent loop. Search
-            # requests land in _search above, which forwards them to the
-            # same provider chain — there is no web retrieval either way.
             return await self._ai(message, text)
         return await self._ai(message, text)
 
-    async def _roast(self, message: discord.Message, route: Route) -> bool:
+    async def _roast(
+        self,
+        message: discord.Message,
+        route: Route,
+        *,
+        reply: _ReplyContext | None = None,
+    ) -> bool:
         """``@Paradise roast <someone>`` — a jab aimed at the right person,
         about what they actually just said when Paradise knows it."""
-        target = self._roast_target(message, route.payload or "")
+        target = self._roast_target(message, route.payload or "", reply=reply)
         engine = getattr(self.bot, "personality", None)
         intensity = sanitize_intensity(getattr(engine, "roast_intensity", "spicy"))
         recent = getattr(engine, "_recent_roasts", None)
-        context = self._target_last_words(message, target)
+        context = getattr(target, "reply_quote", "") or self._target_last_words(message, target)
         line = await self._tease_with_ai(message, target, context)
         if line is None:
             if context:
@@ -433,8 +937,13 @@ class Assistant(commands.Cog):
         return text or None
 
     @staticmethod
-    def _roast_target(message: discord.Message, payload: str):
-        """Who the roast is for: a mentioned member, the asker, or a plain name."""
+    def _roast_target(
+        message: discord.Message,
+        payload: str,
+        *,
+        reply: _ReplyContext | None = None,
+    ):
+        """Who the roast is for: a mentioned member, reply author, asker, or plain name."""
         text = (payload or "").strip()
         mention = re.search(r"<@!?(\d+)>", text)
         if mention is not None and message.guild is not None:
@@ -449,8 +958,16 @@ class Assistant(commands.Cog):
                     name=clean_name(name, fallback="them"),
                     self_roast=False,
                     id=int(getattr(member, "id", 0) or 0),
+                    reply_quote="",
                 )
         lowered = text.lower()
+        if reply is not None and lowered in _PRONOUN_TARGET and reply.author_name:
+            return SimpleNamespace(
+                name=clean_name(reply.author_name, fallback="them"),
+                self_roast=(reply.author_id == int(getattr(message.author, "id", 0) or 0)),
+                id=reply.author_id,
+                reply_quote=reply.text[:220],
+            )
         if not text or lowered == "me" or lowered.startswith("me ") or lowered == "myself":
             name = (
                 getattr(message.author, "display_name", None)
@@ -461,9 +978,13 @@ class Assistant(commands.Cog):
                 name=clean_name(name, fallback="you"),
                 self_roast=True,
                 id=int(getattr(message.author, "id", 0) or 0),
+                reply_quote="",
             )
         return SimpleNamespace(
-            name=clean_name(text, fallback="them"), self_roast=False, id=0
+            name=clean_name(text, fallback="them"),
+            self_roast=False,
+            id=0,
+            reply_quote="",
         )
 
     # ------------------------------------------------------------------
@@ -481,11 +1002,15 @@ class Assistant(commands.Cog):
         # send their own message (a reminder, a poll, an info card) are
         # dispatched in full; everything else is compacted into one reply.
         asker = getattr(message.author, "display_name", None) or "someone"
+        asker_id = int(getattr(message.author, "id", 0) or 0)
         own_kinds = (REMIND, POLL, INFO)
         compact_routes = [route for route in routes if route.kind not in own_kinds]
         own_routes = [route for route in routes if route.kind in own_kinds]
         outcomes = await asyncio.gather(
-            *(self._compact(route, asker=asker) for route in compact_routes),
+            *(
+                self._compact(route, asker=asker, asker_id=asker_id, guild=message.guild)
+                for route in compact_routes
+            ),
             *(self._dispatch(message, route, "") for route in own_routes),
             return_exceptions=True,
         )
@@ -525,8 +1050,27 @@ class Assistant(commands.Cog):
         await self._quiet_reply(message, "\n".join(lines), **extras)
         return True
 
+    def _user_timezone(self, user_id: int) -> str | None:
+        utility = self.bot.get_cog("Utility")
+        if utility is None or not user_id:
+            return None
+        db = getattr(utility, "db", None)
+        getter = getattr(db, "get_user_timezone", None)
+        if not callable(getter):
+            return None
+        try:
+            tz_name = getter(int(user_id))
+        except Exception:  # noqa: BLE001
+            return None
+        return str(tz_name).strip() if isinstance(tz_name, str) and tz_name.strip() else None
+
     async def _compact(
-        self, route: Route, *, asker: str = "someone"
+        self,
+        route: Route,
+        *,
+        asker: str = "someone",
+        asker_id: int = 0,
+        guild: discord.Guild | None = None,
     ) -> tuple[str, list[discord.Embed]]:
         """One short, combinable answer for a single route. Never raises."""
         kind = route.kind
@@ -540,12 +1084,22 @@ class Assistant(commands.Cog):
             if kind == WEATHER:
                 return await self._compact_weather(route)
             if kind == TIME:
-                return self._compact_time(route), []
+                return self._compact_time(route, asker=asker, asker_id=asker_id, guild=guild), []
             if kind == DATE:
-                now = datetime.now(ZoneInfo("UTC"))
-                return f"📅 today is **{now.strftime('%A, %d %B %Y')}** (UTC)", []
+                tz_name = self._user_timezone(asker_id)
+                try:
+                    zone = ZoneInfo(tz_name) if tz_name else ZoneInfo("UTC")
+                except (ZoneInfoNotFoundError, KeyError, ValueError):
+                    tz_name, zone = None, ZoneInfo("UTC")
+                now = datetime.now(zone)
+                return (
+                    f"📅 today is **{now.strftime('%A, %d %B %Y')}** ({tz_name or 'UTC'})",
+                    [],
+                )
             if kind == TRANSLATE:
                 return await self._compact_translate(route)
+            if kind == RECIPE:
+                return self._compact_recipe(route), []
             if kind in (MEME, GIF):
                 return await self._compact_media(route)
             if kind == UTILITY:
@@ -647,15 +1201,57 @@ class Assistant(commands.Cog):
             [],
         )
 
-    def _compact_time(self, route: Route) -> str:
-        tz_name = resolve_timezone(route.payload) if route.payload else "UTC"
+    def _compact_time(
+        self,
+        route: Route,
+        *,
+        asker: str = "someone",
+        asker_id: int = 0,
+        guild: discord.Guild | None = None,
+    ) -> str:
+        raw = (route.payload or "").strip()
+        if not raw or raw.casefold() in _SELF_TIME_DEIXIS:
+            saved = self._user_timezone(asker_id)
+            tz_name = saved or "UTC"
+            label = asker if saved else "UTC"
+        else:
+            mention_match = re.fullmatch(r"<@!?(\d+)>", raw)
+            if mention_match is not None:
+                target_id = int(mention_match.group(1))
+                saved = self._user_timezone(target_id)
+                member = guild.get_member(target_id) if guild is not None else None
+                who = getattr(member, "display_name", None) or "that member"
+                if not saved:
+                    return f"🕒 **{who}** hasn't set a timezone yet (`/settimezone`)."
+                tz_name, label = saved, who
+            else:
+                tz_name = resolve_timezone(raw)
+                label = raw.title()
         if tz_name is None:
-            return f"🕒 I don't recognize the place **{shorten(route.payload, 40)}**."
-        info = get_current_time_for_zone(tz_name, label=route.payload.title() or "UTC")
+            return f"🕒 I don't recognize the place **{shorten(raw, 40)}**."
+        info = get_current_time_for_zone(tz_name, label=label or "UTC")
         return (
             f"🕒 **{info.location_or_target}** — {info.formatted_12h} "
             f"({info.abbreviation})"
         )
+
+    def _compact_recipe(self, route: Route) -> str:
+        items = normalize_input(route.payload)
+        if not items:
+            return "🍳 tell me what ingredients you have."
+        filters = self._parse_recipe_filters(route.payload2)
+        matches = rank_recipes(items, filters=filters, limit=3)
+        if not matches:
+            matches = near_misses(items, filters=filters, limit=2)
+        if not matches:
+            return f"🍳 no recipe match for **{shorten(route.payload, 50)}**."
+        picks = ", ".join(
+            f"**{m.recipe.name}** ({m.recipe.time_minutes}m)"
+            if m.recipe.time_minutes
+            else f"**{m.recipe.name}**"
+            for m in matches[:3]
+        )
+        return f"🍳 {picks}"
 
     async def _compact_translate(self, route: Route) -> tuple[str, list[discord.Embed]]:
         target = resolve_language(route.payload2)
@@ -733,13 +1329,18 @@ class Assistant(commands.Cog):
     async def _command_help(self, message: discord.Message, route: Route) -> bool:
         name = route.payload.casefold().lstrip("/")
         if name in RETIRED_COMMANDS:
-            # The capability still exists — only the command is gone.
-            example = _RETIRED_EXAMPLES.get(name, f"@Paradise {name} …")
-            await self._quiet_reply(
-                message,
-                f"`/{name}` isn't a command any more — just ask me directly: "
-                f"*{example}*",
-            )
+            example = _RETIRED_EXAMPLES.get(name)
+            if example:
+                await self._quiet_reply(
+                    message,
+                    f"`/{name}` isn't a command any more — just ask me directly: "
+                    f"*{example}*",
+                )
+            else:
+                await self._quiet_reply(
+                    message,
+                    f"`/{name}` has been removed. try `/help` to see what's available.",
+                )
             return True
         blurb = HELP_BLURBS.get(name)
         if blurb is None:
@@ -785,6 +1386,9 @@ class Assistant(commands.Cog):
         except ParadiseError as error:
             await self._quiet_reply(message, f"🧮 {error}")
             return True
+        num_val = getattr(result, "result", None)
+        if isinstance(num_val, (int, float)):
+            self._note_turn_detail(message, numeric=float(num_val))
         await self._quiet_reply(message, f"🧮 {result.display}")
         return True
 
@@ -796,10 +1400,12 @@ class Assistant(commands.Cog):
             return await self._search(message, route)
         try:
             term = cog.feature.service.validate(route.payload)
-            result = await cog.feature.lookup(term)
+            result = await asyncio.wait_for(
+                cog.feature.lookup(term), timeout=_TOOL_TIMEOUT
+            )
         except ParadiseError:
             result = None
-        except Exception:  # noqa: BLE001 - fall through to web search
+        except Exception:  # noqa: BLE001 - fall through to AI search
             log.debug("Dictionary pre-lookup failed", exc_info=True)
             result = None
 
@@ -835,10 +1441,24 @@ class Assistant(commands.Cog):
                 f"(e.g. *{route.payload} USD to INR*).",
             )
             return True
+        parsed_tuple: tuple[float, str, str] | None = None
         try:
-            outcome = await utility.conversion_engine.convert_query(route.payload)
+            parsed_tuple = parse_conversion_query(route.payload)
+        except (ParadiseError, ValueError):
+            parsed_tuple = None
+        try:
+            outcome = await asyncio.wait_for(
+                utility.conversion_engine.convert_query(route.payload),
+                timeout=_TOOL_TIMEOUT,
+            )
         except ParadiseError as error:
             await self._quiet_reply(message, str(error))
+            return True
+        except asyncio.TimeoutError:
+            await self._quiet_reply(
+                message,
+                "the conversion service timed out — try again in a moment.",
+            )
             return True
         except Exception:  # noqa: BLE001
             log.warning("Mention conversion failed", exc_info=True)
@@ -846,6 +1466,12 @@ class Assistant(commands.Cog):
             return True
         from functions.conversion import build_conversion_embed  # local import fine
 
+        to_val = getattr(outcome, "to_value", None)
+        self._note_turn_detail(
+            message,
+            numeric=float(to_val) if isinstance(to_val, (int, float)) else None,
+            conversion=parsed_tuple,
+        )
         await self._quiet_reply(message, embed=build_conversion_embed(outcome))
         return True
 
@@ -860,8 +1486,10 @@ class Assistant(commands.Cog):
 
         response = await self._find_images(subject, route.count)
         if response is None or not response.has_results:
-            # No usable picture: say so once, then answer the question the
-            # only other way we can — by asking the AI about the subject.
+            ai = getattr(self.bot, "ai", None)
+            if ai is None or not getattr(ai, "available", False):
+                await self._quiet_reply(message, NO_IMAGE_LINE)
+                return True
             await self._quiet_reply(
                 message,
                 f"{NO_IMAGE_LINE} asking the AI about **{shorten(subject, 60)}** instead…",
@@ -892,13 +1520,19 @@ class Assistant(commands.Cog):
         utility = self.bot.get_cog("Utility")
         if utility is None:
             return False
-        if not route.payload:
+        city = (route.payload or "").strip()
+        if not city:
+            city = _city_from_iana(self._user_timezone(message.author.id))
+        if not city:
             await self._quiet_reply(
                 message, "which city? e.g. *weather in Delhi* or *weather Tokyo*."
             )
             return True
         try:
-            data = await utility.weather_service.get_weather(route.payload)
+            data = await asyncio.wait_for(
+                utility.weather_service.get_weather(city),
+                timeout=_TOOL_TIMEOUT,
+            )
         except ParadiseError as error:
             await self._quiet_reply(message, str(error))
             return True
@@ -908,6 +1542,8 @@ class Assistant(commands.Cog):
                 message, "the weather service is unavailable right now. try again in a bit."
             )
             return True
+        resolved_name = getattr(getattr(data, "location", None), "name", "") or city
+        self._note_turn_detail(message, location=str(resolved_name))
         try:
             image = await asyncio.to_thread(render_weather_card, data)
             await message.reply(
@@ -923,31 +1559,53 @@ class Assistant(commands.Cog):
     # -- time & date ---------------------------------------------------------------
 
     async def _time(self, message: discord.Message, route: Route) -> bool:
-        utility = self.bot.get_cog("Utility")
-
         tz_name: str | None = None
         label = ""
-        if not route.payload:
-            # No place named → the caller's configured timezone, if any.
-            if utility is not None:
-                tz_name = utility.db.get_user_timezone(message.author.id)
-                label = message.author.display_name
+        raw = (route.payload or "").strip()
+        if not raw or raw.casefold() in _SELF_TIME_DEIXIS:
+            tz_name = self._user_timezone(message.author.id)
+            label = getattr(message.author, "display_name", None) or "Local"
             if tz_name is None:
                 info = get_current_time_for_zone("UTC", label="UTC")
-                await self._quiet_reply(
-                    message, embed=build_time_embed(info),
-                )
+                await self._quiet_reply(message, embed=build_time_embed(info))
                 return True
         else:
-            tz_name = resolve_timezone(route.payload)
-            if tz_name is None:
-                await self._quiet_reply(
-                    message,
-                    f"I don't recognize the place **{shorten(route.payload, 40)}** for time — "
-                    "try a major city like `Tokyo`, `London`, `New York`, or an IANA zone.",
+            mention_match = re.search(r"<@!?(\d+)>", raw)
+            if mention_match is not None:
+                target_id = int(mention_match.group(1))
+                member = (
+                    message.guild.get_member(target_id)
+                    if message.guild is not None
+                    else None
                 )
-                return True
-            label = route.payload.title()
+                who = (
+                    getattr(member, "display_name", None)
+                    or getattr(member, "name", None)
+                    or "that member"
+                )
+                tz_name = self._user_timezone(target_id)
+                if tz_name is None:
+                    await self._quiet_reply(
+                        message,
+                        f"**{discord.utils.escape_markdown(who)}** hasn't saved a timezone yet — "
+                        "they can set one with `/settimezone`.",
+                    )
+                    return True
+                label = who
+                city_hint = _city_from_iana(tz_name)
+                if city_hint:
+                    self._note_turn_detail(message, location=city_hint)
+            else:
+                tz_name = resolve_timezone(raw)
+                if tz_name is None:
+                    await self._quiet_reply(
+                        message,
+                        f"I don't recognize the place **{shorten(raw, 40)}** for time — "
+                        "try a major city like `Tokyo`, `London`, `New York`, or an IANA zone.",
+                    )
+                    return True
+                label = raw.title()
+                self._note_turn_detail(message, location=raw)
         try:
             info = get_current_time_for_zone(tz_name, label=label)
         except ParadiseError as error:
@@ -957,11 +1615,11 @@ class Assistant(commands.Cog):
         return True
 
     async def _date(self, message: discord.Message) -> bool:
-        utility = self.bot.get_cog("Utility")
-        tz_name = (
-            utility.db.get_user_timezone(message.author.id) if utility is not None else None
-        )
-        zone = ZoneInfo(tz_name) if tz_name else ZoneInfo("UTC")
+        tz_name = self._user_timezone(message.author.id)
+        try:
+            zone = ZoneInfo(tz_name) if tz_name else ZoneInfo("UTC")
+        except (ZoneInfoNotFoundError, KeyError, ValueError):
+            tz_name, zone = None, ZoneInfo("UTC")
         now = datetime.now(zone)
         await self._quiet_reply(
             message,
@@ -970,9 +1628,17 @@ class Assistant(commands.Cog):
         )
         return True
 
-    # -- translate ---------------------------------------------------------------
+    # -- translate & recipe --------------------------------------------------------
 
     async def _translate(self, message: discord.Message, route: Route) -> bool:
+        text = (route.payload or "").strip()
+        if not text:
+            await self._quiet_reply(
+                message,
+                "what should I translate? reply to a message with "
+                "`@Paradise translate to Hindi` or say `@Paradise translate hello into Japanese`.",
+            )
+            return True
         target = resolve_language(route.payload2)
         if target is None:
             await self._quiet_reply(
@@ -982,17 +1648,104 @@ class Assistant(commands.Cog):
             )
             return True
         try:
-            result = await translate_text(route.payload, target)
+            result = await asyncio.wait_for(
+                translate_text(text, target), timeout=15.0
+            )
         except Exception:  # noqa: BLE001 - translation is a native best-effort tool
             log.warning("Mention translation failed", exc_info=True)
             result = None
         if result is None:
-            await self._quiet_reply(message, "the translation service isn't responding right now.")
+            ai = getattr(self.bot, "ai", None)
+            if ai is not None and getattr(ai, "available", False):
+                return await self._answer_with_ai(
+                    message,
+                    f"Translate into {route.payload2} (reply with only the translation): {text}",
+                )
+            await self._quiet_reply(
+                message, "the translation service isn't responding right now."
+            )
             return True
         await self._quiet_reply(
             message,
             f"> {shorten(result.text, 900)}\n\n-# {result.source} → {target} · Google Translate",
         )
+        return True
+
+    @staticmethod
+    def _parse_recipe_filters(meta: str) -> RecipeFilters:
+        diet_part, _, mins_part = str(meta or "").partition("|")
+        diet = diet_part.strip() or None
+        max_time = int(mins_part) if mins_part.strip().isdigit() else None
+        return RecipeFilters(diet=diet, max_time=max_time)
+
+    async def _recipe(self, message: discord.Message, route: Route) -> bool:
+        """Offline recipe matching from the bundled recipe book (zero API keys)."""
+        ingredients = normalize_input(route.payload)
+        if not ingredients:
+            await self._quiet_reply(
+                message,
+                "tell me what's in your kitchen — e.g. `@Paradise recipe with eggs, onion, bread`.",
+            )
+            return True
+        filters = self._parse_recipe_filters(route.payload2)
+        matches = rank_recipes(ingredients, filters=filters, limit=3)
+        approx = False
+        if not matches:
+            matches = near_misses(ingredients, filters=filters, limit=3)
+            approx = True
+        if not matches and (filters.diet or filters.max_time):
+            matches = rank_recipes(ingredients, filters=RecipeFilters(), limit=3)
+            approx = True
+        if not matches:
+            await self._quiet_reply(
+                message,
+                f"couldn't match a recipe with **{shorten(', '.join(prettify(i) for i in ingredients), 80)}** — "
+                "try adding a base like `rice`, `bread`, `eggs`, `pasta`, or `paneer`.",
+            )
+            return True
+
+        top = matches[0]
+        recipe = top.recipe
+        subtitle = "Closest match from what you have:" if approx else "Best match from your kitchen:"
+        meta_bits = []
+        if recipe.time_minutes:
+            meta_bits.append(f"⏱ {recipe.time_minutes} min")
+        if recipe.difficulty:
+            meta_bits.append(f"📊 {recipe.difficulty}")
+        if recipe.cuisine:
+            meta_bits.append(recipe.cuisine.title())
+
+        desc_lines = [subtitle]
+        if meta_bits:
+            desc_lines.append(" · ".join(meta_bits))
+        if top.have:
+            desc_lines.append(
+                "**Have:** " + ", ".join(prettify(i) for i in top.have[:8])
+            )
+        if top.missing:
+            missing_bits = []
+            for item in top.missing[:5]:
+                sub = suggest_substitution(item)
+                missing_bits.append(
+                    f"{prettify(item)} *(or {prettify(sub)})*" if sub else prettify(item)
+                )
+            desc_lines.append("**Need:** " + ", ".join(missing_bits))
+        if recipe.instructions:
+            steps_preview = "\n".join(
+                f"{idx}. {shorten(step, 140)}"
+                for idx, step in enumerate(recipe.instructions[:4], 1)
+            )
+            desc_lines.append(f"\n**Steps**\n{steps_preview}")
+        if len(matches) > 1:
+            alts = ", ".join(m.recipe.name for m in matches[1:3])
+            desc_lines.append(f"\n-# Also possible: {alts} · use `/recipe` for interactive steps")
+
+        embed = discord.Embed(
+            title=f"🍳 {recipe.name}",
+            description="\n".join(desc_lines)[:4000],
+            colour=Colour.ACCENT,
+        )
+        await self._quiet_reply(message, embed=embed)
         return True
 
     # -- search (forwarded straight to the AI) --------------------------------------------
@@ -1099,7 +1852,13 @@ class Assistant(commands.Cog):
             await self._quiet_reply(message, "the poll fell over. permissions, probably.")
         return True
 
-    async def _info(self, message: discord.Message, route: Route) -> bool:
+    async def _info(
+        self,
+        message: discord.Message,
+        route: Route,
+        *,
+        reply: _ReplyContext | None = None,
+    ) -> bool:
         """Discord-native info: whois, avatar, server card. No API calls."""
         tool = route.payload2 or "whois"
         if tool == "find":
@@ -1128,7 +1887,7 @@ class Assistant(commands.Cog):
             await self._quiet_reply(message, embed=embed)
             return True
 
-        member = await self._resolve_member(message, route)
+        member = await self._resolve_member(message, route, reply=reply)
         if member is None:
             await self._quiet_reply(message, "who? mention them — `who is @someone`.")
             return True
@@ -1167,10 +1926,14 @@ class Assistant(commands.Cog):
         await self._quiet_reply(message, embed=embed)
         return True
 
-    async def _resolve_member(self, message: discord.Message, route: Route):
-        """The member an info route points at (mention), else the asker."""
-        import re as _re
-
+    async def _resolve_member(
+        self,
+        message: discord.Message,
+        route: Route,
+        *,
+        reply: _ReplyContext | None = None,
+    ):
+        """The member an info route points at (mention, reply author, or asker)."""
         target = None
         for mention in getattr(message, "mentions", []) or []:
             if getattr(mention, "bot", False):
@@ -1178,7 +1941,7 @@ class Assistant(commands.Cog):
             target = mention
             break
         if target is None:
-            match = _re.search(r"<@!?(\d+)>", route.payload or "")
+            match = re.search(r"<@!?(\d+)>", route.payload or "")
             if match and message.guild is not None:
                 try:
                     target = message.guild.get_member(int(match.group(1))) or (
@@ -1186,14 +1949,21 @@ class Assistant(commands.Cog):
                     )
                 except (discord.DiscordException, ValueError):
                     target = None
+        if (
+            target is None
+            and reply is not None
+            and reply.author is not None
+            and not getattr(reply.author, "bot", False)
+            and (route.payload or "").strip().casefold() not in ("me", "mine", "myself")
+        ):
+            target = reply.author
         return target or getattr(message, "author", None)
 
     async def _research(self, message: discord.Message, route: Route) -> bool:
         """Web research: real sources, real links, honest failure.
 
-        Every failure mode falls back to a plain model answer — the bot
-        never refuses a genuine question just because the web side is
-        having a bad day.
+        Reuses its own thinking placeholder on model fallback so a failed
+        web lookup never leaves a stale progress bubble in the channel.
         """
         subject = (route.payload or "").strip()
         if not subject:
@@ -1206,13 +1976,17 @@ class Assistant(commands.Cog):
         ai = self.bot.ai
         asker = getattr(message.author, "display_name", None) or "someone"
         budget = service.timeout * (2 + max(0, service.fetch_pages)) + _AI_TIMEOUT
+        placeholder = None
         try:
             if mode == "link":
                 placeholder = await self._thinking_placeholder(
                     message, "🔗 reading that page…"
                 )
+                page_kwargs: dict = {"asker": asker}
+                if isinstance(service, ResearchService):
+                    page_kwargs["asker_id"] = int(getattr(message.author, "id", 0) or 0)
                 summary = await asyncio.wait_for(
-                    service.summarize_page(subject, ai, asker=asker),
+                    service.summarize_page(subject, ai, **page_kwargs),
                     timeout=budget,
                 )
                 if summary:
@@ -1240,15 +2014,27 @@ class Assistant(commands.Cog):
             raise
         except (asyncio.TimeoutError, Exception):  # noqa: BLE001 - fall back, never stall
             log.warning("Web research failed for %r", subject, exc_info=True)
-            return await self._answer_with_ai(message, subject)
+            return await self._answer_with_ai(
+                message, subject, placeholder=placeholder
+            )
 
         if answer.answer:
             await self._deliver_ai_answer(
                 message, placeholder, self._format_research(answer)
             )
             return True
-        # Nothing usable came back — the model still gets a shot at it.
-        return await self._answer_with_ai(message, subject)
+        # If the AI synthesis failed/was off, surface the real sources we did find.
+        surviving = getattr(answer, "sources", None) or []
+        if surviving:
+            lines = [f"🔍 top sources for **{shorten(subject, 80)}**:"]
+            for idx, src in enumerate(surviving[:5], 1):
+                title = (src.title or src.url).strip()
+                snippet = f" — {shorten(src.snippet, 110)}" if getattr(src, "snippet", "") else ""
+                lines.append(f"{idx}. [{title}]({src.url}){snippet}")
+            await self._deliver_ai_answer(message, placeholder, "\n".join(lines))
+            return True
+        # Nothing usable came back — reuse the placeholder for the model's shot.
+        return await self._answer_with_ai(message, subject, placeholder=placeholder)
 
     def _format_research(self, answer) -> str:
         """Answer text plus a clickable source footer (real links only)."""
@@ -1356,26 +2142,32 @@ class Assistant(commands.Cog):
             await self._deliver_ai_answer(message, placeholder, SEARCH_FAIL_LINE)
         return True
 
-    async def _build(self, message: discord.Message, route: Route) -> bool:
+    async def _build(
+        self, message: discord.Message, route: Route, text: str = ""
+    ) -> bool:
         """Handle AI Build Mode: create or edit web applications with live previews."""
-        if not self.build_orchestrator:
-            await self._quiet_reply(message, "AI Build Mode is not configured on this instance.")
-            return True
-
         payload = (route.payload or "").strip()
         is_edit = route.payload2 == "edit"
 
         if is_edit:
-            # Check for existing project owned by the user
-            active_project = self.build_orchestrator.store.get_active_user_project(
-                message.author.id, message.channel.id
-            )
-            if active_project:
-                return await self.build_orchestrator.handle_edit_build(
-                    message, active_project, payload
+            if self.build_orchestrator:
+                active_project = self.build_orchestrator.store.get_active_user_project(
+                    message.author.id, message.channel.id
                 )
-            # If no active project found, fallback to treating as a new build or prompt hint
-            log.info("Edit requested but no active project found for user %d; starting new build", message.author.id)
+                if active_project:
+                    return await self.build_orchestrator.handle_edit_build(
+                        message, active_project, payload
+                    )
+            # Without an active project in this channel, a generic "add a …" or
+            # "improve the …" sentence is a normal AI request — not a command to
+            # spin up an unasked-for web app (or fail with "Build Mode off").
+            return await self._ai(message, text or payload)
+
+        if not self.build_orchestrator:
+            await self._quiet_reply(
+                message, "AI Build Mode is not configured on this instance."
+            )
+            return True
 
         # Start new build
         return await self.build_orchestrator.handle_new_build(message, payload)
@@ -1467,11 +2259,13 @@ class Assistant(commands.Cog):
 
     # -- recap, memes and GIFs by mention ---------------------------------
 
-    async def _summarize(self, message: discord.Message) -> bool:
+    async def _summarize(
+        self, message: discord.Message, route: Route | None = None
+    ) -> bool:
         """``@Paradise summarize`` — the /summarize logic, no slash command.
 
         Reads the recent human conversation in this channel (bounded, oldest
-        first) and asks the AI for the same recap /summarize produces.
+        first), honouring an explicit count like "summarize last 20 messages".
         """
         ai = getattr(self.bot, "ai", None)
         if ai is None or not getattr(ai, "available", False):
@@ -1485,11 +2279,16 @@ class Assistant(commands.Cog):
             await self._quiet_reply(message, "i need a normal text channel for that.")
             return True
 
-        wanted = 40
+        raw_wanted = str(getattr(route, "payload", "") or "").strip()
+        wanted = max(5, min(int(raw_wanted), 100)) if raw_wanted.isdigit() else 40
+        current_id = getattr(message, "id", None)
         picked = []
         try:
             async for past in channel.history(limit=wanted * 3):
                 if past.author.bot or not str(past.content).strip():
+                    continue
+                past_id = getattr(past, "id", None)
+                if current_id is not None and past_id is not None and past_id == current_id:
                     continue
                 picked.append(past)
                 if len(picked) >= wanted:
@@ -1608,18 +2407,32 @@ class Assistant(commands.Cog):
         await self._quiet_reply(message, embed=meme_embed(meme))
         return True
 
-    async def _answer_with_ai(self, message: discord.Message, subject: str) -> bool:
-        """Ask the AI *subject* and deliver its answer, placeholder first."""
+    async def _answer_with_ai(
+        self,
+        message: discord.Message,
+        subject: str,
+        *,
+        placeholder=None,
+    ) -> bool:
+        """Ask the AI *subject* and deliver its answer, reusing any placeholder."""
         ai = self.bot.ai
         if not getattr(ai, "available", False):
+            if placeholder is not None:
+                await self._deliver_ai_answer(
+                    message,
+                    placeholder,
+                    "couldn't get a live answer right now, and my AI brain isn't configured here.",
+                )
+                return True
             return await self._ai_unavailable_note(message)
 
-        try:
-            placeholder = await message.reply(
-                "🧠 thinking with my entire brain…", mention_author=False
-            )
-        except discord.DiscordException:
-            placeholder = None
+        if placeholder is None:
+            try:
+                placeholder = await message.reply(
+                    "🧠 thinking with my entire brain…", mention_author=False
+                )
+            except discord.DiscordException:
+                placeholder = None
 
         try:
             answer = await asyncio.wait_for(
@@ -1652,11 +2465,13 @@ class Assistant(commands.Cog):
     async def _deliver_ai_answer(
         self, message: discord.Message, placeholder, text: str
     ) -> None:
-        """Replace the placeholder with the full answer, split if needed."""
+        """Replace the placeholder with the full answer; reply if edit fails."""
         chunks = split_discord_text(text)
+        delivered_first = False
         if placeholder is not None:
-            await self._quiet_edit(placeholder, chunks[0])
-        else:
+            edited = await self._quiet_edit(placeholder, chunks[0])
+            delivered_first = edited is not False
+        if not delivered_first:
             await self._quiet_reply(message, chunks[0])
         for chunk in chunks[1:]:
             await self._quiet_reply(message, chunk)
@@ -1801,13 +2616,17 @@ class Assistant(commands.Cog):
         except (discord.DiscordException, asyncio.TimeoutError, AttributeError):
             log.debug("Assistant reply failed", exc_info=True)
 
-    async def _quiet_edit(self, message: discord.Message, content: str = "", **kwargs) -> None:
+    async def _quiet_edit(
+        self, message: discord.Message, content: str = "", **kwargs
+    ) -> bool:
         try:
             if content:
                 kwargs.setdefault("content", split_discord_text(content)[0])
             await asyncio.wait_for(message.edit(**kwargs), timeout=15)
+            return True
         except (discord.DiscordException, asyncio.TimeoutError, AttributeError):
             log.debug("Assistant edit failed", exc_info=True)
+            return False
 
 
 async def setup(bot: commands.Bot) -> None:
