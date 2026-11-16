@@ -8,6 +8,11 @@ from .buffer import (
 )
 from .constants import (
     AUTHORIZED_CLIP_USER_IDS,
+    MAX_CLIP_DURATION,
+    MIN_CLIP_DURATION,
+    OPUS_SILENCE,
+    SAMPLE_RATE,
+    UNAUTHORIZED_CLIP_MESSAGE,
     ClipAuthorizationError,
     ClipBusyError,
     ClipDeliveryError,
@@ -17,17 +22,13 @@ from .constants import (
     ClipFileTooLargeError,
     ClipUnavailableError,
     ClipValidationError,
-    MAX_CLIP_DURATION,
-    MIN_CLIP_DURATION,
     NoUsableAudioError,
-    OPUS_SILENCE,
-    SAMPLE_RATE,
-    UNAUTHORIZED_CLIP_MESSAGE,
     authorize_clip_user,
     require_clip_authorization,
     validate_clip_duration,
 )
 from .exporter import ClipExportPipeline, ExportedClip, build_clip_filename
+from .join_policy import voice_client_class_for
 from .mixer import (
     MixResult,
     apply_smooth_peak_limiter,
@@ -36,9 +37,11 @@ from .mixer import (
     plan_speaker_timeline,
 )
 from .opus_codec import SpeakerOpusDecoder, ensure_opus_loaded
-from .join_policy import voice_client_class_for
 from .receiver import (
+    SUPPORTED_TRANSPORT_MODES,
     ClipVoiceClient,
+    ClipVoiceConnectionState,
+    ClipVoiceWebSocket,
     ParsedRTPPacket,
     TransportDecryptor,
     VoiceReceiveRouter,
@@ -61,6 +64,8 @@ __all__ = [
     "ClipUnavailableError",
     "ClipValidationError",
     "ClipVoiceClient",
+    "ClipVoiceConnectionState",
+    "ClipVoiceWebSocket",
     "ExportedClip",
     "MAX_CLIP_DURATION",
     "MIN_CLIP_DURATION",
@@ -70,6 +75,7 @@ __all__ = [
     "ParsedRTPPacket",
     "RollingAudioBuffer",
     "SAMPLE_RATE",
+    "SUPPORTED_TRANSPORT_MODES",
     "SpeakerIntervalPackets",
     "SpeakerOpusDecoder",
     "TransportDecryptor",

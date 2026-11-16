@@ -3,12 +3,12 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
-from dataclasses import dataclass
 import logging
 import os
 import threading
 import time
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import discord
 
@@ -16,12 +16,12 @@ from config import VoiceClipConfig
 
 from .buffer import ClipIntervalSnapshot, NoUsableAudioError, RollingAudioBuffer
 from .constants import (
+    UNAUTHORIZED_CLIP_MESSAGE,
     ClipAuthorizationError,
     ClipBusyError,
     ClipDeliveryError,
     ClipFileTooLargeError,
     ClipUnavailableError,
-    UNAUTHORIZED_CLIP_MESSAGE,
     authorize_clip_user,
     require_clip_authorization,
     validate_clip_duration,
@@ -187,6 +187,19 @@ class VoiceClipService:
                 getattr(conn, "dave_protocol_version", 0) or 0
             )
 
+        def _dave_downgraded() -> bool:
+            conn = getattr(voice_client, "_connection", None)
+            return bool(getattr(conn, "dave_downgraded", False))
+
+        def _own_uid() -> int | None:
+            bot_user = getattr(self.bot, "user", None)
+            uid = getattr(bot_user, "id", None)
+            return int(uid) if isinstance(uid, int) and uid > 0 else None
+
+        conn_obj = getattr(voice_client, "_connection", None)
+        conn_dave_lock = getattr(conn_obj, "dave_lock", None)
+        recovery_cb = getattr(conn_obj, "request_inplace_dave_recovery", None)
+
         with self._lock:
             old_router = self._routers.pop(gid, None)
             router = VoiceReceiveRouter(
@@ -194,6 +207,10 @@ class VoiceClipService:
                 buffer=buf,
                 is_bot_user=_is_bot,
                 dave_state_getter=_dave_state,
+                dave_downgraded_getter=_dave_downgraded,
+                dave_lock=conn_dave_lock if isinstance(conn_dave_lock, type(self._lock)) or hasattr(conn_dave_lock, "__enter__") else None,
+                dave_recovery_callback=recovery_cb if callable(recovery_cb) else None,
+                own_user_id_getter=_own_uid,
                 clock=self._clock,
             )
             # Inherit from the caller-supplied router first (same live voice
@@ -283,8 +300,17 @@ class VoiceClipService:
             router = self._routers.get(gid)
         health: dict[str, int | float | bool | None] = dict(buf_stats)
         health.update(router_stats)
+        health["audio_received"] = (
+            int(router.audio_packets_received) if router is not None else 0
+        )
         health["non_silence_buffered"] = (
             int(router.non_silence_buffered) if router is not None else 0
+        )
+        health["dave_not_ready_drops"] = (
+            int(router.dave_not_ready_drops) if router is not None else 0
+        )
+        health["dave_ssrc_resolved"] = (
+            int(router.dave_ssrc_resolved) if router is not None else 0
         )
         health["dave_fail_since_success"] = (
             int(router.dave_fail_since_success) if router is not None else 0
@@ -294,6 +320,12 @@ class VoiceClipService:
             if router is not None and router.last_dave_success_mono is not None
             else None
         )
+        if router is not None:
+            dave_ver, dave_ready = router.dave_status()
+        else:
+            dave_ver, dave_ready = 0, False
+        health["dave_protocol_version"] = dave_ver
+        health["dave_ready"] = dave_ready
         health["receiver_armed"] = router.has_transport() if router is not None else False
         return health
 
@@ -340,6 +372,18 @@ class VoiceClipService:
                     "the connection may have gone silent or capture is "
                     "degraded"
                 )
+            dave_ver = int(h.get("dave_protocol_version") or 0)
+            dave_ready = bool(h.get("dave_ready", True))
+            if dave_ver > 0 and not dave_ready:
+                return (
+                    f"{h.get('received')} packets arrived while DAVE E2EE v{dave_ver} "
+                    "MLS key exchange is still incomplete (none decrypted yet)"
+                )
+            if int(h.get("dave_errors") or 0) > 0:
+                return (
+                    f"{h.get('received')} packets arrived but none decrypted — "
+                    f"DAVE E2EE rejected {h.get('dave_errors')} frame(s)"
+                )
             return (
                 f"{h.get('received')} packets arrived but none decrypted into "
                 "a mapped speaker's voice yet (waiting for users to start "
@@ -378,10 +422,15 @@ class VoiceClipService:
                     "buffered_packets",
                     "last_packet_age_seconds",
                     "received",
+                    "audio_received",
                     "buffered",
                     "non_silence_buffered",
                     "transport_errors",
+                    "dave_protocol_version",
+                    "dave_ready",
                     "dave_errors",
+                    "dave_not_ready_drops",
+                    "dave_ssrc_resolved",
                     "dave_fail_since_success",
                     "receiver_armed",
                 )
@@ -436,14 +485,25 @@ class VoiceClipService:
                 and router.last_dave_success_mono is not None
                 and (self._clock() - router.last_dave_success_mono) >= 30.0
             )
-            # A receiver that gets packets but decodes nothing AT ALL
-            # (no decryptor, or everything dropped pre-buffer) is equally dead.
-            dark_pipe = (
-                router.packets_received >= 500
+            # A receiver that gets packets without being armed, or receives
+            # hundreds of actual Opus frames while buffering nothing (e.g. a
+            # stalled MLS welcome where dave_session.ready stayed False), is
+            # dead — whereas RTCP/video datagrams on an armed silent channel
+            # must NOT trigger a bogus disconnect.
+            disarmed_dark = (
+                not router.has_transport()
+                and router.packets_received >= 500
                 and router.packets_buffered == 0
-                and router.transport_errors < router.packets_received // 2
             )
-            if never_worked or went_dark or dark_pipe:
+            audio_dark = (
+                router.audio_packets_received >= 500
+                and router.packets_buffered == 0
+                and router.transport_errors < router.audio_packets_received // 2
+            )
+            dave_stuck_unready = (
+                router.dave_not_ready_drops >= 250 and not router.dave_ever_succeeded
+            )
+            if never_worked or went_dark or disarmed_dark or audio_dark or dave_stuck_unready:
                 broken.append(gid)
         return broken
 
@@ -646,7 +706,7 @@ class VoiceClipService:
                 "Could not send the clip via DM — check that Direct Messages from "
                 "server members are enabled."
             ) from exc
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             log.warning("Clip DM upload timed out")
             raise ClipDeliveryError(
                 "Uploading the clip via DM timed out. Please try again."

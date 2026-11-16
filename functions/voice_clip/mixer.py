@@ -2,14 +2,17 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import logging
 import math
+from dataclasses import dataclass
 
 import numpy as np
 
 from .buffer import BufferedAudioPacket, ClipIntervalSnapshot, SpeakerIntervalPackets
-from .constants import FRAME_SAMPLES, NoUsableAudioError, SAMPLE_RATE
+from .constants import FRAME_SAMPLES, SAMPLE_RATE, ClipExportError, NoUsableAudioError
 from .opus_codec import SpeakerOpusDecoder
+
+log = logging.getLogger(__name__)
 
 # Maximum consecutive lost 20ms frames concealed via Opus FEC/PLC (100 ms);
 # longer gaps remain clean silence so concealed tails never drone unnaturally.
@@ -27,6 +30,9 @@ LIMITER_CEILING: float = 0.92
 # (loudnorm in single-pass mode) rides the gain up and down between sentences,
 # which is audible as a wobble on a short clip — the "jitter" people hear.
 TARGET_RMS_DBFS: float = -20.0
+# Cap static make-up gain (+26 dB) so near-zero comfort noise / DTX residue is
+# never amplified into audible hiss, while quiet mics still reach target RMS.
+MAX_STATIC_GAIN: float = 20.0
 LIMITER_BLOCK_SAMPLES: int = 480  # 10 ms @ 48 kHz
 SILENCE_PEAK_THRESHOLD: float = 1e-4
 
@@ -210,10 +216,11 @@ def _render_speaker_into_mix(
     mix: np.ndarray,
     speaker: SpeakerIntervalPackets,
     window_start_mono: float,
-) -> tuple[int, int]:
+) -> tuple[int, int, int]:
     """Decode and align one speaker's packets onto the shared ``mix`` buffer."""
     decoder = SpeakerOpusDecoder()
     concealed = 0
+    decoded_non_silent = 0
 
     # Warm decoder state with immediately preceding frames; discard PCM output.
     last_warmup_epoch: int | None = None
@@ -229,7 +236,7 @@ def _render_speaker_into_mix(
         last_warmup_ssrc = wpkt.ssrc
 
     if not speaker.packets:
-        return 0, decoder.decode_errors
+        return 0, decoder.decode_errors, 0
 
     previous_epoch: int | None = None
     previous_ssrc: int | None = None
@@ -269,9 +276,11 @@ def _render_speaker_into_mix(
             # shifts and the next packet still lands on the grid.
             decoded = decoder.decode_plc()
             concealed += 1
+        elif not packet.is_silence:
+            decoded_non_silent += 1
         written_until = _add_frame(mix, cursor, decoded)
 
-    return concealed, decoder.decode_errors
+    return concealed, decoder.decode_errors, decoded_non_silent
 
 
 def apply_static_gain(
@@ -279,21 +288,28 @@ def apply_static_gain(
     *,
     target_rms_dbfs: float = TARGET_RMS_DBFS,
     peak_ceiling: float = LIMITER_CEILING,
+    max_gain: float = MAX_STATIC_GAIN,
 ) -> float:
     """Level the whole clip with one constant gain; return the gain applied.
 
     Constant, not adaptive: every part of the clip is scaled by the same
     factor, so a pause stays as quiet relative to speech as it really was and
     the level never breathes. The gain is capped so the loudest sample lands
-    under ``peak_ceiling`` — no pre-limiter clipping, no pumping.
+    under ``peak_ceiling`` (and never exceeds ``max_gain`` on dead comfort
+    noise) — no pre-limiter clipping, no pumping.
     """
     if samples.size == 0:
         return 1.0
-    rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float32))))
+    np.nan_to_num(samples, copy=False, nan=0.0, posinf=peak_ceiling, neginf=-peak_ceiling)
+    # Accumulate in float64 so long 180s buffers (~8.6M samples) never overflow
+    # or lose precision when computing clip-wide RMS.
+    rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
     peak = float(np.max(np.abs(samples)))
     if rms <= 1e-7 or peak <= 1e-7:
         return 1.0
     gain = float(10.0 ** (target_rms_dbfs / 20.0) / rms)
+    if max_gain > 0.0 and gain > max_gain:
+        gain = max_gain
     if gain * peak > peak_ceiling:
         gain = peak_ceiling / peak
     samples *= np.float32(gain)
@@ -372,23 +388,42 @@ def mix_snapshot_to_pcm_f32(snapshot: ClipIntervalSnapshot) -> MixResult:
 
     total_concealed = 0
     total_decode_errors = 0
+    total_decoded_non_silent = 0
     active_speakers = 0
 
     for speaker in snapshot.speakers:
         if not speaker.packets:
             continue
         active_speakers += 1
-        concealed, dec_err = _render_speaker_into_mix(
+        concealed, dec_err, dec_ok = _render_speaker_into_mix(
             mix,
             speaker,
             snapshot.window_start_mono,
         )
         total_concealed += concealed
         total_decode_errors += dec_err
+        total_decoded_non_silent += dec_ok
 
+    np.nan_to_num(mix, copy=False, nan=0.0, posinf=LIMITER_CEILING, neginf=-LIMITER_CEILING)
     apply_static_gain(mix)
     peak_before, peak_after = apply_smooth_peak_limiter(mix)
     if peak_after < SILENCE_PEAK_THRESHOLD:
+        if (
+            snapshot.non_silent_packets > 0
+            and total_decoded_non_silent == 0
+            and total_decode_errors > 0
+        ):
+            log.warning(
+                "All %d non-silent voice packets failed Opus decode in guild %s "
+                "(decode_errors=%d)",
+                snapshot.non_silent_packets,
+                snapshot.guild_id,
+                total_decode_errors,
+            )
+            raise ClipExportError(
+                "Captured voice packets could not be decoded into audio "
+                f"({total_decode_errors} corrupted or undecrypted frame(s))."
+            )
         raise NoUsableAudioError(
             f"No audible speech was captured in the last {snapshot.requested_seconds}s."
         )
