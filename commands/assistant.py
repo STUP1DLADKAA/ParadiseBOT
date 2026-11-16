@@ -1222,7 +1222,7 @@ class Assistant(commands.Cog):
                 member = guild.get_member(target_id) if guild is not None else None
                 who = getattr(member, "display_name", None) or "that member"
                 if not saved:
-                    return f"🕒 **{who}** hasn't set a timezone yet (`/settimezone`)."
+                    return f"🕒 **{who}** hasn't set a timezone yet."
                 tz_name, label = saved, who
             else:
                 tz_name = resolve_timezone(raw)
@@ -1587,8 +1587,7 @@ class Assistant(commands.Cog):
                 if tz_name is None:
                     await self._quiet_reply(
                         message,
-                        f"**{discord.utils.escape_markdown(who)}** hasn't saved a timezone yet — "
-                        "they can set one with `/settimezone`.",
+                        f"**{discord.utils.escape_markdown(who)}** hasn't saved a timezone yet.",
                     )
                     return True
                 label = who
@@ -1624,7 +1623,7 @@ class Assistant(commands.Cog):
         await self._quiet_reply(
             message,
             f"📅 today is **{now.strftime('%A, %d %B %Y')}**"
-            + (f" ({tz_name})" if tz_name else " (UTC — set yours with /settimezone)"),
+            + (f" ({tz_name})" if tz_name else " (UTC)"),
         )
         return True
 

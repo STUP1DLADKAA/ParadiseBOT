@@ -1,25 +1,20 @@
-"""Banter commands: /roast, /meme and /gif.
+"""Banter commands: /roast.
 
 The passive engine (:mod:`functions.personality`) decides *when* to be funny.
-These three let a person ask for it directly, which is most of the fun in a
-friends-only server.
+This lets a person ask for it directly.
 
-Every command is cheap, never blocks the event loop on a slow API for long,
-and degrades instead of failing: no internet means a locally rendered meme,
-no GIF key means a meme with a one-line note about how to turn GIFs on.
+The command is cheap, never blocks the event loop on a slow API for long,
+and degrades instead of failing.
 """
 
 from __future__ import annotations
 
-import asyncio
-import io
 import logging
 
 import discord
 from discord import app_commands
 from discord.ext import commands
 
-from functions.meme_feed import GifSearch, MemeFeed, OnlineMeme
 from functions.memes import render_meme_png
 from functions.roasts import (
     build_roast,
@@ -34,8 +29,8 @@ _NO_GIF_KEY = (
     "gifs are being moody — the owner can add a free `TENOR_API_KEY` "
     "(or `GIPHY_API_KEY`) to `.env` for the good ones. here's a meme instead:"
 )
-_GIF_EMPTY = "that search came back empty. try different words."
 _MEME_EMPTY = "couldn't reach the meme mines. try again in a minute."
+_GIF_EMPTY = "that search came back empty. try different words."
 
 
 def build_roast_line(name: str, *, intensity: str = "spicy") -> str:
@@ -44,12 +39,13 @@ def build_roast_line(name: str, *, intensity: str = "spicy") -> str:
     return build_roast(target, intensity=sanitize_intensity(intensity))
 
 
-def meme_embed(meme: OnlineMeme) -> discord.Embed:
+def meme_embed(meme: object) -> discord.Embed:
     """A neutral embed that lets the image do the talking."""
-    embed = discord.Embed(title=meme.title or None)
-    embed.set_image(url=meme.url)
-    source = f"r/{meme.source}" if meme.source else ""
-    footer = " · ".join(part for part in (source, meme.page_url) if part)
+    embed = discord.Embed(title=getattr(meme, "title", None) or None)
+    embed.set_image(url=getattr(meme, "url", ""))
+    source = getattr(meme, "source", None) or ""
+    page_url = getattr(meme, "page_url", None) or ""
+    footer = " · ".join(part for part in (source, page_url) if part)
     if footer:
         embed.set_footer(text=discord.utils.escape_markdown(footer)[:200])
     return embed
@@ -70,37 +66,10 @@ class Banter(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self._fallback_feed: MemeFeed | None = None
-        self._fallback_gifs: GifSearch | None = None
-
-    # -- lazily reach the personality engine's services when it has them --
-
-    def _personality(self):
-        return getattr(self.bot, "personality", None)
-
-    @property
-    def meme_feed(self) -> MemeFeed:
-        engine = self._personality()
-        feed = getattr(engine, "meme_feed", None)
-        if feed is not None:
-            return feed
-        if self._fallback_feed is None:
-            self._fallback_feed = MemeFeed()
-        return self._fallback_feed
-
-    @property
-    def gif_search(self) -> GifSearch:
-        engine = self._personality()
-        search = getattr(engine, "gif_search", None)
-        if search is not None:
-            return search
-        if self._fallback_gifs is None:
-            self._fallback_gifs = GifSearch()
-        return self._fallback_gifs
 
     @property
     def intensity(self) -> str:
-        engine = self._personality()
+        engine = getattr(self.bot, "personality", None)
         return sanitize_intensity(getattr(engine, "roast_intensity", "spicy"))
 
     # -- commands -------------------------------------------------------
@@ -132,83 +101,6 @@ class Banter(commands.Cog):
             f"{prefix}{line}",
             allowed_mentions=discord.AllowedMentions.none(),
         )
-
-    @app_commands.command(description="A random meme from the internet")
-    @app_commands.describe(topic="Optional: what the meme should be about")
-    @gif_cooldown()
-    async def meme(
-        self, interaction: discord.Interaction, topic: str | None = None
-    ) -> None:
-        await interaction.response.defer(thinking=True)
-        meme = await self._fetch_meme()
-        if meme is not None:
-            await interaction.followup.send(
-                embed=meme_embed(meme),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-
-        # No internet, no problem: draw one.
-        author = clean_name(
-            getattr(interaction.user, "display_name", None), fallback="someone"
-        )
-        try:
-            png = render_topic_meme(
-                topic or "the meme mines are closed today", author=author
-            )
-        except Exception:  # noqa: BLE001 - rendering must never crash a command
-            log.debug("Topic meme render failed", exc_info=True)
-            await interaction.followup.send(_MEME_EMPTY)
-            return
-        await interaction.followup.send(
-            file=discord.File(io.BytesIO(png), filename="paradise_meme.png"),
-            allowed_mentions=discord.AllowedMentions.none(),
-        )
-
-    @app_commands.command(description="A reaction GIF (needs a free Tenor or Giphy key)")
-    @app_commands.describe(query="What kind of reaction, e.g. 'bruh' or 'this is fine'")
-    @gif_cooldown()
-    async def gif(self, interaction: discord.Interaction, query: str) -> None:
-        await interaction.response.defer(thinking=True)
-        search = self.gif_search
-        if not search.available:
-            meme = await self._fetch_meme()
-            if meme is not None:
-                await interaction.followup.send(
-                    _NO_GIF_KEY,
-                    embed=meme_embed(meme),
-                    allowed_mentions=discord.AllowedMentions.none(),
-                )
-                return
-            await interaction.followup.send(_NO_GIF_KEY)
-            return
-
-        gif = await self._search_gif(search, query)
-        if gif is not None:
-            await interaction.followup.send(
-                embed=meme_embed(gif),
-                allowed_mentions=discord.AllowedMentions.none(),
-            )
-            return
-        await interaction.followup.send(_GIF_EMPTY)
-
-    # -- internals ------------------------------------------------------
-
-    async def _fetch_meme(self) -> OnlineMeme | None:
-        try:
-            return await asyncio.wait_for(self.meme_feed.pick(), timeout=8.0)
-        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
-            log.debug("Meme fetch failed", exc_info=True)
-            return None
-
-    async def _search_gif(
-        self, search: GifSearch, query: str
-    ) -> OnlineMeme | None:
-        try:
-            return await asyncio.wait_for(search.search(query), timeout=8.0)
-        except (asyncio.TimeoutError, Exception):  # noqa: BLE001
-            log.debug("GIF search failed", exc_info=True)
-            return None
 
 
 async def setup(bot: commands.Bot) -> None:

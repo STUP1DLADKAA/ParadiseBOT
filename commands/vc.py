@@ -263,26 +263,5 @@ class Voice(commands.GroupCog, group_name="vc", group_description="Voice activit
         embed = build_user_stats_embed(interaction.guild, target, stats_data)
         await interaction.response.send_message(embed=embed)
 
-    @app_commands.command(
-        name="dmreports",
-        description="Toggle daily voice activity summary DMs",
-    )
-    @app_commands.describe(enabled="Whether you want to receive daily voice report DMs")
-    @cooldown(3)
-    async def dmreports(
-        self,
-        interaction: discord.Interaction,
-        enabled: bool,
-    ) -> None:
-        # A user setting, intentionally kept in local SQLite (shared with
-        # /settimezone) — no Supabase dependency here.
-        self.db.set_user_dm_preference(interaction.user.id, enabled)
-        status_str = "enabled ✅" if enabled else "disabled ❌"
-        await interaction.response.send_message(
-            f"Daily voice report DMs are now **{status_str}** for you.",
-            ephemeral=True,
-        )
-
-
 async def setup(bot: commands.Bot) -> None:
     await bot.add_cog(Voice(bot))

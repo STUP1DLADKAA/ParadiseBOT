@@ -36,10 +36,9 @@ from functions.personality import PATTERNS, Personality  # noqa: E402
 from functions.presence import IST, NOTES, ROTATE_SECONDS, PresenceManager  # noqa: E402
 
 EXPECTED_COMMANDS = {
-    "ping", "coinflip", "choose", "roast", "meme", "gif",
-    "remind", "poll", "afk", "translate", "settimezone", "vc", "clip",
+    "ping", "coinflip", "choose", "roast", "translate", "vc", "clip",
     "recipe",
-    "summarize", "help", "edit", "memory",
+    "summarize", "help", "edit", "memory", "mal",
 }
 
 # Names that must never come back at the top level.

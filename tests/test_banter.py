@@ -16,7 +16,6 @@ import unittest
 from collections import deque
 from pathlib import Path
 from types import SimpleNamespace
-from unittest import mock
 from unittest.mock import AsyncMock
 
 import discord
@@ -24,7 +23,6 @@ import discord
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from commands.banter import (  # noqa: E402
-    _NO_GIF_KEY,
     build_roast_line,
     meme_embed,
     render_topic_meme,
@@ -42,7 +40,6 @@ from functions.meme_feed import (  # noqa: E402
     parse_meme,
     parse_tenor,
 )
-from functions import personality as personality_module  # noqa: E402
 from functions.personality import AMBIENT_REACTIONS, Personality  # noqa: E402
 from functions.roasts import (  # noqa: E402
     INTENSITIES,
@@ -539,53 +536,7 @@ class TestBanterCommands(unittest.IsolatedAsyncioTestCase):
         text = interaction.response.send_message.call_args.args[0]
         self.assertIn("roasting myself", text)
 
-    async def test_meme_uses_the_online_feed(self):
-        meme = OnlineMeme(url="https://i.redd.it/x.jpg", title="t", source="memes")
-        feed = SimpleNamespace(pick=AsyncMock(return_value=meme))
-        cog = self._cog(feed=feed)
-        interaction = self._interaction()
-        await cog.meme.callback(cog, interaction, None)
-        interaction.response.defer.assert_awaited_once()
-        embed = interaction.followup.send.call_args.kwargs["embed"]
-        self.assertEqual(embed.image.url, "https://i.redd.it/x.jpg")
 
-    async def test_meme_offline_draws_one(self):
-        feed = SimpleNamespace(pick=AsyncMock(return_value=None))
-        cog = self._cog(feed=feed)
-        interaction = self._interaction()
-        await cog.meme.callback(cog, interaction, "tuesday")
-        attached = interaction.followup.send.call_args.kwargs["file"]
-        self.assertEqual(attached.filename, "paradise_meme.png")
-
-    async def test_gif_without_a_key_explains_and_offers_a_meme(self):
-        meme = OnlineMeme(url="https://i.redd.it/x.jpg", title="t", source="memes")
-        feed = SimpleNamespace(pick=AsyncMock(return_value=meme))
-        cog = self._cog(
-            feed=feed, gifs=GifSearch(tenor_key="", giphy_key="", keyless=False)
-        )
-        interaction = self._interaction()
-        await cog.gif.callback(cog, interaction, "bruh")
-        args = interaction.followup.send.call_args
-        self.assertEqual(args.args[0], _NO_GIF_KEY)
-        self.assertEqual(args.kwargs["embed"].image.url, "https://i.redd.it/x.jpg")
-
-    async def test_gif_with_a_key_posts_the_gif(self):
-        gif = OnlineMeme(url="https://media.tenor.com/a/b.gif", source="tenor", is_gif=True)
-        gifs = SimpleNamespace(available=True, search=AsyncMock(return_value=gif))
-        cog = self._cog(gifs=gifs)
-        interaction = self._interaction()
-        await cog.gif.callback(cog, interaction, "bruh")
-        self.assertEqual(
-            interaction.followup.send.call_args.kwargs["embed"].image.url,
-            "https://media.tenor.com/a/b.gif",
-        )
-
-    async def test_gif_with_no_results_says_so(self):
-        gifs = SimpleNamespace(available=True, search=AsyncMock(return_value=None))
-        cog = self._cog(gifs=gifs)
-        interaction = self._interaction()
-        await cog.gif.callback(cog, interaction, "aaa")
-        self.assertIn("empty", interaction.followup.send.call_args.args[0])
 
     def test_topic_meme_renders_a_png(self):
         png = render_topic_meme("my code compiles", author="Ash")

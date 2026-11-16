@@ -1851,7 +1851,7 @@ class TestContextAwareToolPipeline(unittest.IsolatedAsyncioTestCase):
         m_unset = self._as_user("what time is it for <@999>?", 202)
         m_unset.guild.get_member = lambda uid: SimpleNamespace(id=uid, display_name="Zed", name="zed")
         self.assertTrue(await assistant.handle_message(m_unset))
-        self.assertIn("/settimezone", m_unset.replies[0]["content"])
+        self.assertNotIn("/settimezone", m_unset.replies[0]["content"])
 
     async def test_build_edit_without_project_falls_back_to_ai(self):
         ai = FakeAI(available=True, answer="here are better rules")
