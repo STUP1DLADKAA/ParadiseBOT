@@ -7,7 +7,7 @@ import logging
 import secrets
 import time
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Callable, Coroutine
+from typing import TYPE_CHECKING
 
 import discord
 
@@ -413,7 +413,7 @@ class BuildOrchestrator:
             await self._safe_edit_message(status_message, err_embed)
             return True
 
-        except Exception as e:
+        except Exception:
             log.exception("Unexpected error in build pipeline for user %d", user.id)
             err_embed = discord.Embed(
                 title="❌ Build Error",
