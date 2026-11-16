@@ -62,7 +62,8 @@ RETIRED_COMMANDS = frozenset(
         "dictionary",
         "recommend",
         "weather",
-        # Deleted outright: music is gone and those commands go with it.
+        # Deleted outright: music and minigames are gone and their commands go with them.
+        "minigames",
         "music",
         "cmd",
         "p",

@@ -25,13 +25,16 @@ import re
 from dataclasses import dataclass
 
 from functions.cache import TTLCache
+from functions.calculator import extract_expression, looks_like_math
+from functions.conversion import parse_conversion_query
 from functions.helpers import ParadiseError
 from functions.routes import (
     AI, CALCULATE, CONVERT, DATE, DEFINE, DEV, GIF, IMAGE, INFO,
-    MEDIUM_CONFIDENCE, MEME, POLL, REMIND, RESEARCH, SEARCH, SUMMARIZE,
-    TIME, TRANSLATE, UTILITY, WEATHER, WRITE,
+    MEDIUM_CONFIDENCE, MEME, POLL, RECIPE, REMIND, RESEARCH, SEARCH,
+    SUMMARIZE, TIME, TRANSLATE, UTILITY, WEATHER, WRITE,
     Route, clamp_confidence,
 )
+from functions.translate import resolve_language
 
 log = logging.getLogger(__name__)
 
@@ -53,7 +56,8 @@ _INTENT_TO_KIND: dict[str, str] = {
     "define": DEFINE,
     "translate": TRANSLATE,
     "dictionary": DEFINE,
-    "recipe": SEARCH,
+    "recipe": RECIPE,
+    "cook": RECIPE,
     "summarize": SUMMARIZE,
     "recap": SUMMARIZE,
     "meme": MEME,
@@ -208,7 +212,72 @@ def parse_intent(raw: str) -> IntentGuess | None:
     )
 
 
-async def classify_request(text: str, ai) -> IntentGuess | None:
+_TRANSLATE_TAIL = re.compile(
+    r"^(?P<text>.+?)\s+(?:into|to|in)\s+(?P<lang>[a-zA-Z][a-zA-Z \-]{1,24})$",
+    re.IGNORECASE,
+)
+_MIN_ACCEPT_CONFIDENCE = 0.40
+
+
+def validate_refined_route(refined: Route, fallback: Route) -> Route:
+    """Reject classifier guesses whose payloads cannot satisfy the target tool.
+
+    The classifier is allowed to upgrade an ambiguous prompt into a concrete
+    tool, never to steer a valid sentence into a guaranteed parse error.
+    """
+    if refined.confidence < _MIN_ACCEPT_CONFIDENCE:
+        return fallback
+
+    kind = refined.kind
+    payload = refined.payload.strip()
+
+    if kind == CALCULATE:
+        expr = extract_expression(payload)
+        if not expr and not looks_like_math(payload):
+            return fallback
+        if expr:
+            return Route(
+                kind=CALCULATE,
+                payload=expr,
+                confidence=refined.confidence,
+            )
+
+    elif kind == CONVERT:
+        try:
+            parse_conversion_query(payload)
+        except (ParadiseError, ValueError):
+            return fallback
+
+    elif kind == TRANSLATE and not refined.payload2:
+        match = _TRANSLATE_TAIL.match(payload)
+        if match and resolve_language(match.group("lang")):
+            return Route(
+                kind=TRANSLATE,
+                payload=match.group("text").strip(" \"'"),
+                payload2=match.group("lang").strip(),
+                confidence=refined.confidence,
+            )
+        if resolve_language(payload):
+            return Route(
+                kind=TRANSLATE,
+                payload="",
+                payload2=payload,
+                confidence=refined.confidence,
+            )
+        return fallback
+
+    elif kind in (DEFINE, RECIPE, REMIND, POLL) and not payload:
+        return fallback
+
+    return refined
+
+
+async def classify_request(
+    text: str,
+    ai,
+    *,
+    context: str = "",
+) -> IntentGuess | None:
     """Ask the AI for a tiny label for *text*. Never raises, may return None."""
     query = " ".join(str(text or "").split()).strip()
     if not query or len(query) > 400 or ai is None:
@@ -216,13 +285,15 @@ async def classify_request(text: str, ai) -> IntentGuess | None:
     if not getattr(ai, "available", False):
         return None
 
-    key = query.casefold()
+    clean_ctx = " ".join(str(context or "").split()).strip()[:160]
+    key = f"{query.casefold()}|ctx:{clean_ctx.casefold()}" if clean_ctx else query.casefold()
     cached = _cache.get(key)
     if cached is not None:
         return parse_intent(cached)
 
+    prompt = f"{query}\n[context: {clean_ctx}]" if clean_ctx else query
     try:
-        raw = await asyncio.wait_for(ai.classify(query), timeout=_CLASSIFY_TIMEOUT)
+        raw = await asyncio.wait_for(ai.classify(prompt), timeout=_CLASSIFY_TIMEOUT)
     except asyncio.CancelledError:
         raise
     except (asyncio.TimeoutError, ParadiseError):
@@ -253,4 +324,5 @@ __all__ = [
     "classify_request",
     "parse_intent",
     "should_classify",
+    "validate_refined_route",
 ]

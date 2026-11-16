@@ -79,8 +79,10 @@ and every other feature works.
 
 Optional knobs (defaults are sane): `VOICE_HEARTBEAT_INTERVAL`,
 `VOICE_CHECKPOINT_SECONDS`, `VOICE_WRITE_COALESCE_SECONDS`, `VOICE_DB_PATH`,
-`VOICE_DM_REPORTS_ENABLED`, `VOICE_ALERT_CHANNEL_ID`,
-`VOICE_DEAF_WARNING_SECONDS`.
+`VOICE_DM_REPORTS_ENABLED`, `VOICE_ALERT_CHANNEL_ID` (midnight daily
+leaderboard channel), and `VOICE_DEAF_WARNING_SECONDS` (continuous deafened
+seconds before sending a private DM `"no VC farming"` warning to the affected
+user only; `0` disables).
 
 ---
 
@@ -109,8 +111,9 @@ ELEVENLABS_MODEL=eleven_flash_v2_5
 
 ## 4. Voice presence: silent joins
 
-Paradise follows the crowd into whichever accessible voice channel has the most
-humans and leaves when it empties — without posting anything or speaking.
+Paradise follows the crowd into whichever accessible voice channel has strictly
+more humans than its current channel (staying put when counts are tied) and
+leaves when voice empties — without posting anything or speaking.
 
 * `VOICE_PRESENCE_INTERVAL` (default 20 s) controls how quickly it reacts.
 * `VOICE_ARRIVAL_ANNOUNCE=true` restores the old random arrival line in the

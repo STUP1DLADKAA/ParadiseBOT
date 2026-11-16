@@ -321,6 +321,55 @@ class VoicePresence(commands.Cog):
                 return
             await asyncio.sleep(0.1)
 
+    @staticmethod
+    def _channel_id(channel: object) -> int | None:
+        raw = getattr(channel, "id", None)
+        return raw if isinstance(raw, int) and not isinstance(raw, bool) else None
+
+    @staticmethod
+    def _human_count(channel: object) -> int:
+        members = getattr(channel, "members", None) or ()
+        return sum(1 for member in members if not getattr(member, "bot", False))
+
+    def _current_voice_channel(
+        self,
+        guild: discord.Guild,
+        client: discord.VoiceClient | None,
+    ) -> tuple[int | None, object | None]:
+        """Resolve Paradise's active voice channel by ID, independent of object identity."""
+        all_channels: list[object] = list(getattr(guild, "voice_channels", None) or ())
+        all_channels.extend(getattr(guild, "stage_channels", None) or ())
+        by_id = {
+            cid: ch
+            for ch in all_channels
+            if (cid := self._channel_id(ch)) is not None
+        }
+
+        current_ref = getattr(client, "channel", None) if client is not None else None
+        current_id = self._channel_id(current_ref)
+        if current_id is None:
+            me = getattr(guild, "me", None)
+            me_voice = getattr(me, "voice", None) if me is not None else None
+            me_channel = getattr(me_voice, "channel", None) if me_voice is not None else None
+            current_id = self._channel_id(me_channel)
+            if current_id is not None:
+                current_ref = me_channel
+        if current_id is None and self.bot.user is not None:
+            bot_id = self._channel_id(self.bot.user)
+            if bot_id is not None:
+                for cid, ch in by_id.items():
+                    if any(
+                        self._channel_id(member) == bot_id
+                        for member in (getattr(ch, "members", None) or ())
+                    ):
+                        current_id = cid
+                        current_ref = ch
+                        break
+
+        if current_id is None:
+            return None, None
+        return current_id, by_id.get(current_id, current_ref)
+
     async def join_busiest(
         self,
         guild: discord.Guild,
@@ -328,26 +377,46 @@ class VoicePresence(commands.Cog):
         disconnect_when_empty: bool = False,
     ) -> None:
         async with self._guild_lock(guild.id):
-            candidates = []
             client = guild.voice_client
+            afk_id = self._channel_id(getattr(guild, "afk_channel", None))
+            current_id, current_channel = self._current_voice_channel(guild, client)
+            in_voice = bool(
+                current_id is not None
+                and (client is not None or current_channel is not None)
+            )
+            current_humans = (
+                self._human_count(current_channel)
+                if in_voice and current_channel is not None and current_id != afk_id
+                else 0
+            )
+
+            candidates: list[tuple[int, discord.VoiceChannel]] = []
             for channel in guild.voice_channels:
+                chan_id = self._channel_id(channel)
+                if afk_id is not None and chan_id == afk_id:
+                    continue
+                humans = self._human_count(channel)
+                if not humans:
+                    continue
                 permissions = channel.permissions_for(guild.me)
-                humans = sum(not member.bot for member in channel.members)
+                is_current = current_id is not None and chan_id == current_id
                 if (
-                    humans
-                    and channel != guild.afk_channel
-                    and permissions.view_channel
+                    permissions.view_channel
                     and permissions.connect
                     and (
                         not channel.user_limit
                         or len(channel.members) < channel.user_limit
                         or permissions.move_members
-                        or (client and client.channel == channel)
+                        or is_current
                     )
                 ):
                     candidates.append((humans, channel))
 
             if not candidates:
+                # Stay put if Paradise was placed in a non-AFK channel that
+                # still has human listeners (e.g. a locked room).
+                if current_humans > 0:
+                    return
                 if (
                     disconnect_when_empty
                     and client
@@ -358,22 +427,35 @@ class VoicePresence(commands.Cog):
                     await client.disconnect()
                 return
 
-            # Keep the current channel when tied, and never interrupt playback.
+            # Never interrupt active playback.
             if client and client.is_playing():
+                return
+
+            best_humans = max(humans for humans, _ in candidates)
+            # Strict tie-hold: only switch when another channel has strictly
+            # more human members than the channel Paradise already occupies.
+            if current_humans > 0 and current_humans >= best_humans:
                 return
 
             _, target = max(
                 candidates,
                 key=lambda item: (
                     item[0],
-                    bool(client and client.channel == item[1]),
-                    -item[1].id,
+                    bool(
+                        current_id is not None
+                        and self._channel_id(item[1]) == current_id
+                    ),
+                    -(self._channel_id(item[1]) or 0),
                 ),
             )
+            target_id = self._channel_id(target)
             if client and client.is_connected():
-                if client.channel == target:
+                if current_id is not None and target_id == current_id:
                     return
                 await client.move_to(target)
+            elif current_id is not None and target_id == current_id and client is not None:
+                # Already handshaking/reconnecting to this exact channel.
+                return
             else:
                 await target.connect(
                     timeout=CONNECT_TIMEOUT,

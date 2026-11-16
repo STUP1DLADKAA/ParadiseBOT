@@ -400,5 +400,133 @@ class TestSilentJoin(unittest.IsolatedAsyncioTestCase):
         guild.voice_client.play.assert_not_called()
 
 
+class TestVoicePresenceEqualCountTieHold(unittest.IsolatedAsyncioTestCase):
+    """Equal human counts must never trigger unnecessary voice channel moves."""
+
+    async def asyncSetUp(self):
+        self.bot = MagicMock()
+        self.bot.user = SimpleNamespace(id=999000)
+        self.bot.guilds = []
+        self.cog = VoicePresence(self.bot, announce=False)
+
+    async def asyncTearDown(self):
+        await self.cog.cog_unload()
+
+    def _guild(self, *channels, afk=None):
+        guild = MagicMock()
+        guild.id = 88001
+        guild.me = MagicMock()
+        guild.me.voice = None
+        guild.afk_channel = afk
+        guild.voice_channels = list(channels)
+        guild.stage_channels = []
+        guild.voice_client = None
+        return guild
+
+    async def test_stays_in_current_channel_on_two_way_and_three_way_tie(self):
+        # Current channel intentionally has the largest ID so a naive -id tie
+        # break would have switched away to vc_a.
+        vc_a = _make_voice_channel(10, humans=2)
+        vc_b = _make_voice_channel(20, humans=2)
+        vc_current = _make_voice_channel(30, humans=2)
+        guild = self._guild(vc_a, vc_b, vc_current)
+        client = _make_fake_voice_client(vc_current)
+        guild.voice_client = client
+
+        await self.cog.join_busiest(guild, disconnect_when_empty=True)
+        client.move_to.assert_not_awaited()
+        self.assertIs(client.channel, vc_current)
+
+    async def test_stays_when_current_channel_drops_into_a_tie(self):
+        vc_other = _make_voice_channel(10, humans=2)
+        vc_current = _make_voice_channel(50, humans=3)
+        guild = self._guild(vc_other, vc_current)
+        client = _make_fake_voice_client(vc_current)
+        guild.voice_client = client
+
+        # One person leaves vc_current, bringing it from 3 down to 2 (tied).
+        vc_current.members.pop()
+        await self.cog.join_busiest(guild, disconnect_when_empty=True)
+        client.move_to.assert_not_awaited()
+        self.assertIs(client.channel, vc_current)
+
+    async def test_stays_when_rival_has_more_bots_but_equal_humans(self):
+        vc_rival = _make_voice_channel(10, humans=2)
+        vc_rival.members.extend(
+            [SimpleNamespace(bot=True, id=500 + i) for i in range(4)]
+        )
+        vc_current = _make_voice_channel(50, humans=2)
+        vc_current.members.append(SimpleNamespace(bot=True, id=999000))
+        guild = self._guild(vc_rival, vc_current)
+        client = _make_fake_voice_client(vc_current)
+        guild.voice_client = client
+
+        await self.cog.join_busiest(guild)
+        client.move_to.assert_not_awaited()
+
+    async def test_stays_when_voice_client_channel_is_distinct_object_same_id(self):
+        vc_other = _make_voice_channel(10, humans=2)
+        vc_current = _make_voice_channel(50, humans=2)
+        guild = self._guild(vc_other, vc_current)
+        # Simulate a discord.Object / uncached channel ref with identical ID.
+        stale_ref = discord.Object(id=50)
+        client = _make_fake_voice_client(stale_ref)
+        guild.voice_client = client
+
+        await self.cog.join_busiest(guild)
+        client.move_to.assert_not_awaited()
+
+    async def test_stays_in_locked_or_full_current_channel_when_tied(self):
+        vc_public = _make_voice_channel(10, humans=2, connect=True)
+        vc_locked = _make_voice_channel(50, humans=2, connect=False)
+        vc_locked.user_limit = 2
+        guild = self._guild(vc_public, vc_locked)
+        client = _make_fake_voice_client(vc_locked)
+        guild.voice_client = client
+
+        await self.cog.join_busiest(guild, disconnect_when_empty=True)
+        client.move_to.assert_not_awaited()
+
+        # Once a public channel gets strictly more humans, Paradise moves.
+        vc_public.members.append(SimpleNamespace(bot=False, id=199))
+        await self.cog.join_busiest(guild, disconnect_when_empty=True)
+        client.move_to.assert_awaited_once_with(vc_public)
+
+    async def test_stays_during_mid_reconnect_on_equal_count(self):
+        vc_other = _make_voice_channel(10, humans=2)
+        vc_other.connect = AsyncMock()
+        vc_current = _make_voice_channel(50, humans=2)
+        vc_current.connect = AsyncMock()
+        guild = self._guild(vc_other, vc_current)
+        client = _make_fake_voice_client(vc_current)
+        client.is_connected = MagicMock(return_value=False)
+        guild.voice_client = client
+
+        await self.cog.join_busiest(guild)
+        client.move_to.assert_not_awaited()
+        vc_other.connect.assert_not_awaited()
+        vc_current.connect.assert_not_awaited()
+
+    async def test_moves_when_another_channel_has_strictly_more_humans(self):
+        vc_current = _make_voice_channel(10, humans=2)
+        vc_busier = _make_voice_channel(50, humans=3)
+        guild = self._guild(vc_current, vc_busier)
+        client = _make_fake_voice_client(vc_current)
+        guild.voice_client = client
+
+        await self.cog.join_busiest(guild)
+        client.move_to.assert_awaited_once_with(vc_busier)
+
+    async def test_moves_away_when_current_channel_empties(self):
+        vc_current = _make_voice_channel(10, humans=0)
+        vc_active = _make_voice_channel(50, humans=1)
+        guild = self._guild(vc_current, vc_active)
+        client = _make_fake_voice_client(vc_current)
+        guild.voice_client = client
+
+        await self.cog.join_busiest(guild, disconnect_when_empty=True)
+        client.move_to.assert_awaited_once_with(vc_active)
+
+
 if __name__ == "__main__":
     unittest.main()

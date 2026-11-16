@@ -882,6 +882,9 @@ def json_tool(args: str) -> str:
             "validate", "check", "verify"
         ) else "format"
         payload = payload[verb.end():].strip()
+    fence = re.match(r"^```(?:json)?\s*([\s\S]*?)\s*```$", payload, re.IGNORECASE)
+    if fence is not None:
+        payload = fence.group(1).strip()
     if not payload:
         raise ParadiseError("paste the JSON after it — 'validate json {\"a\": 1}'.")
     try:
@@ -914,7 +917,7 @@ def _split_list(args: str) -> list[str]:
         r"\s*(?:from|in)?\s*[:,-]?\s*",
         "", str(args or "").strip(), count=1, flags=re.IGNORECASE,
     )
-    items = [t.strip() for t in re.split(r"[,;]+", cleaned) if t.strip()]
+    items = [t.strip(" \t•-*") for t in re.split(r"[,;\n]+", cleaned) if t.strip(" \t•-*")]
     if len(items) < 2:
         raise ParadiseError("give me a comma-separated list — 'sort b, c, a'.")
     return items
@@ -1005,7 +1008,8 @@ def readability_score(text: str) -> str:
 
 def run_tool(key: str, args: str, *, author: str = "") -> ToolResult:
     """Run one toolkit tool. Returns a chat line; never raises for bad input."""
-    args = " ".join(str(args or "").split())
+    raw_args = str(args or "").strip()
+    args = " ".join(raw_args.split())
     try:
         if key == "reverse":
             return ToolResult(f"🔄 `{reverse_text(args)}`" if args else "🔄 reverse *what*?")
@@ -1060,11 +1064,11 @@ def run_tool(key: str, args: str, *, author: str = "") -> ToolResult:
         if key == "timestamp":
             return ToolResult(discord_timestamp(args))
         if key == "json":
-            return ToolResult(json_tool(args))
+            return ToolResult(json_tool(raw_args))
         if key == "sort":
-            return ToolResult(sort_list(args))
+            return ToolResult(sort_list(raw_args))
         if key == "dedupe":
-            return ToolResult(dedupe_list(args))
+            return ToolResult(dedupe_list(raw_args))
         if key == "readability":
             return ToolResult(readability_score(args))
     except ParadiseError as error:

@@ -502,6 +502,10 @@ class ResearchService:
         buffer: list[bytes] = []
         total = 0
         async with session.get(url) as response:
+            final_url = str(getattr(response, "url", "") or url)
+            if final_url != url and not is_fetchable_url(final_url):
+                log.debug("Blocked redirect to unsafe target: %s -> %s", url[:80], final_url[:80])
+                return PageText(url=url, failed=True)
             if response.status != 200:
                 return PageText(url=url, failed=True)
             content_type = str(response.headers.get("Content-Type", "")).casefold()
@@ -620,7 +624,14 @@ class ResearchService:
             cited=cited_indices,
         )
 
-    async def summarize_page(self, url: str, ai: Any, *, asker: str = "someone") -> str:
+    async def summarize_page(
+        self,
+        url: str,
+        ai: Any,
+        *,
+        asker: str = "someone",
+        asker_id: int = 0,
+    ) -> str:
         """Fetch one page and summarize it. Raises nothing; returns a note."""
         page = await self.fetch_page(url)
         if page.failed:
@@ -636,14 +647,16 @@ class ResearchService:
             f"BEGIN UNTRUSTED PAGE CONTENT\n{page.text}\nEND UNTRUSTED PAGE CONTENT"
         )
         try:
+            call_kwargs: dict[str, Any] = {"max_tokens": 400, "role": "deep"}
+            if asker_id:
+                call_kwargs["caller_id"] = int(asker_id)
             return str(
                 await ai.chat(
                     [
                         {"role": "system", "content": system},
                         {"role": "user", "content": prompt},
                     ],
-                    max_tokens=400,
-                    role="deep",
+                    **call_kwargs,
                 )
             ).strip()
         except asyncio.CancelledError:

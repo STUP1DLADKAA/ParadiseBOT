@@ -247,6 +247,37 @@ class TestClassifyRequest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(guess.query, "a wolf")
         self.assertNotIn("Reasoning", guess.query)
 
+    async def test_recipe_mapping_validation_and_context_hint(self):
+        from functions.intent import validate_refined_route
+        from functions.routes import RECIPE, TRANSLATE
+
+        fallback = Route(kind=AI, payload="original ask", confidence=0.4)
+        recipe_guess = parse_intent('{"intent":"recipe","query":"eggs, onion","confidence":0.85}')
+        self.assertEqual(recipe_guess.to_route(fallback).kind, RECIPE)
+
+        # Reject unparseable math/convert hallucinations from Stage-2 classifier.
+        bad_math = Route(kind=CALCULATE, payload="the meaning of life", confidence=0.8)
+        self.assertIs(validate_refined_route(bad_math, fallback), fallback)
+        bad_conv = Route(kind=CONVERT, payload="apples and oranges", confidence=0.8)
+        self.assertIs(validate_refined_route(bad_conv, fallback), fallback)
+        low_conf = Route(kind=WEATHER, payload="Delhi", confidence=0.2)
+        self.assertIs(validate_refined_route(low_conf, fallback), fallback)
+
+        # Accept valid conversions & extract target language on translate routes.
+        good_conv = Route(kind=CONVERT, payload="$100 to INR", confidence=0.85)
+        self.assertEqual(validate_refined_route(good_conv, fallback).kind, CONVERT)
+        tr = Route(kind=TRANSLATE, payload="good morning to Japanese", confidence=0.85)
+        fixed_tr = validate_refined_route(tr, fallback)
+        self.assertEqual(fixed_tr.kind, TRANSLATE)
+        self.assertEqual(fixed_tr.payload, "good morning")
+        self.assertEqual(fixed_tr.payload2, "Japanese")
+
+        # Optional reply context hint is appended and cached separately.
+        gemini = FakeGemini('{"intent":"translate","query":"to English","confidence":0.9}')
+        await classify_request("put this in english", fake_ai(gemini), context="bonjour tout le monde")
+        self.assertEqual(len(gemini.calls), 1)
+        self.assertIn("[context: bonjour tout le monde]", gemini.calls[0])
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

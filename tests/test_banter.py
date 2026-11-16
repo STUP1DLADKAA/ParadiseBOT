@@ -83,28 +83,22 @@ def _personality(**overrides) -> Personality:
         enabled=True,
         reaction_chance=0.0,
         ambient_reaction_chance=0.0,
-        reply_chance=0.0,
-        sticker_chance=0.0,
-        meme_chance=0.0,
-        online_meme_chance=0.0,
-        gif_chance=0.0,
-        random_quip_chance=0.0,
-        roast_chance=0.0,
-        grammar_chance=0.0,
+        lord_reaction_chance=0.0,
         global_cooldown=0,
         channel_cooldown=0,
-        reply_channel_cooldown=0,
-        humour_cooldown=0,
-        grammar_cooldown=0,
-        roast_user_cooldown=0,
+        user_cooldown=0,
+        lord_cooldown=0,
+        ambient_hourly_cap=0,
     )
     defaults.update(overrides)
     gif_search = defaults.pop("_gif_search", None)
+    meme_feed = defaults.pop("_meme_feed", None)
     config = PersonalityConfig(**defaults)
     bot = SimpleNamespace(user=SimpleNamespace(id=999))
     return Personality(
         bot,
         config,
+        meme_feed=meme_feed,
         gif_search=gif_search if gif_search is not None else GifSearch(
             keyless=False
         ),
@@ -428,40 +422,20 @@ class TestGifProviders(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Personality: louder, funnier, roastier
+# Personality: rare emoji reactions only — zero automatic replies
 # ---------------------------------------------------------------------------
 
 
-class TestLouderPersonality(unittest.IsolatedAsyncioTestCase):
-    async def test_a_cocky_message_gets_a_comeback(self):
-        personality = _personality(reply_chance=0.0)
-        msg = _make_msg("i'm him, undefeated, 1v1 me")
-        await personality.handle(msg)
-        msg.reply.assert_awaited_once()
-        sent = msg.reply.call_args.args[0]
-        self.assertIsInstance(sent, str)
-        self.assertGreater(len(sent), 5)
+class TestQuietPersonality(unittest.IsolatedAsyncioTestCase):
+    async def test_cocky_and_roast_me_messages_never_get_unprompted_replies(self):
+        personality = _personality(reaction_chance=1.0, ambient_reaction_chance=1.0)
+        for idx, line in enumerate(("i'm him, undefeated, 1v1 me", "roast me")):
+            msg = _make_msg(line, author_id=40 + idx, channel_id=10 + idx)
+            await personality.handle(msg)
+            msg.reply.assert_not_awaited()
 
-    async def test_roast_me_always_gets_an_answer(self):
-        personality = _personality(
-            global_cooldown=3600, channel_cooldown=3600, roast_user_cooldown=0
-        )
-        msg = _make_msg("roast me")
-        await personality.handle(msg)
-        msg.reply.assert_awaited_once()
-        self.assertIn("Ash", msg.reply.call_args.args[0])
-
-    async def test_the_same_person_is_not_roasted_twice_in_a_row(self):
-        personality = _personality(roast_chance=1.0, roast_user_cooldown=3600)
-        first = _make_msg("honestly i think cereal is cold soup")
-        await personality.handle(first)
-        first.reply.assert_awaited_once()
-        second = _make_msg("another absolutely normal sentence about lunch")
-        await personality.handle(second)
-        second.reply.assert_not_called()
-
-    async def test_roasting_never_happens_on_a_heavy_message(self):
-        personality = _personality(roast_chance=1.0)
+    async def test_reactions_never_happen_on_a_heavy_message(self):
+        personality = _personality(reaction_chance=1.0, ambient_reaction_chance=1.0)
         for text in (
             "my grandfather passed away this morning",
             "i've been really depressed lately",
@@ -472,123 +446,53 @@ class TestLouderPersonality(unittest.IsolatedAsyncioTestCase):
             msg.reply.assert_not_called()
             msg.add_reaction.assert_not_called()
 
-    async def test_stop_roasting_me_is_honoured(self):
-        personality = _personality(roast_chance=1.0, roast_user_cooldown=0)
+    async def test_stop_roasting_me_pauses_even_passive_reactions(self):
+        personality = _personality(reaction_chance=1.0, ambient_reaction_chance=1.0)
         ask = _make_msg("stop roasting me please")
         await personality.handle(ask)
         ask.reply.assert_not_called()
-        msg = _make_msg("i am, objectively, the greatest player here")
+        ask.add_reaction.assert_not_called()
+
+        msg = _make_msg("i finally fixed it and won the match")
         await personality.handle(msg)
         msg.reply.assert_not_called()
+        msg.add_reaction.assert_not_called()
 
-    async def test_the_same_action_is_not_repeated_twice_in_a_row(self):
-        """Two memes back to back reads as a broken bot, not a funny one."""
-        personality = _personality(meme_chance=1.0, online_meme_chance=0.0)
-        first = _make_msg("honestly i think cereal is technically cold soup")
-        await personality.handle(first)
-        first.reply.assert_awaited_once()
-        self.assertEqual(personality._last_action_by_channel[10], "meme")
-
-        # The repeat is *penalised*, so a coin flip now usually lands nowhere:
-        # same channel, cooldowns open, but the meme weight is a quarter.
-        self.assertEqual(
-            personality._weigh("meme", 10, 1.0), personality.REPEAT_PENALTY
-        )
-        self.assertEqual(personality._weigh("meme", 99, 1.0), 1.0)
-        self.assertEqual(personality._weigh("roast", 10, 1.0), 1.0)
-
-        with mock.patch.object(personality_module.random, "random", return_value=0.9):
-            second = _make_msg("another extremely normal sentence about lunch")
-            await personality.handle(second)
-            second.reply.assert_not_called()
-
-        # A different channel is unaffected by that channel's history.
-        with mock.patch.object(personality_module.random, "random", return_value=0.5):
-            third = _make_msg("a third normal sentence about the weather", channel_id=99)
-            await personality.handle(third)
-            third.reply.assert_awaited_once()
-
-    async def test_the_opt_out_survives_an_invitation(self):
-        personality = _personality(roast_chance=1.0, roast_user_cooldown=0)
-        await personality.handle(_make_msg("please stop roasting me"))
-        msg = _make_msg("1v1 me, i'm him")
-        await personality.handle(msg)
-        msg.reply.assert_not_called()
-
-    async def test_ambient_reaction_makes_the_bot_feel_present(self):
+    async def test_ambient_reaction_only_adds_emoji_never_replies(self):
         personality = _personality(ambient_reaction_chance=1.0)
         msg = _make_msg("just had a really long day at the office honestly")
         await personality.handle(msg)
+        msg.reply.assert_not_awaited()
         msg.add_reaction.assert_awaited_once()
         self.assertIn(msg.add_reaction.call_args.args[0], AMBIENT_REACTIONS)
 
-    async def test_online_memes_are_used_when_the_feed_has_one(self):
-        meme = OnlineMeme(url="https://i.redd.it/abc.jpg", title="when it compiles", source="memes")
+    async def test_meme_feed_and_gif_search_never_fire_on_unprompted_messages(self):
+        meme = OnlineMeme(
+            url="https://i.redd.it/abc.jpg", title="when it compiles", source="memes"
+        )
         feed = SimpleNamespace(pick=AsyncMock(return_value=meme))
-        personality = Personality(
-            SimpleNamespace(user=SimpleNamespace(id=999)),
-            PersonalityConfig(
-                meme_chance=1.0,
-                online_meme_chance=1.0,
-                gif_chance=0.0,
-                reaction_chance=0.0,
-                ambient_reaction_chance=0.0,
-                reply_chance=0.0,
-                sticker_chance=0.0,
-                random_quip_chance=0.0,
-                roast_chance=0.0,
-                grammar_chance=0.0,
-                global_cooldown=0,
-                channel_cooldown=0,
-                humour_cooldown=0,
-            ),
-            meme_feed=feed,
+        gifs = SimpleNamespace(available=True, search=AsyncMock(return_value=meme))
+        personality = _personality(
+            reaction_chance=1.0,
+            ambient_reaction_chance=1.0,
+            _meme_feed=feed,
+            _gif_search=gifs,
         )
         msg = _make_msg("just finished the whole project in one sitting somehow")
         await personality.handle(msg)
-        msg.reply.assert_awaited_once()
-        embed = msg.reply.call_args.kwargs["embed"]
-        self.assertEqual(embed.image.url, "https://i.redd.it/abc.jpg")
+        msg.reply.assert_not_awaited()
+        feed.pick.assert_not_awaited()
+        gifs.search.assert_not_awaited()
 
-    async def test_a_dead_feed_falls_back_to_a_drawn_meme(self):
-        feed = SimpleNamespace(pick=AsyncMock(return_value=None))
-        personality = Personality(
-            SimpleNamespace(user=SimpleNamespace(id=999)),
-            PersonalityConfig(
-                meme_chance=1.0,
-                online_meme_chance=1.0,
-                gif_chance=0.0,
-                reaction_chance=0.0,
-                ambient_reaction_chance=0.0,
-                reply_chance=0.0,
-                sticker_chance=0.0,
-                random_quip_chance=0.0,
-                roast_chance=0.0,
-                grammar_chance=0.0,
-                global_cooldown=0,
-                channel_cooldown=0,
-                humour_cooldown=0,
-            ),
-            meme_feed=feed,
-        )
-        msg = _make_msg("honestly i think cereal is technically cold soup")
-        await personality.handle(msg)
-        msg.reply.assert_awaited_once()
-        attached = msg.reply.call_args.kwargs["file"]
-        self.assertEqual(attached.filename, "paradise_meme.png")
-
-    async def test_no_gif_key_means_no_gif_attempt(self):
-        personality = _personality(
-            meme_chance=1.0,
-            gif_chance=1.0,
-            online_meme_chance=0.0,
-            _gif_search=GifSearch(keyless=False),
-        )
-        self.assertFalse(personality.gif_search.available)
-        msg = _make_msg("honestly i think cereal is technically cold soup")
-        await personality.handle(msg)
-        # The meme path still runs; no embed-only GIF reply is produced.
-        self.assertIn("file", msg.reply.call_args.kwargs)
+    async def test_default_reaction_rates_are_infrequent(self):
+        cfg = PersonalityConfig()
+        self.assertLessEqual(cfg.reaction_chance, 0.06)
+        self.assertLessEqual(cfg.ambient_reaction_chance, 0.02)
+        self.assertLessEqual(cfg.lord_reaction_chance, 0.06)
+        self.assertGreaterEqual(cfg.global_cooldown, 45)
+        self.assertGreaterEqual(cfg.channel_cooldown, 240)
+        self.assertGreaterEqual(cfg.user_cooldown, 300)
+        self.assertLessEqual(cfg.ambient_hourly_cap, 4)
 
 
 # ---------------------------------------------------------------------------
@@ -700,41 +604,35 @@ class TestBanterCommands(unittest.IsolatedAsyncioTestCase):
 
 
 class TestBanterConfig(unittest.TestCase):
-    def test_defaults_are_alive_but_controlled(self):
+    def test_defaults_are_emoji_only_and_rare(self):
         cfg = Config.from_env({}).personality
-        # Alive: it still reacts, roasts and quips unprompted…
-        self.assertGreaterEqual(cfg.reaction_chance, 0.15)
-        self.assertGreaterEqual(cfg.roast_chance, 0.05)
-        self.assertGreaterEqual(cfg.random_quip_chance, 0.05)
-        self.assertLessEqual(cfg.global_cooldown, 15)
-        self.assertLessEqual(cfg.channel_cooldown, 60)
+        self.assertLessEqual(cfg.reaction_chance, 0.06)
+        self.assertLessEqual(cfg.ambient_reaction_chance, 0.02)
+        self.assertLessEqual(cfg.lord_reaction_chance, 0.06)
+        self.assertGreaterEqual(cfg.global_cooldown, 45)
+        self.assertGreaterEqual(cfg.channel_cooldown, 240)
+        self.assertGreaterEqual(cfg.user_cooldown, 300)
+        self.assertGreaterEqual(cfg.lord_cooldown, 600)
         self.assertEqual(cfg.roast_intensity, "spicy")
-        # …but controlled: rare interjections, and a hard hourly ceiling on
-        # unprompted chatter so it never fills the chat for no reason.
-        self.assertLessEqual(cfg.interject_chance, 0.05)
-        self.assertGreaterEqual(cfg.interject_cooldown, 300)
         self.assertGreaterEqual(cfg.ambient_hourly_cap, 1)
+        self.assertLessEqual(cfg.ambient_hourly_cap, 4)
 
     def test_env_overrides_are_parsed(self):
         cfg = Config.from_env(
             {
-                "PERSONALITY_ROAST_CHANCE": "0.4",
                 "PERSONALITY_ROAST_INTENSITY": "NUCLEAR",
-                "PERSONALITY_ROAST_USER_COOLDOWN": "120",
-                "PERSONALITY_AMBIENT_REACTION_CHANCE": "0.3",
-                "PERSONALITY_GIF_CHANCE": "0.2",
-                "PERSONALITY_ONLINE_MEME_CHANCE": "0.5",
+                "PERSONALITY_REACTION_CHANCE": "0.04",
+                "PERSONALITY_AMBIENT_REACTION_CHANCE": "0.02",
+                "PERSONALITY_USER_COOLDOWN": "600",
                 "MEME_SOURCES": "memes, dankmemes",
                 "TENOR_API_KEY": "key123",
                 "GIPHY_API_KEY": "",
             }
         ).personality
-        self.assertEqual(cfg.roast_chance, 0.4)
         self.assertEqual(cfg.roast_intensity, "nuclear")
-        self.assertEqual(cfg.roast_user_cooldown, 120)
-        self.assertEqual(cfg.ambient_reaction_chance, 0.3)
-        self.assertEqual(cfg.gif_chance, 0.2)
-        self.assertEqual(cfg.online_meme_chance, 0.5)
+        self.assertEqual(cfg.reaction_chance, 0.04)
+        self.assertEqual(cfg.ambient_reaction_chance, 0.02)
+        self.assertEqual(cfg.user_cooldown, 600)
         self.assertEqual(cfg.meme_sources, ("memes", "dankmemes"))
         self.assertEqual(cfg.tenor_api_key, "key123")
         self.assertEqual(cfg.giphy_api_key, "")
@@ -744,8 +642,8 @@ class TestBanterConfig(unittest.TestCase):
         self.assertEqual(cfg.roast_intensity, "spicy")
 
     def test_a_silly_chance_falls_back(self):
-        cfg = Config.from_env({"PERSONALITY_ROAST_CHANCE": "12"}).personality
-        self.assertEqual(cfg.roast_chance, 0.08)  # the (calmer) default
+        cfg = Config.from_env({"PERSONALITY_REACTION_CHANCE": "12"}).personality
+        self.assertEqual(cfg.reaction_chance, 0.06)
 
 
 # ---------------------------------------------------------------------------
@@ -754,43 +652,39 @@ class TestBanterConfig(unittest.TestCase):
 
 
 class TestAmbientBudget(unittest.IsolatedAsyncioTestCase):
-    """Unprompted chatter is capped per hour — alive, but controlled."""
+    """Passive emoji reactions are capped per hour — never noisy."""
 
-    async def test_unprompted_chatter_stops_at_the_hourly_cap(self):
+    async def test_passive_reactions_stop_at_the_hourly_cap(self):
         personality = _personality(
-            interject_chance=1.0,
-            interject_cooldown=0,
+            ambient_reaction_chance=1.0,
             ambient_hourly_cap=2,
         )
-        replied = 0
-        for index in range(6):
-            # Two authors alternate (a live conversation) with fresh words
-            # each time — identical posts would trip the spam guard.
+        reacted = 0
+        for index in range(4):
             msg = _make_msg(
                 f"so anyway chapter {index} of the saga continues",
-                author_id=42 if index % 2 == 0 else 43,
+                author_id=40 + index,
             )
             await personality.handle(msg)
-            replied += 1 if msg.reply.await_count else 0
-        self.assertEqual(replied, 2)  # said hello twice, then went quiet
+            msg.reply.assert_not_awaited()
+            reacted += 1 if msg.add_reaction.await_count else 0
+        self.assertEqual(reacted, 2)
 
     async def test_a_cap_of_zero_disables_the_ceiling(self):
         personality = _personality(
-            interject_chance=1.0,
-            interject_cooldown=0,
+            ambient_reaction_chance=1.0,
             ambient_hourly_cap=0,
         )
-        replied = 0
+        reacted = 0
         for index in range(4):
             msg = _make_msg(
                 f"plot twist number {index} just dropped",
-                author_id=42 if index % 2 == 0 else 43,
+                author_id=40 + index,
             )
             await personality.handle(msg)
-            replied += 1 if msg.reply.await_count else 0
-        # The first message cannot interject (a conversation needs two
-        # authors first); every later one does — no ceiling in the way.
-        self.assertEqual(replied, 3)
+            msg.reply.assert_not_awaited()
+            reacted += 1 if msg.add_reaction.await_count else 0
+        self.assertEqual(reacted, 4)
 
     def test_the_budget_window_is_one_hour(self):
         personality = _personality(ambient_hourly_cap=1)
@@ -798,119 +692,33 @@ class TestAmbientBudget(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(personality._ambient_budget_ok(10, now))
         personality._record_ambient(10, now)
         self.assertFalse(personality._ambient_budget_ok(10, now + 60))
-        # …and it re-opens after the rolling hour passes.
         self.assertTrue(personality._ambient_budget_ok(10, now + 3601))
-        # Other channels have their own budget.
         self.assertTrue(personality._ambient_budget_ok(11, now + 60))
 
     def test_mentions_are_never_budget_limited(self):
-        # The budget only gates the *passive* path; nothing here is passive.
         personality = _personality(ambient_hourly_cap=0)
         self.assertTrue(personality._ambient_budget_ok(10, 0.0))
 
 
-class TestMemoryCallbacks(unittest.IsolatedAsyncioTestCase):
-    """The passive layer: no AI call, one quoted fact, rare by design."""
+class TestMemoryCallbacksDisabled(unittest.IsolatedAsyncioTestCase):
+    """Stored /memory facts never produce automatic unprompted chat replies."""
 
-    def _with_memory(self, **overrides):
-        tmp = tempfile.TemporaryDirectory()
-        store = MemoryStore(Path(tmp.name) / "memory.db")
-        overrides.setdefault("interject_chance", 0.0)  # two-author tests below
-        personality = _personality(
-            memory_callback_chance=1.0,
-            memory_callback_cooldown=overrides.pop("cooldown", 0),
-            **overrides,
-        )
-        personality.bot.memory = store
-        personality._tmp = tmp  # keep the directory alive
-        return personality, store
+    async def test_remembered_facts_never_trigger_automatic_replies(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            store = MemoryStore(Path(tmp) / "memory.db")
+            store.add(
+                "spent a year reaching level 100 in murder mystery",
+                subject_id=42,
+                subject_name="Ash",
+            )
+            personality = _personality(reaction_chance=1.0, ambient_reaction_chance=1.0)
+            personality.bot.memory = store
+            msg = _make_msg("honestly ranked is a scam this season")
+            await personality.handle(msg)
+            msg.reply.assert_not_awaited()
 
-    async def test_a_remembered_fact_is_quoted_back(self):
-        personality, store = self._with_memory()
-        store.add(
-            "spent a year reaching level 100 in murder mystery",
-            subject_id=42,
-            subject_name="Ash",
-        )
-        msg = _make_msg("honestly ranked is a scam this season")
-        await personality.handle(msg)
-        msg.reply.assert_awaited_once()
-        sent = msg.reply.call_args.args[0]
-        self.assertIn("murder mystery", sent)
-        self.assertIn("Ash", sent)
-        # The fact is quoted verbatim, never rewritten by the frame.
-        self.assertIn('"', sent)
-
-    async def test_memories_about_somebody_else_stay_quiet(self):
-        personality, store = self._with_memory()
-        store.add("secretly loves one direction", subject_id=777, subject_name="Bob")
-        msg = _make_msg("just a normal message about my day")
-        await personality.handle(msg)
-        msg.reply.assert_not_called()
-
-    async def test_the_same_person_is_not_called_back_twice(self):
-        personality, store = self._with_memory(cooldown=3600)
-        store.add("once ate an entire birthday cake alone", subject_id=42)
-        first = _make_msg("anyone up for a game tonight")
-        await personality.handle(first)
-        first.reply.assert_awaited_once()
-        second = _make_msg("different message, same person, minutes later")
-        await personality.handle(second)
-        second.reply.assert_not_called()
-
-    async def test_a_different_person_gets_their_own_callback(self):
-        personality, store = self._with_memory(cooldown=3600)
-        store.add("once ate an entire birthday cake alone", subject_id=42)
-        store.add("afraid of escalators", subject_id=43, subject_name="Rohan")
-        first = _make_msg("anyone up for a game tonight", author_id=42)
-        await personality.handle(first)
-        first.reply.assert_awaited_once()
-        self.assertIn("birthday cake", first.reply.call_args.args[0])
-        second = _make_msg("a completely different message", author_id=43)
-        await personality.handle(second)
-        second.reply.assert_awaited_once()
-        self.assertIn("escalators", second.reply.call_args.args[0])
-
-    async def test_a_very_long_fact_is_capped(self):
-        personality, store = self._with_memory()
-        store.add(
-            "once " + "absolutely " * 40 + "refused to admit the earth is round",
-            subject_id=42,
-        )
-        msg = _make_msg("talking about geography again")
-        await personality.handle(msg)
-        msg.reply.assert_awaited_once()
-        sent = msg.reply.call_args.args[0]
-        self.assertIn("…", sent)
-        self.assertLessEqual(len(sent), 190)
-
-    def test_the_frames_never_admit_to_remembering(self):
-        """The bot knew already — it stalks the server. No frame may say
-        "i remember", "you told me", or anything memory-flavoured, and every
-        frame must address the person by name."""
-        for frame in personality_module._MEMORY_CALLBACK_FRAMES:
-            lowered = frame.lower()
-            self.assertIn("{name}", frame)
-            self.assertIn("{memory}", frame)
-            for banned in (
-                "remember",
-                "taught",
-                "told me",
-                "noted",
-                "filed",
-                "memory #",
-                "you told",
-            ):
-                self.assertNotIn(banned, lowered, f"{banned!r} in {frame!r}")
-
-    async def test_without_a_store_nothing_happens(self):
-        personality = _personality(memory_callback_chance=1.0)
-        msg = _make_msg("just chatting here")
-        await personality.handle(msg)  # must not raise
-        msg.reply.assert_not_called()
-
-    async def test_a_broken_store_never_breaks_chat(self):
-        personality = _personality(memory_callback_chance=1.0)
+    async def test_broken_memory_store_never_affects_passive_handling(self):
+        personality = _personality()
 
         class ExplodingStore:
             def about(self, _subject_id):
@@ -918,7 +726,7 @@ class TestMemoryCallbacks(unittest.IsolatedAsyncioTestCase):
 
         personality.bot.memory = ExplodingStore()
         msg = _make_msg("just chatting here")
-        await personality.handle(msg)  # must not raise
+        await personality.handle(msg)
         msg.reply.assert_not_called()
 
 

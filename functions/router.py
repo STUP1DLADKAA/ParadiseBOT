@@ -39,18 +39,24 @@ import re
 from functions.calculator import extract_expression, looks_like_math
 from functions.toolkit import MEETTIME_SHAPE
 from functions.conversion import parse_conversion_query
-from functions.conversion.currency import resolve_currency
+from functions.conversion.currency import (
+    BASE_USD_RATES,
+    CURRENCY_ALIASES,
+    CURRENCY_SYMBOLS,
+    resolve_currency,
+)
 from functions.conversion.units import TEMP_UNITS, resolve_unit
 from functions.helpers import ParadiseError
 from functions.keywords import keyword_route
 from functions.normalize import normalize_request
 from functions.routes import (
     AI, BUILD, CALCULATE, CHOOSE, COINFLIP, COMMAND_HELP, CONVERT, DATE, DEFINE,
-    DEV, GIF, INFO, MEME, POLL, REMIND, RESEARCH, ROAST, SUMMARIZE, UTILITY,
-    WRITE,
+    DEV, GIF, INFO, MEME, POLL, RECIPE, REMIND, RESEARCH, ROAST, SUMMARIZE,
+    UTILITY, WRITE,
     DETERMINISTIC_KINDS, HELP, HIGH_CONFIDENCE, IMAGE, MEDIUM_CONFIDENCE,
     PING, Route, SEARCH, TIME, TRANSLATE, UNKNOWN, WEATHER,
 )
+from functions.translate import resolve_language
 
 # ---------------------------------------------------------------------------
 # Patterns
@@ -159,7 +165,8 @@ _IMAGE_SUBJECT_TRIM = re.compile(
 _WEATHER = re.compile(
     r"^(?:(?:what(?:'s| is|s)?|how(?:'s| is|s)?)\s+(?:the\s+)?)?"
     r"(?:weather|temperature|forecast)\s*"
-    r"(?:(?:in|at|for|of|like in)\s+(?P<city>[\w' .\-]{2,50}))?\s*[?!.]*$",
+    r"(?:(?:in|at|for|of|like in)\s+(?P<city>[\w' .\-]{2,50})|"
+    r"(?:like\s+)?(?P<deixis>there|over there))?\s*[?!.]*$",
     re.IGNORECASE,
 )
 _WEATHER_CITY_FIRST = re.compile(
@@ -173,14 +180,17 @@ _WEATHER_BARE = re.compile(r"^(?:weather|forecast|temperature)\s*[?!.]*$", re.IG
 
 _TIME_IN = re.compile(
     r"^(?:what(?:'s| is|s)?\s+)?(?:the\s+)?(?:(?:current|local)\s+)?"
-    r"time(?:\s+is\s+it|\s+now)?\s+(?:in|at|for)\s+(?P<city>[\w' .\-]{2,50})\s*[?!.]*$",
+    r"time(?:\s+is\s+it|\s+now)?\s+"
+    r"(?:(?:in|at|for)\s+(?P<city><@!?\d+>|@?[\w' .\-]{2,50})|"
+    r"(?P<deixis>there|over there|here))\s*[?!.]*$",
     re.IGNORECASE,
 )
 _TIME_CITY_FIRST = re.compile(
     r"^(?P<city>[a-z][\w' .\-]{1,40}?)\s+time(?:\s+now)?\s*[?!.]*$", re.IGNORECASE
 )
 _TIME_BARE = re.compile(
-    r"^(?:(?:what(?:'s| is|s)?\s+the\s+)?(?:current|local)\s+)?time(?:\s+now|(?:\s+is\s+it))?\s*[?!.]*$",
+    r"^(?:(?:what(?:'s| is|s)?\s+(?:the\s+|my\s+)?)?(?:current|local|my)\s+time(?:\s+now|\s+is\s+it)?|"
+    r"(?:what(?:'s| is|s)?\s+the\s+)?time(?:\s+now|\s+is\s+it)?)\s*[?!.]*$",
     re.IGNORECASE,
 )
 _DATE = re.compile(
@@ -189,12 +199,34 @@ _DATE = re.compile(
     re.IGNORECASE,
 )
 
+_TRANSLATE_LANG = r"(?:(?:simplified|traditional)\s+chinese|brazilian\s+portuguese|mexican\s+spanish|[a-z][a-z\-]{1,20})"
 _TRANSLATE = re.compile(
-    r"^translate\s+(?P<text>.+?)\s+(?:to|into|in)\s+(?P<lang>[a-z]{2,20})\s*[?!.]*$",
+    rf"^translate\s+(?P<text>.+?)\s+(?:to|into|in)\s+(?P<lang>{_TRANSLATE_LANG})\s*[?!.]*$",
+    re.IGNORECASE,
+)
+# Reply-context form: "@Paradise translate to Hindi" / "translate into English".
+_TRANSLATE_TARGET_ONLY = re.compile(
+    rf"^(?:please\s+)?translate(?:\s+(?:this|that|it))?\s+(?:to|into|in)\s+(?P<lang>{_TRANSLATE_LANG})\s*[?!.]*$",
     re.IGNORECASE,
 )
 _TRANSLATE_SAY = re.compile(
-    r"^(?:how (?:do you|to) say|say)\s+(?P<text>.+?)\s+in\s+(?P<lang>[a-z]{2,20})\s*[?!.]*$",
+    rf"^(?:how (?:do you|to) say|say)\s+(?P<text>.+?)\s+in\s+(?P<lang>{_TRANSLATE_LANG})\s*[?!.]*$",
+    re.IGNORECASE,
+)
+
+# Native offline recipe tool: "recipe with chicken, rice, onion",
+# "what can I cook with eggs and bread", "vegetarian recipe using paneer under 20 mins".
+_RECIPE_ASK = re.compile(
+    r"^(?:please\s+)?(?:"
+    r"(?:(?:give|find|suggest|show|get)\s+(?:me\s+)?)?"
+    r"(?:a\s+|an\s+|some\s+)?"
+    r"(?:(?:quick|easy|fast|simple|healthy)\s+)?"
+    r"(?P<diet>vegetarian|veg|vegan|non[- ]?veg(?:etarian)?)?\s*"
+    r"recipes?\s+(?:with|using|from|for\s+having)\s+(?P<ingredients>.+?)|"
+    r"what\s+(?:can|could|should)\s+(?:i|we)\s+(?:cook|make(?:\s+to\s+eat)?)\s+"
+    r"(?:with|using|from)\s+(?P<ingredients2>.+?)|"
+    r"i\s+have\s+(?P<ingredients3>[^.?!]{4,120}?)\s*,?\s*what\s+(?:can|should)\s+(?:i|we)\s+(?:cook|make)"
+    r")\s*[?!.]*$",
     re.IGNORECASE,
 )
 
@@ -236,8 +268,13 @@ _REASONING_MARKERS = re.compile(
 _SUMMARIZE = re.compile(
     r"^(?:please\s+)?(?:summar(?:ize|ise|ising)?|recap?|tl;?dr|"
     r"what did i miss(?: \S+)?|catch me up(?: on \S+)?|fill me in)"
-    r"(?: (?:the )?(?:last|recent|chat|conversation|channel|this))?\s*"
-    r"(?:\d+ messages?)?\s*(?:please|pls|thx|thanks)?\s*[?!.]*$",
+    r"(?:\s+(?:the\s+)?(?:last|recent|chat|conversation|channel|this))?\s*"
+    r"(?:(?P<count>\d{1,3})\s+(?:messages?|msgs?))?\s*(?:please|pls|thx|thanks)?\s*[?!.]*$",
+    re.IGNORECASE,
+)
+_LINK_REPLY_ASK = re.compile(
+    r"^(?:please\s+)?(?:summar(?:ize|ise)|tl;?dr|read|open|check)\s+"
+    r"(?:this|that|the)\s+(?:link|url|article|page)\s*[?!.]*$",
     re.IGNORECASE,
 )
 
@@ -373,10 +410,10 @@ _UTILITY_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^timestamps?\s+(?:for|of)?\s*(?P<args>.+)$", re.I), "timestamp"),
     (re.compile(
         r"^(?P<mode>validate|check|verify|format|pretty(?:\s?-?\s?print)?|prettify|"
-        r"beautify|fix)\s+(?:this\s+|my\s+|the\s+)?json\b\s*[:?]?\s*(?P<args>.+)$",
+        r"beautify|fix)\s+(?:this\s+|my\s+|the\s+)?json\b\s*[:?]?\s*(?P<args>.*)$",
         re.I), "json"),
     (re.compile(r"^is\s+(?P<args>\{.*\}|\[.*\])\s+valid\s+json\s*\??$", re.I), "json"),
-    (re.compile(r"^sort\s+(?P<args>[^?]+[,;][^?]*)$", re.I), "sort"),
+    (re.compile(r"^sort\s*(?::\s*(?P<args>[^?]+)|\s+(?P<args2>[^?]+[,;][^?]*))$", re.I), "sort"),
     (re.compile(
         r"^(?:dedupe|deduplicate|remove\s+dup(?:licate)?s?|unique(?:\s+lines?)?)\s*"
         r"(?:from|in)?\s*(?:this|these|the|my)?\s*[:]??\s*(?P<args>.+)$", re.I), "dedupe"),
@@ -394,7 +431,7 @@ _WHOLE_SENTENCE_TOOLS = frozenset({"password", "uuid", "meettime"})
 
 _REMIND = re.compile(
     r"^(?:can you\s+|please\s+|could you\s+)?"
-    r"(?:set\s+(?:a|an)\s+)?remind(?:er)?\s+(?P<rest>.+)$",
+    r"(?:(?:set|add|create)\s+(?:a|an)\s+)?remind(?:er)?\s+(?P<rest>.+)$",
     re.IGNORECASE,
 )
 _POLL = re.compile(
@@ -424,7 +461,9 @@ def _utility_route(cleaned: str) -> Route | None:
         if match is None:
             continue
         groups = match.groupdict()
-        args = " ".join(str(groups.get("args") or "").split())
+        args = " ".join(
+            str(groups.get("args") or groups.get("args2") or "").split()
+        )
         mode = str(groups.get("mode") or "").strip().casefold()
         if mode:
             args = f"{mode} {args}".strip()
@@ -485,7 +524,7 @@ def _info_route(cleaned: str) -> Route | None:
 # URL, "git undo …") and must not be eaten by the define/search verbs.
 # ---------------------------------------------------------------------------
 
-_URL_WORD = r"https?://\S+"
+_URL_WORD = r"<?https?://[^\s>]+>?"
 
 #: "summarize this link: <url>" / "tl;dr <url>" / "what does this say <url>"
 _LINK_ASK = re.compile(
@@ -538,6 +577,24 @@ _BUILD_EDIT = re.compile(
     r"style\s+(?:the|this)\s+.+|"
     r"fix\s+(?:the|this)\s+(?:layout|alignment|button|styling|color|bug)\b.*"
     r")\s*[?!.]*$",
+    re.IGNORECASE,
+)
+
+_BUILD_NON_APP_NOUNS = re.compile(
+    r"^(?:(?:a|an|the|some|\d+|two|three|four)\s+)?"
+    r"(?:regex(?:p)?|sql(?:\s+query)?|query|teams?|poll|reminders?|qr(?:\s+code)?|"
+    r"passwords?|uuids?|timestamps?|countdown|recipes?|memes?|gifs?|lists?|"
+    r"sentences?|announcements?|emails?|messages?|summary|excuses?|jokes?|roasts?|"
+    r"quality|specs?|numbers?)\b",
+    re.IGNORECASE,
+)
+_BUILD_NON_UI_EDIT = re.compile(
+    r"^(?:please\s+)?(?:"
+    r"add\s+(?:a|an|the)?\s*reminders?\b|"
+    r"change\s+(?:my\s+)?time\s*zone\b|"
+    r"change\s+[-+]?\d|"
+    r"change\s+[$€£¥₹₩]\s*\d"
+    r")",
     re.IGNORECASE,
 )
 
@@ -620,11 +677,82 @@ _FIND_MESSAGE = re.compile(
 )
 
 
+def _clean_url(raw: str) -> str:
+    """Strip Discord angle brackets and trailing sentence punctuation off a URL."""
+    url = str(raw or "").strip().strip("<>")
+    while url and url[-1] in ".,?!;:>'\"":
+        url = url[:-1]
+    if url.endswith(")") and url.count(")") > url.count("("):
+        url = url[:-1]
+    return url
+
+
+_RECIPE_TIME_TAIL = re.compile(
+    r"\s+(?:in\s+)?(?:under|within|less\s+than|max)\s+(?P<mins>\d{1,3})\s*(?:m|mins?|minutes?)\b",
+    re.IGNORECASE,
+)
+
+
+def _recipe_route(cleaned: str) -> Route | None:
+    """Offline recipe search ('what can I cook with eggs, onion, bread')."""
+    match = _RECIPE_ASK.match(cleaned)
+    if match is None:
+        return None
+    groups = match.groupdict()
+    raw_ing = str(
+        groups.get("ingredients")
+        or groups.get("ingredients2")
+        or groups.get("ingredients3")
+        or ""
+    ).strip(" .,?!")
+    if not raw_ing:
+        return None
+    diet_raw = (groups.get("diet") or "").strip().lower()
+    diet = ""
+    if diet_raw in ("vegan",):
+        diet = "vegan"
+    elif diet_raw in ("veg", "vegetarian"):
+        diet = "vegetarian"
+    elif diet_raw.startswith("non"):
+        diet = "non-veg"
+    max_mins = 0
+    time_match = _RECIPE_TIME_TAIL.search(raw_ing)
+    if time_match is not None:
+        max_mins = max(1, min(int(time_match.group("mins")), 240))
+        raw_ing = (raw_ing[: time_match.start()] + raw_ing[time_match.end() :]).strip(" ,")
+    if not diet:
+        diet_inline = re.search(
+            r"\b(vegan|vegetarian|non[- ]?veg(?:etarian)?)\b", raw_ing, re.IGNORECASE
+        )
+        if diet_inline is not None:
+            word = diet_inline.group(1).lower()
+            diet = "non-veg" if word.startswith("non") else word
+            raw_ing = (raw_ing[: diet_inline.start()] + raw_ing[diet_inline.end() :]).strip(" ,")
+    # Normalize "eggs, bread and onion" -> "eggs, bread, onion"
+    normalized_ing = re.sub(r"\s+(?:and|&|with|plus)\s+", ", ", raw_ing, flags=re.IGNORECASE)
+    normalized_ing = ", ".join(
+        item.strip(" ,") for item in normalized_ing.split(",") if item.strip(" ,")
+    )
+    if not normalized_ing:
+        return None
+    meta = diet
+    if max_mins:
+        meta = f"{diet}|{max_mins}" if diet else f"|{max_mins}"
+    return Route(kind=RECIPE, payload=normalized_ing, payload2=meta, confidence=0.92)
+
+
 def _research_route(cleaned: str) -> Route | None:
     """A web-research request (link summary, news, bare URL), or None."""
+    if _LINK_REPLY_ASK.match(cleaned):
+        return Route(kind=RESEARCH, payload="", payload2="link", confidence=0.88)
     match = _LINK_ASK.match(cleaned)
     if match is not None:
-        return Route(kind=RESEARCH, payload=match.group("url"), payload2="link", confidence=0.92)
+        return Route(
+            kind=RESEARCH,
+            payload=_clean_url(match.group("url")),
+            payload2="link",
+            confidence=0.92,
+        )
     compare = _COMPARE_ASK.match(cleaned)
     if compare is not None and len(compare.group("q").split()) >= 1:
         return Route(
@@ -640,7 +768,12 @@ def _research_route(cleaned: str) -> Route | None:
         )
     match = _BARE_URL.match(cleaned)
     if match is not None:
-        return Route(kind=RESEARCH, payload=match.group("url"), payload2="link", confidence=0.85)
+        return Route(
+            kind=RESEARCH,
+            payload=_clean_url(match.group("url")),
+            payload2="link",
+            confidence=0.85,
+        )
     return None
 
 
@@ -668,28 +801,29 @@ def _write_route(cleaned: str) -> Route | None:
     return None
 
 
-def _build_route(cleaned: str) -> Route | None:
-    """An AI Build Mode request (new project or iterative modification), or None."""
-    # Check new project triggers first
+def _build_new_route(cleaned: str) -> Route | None:
+    """An explicit new AI Build Mode project request, or None."""
     match = _BUILD_TRIGGER.match(cleaned)
     if match is not None:
         desc = match.group("desc").strip()
-        if desc:
+        if desc and not _BUILD_NON_APP_NOUNS.match(desc):
             return Route(kind=BUILD, payload=cleaned, payload2="new", confidence=0.92)
 
-    # Check explicit build requests (e.g. "build a portfolio website", "code a calculator")
     match = _BUILD_EXPLICIT.match(cleaned)
     if match is not None:
         desc = match.group("desc").strip()
-        # Avoid stealing simple questions like "build quality of macbook"
-        if len(desc) >= 3 and not desc.startswith(("quality", "spec", "number")):
+        if len(desc) >= 3 and not _BUILD_NON_APP_NOUNS.match(desc):
             return Route(kind=BUILD, payload=cleaned, payload2="new", confidence=0.90)
 
-    # Check iterative edit requests
-    match = _BUILD_EDIT.match(cleaned)
-    if match is not None:
-        return Route(kind=BUILD, payload=cleaned, payload2="edit", confidence=0.88)
+    return None
 
+
+def _build_edit_route(cleaned: str) -> Route | None:
+    """An iterative AI Build Mode edit request, or None."""
+    if _BUILD_NON_UI_EDIT.match(cleaned):
+        return None
+    if _BUILD_EDIT.match(cleaned) is not None:
+        return Route(kind=BUILD, payload=cleaned, payload2="edit", confidence=0.88)
     return None
 
 
@@ -740,15 +874,29 @@ def _looks_fresh(text: str) -> bool:
     return bool(_FRESH_WORDS.search(text))
 
 
+_KNOWN_CURRENCIES = frozenset(
+    set(BASE_USD_RATES) | set(CURRENCY_SYMBOLS) | set(CURRENCY_ALIASES)
+)
+
+
 def _conversion_resolvable(value: float, from_raw: str, to_raw: str) -> bool:
+    del value
+    from_c = from_raw.strip().lower().strip("°º∘")
+    to_c = to_raw.strip().lower().strip("°º∘")
+    if from_c in TEMP_UNITS and to_c in TEMP_UNITS:
+        return True
     from_u, to_u = resolve_unit(from_raw), resolve_unit(to_raw)
     if from_u and to_u:
         return True
-    if resolve_currency(from_raw) and resolve_currency(to_raw):
+    from_key = from_raw.strip().rstrip(".").lower().replace(" ", "")
+    to_key = to_raw.strip().rstrip(".").lower().replace(" ", "")
+    if (
+        resolve_currency(from_raw)
+        and resolve_currency(to_raw)
+        and (from_key in _KNOWN_CURRENCIES or to_key in _KNOWN_CURRENCIES)
+    ):
         return True
-    from_c = from_raw.strip().lower().strip("°º∘")
-    to_c = to_raw.strip().lower().strip("°º∘")
-    return from_c in TEMP_UNITS and to_c in TEMP_UNITS
+    return False
 
 
 def _try_conversion(text: str) -> Route | None:
@@ -834,14 +982,9 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
     if choose_match:
         return Route(kind=CHOOSE, payload=choose_match.group("options").strip(), confidence=0.95)
 
-    # -- AI Build Mode: users creating or updating websites and web apps
-    build = _build_route(cleaned)
-    if build is not None:
-        return build
-
-    # -- research, writing help, dev help and channel-history search: their
-    # shapes are unmistakable, so they claim their requests before the
-    # generic define/search verbs can overthink them.
+    # -- research, writing help, dev help, recipes and channel-history search:
+    # their shapes are unmistakable, so they claim their requests before
+    # generic build/define/search verbs can overthink them.
     found = _find_message_route(cleaned)
     if found is not None:
         return found
@@ -854,9 +997,20 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
     dev = _dev_route(cleaned)
     if dev is not None:
         return dev
+    recipe = _recipe_route(cleaned)
+    if recipe is not None:
+        return recipe
 
-    # -- image requests go first: "find me a picture of X" must never be
-    # grabbed by the generic "find …" web-search verb below.
+    # -- AI Build Mode (explicit new projects): runs before utility/image so
+    # "build a timer website" or "code a calculator" enters Build Mode, while
+    # dev/write/recipe/non-app guards above keep "build a regex" or "write an
+    # announcement" on their native tools.
+    build_new = _build_new_route(cleaned)
+    if build_new is not None:
+        return build_new
+
+    # -- image requests go before search so "find me a picture of X" never
+    # gets grabbed by the generic "find …" web-search verb below.
     route = _try_image(cleaned)
     if route is not None:
         return route
@@ -885,7 +1039,12 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
     convert_text = _CONVERT_VERB.sub("", cleaned, count=1) if _CONVERT_VERB.match(cleaned) else ""
     if convert_text:
         route = _try_conversion(convert_text.rstrip("?!."))
-        return route or Route(kind=CONVERT, payload=convert_text, confidence=0.6)
+        if route is not None:
+            return route
+        # Only bare "convert …" claims an unparsed 0.6 fallback; "change the
+        # button color to red" or "turn off the lights" is not a unit query.
+        if cleaned.casefold().startswith("convert "):
+            return Route(kind=CONVERT, payload=convert_text, confidence=0.6)
     route = _try_conversion(cleaned)
     if route is not None:
         return route
@@ -906,7 +1065,9 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
     for pattern in (_WEATHER_HOW, _WEATHER_CITY_FIRST, _WEATHER):
         match = pattern.match(cleaned)
         if match:
-            return Route(kind=WEATHER, payload=(match.group("city") or "").strip(), confidence=0.9)
+            groups = match.groupdict()
+            place = (groups.get("city") or groups.get("deixis") or "").strip()
+            return Route(kind=WEATHER, payload=place, confidence=0.9)
     if _WEATHER_BARE.match(cleaned):
         return Route(kind=WEATHER, payload="", confidence=0.8)
 
@@ -920,15 +1081,34 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
     for pattern in (_TIME_IN, _TIME_CITY_FIRST):
         match = pattern.match(cleaned)
         if match:
-            return Route(kind=TIME, payload=match.group("city").strip(), confidence=0.9)
+            groups = match.groupdict()
+            place = (groups.get("city") or groups.get("deixis") or "").strip()
+            return Route(kind=TIME, payload=place, confidence=0.9)
     if _TIME_BARE.match(cleaned):
         return Route(kind=TIME, payload="", confidence=0.75)
 
-    match = _TRANSLATE.match(cleaned) or _TRANSLATE_SAY.match(cleaned)
-    if match:
+    target_only = _TRANSLATE_TARGET_ONLY.match(cleaned)
+    if target_only and resolve_language(target_only.group("lang")):
         return Route(
             kind=TRANSLATE,
-            payload=match.group("text").strip(),
+            payload="",
+            payload2=target_only.group("lang").strip(),
+            confidence=0.9,
+        )
+    match = _TRANSLATE.match(cleaned) or _TRANSLATE_SAY.match(cleaned)
+    if match and resolve_language(match.group("lang")):
+        return Route(
+            kind=TRANSLATE,
+            payload=match.group("text").strip(" \"'“”"),
+            payload2=match.group("lang").strip(),
+            confidence=0.9,
+        )
+    if match:
+        # Unknown target language name on explicit "translate X to Y": still
+        # route to TRANSLATE so the user gets a helpful supported-language note.
+        return Route(
+            kind=TRANSLATE,
+            payload=match.group("text").strip(" \"'“”"),
             payload2=match.group("lang").strip(),
             confidence=0.9,
         )
@@ -937,8 +1117,11 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
     # These sit after the definition/translation tools (so "what is a meme"
     # stays a definition) and before the search verbs (so "show me a meme"
     # never becomes a web lookup).
-    if _SUMMARIZE.match(cleaned):
-        return Route(kind=SUMMARIZE, confidence=0.92)
+    summarize_match = _SUMMARIZE.match(cleaned)
+    if summarize_match:
+        raw_count = summarize_match.group("count")
+        msg_payload = str(max(5, min(int(raw_count), 100))) if raw_count else ""
+        return Route(kind=SUMMARIZE, payload=msg_payload, confidence=0.92)
     meme = _meme_route(cleaned)
     if meme is not None:
         return meme
@@ -962,6 +1145,13 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
     utility = _utility_route(cleaned)
     if utility is not None:
         return utility
+
+    # -- Iterative AI Build Mode edits ("make the background dark", "add a
+    # navbar", "fix the button alignment"): runs after deterministic tools so
+    # "change $100 to INR" and "add a reminder in 5m" are never stolen.
+    build_edit = _build_edit_route(cleaned)
+    if build_edit is not None:
+        return build_edit
 
     # -- implicit "what is X" definitions come after the tools that could
     # claim the same shape ("what's the date", "what's the weather in …").
@@ -1034,6 +1224,44 @@ def route_strict(text: str, *, allow_ai: bool = True) -> Route:
 _TRUST_STRICT = 0.9
 
 
+_MULTILINE_PREFIX_STRIP = re.compile(
+    r"^(?:(?:format|prettify|minify|validate)\s+(?:this\s+)?json\s*[:\n]\s*|"
+    r"json\s*[:\n]\s*|"
+    r"(?:sort|alphabeti[sz]e)(?:\s+(?:this|these))?(?:\s+(?:list|lines|items))?\s*[:\n]\s*|"
+    r"(?:dedupe|deduplicate|remove\s+duplicates(?:\s+from)?)\s*[:\n]\s*|"
+    r"(?:review|check|look\s+(?:at|over)|critique)\s+(?:this|that|my|the)?\s*"
+    r"(?:code|snippet|code\s+snippet|script|function|patch|pr)\b\s*[:,]?\s*|"
+    r"(?:explain|fix|whats|what's|what\s+is|what\s+does|help(?:\s+me)?\s+(?:with|fix))\s+"
+    r"(?:this|that|the|my)?\s*(?:error|exception|traceback|stack\s*trace|crash\s+log|"
+    r"error\s+log|bug|crash|panic)\b\s*[:,]?\s*|"
+    r"(?:rewrite|reword|rephrase|reformulate|shorten|condense|tighten)\s+)",
+    re.IGNORECASE,
+)
+
+
+def _restore_multiline_payload(raw_text: str, route: Route) -> Route:
+    """Keep line breaks intact for code blocks, tracebacks, JSON and line lists."""
+    raw = str(raw_text or "")
+    if "\n" not in raw:
+        return route
+    if route.kind in (DEV, WRITE) or (
+        route.kind == UTILITY and route.payload2 in ("json", "sort", "dedupe")
+    ):
+        trimmed = raw.strip()
+        body = _MULTILINE_PREFIX_STRIP.sub("", trimmed, count=1).strip()
+        if body and "\n" in body:
+            return Route(
+                kind=route.kind,
+                payload=body,
+                payload2=route.payload2,
+                confidence=route.confidence,
+                fresh=route.fresh,
+                reason_complex=route.reason_complex,
+                count=route.count,
+            )
+    return route
+
+
 def route_query(text: str, *, allow_ai: bool = True) -> Route:
     """Classify a user query into the best tool.
 
@@ -1046,10 +1274,11 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
     The most confident candidate wins, so a well-formed sentence costs one
     pass and a mangled one costs three cheap ones.
     """
-    cleaned = _squash(text)
+    raw = str(text or "")
+    cleaned = _squash(raw)
     best = route_strict(cleaned, allow_ai=allow_ai)
     if best.confidence >= _TRUST_STRICT:
-        return best
+        return _restore_multiline_payload(raw, best)
     if not cleaned:
         return best
 
@@ -1059,7 +1288,7 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
         if alternative.confidence > best.confidence:
             best = alternative
     if best.confidence >= _TRUST_STRICT:
-        return best
+        return _restore_multiline_payload(raw, best)
 
     guess = keyword_route(normalized)
     if guess is not None and guess.confidence > best.confidence:
@@ -1078,7 +1307,7 @@ def route_query(text: str, *, allow_ai: bool = True) -> Route:
             fresh=best.fresh,
             reason_complex=best.reason_complex,
         )
-    return best
+    return _restore_multiline_payload(raw, best)
 
 
 # ---------------------------------------------------------------------------
@@ -1097,14 +1326,82 @@ _MAX_COMPOUND_PARTS = 3
 # Kinds that can take part in a combined answer at all.
 _COMPOUND_KINDS = frozenset(
     {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, SEARCH, DEFINE,
-     MEME, GIF, SUMMARIZE, UTILITY, INFO, REMIND, POLL, RESEARCH}
+     RECIPE, MEME, GIF, SUMMARIZE, UTILITY, INFO, REMIND, POLL, RESEARCH}
 )
 # At least one part must be an unambiguous deterministic tool, otherwise the
 # "and" was almost certainly part of a single sentence.
 _STRONG_KINDS = frozenset(
-    {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, MEME, GIF,
-     UTILITY, INFO}
+    {CALCULATE, CONVERT, WEATHER, TIME, DATE, IMAGE, TRANSLATE, RECIPE, MEME,
+     GIF, UTILITY, INFO}
 )
+# Single-argument tools where "and" is part of the payload ("recipe with eggs
+# and rice", "choose pizza and pasta", "poll: cats and dogs", "build a todo and
+# notes app", "sort a and b", "encode foo and bar").
+_ATOMIC_KINDS = frozenset({BUILD, CHOOSE, DEV, POLL, RECIPE, ROAST, WRITE})
+_ATOMIC_UTILITY_TOOLS = frozenset(
+    {"aesthetic", "base64", "binary", "case", "count", "dedupe", "hash",
+     "hex", "json", "meettime", "mock", "morse", "pick", "qr", "reverse",
+     "rot13", "sort", "teams", "url"}
+)
+_SHARED_PLACE_PART = re.compile(r"^[a-zA-Z][a-zA-Z' .\-]{1,35}$")
+# Real country/state names containing "and" that must never be split in half.
+_COMPOUND_PLACE_NAMES = frozenset(
+    {
+        "trinidad and tobago",
+        "antigua and barbuda",
+        "bosnia and herzegovina",
+        "saint kitts and nevis",
+        "st kitts and nevis",
+        "saint vincent and the grenadines",
+        "sao tome and principe",
+        "turks and caicos",
+        "jammu and kashmir",
+        "andaman and nicobar",
+        "daman and diu",
+        "dadra and nagar haveli",
+        "newfoundland and labrador",
+        "brighton and hove",
+    }
+)
+_SHARED_VERB_CUES = frozenset(
+    {"time", "weather", "temperature", "forecast", "convert", "calculate",
+     "translate", "define", "search", "google", "show", "send", "meme", "gif",
+     "remind", "poll", "summarize", "recap", "date", "what", "whats", "what's",
+     "how", "who"}
+)
+
+
+def _shared_verb_fanout(primary: Route) -> list[Route] | None:
+    """Expand 'weather in Delhi and Mumbai' or 'time in Tokyo and London'."""
+    if primary.kind not in (WEATHER, TIME) or not primary.payload:
+        return None
+    lowered = primary.payload.strip(" ?!.").casefold()
+    if lowered in _COMPOUND_PLACE_NAMES:
+        return None
+    if " and " not in lowered and " & " not in lowered:
+        return None
+    raw_parts = re.split(
+        r"\s*,\s*(?:and\s+)?|\s+(?:and|&)\s+",
+        primary.payload.strip(" ?!."),
+        flags=re.IGNORECASE,
+    )
+    parts = [p.strip() for p in raw_parts if p.strip()]
+    if not 2 <= len(parts) <= _MAX_COMPOUND_PARTS:
+        return None
+    normalized: list[str] = []
+    for idx, part in enumerate(parts):
+        if idx > 0:
+            part = re.sub(r"^(?:in|at|for)\s+", "", part, flags=re.IGNORECASE).strip()
+        first_word = part.split()[0].casefold() if part.split() else ""
+        if idx > 0 and first_word in _SHARED_VERB_CUES:
+            return None
+        if not _SHARED_PLACE_PART.match(part):
+            return None
+        normalized.append(part)
+    return [
+        Route(kind=primary.kind, payload=part, confidence=primary.confidence)
+        for part in normalized
+    ]
 
 
 def route_many(text: str) -> list[Route]:
@@ -1114,10 +1411,18 @@ def route_many(text: str) -> list[Route]:
     and two or three routes for genuine multi-tool requests. Callers can
     execute the parts concurrently and combine the answers.
     """
-    cleaned = _squash(text)
-    primary = route_query(cleaned)
-    if not cleaned or len(cleaned) > 400:
+    raw = str(text or "")
+    cleaned = _squash(raw)
+    primary = route_query(raw)
+    if not cleaned or len(cleaned) > 400 or "\n" in raw:
         return [primary]
+    # Protect tools whose own argument naturally contains "and".
+    if primary.kind in _ATOMIC_KINDS or (
+        primary.kind == UTILITY and primary.payload2 in _ATOMIC_UTILITY_TOOLS
+    ):
+        # Allow explicit semicolon chaining ("remind me in 5m to stretch; weather in Delhi")
+        if ";" not in cleaned:
+            return [primary]
     # Fast path: no join word at all, so there is nothing to split. Greedy
     # single-tool patterns ("weather in Delhi and time in Tokyo" matches the
     # weather regex whole) must still be re-checked, so confidence alone is
@@ -1127,26 +1432,30 @@ def route_many(text: str) -> list[Route]:
 
     segments = [part.strip(" ,;") for part in _COMPOUND_SPLIT.split(cleaned)]
     segments = [part for part in segments if len(part) >= 2]
-    if not 2 <= len(segments) <= _MAX_COMPOUND_PARTS:
-        return [primary]
+    if 2 <= len(segments) <= _MAX_COMPOUND_PARTS:
+        routes = [route_query(segment) for segment in segments]
+        usable = [
+            route
+            for route in routes
+            if route.kind in _COMPOUND_KINDS and route.confidence >= 0.6
+        ]
+        # Require EVERY segment to resolve cleanly so we never silently discard
+        # half of what the user asked.
+        if len(usable) == len(segments) and any(
+            route.kind in _STRONG_KINDS for route in usable
+        ):
+            return usable[:_MAX_COMPOUND_PARTS]
 
-    routes = [route_query(segment) for segment in segments]
-    usable = [
-        route
-        for route in routes
-        if route.kind in _COMPOUND_KINDS and route.confidence >= 0.6
-    ]
-    if len(usable) < 2:
-        return [primary]
-    if not any(route.kind in _STRONG_KINDS for route in usable):
-        return [primary]
-    return usable[:_MAX_COMPOUND_PARTS]
+    fanout = _shared_verb_fanout(primary)
+    if fanout is not None:
+        return fanout
+    return [primary]
 
 
 __all__ = [
     "AI", "BUILD", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE", "DEFINE",
     "DETERMINISTIC_KINDS", "DEV", "GIF", "HELP", "HIGH_CONFIDENCE", "IMAGE",
-    "MEDIUM_CONFIDENCE", "MEME", "PING", "RESEARCH", "ROAST", "Route", "SEARCH",
-    "SUMMARIZE", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER", "WRITE",
+    "MEDIUM_CONFIDENCE", "MEME", "PING", "RECIPE", "RESEARCH", "ROAST", "Route",
+    "SEARCH", "SUMMARIZE", "TIME", "TRANSLATE", "UNKNOWN", "WEATHER", "WRITE",
     "route_many", "route_query", "route_strict",
 ]

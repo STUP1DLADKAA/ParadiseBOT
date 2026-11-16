@@ -3,7 +3,7 @@
 <img src="assets/banner.png" alt="Paradise Bot — a Discord bot that answers with tools first and AI for everything language-shaped" width="100%">
 
 **A Discord bot for a real friend group.** Search, weather, conversions, a
-dictionary, mini-games, voice-activity leaderboards — and an AI layer that is
+dictionary, recipes, voice-activity leaderboards — and an AI layer that is
 only ever the *last* resort.
 
 [![CI](https://github.com/STUP1DLADKAA/ParadiseBOT/actions/workflows/ci.yml/badge.svg)](https://github.com/STUP1DLADKAA/ParadiseBOT/actions/workflows/ci.yml)
@@ -72,7 +72,7 @@ cannot answer:
 | `/summarize` | AI summary of recent conversation | optional |
 | `/memory add/list/remove/clear [user]` | the lords (Stupid, Taher) teach the bot facts about a member (or the server) that surface when that person talks | optional |
 | `@Paradise roast <someone>` | an AI tease about what that person actually just said (roast-book fallback) | optional |
-| Personality & banter | canned reactions, replies, stickers, context roasts, interjections, rendered memes, keyless internet memes and **keyless reaction GIFs** — **no model** for any of it | never |
+| Passive reactions & explicit banter | rare, cooldown-gated emoji reactions on chat (never unprompted text/GIF/image replies); `/roast`, `/meme` and `/gif` on demand | never |
 
 **3. What is *not* AI.** Every image the bot produces — leaderboard cards,
 dictionary cards, weather cards, recipe cards — is drawn programmatically with
@@ -99,13 +99,12 @@ conversation, `/summarize` and the AI-shaped answers are unavailable.
 | **Mention-first interface** | `@Paradise 100 USD to INR`, `@Paradise weather in Delhi`, `@Paradise roll 2d20+3` — no slash commands to memorise. A deterministic router picks the right native tool; two requests in one sentence run concurrently, and 12 AI answers can be in flight at once with a per-member fairness cap. |
 | **Multi-model brains** | List several models on one OpenAI-compatible endpoint (`AI_MODELS=fast:gpt-4o-mini,deep:gpt-4o`): fast models handle labels and quips, deep models handle real questions and recaps, and a failing model is failed over mid-flight — then Gemini, as always. |
 | **Voice leaderboards** | Supabase-backed tracking with crash-safe checkpoints, IST calendar windows and a daily DM that reads like a note from a person. The card is a rendered page — a podium, then one grouped list, in white on light grey with a single accent per period. |
-| **Cards, drawn in code** | Dictionary, weather, recipe, mini-game and leaderboard visuals are Pillow-rendered at 2× supersampling — deterministic, cacheable, never generated. The leaderboard's contrast ratios are asserted in the test suite, not eyeballed. |
+| **Cards, drawn in code** | Dictionary, weather, recipe and leaderboard visuals are Pillow-rendered at 2× supersampling — deterministic, cacheable, never generated. The leaderboard's contrast ratios are asserted in the test suite, not eyeballed. |
 | **Pronunciation** | Optional ElevenLabs voice for dictionary words, with an OpenAI-compatible and a free web fallback. Hindi, English and Hinglish. |
-| **It actually talks back** | Reactions, one-liners, stickers, roasts that quote your own words back at you, "hello!" interjections when two people are talking, reaction GIFs and memes pulled from real Reddit communities — none of it needs an API key. Say "roast me", type something cocky, or just be funny near it. [How it works](docs/humour.md). |
-| **A living personality** | Every AI reply carries a rotating mood, a guard against repeating his own phrasings, and the slang this group actually types — picked up live from chat, in memory only. Roasts never reuse an angle about the same person (no more grudge loops), and if somebody talks *about* him without pinging him, he butts in with a freshly written line. He speaks Hinglish when the room does, with the friendly-fire profanity the room uses — never at anyone's identity, never when someone's upset. |
-| **Long-term memory** | The lords (`/memory`) teach the bot facts *about specific members* — they surface when that person talks or is asked about, never dumped into every reply. The bot never says "I remember": it acts like it always knew, because it watches everyone. SQLite always, an optional Supabase mirror for durability, and a rare quoted callback from the personality. |
-| **Silent presence** | Follows the crowd into the busiest voice channel and says nothing when it arrives. |
-| **Mini-games** | A recoverable SQLite scheduler, four modular games, aggregate-only leaderboard. |
+| **Knows when to stay quiet** | Unprompted chat only ever gets an occasional, cooldown-gated emoji reaction — never unsolicited text, GIF, meme or sticker replies. Memes, reaction GIFs and roasts are available whenever you ask via `/meme`, `/gif`, `/roast` or `@Paradise`. [How it works](docs/humour.md). |
+| **A living personality** | Every AI reply carries a rotating mood, a guard against repeating his own phrasings, and the slang this group actually types — picked up live from chat, in memory only. Roasts never reuse an angle about the same person (no more grudge loops). He speaks Hinglish when the room does, with the friendly-fire profanity the room uses — never at anyone's identity, never when someone's upset. |
+| **Long-term memory** | The lords (`/memory`) teach the bot facts *about specific members* — they surface when that person talks or is asked about, never dumped into every reply. The bot never says "I remember": it acts like it always knew, because it watches everyone. SQLite always, plus an optional Supabase mirror for durability. |
+| **Silent presence** | Follows the crowd into the busiest voice channel, holds its channel on ties, and says nothing when it arrives. |
 | **Self-updating** | Pulls the latest revision from GitHub on start-up and while online — validated, backed up, crash-loop guarded, and it never touches `.env` or `data/`. |
 | **No mandatory keys** | Dictionary, conversions, calculator, weather, time, translation, image search, web research (DuckDuckGo-lite + Wikipedia) and the entire free toolkit (dice, QR codes, passwords, ciphers, countdowns, teams, meeting planner, timestamps, JSON/sort/dedupe/readability, reminders, polls, info cards) work with zero configuration. Questions, writing and dev help need an AI key. |
 
@@ -224,8 +223,7 @@ ParadiseBOT/
 │   ├── vc.py                  /vc leaderboard · /vc stats · /vc dmreports
 │   ├── voice_presence.py      silent crowd-following into voice channels
 │   ├── clip.py                rolling voice-clip capture and export
-│   ├── dictionary.py          chat triggers, cards, playback buttons
-│   ├── minigames.py           game scheduler, admin controls, leaderboard
+│   ├── dictionary.py          dictionary cards and pronunciation playback
 │   ├── edit.py                operator-only voice-time corrections
 │   ├── ai.py · recipe.py · fun.py · system.py · utility.py
 ├── functions/                 the engines, framework-free and unit-testable
@@ -238,7 +236,6 @@ ParadiseBOT/
 │   ├── images/                real web image search, URL safety, embed builder
 │   ├── voice/                 tracking, Supabase persistence, windows, card renderer
 │   ├── voice_clip/            Opus decoding, rolling buffer, mixer, AAC export
-│   ├── minigames/             recoverable scheduler + four games
 │   ├── recipes/               recipe engine and bundled recipe book
 │   ├── tts.py                 ElevenLabs → OpenAI-compatible → free voice
 │   ├── gemini.py · ai.py      provider chain (openai-compatible → gemini), personality

@@ -87,7 +87,7 @@ def deaf_exempt_user_ids() -> tuple[int, ...]:
         if value.isdigit() and int(value) > 0 and int(value) not in ids:
             ids.append(int(value))
     return tuple(ids)
-VOICE_ALERT_CHANNEL_ID = 0  # set VOICE_ALERT_CHANNEL_ID to enable alerts
+VOICE_ALERT_CHANNEL_ID = 0  # set VOICE_ALERT_CHANNEL_ID to enable midnight leaderboards
 DEAF_WARNING_DELAY_SECONDS = 30.0
 
 
@@ -107,7 +107,7 @@ def excluded_from_credit(member, channel, state) -> bool:
 
 def _should_warn_deaf(member, channel, state) -> bool:
     """True when a member is deafened in a non-AFK VC and eligible for warning."""
-    if channel is None or state is None:
+    if channel is None or state is None or getattr(member, "bot", False):
         return False
     afk_channel = getattr(member.guild, "afk_channel", None)
     if afk_channel is not None and channel.id == afk_channel.id:
@@ -402,7 +402,7 @@ class VoiceTracker:
         if not _should_warn_deaf(member, channel, state):
             self._cancel_deaf_warning(key)
             return
-        if self.alert_channel_id <= 0 or key in self._deaf_warned:
+        if self.deaf_warning_seconds <= 0 or key in self._deaf_warned:
             return
         existing = self._deaf_warning_tasks.get(key)
         if existing is not None and not existing.done():
@@ -412,11 +412,51 @@ class VoiceTracker:
             name=f"voice-deaf-warning-{key[0]}-{key[1]}",
         )
 
+    async def _resolve_warning_recipient(
+        self,
+        guild: Any,
+        user_id: int,
+        fallback_member: Any,
+    ) -> Any | None:
+        """Resolve only the affected human user for a private DM warning."""
+        candidates: list[Any] = []
+        if guild is not None and hasattr(guild, "get_member"):
+            candidates.append(guild.get_member(user_id))
+        candidates.append(fallback_member)
+        get_user = getattr(self.bot, "get_user", None)
+        if callable(get_user):
+            candidates.append(get_user(user_id))
+
+        for candidate in candidates:
+            if (
+                candidate is not None
+                and getattr(candidate, "id", None) == user_id
+                and not getattr(candidate, "bot", False)
+                and asyncio.iscoroutinefunction(getattr(candidate, "send", None))
+            ):
+                return candidate
+
+        fetch_user = getattr(self.bot, "fetch_user", None)
+        if asyncio.iscoroutinefunction(fetch_user):
+            try:
+                fetched = await fetch_user(user_id)
+            except discord.DiscordException:
+                return None
+            if (
+                fetched is not None
+                and getattr(fetched, "id", None) == user_id
+                and not getattr(fetched, "bot", False)
+                and asyncio.iscoroutinefunction(getattr(fetched, "send", None))
+            ):
+                return fetched
+        return None
+
     async def _deaf_warning_worker(
         self,
         key: tuple[int, int],
         fallback_member: discord.Member,
     ) -> None:
+        """Privately DM only the affected deafened user; never post publicly."""
         current_task = asyncio.current_task()
         try:
             await asyncio.sleep(self.deaf_warning_seconds)
@@ -430,6 +470,8 @@ class VoiceTracker:
             return
 
         guild_id, user_id = key
+        if user_id in deaf_exempt_user_ids():
+            return
         session = self.active_sessions.get(key)
         if session is None or not session.is_deaf:
             return
@@ -444,37 +486,46 @@ class VoiceTracker:
         if afk_channel is not None and getattr(afk_channel, "id", None) == session.channel_id:
             return
 
-        member = None
-        if hasattr(guild, "get_member"):
-            cand = guild.get_member(user_id)
-            if getattr(cand, "id", None) == user_id:
-                member = cand
-        if member is None:
-            member = fallback_member
-
-        _resolved_guild, alert_channel, _transient = await self._resolve_alert_channel(guild)
-        if alert_channel is None:
+        # Record the warning attempt once per deafen episode so closed DMs do
+        # not keep retrying on unrelated voice-state updates, and never fall
+        # back to posting in any public guild or voice text channel.
+        self._deaf_warned.add(key)
+        recipient = await self._resolve_warning_recipient(
+            guild, user_id, fallback_member
+        )
+        if recipient is None:
             log.debug(
-                "Skipping deafened VC warning for user %s: channel %s unavailable",
+                "Skipping private deafened VC warning for user %s: DM target unavailable",
                 user_id,
-                self.alert_channel_id,
             )
             return
 
-        self._deaf_warned.add(key)
         seconds_int = max(1, int(round(self.deaf_warning_seconds)))
         unit = "second" if seconds_int == 1 else "seconds"
+        guild_name = getattr(guild, "name", None)
+        where = (
+            f"<#{session.channel_id}> in **{guild_name.strip()}**"
+            if isinstance(guild_name, str) and guild_name.strip()
+            else f"<#{session.channel_id}>"
+        )
         try:
-            await alert_channel.send(
-                f"{member.mention} no VC farming — you've been deafened in "
-                f"<#{session.channel_id}> for {seconds_int} {unit}. "
-                "Deafened time doesn't count; undeafen to resume earning VC time.",
-                allowed_mentions=discord.AllowedMentions(
-                    users=[member], roles=False, everyone=False
-                ),
+            await recipient.send(
+                f"No VC farming — you've been deafened in {where} "
+                f"for {seconds_int} {unit}. Deafened time doesn't count; "
+                "undeafen to resume earning VC time.",
+                allowed_mentions=discord.AllowedMentions.none(),
+            )
+        except discord.Forbidden:
+            log.debug(
+                "Skipping private deafened VC warning for user %s: DMs closed",
+                user_id,
             )
         except discord.DiscordException:
-            log.warning("Could not send deafened VC warning", exc_info=True)
+            log.warning(
+                "Could not send private deafened VC warning to user %s",
+                user_id,
+                exc_info=True,
+            )
 
     def _is_matching_alert_channel(self, channel: Any) -> bool:
         return (

@@ -467,6 +467,7 @@ def _make_mock_member(guild, user_id, name="Alex"):
     member.guild = guild
     member.display_avatar.url = f"https://cdn.discordapp.com/avatars/{user_id}/x.png"
     member.voice = MagicMock(self_mute=False, mute=False, self_deaf=False, deaf=False)
+    member.send = AsyncMock()
     return member
 
 
@@ -659,8 +660,119 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
             total = sum(row["duration_seconds"] for row in self.fake.daily.values()
                         if row["user_id"] == user_id)
             self.assertEqual(total, expected)
+            # Never leaks the "no VC farming" warning to any public channel.
             channel.send.assert_not_awaited()
-            self.assertEqual(alert_channel.send.await_count, int(user_id == 777))
+            alert_channel.send.assert_not_awaited()
+            # Delivered privately via DM to the non-exempt deafened user only.
+            self.assertEqual(member.send.await_count, int(user_id == 777))
+            if user_id == 777:
+                dm_text = member.send.await_args.args[0]
+                self.assertIn("no vc farming", dm_text.casefold())
+                mentions = member.send.await_args.kwargs["allowed_mentions"]
+                self.assertFalse(mentions.everyone)
+                self.assertFalse(mentions.roles)
+                self.assertFalse(mentions.users)
+
+    async def test_deaf_warning_is_private_to_affected_user_even_without_alert_channel(self):
+        guild = _make_mock_guild()
+        guild.name = "Paradise"
+        channel = MagicMock(id=888)
+        channel.send = AsyncMock()
+        alert_channel = MagicMock(id=ALERT_CHANNEL_ID, guild=guild)
+        alert_channel.send = AsyncMock()
+        guild.get_channel.side_effect = (
+            lambda cid: alert_channel if cid == ALERT_CHANNEL_ID else None
+        )
+        guild.get_channel_or_thread.side_effect = guild.get_channel.side_effect
+
+        deafened = _make_mock_member(guild, 701, "Bob")
+        bystander = _make_mock_member(guild, 702, "Alice")
+        members = {deafened.id: deafened, bystander.id: bystander}
+        guild.get_member.side_effect = lambda uid: members.get(uid)
+        self.mock_bot.get_guild.return_value = guild
+
+        # Even with alert_channel_id=0 (default), private DM warning still fires.
+        tracker = VoiceTracker(
+            self.mock_bot,
+            self.store,
+            alert_channel_id=0,
+            deaf_warning_seconds=0.02,
+        )
+        await tracker.handle_voice_state_update(
+            bystander, _voice_state(None), _voice_state(channel)
+        )
+        deaf_state = _voice_state(channel)
+        deaf_state.self_deaf = True
+        await tracker.handle_voice_state_update(
+            deafened, _voice_state(None), deaf_state
+        )
+        await asyncio.sleep(0.05)
+
+        deafened.send.assert_awaited_once()
+        self.assertIn("no vc farming", deafened.send.await_args.args[0].casefold())
+        self.assertIn("Paradise", deafened.send.await_args.args[0])
+        bystander.send.assert_not_awaited()
+        channel.send.assert_not_awaited()
+        alert_channel.send.assert_not_awaited()
+        await tracker.stop()
+
+    async def test_deaf_warning_closed_dms_never_falls_back_to_public_channel(self):
+        import discord
+
+        guild = _make_mock_guild()
+        alert_channel = MagicMock(id=ALERT_CHANNEL_ID, guild=guild)
+        alert_channel.send = AsyncMock()
+        guild.get_channel.side_effect = (
+            lambda cid: alert_channel if cid == ALERT_CHANNEL_ID else None
+        )
+        guild.get_channel_or_thread.side_effect = guild.get_channel.side_effect
+        self.mock_bot.get_guild.return_value = guild
+        self.tracker.deaf_warning_seconds = 0.02
+
+        channel = MagicMock(id=888)
+        channel.send = AsyncMock()
+        member = _make_mock_member(guild, 777)
+        response = MagicMock(status=403, reason="Forbidden")
+        member.send = AsyncMock(
+            side_effect=discord.Forbidden(response, "Cannot send messages to this user")
+        )
+        guild.get_member.return_value = member
+
+        deaf_state = _voice_state(channel)
+        deaf_state.self_deaf = True
+        await self.tracker.handle_voice_state_update(
+            member, _voice_state(None), deaf_state
+        )
+        await asyncio.sleep(0.05)
+        member.send.assert_awaited_once()
+        alert_channel.send.assert_not_awaited()
+        channel.send.assert_not_awaited()
+
+        # Toggling mute while still deafened does not spam another DM attempt.
+        still_deaf = _voice_state(channel)
+        still_deaf.self_deaf = True
+        still_deaf.self_mute = True
+        await self.tracker.handle_voice_state_update(member, deaf_state, still_deaf)
+        await asyncio.sleep(0.05)
+        member.send.assert_awaited_once()
+        alert_channel.send.assert_not_awaited()
+        channel.send.assert_not_awaited()
+
+    async def test_deaf_warning_disabled_when_seconds_zero(self):
+        guild = _make_mock_guild()
+        channel = MagicMock(id=888)
+        member = _make_mock_member(guild, 777)
+        guild.get_member.return_value = member
+        self.mock_bot.get_guild.return_value = guild
+        self.tracker.deaf_warning_seconds = 0.0
+
+        deaf_state = _voice_state(channel)
+        deaf_state.self_deaf = True
+        await self.tracker.handle_voice_state_update(
+            member, _voice_state(None), deaf_state
+        )
+        await asyncio.sleep(0.03)
+        member.send.assert_not_awaited()
 
     async def test_short_deaf_under_30s_cancels_warning(self):
         guild = _make_mock_guild()
@@ -683,6 +795,7 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
         # Undeafen before 30s threshold -> cancels warning
         await self.tracker.handle_voice_state_update(member, deaf_state, _voice_state(channel))
         await asyncio.sleep(0.09)
+        member.send.assert_not_awaited()
         alert_channel.send.assert_not_awaited()
 
     async def test_muted_user_still_detected_and_counted_without_warning(self):
@@ -715,6 +828,7 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
                 member, muted_state, _voice_state(None)
             )
 
+        member.send.assert_not_awaited()
         alert_channel.send.assert_not_awaited()
         total = sum(
             row["duration_seconds"]
@@ -722,6 +836,41 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
             if row["user_id"] == 777
         )
         self.assertEqual(total, 1800)
+
+    async def test_deaf_warning_rearms_after_undeafen_and_fetches_uncached_user(self):
+        guild = _make_mock_guild()
+        guild.get_member.return_value = None
+        self.mock_bot.get_guild.return_value = guild
+        self.mock_bot.get_user.return_value = None
+        fetched_user = MagicMock(id=777, bot=False)
+        fetched_user.send = AsyncMock()
+        self.mock_bot.fetch_user = AsyncMock(return_value=fetched_user)
+        self.tracker.deaf_warning_seconds = 0.02
+
+        channel = MagicMock(id=888)
+        member = _make_mock_member(guild, 777)
+        # Simulate a minimal member stub without a coroutine send method so
+        # fallback hits fetch_user for the exact user ID.
+        member.send = MagicMock()
+
+        server_deaf = _voice_state(channel)
+        server_deaf.deaf = True
+        await self.tracker.handle_voice_state_update(
+            member, _voice_state(None), server_deaf
+        )
+        await asyncio.sleep(0.05)
+        self.mock_bot.fetch_user.assert_awaited_once_with(777)
+        fetched_user.send.assert_awaited_once()
+
+        # Undeafen clears the episode; deafening again delivers a fresh private DM.
+        await self.tracker.handle_voice_state_update(
+            member, server_deaf, _voice_state(channel)
+        )
+        await self.tracker.handle_voice_state_update(
+            member, _voice_state(channel), server_deaf
+        )
+        await asyncio.sleep(0.05)
+        self.assertEqual(fetched_user.send.await_count, 2)
 
     async def test_join_8pm_leave_after_midnight_rollover_and_daily_channel_leaderboard(self):
         guild = _make_mock_guild()

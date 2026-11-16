@@ -34,6 +34,7 @@ DATE = "date"
 TRANSLATE = "translate"
 SEARCH = "search"
 SUMMARIZE = "summarize"
+RECIPE = "recipe"      # offline recipe matching from ingredients
 MEME = "meme"
 GIF = "gif"
 UTILITY = "utility"    # deterministic toolkit tools (payload2 = tool key)
@@ -52,8 +53,8 @@ KINDS = frozenset(
     {
         HELP, COMMAND_HELP, PING, COINFLIP, CHOOSE, ROAST, CALCULATE, DEFINE,
         CONVERT, IMAGE, WEATHER, TIME, DATE, TRANSLATE, SEARCH, SUMMARIZE,
-        MEME, GIF, UTILITY, REMIND, POLL, INFO, RESEARCH, WRITE, DEV, BUILD,
-        AI, UNKNOWN,
+        RECIPE, MEME, GIF, UTILITY, REMIND, POLL, INFO, RESEARCH, WRITE, DEV,
+        BUILD, AI, UNKNOWN,
     }
 )
 
@@ -61,13 +62,19 @@ KINDS = frozenset(
 #: by asking a language model to invent the answer.
 DETERMINISTIC_KINDS = frozenset(
     {CALCULATE, CONVERT, WEATHER, TIME, DATE, DEFINE, TRANSLATE, IMAGE,
-     MEME, GIF, UTILITY, REMIND, POLL, INFO}
+     RECIPE, MEME, GIF, UTILITY, REMIND, POLL, INFO}
 )
+
+#: Route kinds where newlines carry structural meaning (code blocks, JSON,
+#: stack traces, line-based list tools).
+_MULTILINE_KINDS = frozenset({DEV, WRITE})
+_MULTILINE_UTILITY_TOOLS = frozenset({"json", "sort", "dedupe"})
 
 # Confidence bands used across the routing stack.
 HIGH_CONFIDENCE = 0.75   # execute immediately
 MEDIUM_CONFIDENCE = 0.45  # worth one tiny AI classification
 MAX_PAYLOAD = 400
+MAX_RICH_PAYLOAD = 1600
 
 
 def clamp_confidence(value) -> float:
@@ -99,8 +106,18 @@ class Route:
         self.kind = str(self.kind or UNKNOWN)
         if self.kind not in KINDS:
             self.kind = UNKNOWN
-        self.payload = " ".join(str(self.payload or "").split())[:MAX_PAYLOAD]
         self.payload2 = " ".join(str(self.payload2 or "").split())[:80]
+        raw_payload = str(self.payload or "")
+        preserve_lines = (
+            self.kind in _MULTILINE_KINDS
+            or (self.kind == UTILITY and self.payload2 in _MULTILINE_UTILITY_TOOLS)
+        )
+        if preserve_lines and "\n" in raw_payload:
+            lines = [line.rstrip() for line in raw_payload.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+            self.payload = "\n".join(lines).strip()[:MAX_RICH_PAYLOAD]
+        else:
+            cap = MAX_RICH_PAYLOAD if preserve_lines else MAX_PAYLOAD
+            self.payload = " ".join(raw_payload.split())[:cap]
         self.confidence = clamp_confidence(self.confidence)
         self.fresh = bool(self.fresh)
         self.reason_complex = bool(self.reason_complex)
@@ -126,6 +143,6 @@ __all__ = [
     "AI", "BUILD", "CALCULATE", "CHOOSE", "COINFLIP", "COMMAND_HELP", "CONVERT", "DATE",
     "DEFINE", "DETERMINISTIC_KINDS", "GIF", "HELP", "HIGH_CONFIDENCE", "IMAGE",
     "DEV", "INFO", "KINDS", "MEDIUM_CONFIDENCE", "MEME", "PING", "POLL",
-    "REMIND", "RESEARCH", "Route", "SEARCH", "SUMMARIZE", "TIME",
+    "RECIPE", "REMIND", "RESEARCH", "Route", "SEARCH", "SUMMARIZE", "TIME",
     "TRANSLATE", "UNKNOWN", "UTILITY", "WEATHER", "WRITE", "clamp_confidence",
 ]
