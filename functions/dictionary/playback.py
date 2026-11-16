@@ -63,15 +63,15 @@ def _has_nacl() -> bool:
 
 
 def resolve_ffmpeg_executable() -> str | None:
-    """Locate an ffmpeg binary on PATH or from the bundled imageio-ffmpeg wheel."""
+    """Locate a runnable ffmpeg binary on PATH or from imageio-ffmpeg."""
     system_ffmpeg = shutil.which("ffmpeg")
-    if system_ffmpeg:
+    if system_ffmpeg and os.path.isfile(system_ffmpeg) and os.access(system_ffmpeg, os.X_OK):
         return system_ffmpeg
     try:
         import imageio_ffmpeg
 
         bundled = imageio_ffmpeg.get_ffmpeg_exe()
-        if bundled and os.path.isfile(bundled):
+        if bundled and os.path.isfile(bundled) and os.access(bundled, os.X_OK):
             return bundled
     except Exception:  # pragma: no cover - optional fallback probe
         pass
@@ -165,7 +165,7 @@ class VoicePlayback:
 
             except PlaybackUnavailable:
                 raise
-            except asyncio.TimeoutError as error:
+            except TimeoutError as error:
                 raise PlaybackUnavailable("couldn't get into that voice channel") from error
             except discord.ClientException as error:
                 log.debug("Voice playback client error: %s", error)
@@ -197,7 +197,7 @@ class VoicePlayback:
         try:
             await asyncio.wait_for(finished.wait(), timeout=MAX_CLIP_SECONDS)
             await asyncio.sleep(LINGER_SECONDS)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.debug("Pronunciation playback overran; cutting it short")
         finally:
             try:
@@ -246,7 +246,7 @@ class VoicePlayback:
             return
         try:
             await asyncio.wait_for(wait_for_idle(guild.id), timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.debug("Timed out waiting for voice enforcement to settle")
         except Exception:  # noqa: BLE001 - playback must never fail on this
             log.debug("Enforcement wait skipped", exc_info=True)
@@ -258,7 +258,7 @@ class VoicePlayback:
             return
         try:
             await asyncio.wait_for(client.disconnect(force=True), timeout=8)
-        except (asyncio.TimeoutError, discord.DiscordException, RuntimeError):
+        except (TimeoutError, discord.DiscordException, RuntimeError):
             log.debug("Voice disconnect failed", exc_info=True)
 
     async def shutdown(self) -> None:

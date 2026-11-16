@@ -3,22 +3,34 @@
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict, deque
-from collections.abc import Callable
-from dataclasses import dataclass
 import logging
 import struct
 import threading
 import time
+from collections import OrderedDict, deque
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
+
+try:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
+    _HAS_AES_GCM = True
+except ImportError:  # pragma: no cover - cryptography is a core runtime dep
+    AESGCM = None  # type: ignore[assignment,misc]
+    InvalidTag = CryptoError = Exception  # type: ignore[assignment,misc]
+    _HAS_AES_GCM = False
 
 import davey
 import discord
-from discord.enums import SpeakingState
-from discord.gateway import DiscordVoiceWebSocket
-from discord.voice_state import VoiceConnectionState
 import nacl.secret
-from nacl.exceptions import CryptoError
+from discord import opus
+from discord import utils as discord_utils
+from discord.enums import SpeakingState
+from discord.gateway import DiscordVoiceWebSocket, VoiceKeepAliveHandler
+from discord.voice_state import ConnectionFlowState, VoiceConnectionState
+from nacl.exceptions import CryptoError as NaclCryptoError
 
 from . import dave_compat
 from .buffer import RollingAudioBuffer
@@ -30,33 +42,61 @@ DISCORD_OPUS_PAYLOAD_TYPE: int = 120  # 0x78
 VOICE_OP_READY: int = 2
 VOICE_OP_SESSION_DESCRIPTION: int = 4
 VOICE_OP_SPEAKING: int = 5
-# Op 11 ("clients_connect") only carries the roster (``user_ids``) — SSRC
-# mappings arrive on op 5 (SPEAKING).  Op 12 does not exist in the current
-# voice gateway protocol; the handler below stays as harmless defence.
-VOICE_OP_CLIENT_CONNECT: int = 11
+VOICE_OP_RESUMED: int = 9
+VOICE_OP_CLIENT_CONNECT: int = 11  # CLIENTS_CONNECT in Voice Gateway v8
 VOICE_OP_VIDEO: int = 12
 VOICE_OP_CLIENT_DISCONNECT: int = 13
-VOICE_OP_RESUMED: int = 9
 VOICE_OP_DAVE_PREPARE_TRANSITION: int = dave_compat.DAVE_PREPARE_TRANSITION_OP
 VOICE_OP_DAVE_EXECUTE_TRANSITION: int = dave_compat.DAVE_EXECUTE_TRANSITION_OP
+VOICE_OP_DAVE_PREPARE_EPOCH: int = dave_compat.DAVE_PREPARE_EPOCH_OP
 
-# Log the DAVE-decryption failure streak at these packet counts (≈1s of active
-# speech per 50) instead of spamming on every dropped packet.
+# Log DAVE decryption failure streaks at bounded milestones (~1s per 50 packets).
 DAVE_FAILURE_LOG_STREAKS: tuple[int, ...] = (50, 500, 5_000)
+# Consecutive post-ready DAVE decryption failures before requesting an in-place
+# MLS session re-init (op 31 + op 26) without dropping the voice connection.
+DAVE_INPLACE_RECOVERY_STREAK: int = 50
+DAVE_INPLACE_RECOVERY_COOLDOWN_SECONDS: float = 15.0
 
 MAX_SSRC_MAPPINGS: int = 256
 MAX_STAGED_SSRCS: int = 16
-MAX_STAGED_PACKETS_PER_SSRC: int = 25
-# How long packets from a not-yet-mapped SSRC are kept so they can be
-# decrypted retroactively once a SPEAKING event maps it to a user.  Discord
-# only sends SPEAKING when a user *starts* talking, so someone who was
-# already speaking when the bot joined/moved keeps talking well past a 2s
-# window; 8s covers a normal breath pause without meaningful memory cost
-# (25 packets x 16 SSRCs max).
-STAGED_TTL_SECONDS: float = 8.0
+# Up to 3 s of 20 ms packets per unmapped SSRC so speech already in progress
+# when the bot joins/moves is recovered retroactively once mapped.
+MAX_STAGED_PACKETS_PER_SSRC: int = 150
+STAGED_TTL_SECONDS: float = 15.0
+SSRC_DAVE_PROBE_INTERVAL_SECONDS: float = 0.25
+
+# Short pre-MLS buffer for speakers whose first DAVE-encrypted frames arrive a
+# few milliseconds before MLS_WELCOME (op 30) or MLS_ANNOUNCE_COMMIT_TRANSITION
+# (op 29) installs their decryptor ratchet.
+MAX_DAVE_WAIT_USERS: int = 16
+MAX_DAVE_WAIT_PACKETS_PER_USER: int = 100
+DAVE_WAIT_TTL_SECONDS: float = 4.0
+
 UDP_KEEPALIVE_INTERVAL_SECONDS: float = 15.0
 
 _RTP_FIXED_STRUCT = struct.Struct(">HII")
+
+_TRANSPORT_CRYPTO_ERRORS: tuple[type[BaseException], ...] = (
+    (NaclCryptoError, InvalidTag) if _HAS_AES_GCM else (NaclCryptoError,)
+)
+
+
+def _build_supported_modes() -> tuple[str, ...]:
+    modes: list[str] = []
+    if _HAS_AES_GCM:
+        modes.append("aead_aes256_gcm_rtpsize")
+    modes.extend(
+        (
+            "aead_xchacha20_poly1305_rtpsize",
+            "xsalsa20_poly1305_lite",
+            "xsalsa20_poly1305_suffix",
+            "xsalsa20_poly1305",
+        )
+    )
+    return tuple(modes)
+
+
+SUPPORTED_TRANSPORT_MODES: tuple[str, ...] = _build_supported_modes()
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,50 +114,70 @@ class _StagedFrame:
     mono_time: float
     sequence: int
     rtp_timestamp: int
+    ssrc: int
     payload: bytes
 
 
-class TransportDecryptor:
-    """Decrypts outer Discord RTP transport encryption and strips RTP extensions."""
+def _strip_rtp_padding(plaintext: bytes, min_prefix_bytes: int = 0) -> bytes | None:
+    """Strip RFC 3550 §5.1 padding without allowing underflow into headers."""
+    total = len(plaintext)
+    if total <= min_prefix_bytes:
+        return None
+    pad_len = plaintext[-1]
+    if pad_len == 0 or pad_len > (total - min_prefix_bytes):
+        return None
+    return plaintext[: total - pad_len]
 
-    SUPPORTED_MODES: tuple[str, ...] = (
-        "aead_xchacha20_poly1305_rtpsize",
-        "xsalsa20_poly1305_lite",
-        "xsalsa20_poly1305_suffix",
-        "xsalsa20_poly1305",
-    )
+
+class TransportDecryptor:
+    """Decrypts outer Discord RTP transport encryption and strips RTP extensions.
+
+    Supports both current Discord Voice v8 AEAD transport modes
+    (``aead_aes256_gcm_rtpsize`` and ``aead_xchacha20_poly1305_rtpsize``) as
+    well as legacy XSalsa20 modes for backwards compatibility.
+    """
+
+    SUPPORTED_MODES: tuple[str, ...] = SUPPORTED_TRANSPORT_MODES
 
     def __init__(self, mode: str, secret_key: bytes) -> None:
         if mode not in self.SUPPORTED_MODES:
             raise ValueError(f"Unsupported Discord voice transport mode: {mode}")
-        if len(secret_key) != 32:
+        key_bytes = bytes(secret_key)
+        if len(key_bytes) != 32:
             raise ValueError("Discord voice transport secret key must be 32 bytes")
         self.mode = mode
-        if mode.startswith("aead_"):
-            self._aead: nacl.secret.Aead | None = nacl.secret.Aead(bytes(secret_key))
-            self._sbox: nacl.secret.SecretBox | None = None
+        self._aesgcm: Any = None
+        self._aead: nacl.secret.Aead | None = None
+        self._sbox: nacl.secret.SecretBox | None = None
+
+        if mode == "aead_aes256_gcm_rtpsize":
+            assert AESGCM is not None
+            self._aesgcm = AESGCM(key_bytes)
+        elif mode == "aead_xchacha20_poly1305_rtpsize":
+            self._aead = nacl.secret.Aead(key_bytes)
         else:
-            self._aead = None
-            self._sbox = nacl.secret.SecretBox(bytes(secret_key))
+            self._sbox = nacl.secret.SecretBox(key_bytes)
 
     def decrypt_rtp(self, datagram: bytes) -> ParsedRTPPacket | None:
         """Parse and decrypt one UDP datagram; returns None for non-Opus/RTCP frames."""
         length = len(datagram)
         if length < 16:
             return None
-        # Ignore 74-byte Discord UDP IP discovery responses.
-        if length == 74 and datagram[0] == 0x00 and datagram[1] == 0x02:
+        # Ignore 74-byte Discord UDP IP discovery packets (0x0001 / 0x0002).
+        if length == 74 and datagram[0] == 0x00 and datagram[1] in (0x01, 0x02):
             return None
 
         b0 = datagram[0]
         b1 = datagram[1]
-        # RTP v2 check
+        # RTP version 2 check.
         if (b0 >> 6) != 2:
             return None
-        # Ignore RTCP packets (payload types 200..204)
-        if 200 <= b1 <= 204:
+        # Ignore multiplexed RTCP packets (RFC 5761: packet types 200..209).
+        # Opus with marker bit M=1 has b1 == 0xF8 (248), safely above this range.
+        if 200 <= b1 <= 209:
             return None
-        # Only process Discord Opus audio frames (payload type 120)
+        # Filter strictly to Discord Opus audio (payload type 120), excluding
+        # video/screenshare/RTX streams (payload types 101..110).
         if (b1 & 0x7F) != DISCORD_OPUS_PAYLOAD_TYPE:
             return None
 
@@ -130,26 +190,39 @@ class TransportDecryptor:
 
         sequence, rtp_timestamp, ssrc = _RTP_FIXED_STRUCT.unpack_from(datagram, 2)
 
-        if self.mode == "aead_xchacha20_poly1305_rtpsize":
+        if self.mode in ("aead_aes256_gcm_rtpsize", "aead_xchacha20_poly1305_rtpsize"):
+            # In *_rtpsize modes the unencrypted AAD covers the fixed header,
+            # CSRC list, and the 4-byte extension preamble (profile + length
+            # in 32-bit words, both RFC 8285 0xBEDE one-byte and 0x100x
+            # two-byte headers); the extension body itself is encrypted.
             aad_len = base_header_len + (4 if extended else 0)
-            # Needs at least AAD + 16-byte AEAD tag + 4-byte nonce suffix.
+            # Needs at least AAD + 16-byte AEAD auth tag + 4-byte nonce suffix.
             if length < aad_len + 20:
                 return None
             aad = datagram[:aad_len]
             ciphertext = datagram[aad_len:-4]
-            nonce = bytearray(24)
-            nonce[:4] = datagram[-4:]
-            assert self._aead is not None
-            plaintext = self._aead.decrypt(ciphertext, aad, bytes(nonce))
-            if padding and plaintext:
-                pad_len = plaintext[-1]
-                if 0 < pad_len <= len(plaintext):
-                    plaintext = plaintext[:-pad_len]
+            if self.mode == "aead_aes256_gcm_rtpsize":
+                nonce12 = bytearray(12)
+                nonce12[:4] = datagram[-4:]
+                plaintext = self._aesgcm.decrypt(bytes(nonce12), ciphertext, aad)
+            else:
+                nonce24 = bytearray(24)
+                nonce24[:4] = datagram[-4:]
+                assert self._aead is not None
+                plaintext = self._aead.decrypt(ciphertext, aad, bytes(nonce24))
+
+            ext_bytes = 0
             if extended:
                 ext_words = struct.unpack_from(">H", aad, base_header_len + 2)[0]
                 ext_bytes = ext_words * 4
                 if len(plaintext) < ext_bytes:
                     return None
+            if padding:
+                stripped = _strip_rtp_padding(plaintext, min_prefix_bytes=ext_bytes)
+                if stripped is None:
+                    return None
+                plaintext = stripped
+            if ext_bytes:
                 plaintext = plaintext[ext_bytes:]
         else:
             assert self._sbox is not None
@@ -174,10 +247,7 @@ class TransportDecryptor:
                 nonce[:12] = datagram[:12]
                 plaintext = self._sbox.decrypt(ciphertext, bytes(nonce))
 
-            if padding and plaintext:
-                pad_len = plaintext[-1]
-                if 0 < pad_len <= len(plaintext):
-                    plaintext = plaintext[:-pad_len]
+            ext_total = 0
             if extended:
                 if len(plaintext) < 4:
                     return None
@@ -185,6 +255,12 @@ class TransportDecryptor:
                 ext_total = 4 + ext_words * 4
                 if len(plaintext) < ext_total:
                     return None
+            if padding:
+                stripped = _strip_rtp_padding(plaintext, min_prefix_bytes=ext_total)
+                if stripped is None:
+                    return None
+                plaintext = stripped
+            if ext_total:
                 plaintext = plaintext[ext_total:]
 
         if not plaintext or len(plaintext) > MAX_OPUS_PACKET_BYTES:
@@ -198,8 +274,13 @@ class TransportDecryptor:
         )
 
 
+def _is_missing_decryptor_error(err: BaseException) -> bool:
+    text = str(err)
+    return "NoDecryptorForUser" in text or "MissingKeyRatchet" in text
+
+
 class VoiceReceiveRouter:
-    """Thread-safe packet decryptor, SSRC resolver and buffer feeder."""
+    """Thread-safe packet decryptor, SSRC resolver and rolling-buffer feeder."""
 
     def __init__(
         self,
@@ -208,12 +289,20 @@ class VoiceReceiveRouter:
         buffer: RollingAudioBuffer,
         is_bot_user: Callable[[int], bool] | None = None,
         dave_state_getter: Callable[[], tuple[davey.DaveSession | None, int]] | None = None,
+        dave_downgraded_getter: Callable[[], bool] | None = None,
+        dave_lock: threading.RLock | None = None,
+        dave_recovery_callback: Callable[[], None] | None = None,
+        own_user_id_getter: Callable[[], int | None] | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.guild_id = int(guild_id)
         self.buffer = buffer
         self._is_bot_user = is_bot_user or (lambda _uid: False)
         self._dave_state_getter = dave_state_getter or (lambda: (None, 0))
+        self._dave_downgraded_getter = dave_downgraded_getter or (lambda: False)
+        self._dave_lock = dave_lock or threading.RLock()
+        self._dave_recovery_callback = dave_recovery_callback
+        self._own_user_id_getter = own_user_id_getter or (lambda: None)
         self._clock = clock
 
         self._lock = threading.Lock()
@@ -222,25 +311,19 @@ class VoiceReceiveRouter:
         self._ssrc_to_user: OrderedDict[int, int] = OrderedDict()
         self._user_to_ssrc: dict[int, int] = {}
         self._staged_by_ssrc: OrderedDict[int, deque[_StagedFrame]] = OrderedDict()
+        self._ssrc_last_probe_mono: OrderedDict[int, float] = OrderedDict()
+        self._dave_wait_by_user: OrderedDict[int, deque[_StagedFrame]] = OrderedDict()
 
-        # Privacy-safe counters (never store packet payloads or keys)
+        # Privacy-safe counters (never store packet payloads or keys).
         self.packets_received: int = 0
+        self.audio_packets_received: int = 0
         self.packets_buffered: int = 0
         self.transport_errors: int = 0
         self.dave_errors: int = 0
-        # Non-silence frames actually buffered — the "real speech heard"
-        # counter.  Silence frames bypass the DAVE gate, so a receiver whose
-        # speech decryption broke keeps buffering silence: without this
-        # counter that state masquerades as healthy.
+        self.dave_not_ready_drops: int = 0
+        self.dave_ssrc_resolved: int = 0
         self.non_silence_buffered: int = 0
-        # Consecutive DAVE E2EE decryption failures without a success.  A large
-        # streak that never resets means the DAVE session never received its
-        # key ratchets (missing transition application) — actionable signal.
         self.dave_fail_streak: int = 0
-        # Failures since the LAST successful decryption, plus when that
-        # success was.  These catch the "worked, then broke mid-connection"
-        # case (stale keys after an MLS group change) which
-        # ``dave_ever_succeeded`` alone can never see.
         self.dave_fail_since_success: int = 0
         self.last_dave_success_mono: float | None = None
         self.dave_ever_succeeded: bool = False
@@ -268,16 +351,17 @@ class VoiceReceiveRouter:
         with self._lock:
             return self._decryptor is not None
 
-    def inherit_from(self, old: "VoiceReceiveRouter | None") -> None:
-        """Carry live capture state over from a previous router.
+    def dave_status(self) -> tuple[int, bool]:
+        """Return ``(protocol_version, session_ready)`` for health reporting."""
+        session, version = self._dave_state_getter()
+        if session is None:
+            return int(version or 0), int(version or 0) == 0
+        with self._dave_lock:
+            ready = bool(getattr(session, "ready", False))
+        return int(version or 0), ready
 
-        Rebinds happen on channel moves and recoveries **without** a new voice
-        handshake, so the new router must NOT start from zero: Discord does not
-        re-send SESSION_DESCRIPTION (op 4) on a live connection, and SPEAKING
-        events only arrive when users *start* talking.  Inheriting the
-        transport decryptor, the bot's own SSRC, the SSRC→user mappings and
-        the staged packets keeps capture seamless across the rebind.
-        """
+    def inherit_from(self, old: VoiceReceiveRouter | None) -> None:
+        """Carry live capture state over from a previous router across rebinds."""
         if old is None or old is self:
             return
         with self._lock:
@@ -290,16 +374,23 @@ class VoiceReceiveRouter:
                     (ssrc, deque(q, maxlen=MAX_STAGED_PACKETS_PER_SSRC))
                     for ssrc, q in old._staged_by_ssrc.items()
                 )
-                # Keep the diagnostic story continuous across the rebind.
+                self._dave_wait_by_user = OrderedDict(
+                    (uid, deque(q, maxlen=MAX_DAVE_WAIT_PACKETS_PER_USER))
+                    for uid, q in old._dave_wait_by_user.items()
+                )
                 self.packets_received = old.packets_received
+                self.audio_packets_received = old.audio_packets_received
                 self.packets_buffered = old.packets_buffered
                 self.transport_errors = old.transport_errors
                 self.dave_errors = old.dave_errors
+                self.dave_not_ready_drops = old.dave_not_ready_drops
+                self.dave_ssrc_resolved = old.dave_ssrc_resolved
                 self.non_silence_buffered = old.non_silence_buffered
                 self.dave_fail_streak = old.dave_fail_streak
                 self.dave_fail_since_success = old.dave_fail_since_success
                 self.last_dave_success_mono = old.last_dave_success_mono
                 self.dave_ever_succeeded = old.dave_ever_succeeded
+                self._first_packet_logged = old._first_packet_logged
         log.info(
             "Voice receiver state inherited for guild %s (%d SSRC mappings)",
             self.guild_id,
@@ -310,54 +401,165 @@ class VoiceReceiveRouter:
         with self._lock:
             self._own_ssrc = int(ssrc)
 
+    def _bind_ssrc_unlocked(
+        self, uid: int, ssrc_int: int, now: float
+    ) -> list[_StagedFrame]:
+        if self._own_ssrc is not None and ssrc_int == self._own_ssrc:
+            return []
+        old_ssrc = self._user_to_ssrc.get(uid)
+        if old_ssrc is not None and old_ssrc != ssrc_int:
+            self._ssrc_to_user.pop(old_ssrc, None)
+        self._user_to_ssrc[uid] = ssrc_int
+        self._ssrc_to_user[ssrc_int] = uid
+        self._ssrc_to_user.move_to_end(ssrc_int)
+        while len(self._ssrc_to_user) > MAX_SSRC_MAPPINGS:
+            evicted_ssrc, evicted_uid = self._ssrc_to_user.popitem(last=False)
+            if self._user_to_ssrc.get(evicted_uid) == evicted_ssrc:
+                self._user_to_ssrc.pop(evicted_uid, None)
+
+        self._ssrc_last_probe_mono.pop(ssrc_int, None)
+        staged_q = self._staged_by_ssrc.pop(ssrc_int, None)
+        if not staged_q:
+            return []
+        cutoff = now - STAGED_TTL_SECONDS
+        return [f for f in staged_q if f.mono_time >= cutoff]
+
+    def _record_buffered_packet(self, opus_bytes: bytes, mono_time: float) -> None:
+        self.packets_buffered += 1
+        if opus_bytes != OPUS_SILENCE:
+            self.non_silence_buffered += 1
+            if self.dave_fail_since_success > 0:
+                log.info(
+                    "Voice capture recovered in guild %s after %d failed "
+                    "packet(s) since the last decoded speech frame",
+                    self.guild_id,
+                    self.dave_fail_since_success,
+                )
+            self.dave_fail_since_success = 0
+            self.last_dave_success_mono = mono_time
+            self.dave_ever_succeeded = True
+
+    def _append_decoded_frame(
+        self,
+        *,
+        user_id: int,
+        opus_bytes: bytes,
+        rtp_timestamp: int,
+        sequence: int,
+        ssrc: int,
+        mono_time: float,
+    ) -> None:
+        if self.buffer.append_packet(
+            user_id=user_id,
+            opus_data=opus_bytes,
+            rtp_timestamp=rtp_timestamp,
+            sequence=sequence,
+            ssrc=ssrc,
+            mono_time=mono_time,
+        ):
+            self._record_buffered_packet(opus_bytes, mono_time)
+
     def register_ssrc(self, user_id: int, ssrc: int) -> None:
         """Map ``ssrc -> user_id`` and flush any recently staged UDP frames."""
         uid = int(user_id)
         ssrc_int = int(ssrc)
+        if uid <= 0 or ssrc_int <= 0:
+            return
         now = self._clock()
-        staged_frames: list[_StagedFrame] = []
 
         with self._lock:
-            if self._own_ssrc is not None and ssrc_int == self._own_ssrc:
-                return
-            old_ssrc = self._user_to_ssrc.get(uid)
-            if old_ssrc is not None and old_ssrc != ssrc_int:
-                self._ssrc_to_user.pop(old_ssrc, None)
-            self._user_to_ssrc[uid] = ssrc_int
-            self._ssrc_to_user[ssrc_int] = uid
-            self._ssrc_to_user.move_to_end(ssrc_int)
-            while len(self._ssrc_to_user) > MAX_SSRC_MAPPINGS:
-                evicted_ssrc, evicted_uid = self._ssrc_to_user.popitem(last=False)
-                if self._user_to_ssrc.get(evicted_uid) == evicted_ssrc:
-                    self._user_to_ssrc.pop(evicted_uid, None)
+            staged_frames = self._bind_ssrc_unlocked(uid, ssrc_int, now)
 
-            staged_q = self._staged_by_ssrc.pop(ssrc_int, None)
-            if staged_q:
-                cutoff = now - STAGED_TTL_SECONDS
-                staged_frames = [f for f in staged_q if f.mono_time >= cutoff]
-
-        if not staged_frames:
-            return
-        if self._is_bot_user(uid):
+        if not staged_frames or self._is_bot_user(uid):
             return
 
         for frame in staged_frames:
-            opus_bytes = self._unwrap_dave(uid, frame.payload)
+            opus_bytes = self._unwrap_dave(uid, frame)
             if opus_bytes is not None:
-                if self.buffer.append_packet(
+                self._append_decoded_frame(
                     user_id=uid,
-                    opus_data=opus_bytes,
+                    opus_bytes=opus_bytes,
                     rtp_timestamp=frame.rtp_timestamp,
                     sequence=frame.sequence,
                     ssrc=ssrc_int,
                     mono_time=frame.mono_time,
+                )
+
+    def flush(self) -> int:
+        """Retry frames queued while MLS ratchets or SSRC bindings completed."""
+        now = self._clock()
+        flushed = 0
+
+        # 1. Drain known-speaker frames that arrived just before MLS welcome/commit.
+        with self._lock:
+            wait_items = list(self._dave_wait_by_user.items())
+            self._dave_wait_by_user.clear()
+            staged_ssrcs = [
+                (ssrc, deque(q))
+                for ssrc, q in self._staged_by_ssrc.items()
+                if q
+            ]
+            self._ssrc_last_probe_mono.clear()
+
+        cutoff = now - DAVE_WAIT_TTL_SECONDS
+        for uid, frames in wait_items:
+            if self._is_bot_user(uid):
+                continue
+            for frame in frames:
+                if frame.mono_time < cutoff:
+                    continue
+                opus_bytes = self._unwrap_dave(uid, frame, allow_requeue=False)
+                if opus_bytes is not None:
+                    self._append_decoded_frame(
+                        user_id=uid,
+                        opus_bytes=opus_bytes,
+                        rtp_timestamp=frame.rtp_timestamp,
+                        sequence=frame.sequence,
+                        ssrc=frame.ssrc,
+                        mono_time=frame.mono_time,
+                    )
+                    flushed += 1
+
+        # 2. Try DAVE AEAD sender identification on any unmapped SSRC bursts
+        #    that arrived before the group welcome completed.
+        staged_cutoff = now - STAGED_TTL_SECONDS
+        for ssrc, frames in staged_ssrcs:
+            fresh = [f for f in frames if f.mono_time >= staged_cutoff]
+            if not fresh:
+                continue
+            # Probe the earliest frame first so DAVE's per-sender nonce window
+            # advances monotonically (1 -> 2 -> 3 -> ...) when flushing the rest.
+            probe_frame = fresh[0]
+            resolved = self._try_resolve_ssrc_via_dave(probe_frame.payload)
+            if resolved is None:
+                continue
+            uid, first_opus = resolved
+            with self._lock:
+                # Re-pop live queue in case more frames arrived concurrently.
+                current = self._bind_ssrc_unlocked(uid, ssrc, now)
+            self.dave_ssrc_resolved += 1
+            if self._is_bot_user(uid):
+                continue
+            for frame in current:
+                if (
+                    frame.sequence == probe_frame.sequence
+                    and frame.rtp_timestamp == probe_frame.rtp_timestamp
                 ):
-                    self.packets_buffered += 1
-                    if opus_bytes != OPUS_SILENCE:
-                        self.non_silence_buffered += 1
-                        self.dave_fail_since_success = 0
-                        self.last_dave_success_mono = frame.mono_time
-                        self.dave_ever_succeeded = True
+                    opus_bytes: bytes | None = first_opus
+                else:
+                    opus_bytes = self._unwrap_dave(uid, frame, allow_requeue=False)
+                if opus_bytes is not None:
+                    self._append_decoded_frame(
+                        user_id=uid,
+                        opus_bytes=opus_bytes,
+                        rtp_timestamp=frame.rtp_timestamp,
+                        sequence=frame.sequence,
+                        ssrc=ssrc,
+                        mono_time=frame.mono_time,
+                    )
+                    flushed += 1
+
+        return flushed
 
     def remove_user(self, user_id: int) -> None:
         uid = int(user_id)
@@ -366,6 +568,8 @@ class VoiceReceiveRouter:
             if ssrc is not None:
                 self._ssrc_to_user.pop(ssrc, None)
                 self._staged_by_ssrc.pop(ssrc, None)
+                self._ssrc_last_probe_mono.pop(ssrc, None)
+            self._dave_wait_by_user.pop(uid, None)
         self.buffer.mark_speaker_discontinuity(uid)
 
     def reset(self) -> None:
@@ -375,6 +579,23 @@ class VoiceReceiveRouter:
             self._ssrc_to_user.clear()
             self._user_to_ssrc.clear()
             self._staged_by_ssrc.clear()
+            self._ssrc_last_probe_mono.clear()
+            self._dave_wait_by_user.clear()
+
+    def _try_resolve_ssrc_via_dave(self, payload: bytes) -> tuple[int, bytes] | None:
+        dave_session, dave_version = self._dave_state_getter()
+        if dave_session is None or dave_version <= 0:
+            return None
+        with self._lock:
+            mapped_users = tuple(self._user_to_ssrc.keys())
+        own_uid = self._own_user_id_getter()
+        with self._dave_lock:
+            return dave_compat.try_identify_dave_sender(
+                dave_session,
+                payload,
+                own_user_id=own_uid,
+                already_mapped_users=mapped_users,
+            )
 
     def handle_udp_packet(self, datagram: bytes) -> None:
         """Non-blocking callback invoked on ``SocketReader`` thread per UDP packet."""
@@ -396,7 +617,7 @@ class VoiceReceiveRouter:
 
         try:
             parsed = decryptor.decrypt_rtp(datagram)
-        except CryptoError:
+        except _TRANSPORT_CRYPTO_ERRORS:
             self.transport_errors += 1
             return
         except Exception:  # noqa: BLE001 - malformed network input must never crash reader
@@ -408,83 +629,146 @@ class VoiceReceiveRouter:
         if own_ssrc is not None and parsed.ssrc == own_ssrc:
             return
 
+        self.audio_packets_received += 1
+        frame = _StagedFrame(
+            mono_time=arrival_mono,
+            sequence=parsed.sequence,
+            rtp_timestamp=parsed.rtp_timestamp,
+            ssrc=parsed.ssrc,
+            payload=parsed.payload,
+        )
+
+        should_probe_dave = False
         with self._lock:
             user_id = self._ssrc_to_user.get(parsed.ssrc)
             if user_id is None:
-                # Ignore pre-SPEAKING silence bursts; stage speech frames briefly.
-                if parsed.payload != OPUS_SILENCE:
-                    self._stage_unknown_ssrc_unlocked(parsed, arrival_mono)
+                if parsed.payload == OPUS_SILENCE:
+                    return
+                last_probe = self._ssrc_last_probe_mono.get(parsed.ssrc)
+                if (
+                    dave_compat.is_dave_encrypted_frame(parsed.payload)
+                    and (
+                        last_probe is None
+                        or (arrival_mono - last_probe) >= SSRC_DAVE_PROBE_INTERVAL_SECONDS
+                    )
+                ):
+                    self._ssrc_last_probe_mono[parsed.ssrc] = arrival_mono
+                    while len(self._ssrc_last_probe_mono) > MAX_STAGED_SSRCS * 2:
+                        self._ssrc_last_probe_mono.popitem(last=False)
+                    should_probe_dave = True
+                else:
+                    self._stage_unknown_ssrc_unlocked(frame)
+                    return
+
+        if user_id is None:
+            resolved = self._try_resolve_ssrc_via_dave(parsed.payload) if should_probe_dave else None
+            if resolved is None:
+                with self._lock:
+                    # Another event may have mapped the SSRC while we probed.
+                    user_id = self._ssrc_to_user.get(parsed.ssrc)
+                    if user_id is None:
+                        self._stage_unknown_ssrc_unlocked(frame)
+                        return
+            else:
+                uid, current_opus = resolved
+                self.dave_ssrc_resolved += 1
+                with self._lock:
+                    earlier_frames = self._bind_ssrc_unlocked(uid, parsed.ssrc, arrival_mono)
+                log.debug(
+                    "Resolved unmapped audio SSRC %s in guild %s via DAVE AEAD",
+                    parsed.ssrc,
+                    self.guild_id,
+                )
+                if self._is_bot_user(uid):
+                    return
+                self.dave_fail_streak = 0
+                self.dave_fail_since_success = 0
+                self.last_dave_success_mono = arrival_mono
+                self.dave_ever_succeeded = True
+                for staged in earlier_frames:
+                    opus_prev = self._unwrap_dave(uid, staged, allow_requeue=False)
+                    if opus_prev is not None:
+                        self._append_decoded_frame(
+                            user_id=uid,
+                            opus_bytes=opus_prev,
+                            rtp_timestamp=staged.rtp_timestamp,
+                            sequence=staged.sequence,
+                            ssrc=parsed.ssrc,
+                            mono_time=staged.mono_time,
+                        )
+                self._append_decoded_frame(
+                    user_id=uid,
+                    opus_bytes=current_opus,
+                    rtp_timestamp=parsed.rtp_timestamp,
+                    sequence=parsed.sequence,
+                    ssrc=parsed.ssrc,
+                    mono_time=arrival_mono,
+                )
                 return
 
         if self._is_bot_user(user_id):
             return
 
-        opus_bytes = self._unwrap_dave(user_id, parsed.payload)
+        opus_bytes = self._unwrap_dave(user_id, frame)
         if opus_bytes is None:
             return
 
-        if self.buffer.append_packet(
+        self._append_decoded_frame(
             user_id=user_id,
-            opus_data=opus_bytes,
+            opus_bytes=opus_bytes,
             rtp_timestamp=parsed.rtp_timestamp,
             sequence=parsed.sequence,
             ssrc=parsed.ssrc,
             mono_time=arrival_mono,
-        ):
-            self.packets_buffered += 1
-            if opus_bytes != OPUS_SILENCE:
-                self.non_silence_buffered += 1
-                if self.dave_fail_since_success > 0:
-                    log.info(
-                        "Voice capture recovered in guild %s after %d failed "
-                        "packet(s) since the last decoded speech frame",
-                        self.guild_id,
-                        self.dave_fail_since_success,
-                    )
-                self.dave_fail_since_success = 0
-                self.last_dave_success_mono = arrival_mono
-                self.dave_ever_succeeded = True
+        )
 
-    def _stage_unknown_ssrc_unlocked(
-        self,
-        parsed: ParsedRTPPacket,
-        arrival_mono: float,
-    ) -> None:
-        cutoff = arrival_mono - STAGED_TTL_SECONDS
+    def _stage_unknown_ssrc_unlocked(self, frame: _StagedFrame) -> None:
+        cutoff = frame.mono_time - STAGED_TTL_SECONDS
         stale_keys = [
-            k
-            for k, q in self._staged_by_ssrc.items()
-            if not q or q[-1].mono_time < cutoff
+            k for k, q in self._staged_by_ssrc.items() if not q or q[-1].mono_time < cutoff
         ]
         for k in stale_keys:
             self._staged_by_ssrc.pop(k, None)
 
-        q = self._staged_by_ssrc.get(parsed.ssrc)
+        q = self._staged_by_ssrc.get(frame.ssrc)
         if q is None:
             while len(self._staged_by_ssrc) >= MAX_STAGED_SSRCS:
                 self._staged_by_ssrc.popitem(last=False)
             q = deque(maxlen=MAX_STAGED_PACKETS_PER_SSRC)
-            self._staged_by_ssrc[parsed.ssrc] = q
+            self._staged_by_ssrc[frame.ssrc] = q
         else:
-            self._staged_by_ssrc.move_to_end(parsed.ssrc)
+            self._staged_by_ssrc.move_to_end(frame.ssrc)
+        q.append(frame)
 
-        q.append(
-            _StagedFrame(
-                mono_time=arrival_mono,
-                sequence=parsed.sequence,
-                rtp_timestamp=parsed.rtp_timestamp,
-                payload=parsed.payload,
-            )
-        )
+    def _queue_for_dave_ready(self, user_id: int, frame: _StagedFrame) -> None:
+        cutoff = frame.mono_time - DAVE_WAIT_TTL_SECONDS
+        with self._lock:
+            stale = [
+                uid
+                for uid, q in self._dave_wait_by_user.items()
+                if not q or q[-1].mono_time < cutoff
+            ]
+            for uid in stale:
+                self._dave_wait_by_user.pop(uid, None)
+            q = self._dave_wait_by_user.get(user_id)
+            if q is None:
+                while len(self._dave_wait_by_user) >= MAX_DAVE_WAIT_USERS:
+                    self._dave_wait_by_user.popitem(last=False)
+                q = deque(maxlen=MAX_DAVE_WAIT_PACKETS_PER_USER)
+                self._dave_wait_by_user[user_id] = q
+            else:
+                self._dave_wait_by_user.move_to_end(user_id)
+            q.append(frame)
 
-    def _unwrap_dave(self, user_id: int, transport_payload: bytes) -> bytes | None:
-        """Unwrap Discord DAVE E2EE audio payload when active on the voice session.
-
-        Every incoming packet in a DAVE session passes through here, so this is
-        also the place where a broken key exchange becomes visible: a failure
-        streak that never resets means the session never received its key
-        ratchets (see :mod:`functions.voice_clip.dave_compat`).
-        """
+    def _unwrap_dave(
+        self,
+        user_id: int,
+        frame: _StagedFrame,
+        *,
+        allow_requeue: bool = True,
+    ) -> bytes | None:
+        """Unwrap Discord DAVE E2EE audio payload when active on the session."""
+        transport_payload = frame.payload
         if transport_payload == OPUS_SILENCE:
             return OPUS_SILENCE
 
@@ -492,79 +776,526 @@ class VoiceReceiveRouter:
         if dave_session is None:
             return transport_payload
 
-        if dave_version > 0:
-            if not dave_session.ready:
-                # MLS group not established yet: only unencrypted (passthrough)
-                # frames can be handled at all.
+        downgraded = bool(self._dave_downgraded_getter())
+
+        with self._dave_lock:
+            is_ready = bool(getattr(dave_session, "ready", False))
+
+            if dave_version > 0 and not downgraded:
+                if not is_ready:
+                    # MLS group is still completing its initial welcome/commit.
+                    try:
+                        if dave_session.can_passthrough(user_id):
+                            out = dave_session.decrypt(
+                                user_id, davey.MediaType.audio, transport_payload
+                            )
+                            return bytes(out) if out else None
+                    except Exception:  # noqa: BLE001
+                        self.dave_errors += 1
+                    self.dave_not_ready_drops += 1
+                    if allow_requeue and dave_compat.is_dave_encrypted_frame(transport_payload):
+                        self._queue_for_dave_ready(user_id, frame)
+                    return None
+
                 try:
-                    if dave_session.can_passthrough(user_id):
-                        return dave_session.decrypt(
-                            user_id, davey.MediaType.audio, transport_payload
-                        )
-                except Exception:  # noqa: BLE001
-                    self.dave_errors += 1
-                return None
-            try:
-                decrypted = dave_session.decrypt(
-                    user_id, davey.MediaType.audio, transport_payload
-                )
-            except Exception as err:  # noqa: BLE001
-                self.dave_errors += 1
-                self.dave_fail_streak += 1
-                self.dave_fail_since_success += 1
-                streak = self.dave_fail_streak
-                if streak in DAVE_FAILURE_LOG_STREAKS:
-                    log.warning(
-                        "DAVE E2EE decryption has failed for %d packets in a row "
-                        "in guild %s (last error: %s). Voice capture cannot hear "
-                        "anyone until the E2EE keys are applied — the receiver "
-                        "applies DAVE transitions automatically, so this usually "
-                        "means the key exchange never completed and the voice "
-                        "connection needs to be re-established.",
-                        streak,
-                        self.guild_id,
-                        err.__class__.__name__,
+                    decrypted = dave_session.decrypt(
+                        user_id, davey.MediaType.audio, transport_payload
                     )
-                # Last resort: davey returns the raw frame itself when this
-                # user's decryptor is in passthrough mode.
+                except Exception as err:  # noqa: BLE001
+                    # A brand-new joiner's first RTP frames can arrive a few ms
+                    # before their MLS Add commit completes; stage briefly so
+                    # their first word is decoded once op 29 arrives.
+                    if (
+                        allow_requeue
+                        and _is_missing_decryptor_error(err)
+                        and dave_compat.is_dave_encrypted_frame(transport_payload)
+                    ):
+                        self._queue_for_dave_ready(user_id, frame)
+                    self.dave_errors += 1
+                    self.dave_fail_streak += 1
+                    self.dave_fail_since_success += 1
+                    streak = self.dave_fail_streak
+                    if streak in DAVE_FAILURE_LOG_STREAKS:
+                        log.warning(
+                            "DAVE E2EE decryption has failed for %d packets in a row "
+                            "in guild %s (last error: %s); requesting MLS session refresh.",
+                            streak,
+                            self.guild_id,
+                            err.__class__.__name__,
+                        )
+                    if (
+                        self._dave_recovery_callback is not None
+                        and streak >= DAVE_INPLACE_RECOVERY_STREAK
+                        and streak % DAVE_INPLACE_RECOVERY_STREAK == 0
+                    ):
+                        try:
+                            self._dave_recovery_callback()
+                        except Exception:  # noqa: BLE001
+                            log.debug("DAVE in-place recovery trigger failed", exc_info=True)
+                    return None
+
+                if self.dave_fail_streak > 0:
+                    log.info(
+                        "DAVE E2EE decryption recovered in guild %s after %d "
+                        "consecutive failure(s)",
+                        self.guild_id,
+                        self.dave_fail_streak,
+                    )
+                self.dave_fail_streak = 0
+                self.dave_fail_since_success = 0
+                self.last_dave_success_mono = frame.mono_time
+                self.dave_ever_succeeded = True
+                return bytes(decrypted) if decrypted else None
+
+            # Protocol version 0 / downgraded call: decrypt any in-flight E2EE
+            # tail packets during the 10s grace window, pass plaintext Opus through.
+            if is_ready:
                 try:
-                    if dave_session.can_passthrough(user_id):
+                    if dave_session.can_passthrough(user_id) or dave_compat.is_dave_encrypted_frame(
+                        transport_payload
+                    ):
                         out = dave_session.decrypt(
                             user_id, davey.MediaType.audio, transport_payload
                         )
                         if out:
-                            return out
+                            return bytes(out)
                 except Exception:  # noqa: BLE001
-                    pass
-                return None
-            if self.dave_fail_streak > 0:
-                log.info(
-                    "DAVE E2EE decryption recovered in guild %s after %d "
-                    "consecutive failure(s)",
-                    self.guild_id,
-                    self.dave_fail_streak,
-                )
-            self.dave_fail_streak = 0
-            self.dave_fail_since_success = 0
-            self.last_dave_success_mono = self._clock()
-            self.dave_ever_succeeded = True
-            return decrypted if decrypted else None
+                    if dave_compat.is_dave_encrypted_frame(transport_payload):
+                        # Never feed raw MLS ciphertext into the Opus decoder.
+                        self.dave_errors += 1
+                        return None
+                    log.debug("Passthrough DAVE decrypt fell back to raw Opus")
 
-        # Protocol version 0 (downgraded / passthrough): if a session still has
-        # active passthrough decryptors, run through it, else pass raw Opus.
-        if dave_session.ready:
+        if dave_compat.is_dave_encrypted_frame(transport_payload):
+            self.dave_errors += 1
+            return None
+        return transport_payload
+
+
+class ClipVoiceWebSocket(DiscordVoiceWebSocket):
+    """Voice Gateway v8 websocket driving the full ``davey`` 0.2 state machine.
+
+    Implements the ``Rapptz/discord.py#10548`` / ``libdave`` updates missing
+    from ``discord.py`` 2.7.1 — most critically ``prepare_transition`` after
+    binary opcodes 29 (``MLS_ANNOUNCE_COMMIT_TRANSITION``) and 30
+    (``MLS_WELCOME``), roster tracking across opcodes 11/13, and thread-safe
+    session locking shared with the UDP receive thread.
+    """
+
+    _paradise_dave_bridge: bool = True
+
+    async def received_message(self, msg: dict[str, Any]) -> None:
+        op = msg.get("op")
+        data = msg.get("d")
+        self.seq_ack = msg.get("seq", self.seq_ack)
+        state: ClipVoiceConnectionState = self._connection  # type: ignore[assignment]
+
+        if op == self.READY and isinstance(data, dict):
+            await self.initial_connection(data)
+        elif op == self.HEARTBEAT_ACK:
+            if self._keep_alive:
+                self._keep_alive.ack()
+        elif op == self.RESUMED:
+            log.debug("Voice RESUME succeeded for guild %s", getattr(state.guild, "id", "?"))
+        elif op == self.SESSION_DESCRIPTION and isinstance(data, dict):
+            state.mode = data["mode"]
+            await self.load_secret_key(data)
+            dave_ver = int(data.get("dave_protocol_version", 0) or 0)
+            state.dave_protocol_version = dave_ver
+            state.dave_downgraded = dave_ver == 0
+            if dave_ver > 0 or state.dave_session is not None:
+                await state.reinit_dave_session(ws=self)
+        elif op == self.HELLO and isinstance(data, dict):
+            interval = data["heartbeat_interval"] / 1000.0
+            self._keep_alive = VoiceKeepAliveHandler(ws=self, interval=min(interval, 5.0))
+            self._keep_alive.start()
+        elif op == self.CLIENTS_CONNECT and isinstance(data, dict):
+            raw_ids = data.get("user_ids")
+            if isinstance(raw_ids, list):
+                for raw_uid in raw_ids:
+                    try:
+                        state.connected_user_ids.add(int(raw_uid))
+                    except (TypeError, ValueError):
+                        continue
+            single_uid = data.get("user_id")
+            if single_uid is not None:
+                try:
+                    state.connected_user_ids.add(int(single_uid))
+                except (TypeError, ValueError):
+                    pass
+        elif op == self.CLIENT_DISCONNECT and isinstance(data, dict):
+            raw_uid = data.get("user_id")
+            if raw_uid is not None:
+                try:
+                    state.connected_user_ids.discard(int(raw_uid))
+                except (TypeError, ValueError):
+                    pass
+        elif op == self.DAVE_PREPARE_EPOCH and isinstance(data, dict):
+            # Handled even when state.dave_session is still None so a call that
+            # began at protocol v0 (non-E2EE) can upgrade cleanly to DAVE v1+.
+            epoch = data.get("epoch")
+            ver = data.get("protocol_version")
+            if epoch == 1 and isinstance(ver, int):
+                state.dave_protocol_version = ver
+                await state.reinit_dave_session(ws=self)
+        elif state.dave_session is not None and isinstance(data, dict):
+            if op == self.DAVE_PREPARE_TRANSITION:
+                tid = data.get("transition_id")
+                ver = data.get("protocol_version")
+                if isinstance(tid, int) and isinstance(ver, int):
+                    state.dave_pending_transitions[tid] = ver
+                    with state.dave_lock:
+                        dave_compat.prepare_dave_transition(state.dave_session, tid, ver)
+                    if tid == 0:
+                        await state._execute_transition(0)
+                    else:
+                        await self.send_transition_ready(tid)
+                    state.notify_dave_keys_updated()
+            elif op == self.DAVE_EXECUTE_TRANSITION:
+                tid = data.get("transition_id")
+                if isinstance(tid, int):
+                    await state._execute_transition(tid)
+
+        await self._hook(self, msg)
+
+    async def received_binary_message(self, msg: bytes) -> None:
+        if len(msg) < 3:
+            return
+        self.seq_ack = struct.unpack_from(">H", msg, 0)[0]
+        op = msg[2]
+        state: ClipVoiceConnectionState = self._connection  # type: ignore[assignment]
+        session = state.dave_session
+        if session is None:
+            return
+
+        if op == self.MLS_EXTERNAL_SENDER:
+            channel_id = getattr(getattr(state.voice_client, "channel", None), "id", None)
+            user_id = getattr(getattr(state, "user", None), "id", None)
+            with state.dave_lock:
+                applied, reinitialized = dave_compat.set_dave_external_sender(
+                    session,
+                    msg[3:],
+                    protocol_version=state.dave_protocol_version,
+                    user_id=user_id,
+                    channel_id=channel_id,
+                )
+                key_pkg = (
+                    session.get_serialized_key_package()
+                    if applied and reinitialized
+                    else None
+                )
+            if key_pkg:
+                await self.send_binary(self.MLS_KEY_PACKAGE, key_pkg)
+
+        elif op == self.MLS_PROPOSALS:
+            if len(msg) < 4:
+                return
+            optype = msg[3]
+            expected_ids = state.expected_dave_user_ids()
             try:
-                if dave_session.can_passthrough(user_id):
-                    return dave_session.decrypt(
-                        user_id, davey.MediaType.audio, transport_payload
+                with state.dave_lock:
+                    commit_welcome = dave_compat.process_dave_proposals(
+                        session,
+                        optype,
+                        msg[4:],
+                        expected_user_ids=expected_ids,
                     )
             except Exception:  # noqa: BLE001
-                log.debug("Passthrough DAVE decrypt fallback to raw Opus")
-        return transport_payload
+                log.warning(
+                    "Failed to process MLS proposals in guild %s; re-initialising DAVE session",
+                    getattr(state.guild, "id", "?"),
+                    exc_info=True,
+                )
+                await state.reinit_dave_session(ws=self)
+                return
+            if commit_welcome:
+                await self.send_binary(self.MLS_COMMIT_WELCOME, commit_welcome)
+
+        elif op == self.MLS_ANNOUNCE_COMMIT_TRANSITION:
+            if len(msg) < 5:
+                return
+            transition_id = struct.unpack_from(">H", msg, 3)[0]
+            try:
+                with state.dave_lock:
+                    prepared = dave_compat.process_dave_commit_transition(
+                        session,
+                        transition_id,
+                        msg[5:],
+                        fallback_version=state.dave_protocol_version or 1,
+                    )
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "Invalid MLS commit (transition %d) in guild %s; recovering",
+                    transition_id,
+                    getattr(state.guild, "id", "?"),
+                )
+                await state._recover_from_invalid_commit(transition_id, ws=self)
+                return
+
+            if not prepared:
+                return
+
+            state.on_mls_transition_prepared(transition_id)
+            if transition_id != 0:
+                state.dave_pending_transitions[transition_id] = state.dave_protocol_version
+                await self.send_transition_ready(transition_id)
+            log.info(
+                "DAVE MLS commit transition %d ready for guild %s (epoch=%s)",
+                transition_id,
+                getattr(state.guild, "id", "?"),
+                getattr(session, "epoch", "?"),
+            )
+            state.notify_dave_keys_updated()
+
+        elif op == self.MLS_WELCOME:
+            if len(msg) < 5:
+                return
+            transition_id = struct.unpack_from(">H", msg, 3)[0]
+            recognized_ids = state.expected_dave_user_ids()
+            try:
+                with state.dave_lock:
+                    dave_compat.process_dave_welcome_transition(
+                        session,
+                        transition_id,
+                        msg[5:],
+                        recognized_user_ids=recognized_ids,
+                        fallback_version=state.dave_protocol_version or 1,
+                    )
+            except Exception:  # noqa: BLE001
+                log.warning(
+                    "Invalid MLS welcome (transition %d) in guild %s; recovering",
+                    transition_id,
+                    getattr(state.guild, "id", "?"),
+                )
+                await state._recover_from_invalid_commit(transition_id, ws=self)
+                return
+
+            state.on_mls_transition_prepared(transition_id)
+            if transition_id != 0:
+                state.dave_pending_transitions[transition_id] = state.dave_protocol_version
+                await self.send_transition_ready(transition_id)
+            log.info(
+                "DAVE MLS welcome transition %d ready for guild %s (epoch=%s)",
+                transition_id,
+                getattr(state.guild, "id", "?"),
+                getattr(session, "epoch", "?"),
+            )
+            state.notify_dave_keys_updated()
+
+
+class ClipVoiceConnectionState(VoiceConnectionState):
+    """Thread-safe voice connection state paired with :class:`ClipVoiceWebSocket`."""
+
+    def __init__(self, voice_client: ClipVoiceClient, *, hook: Any = None) -> None:
+        super().__init__(voice_client, hook=hook)
+        self.dave_lock: threading.RLock = threading.RLock()
+        self.connected_user_ids: set[int] = set()
+        self.last_dave_transition_id: int | None = None
+        self._dave_reinitializing: bool = False
+        self._last_dave_recovery_mono: float = 0.0
+
+    @property
+    def can_encrypt(self) -> bool:
+        session = self.dave_session
+        return (
+            self.dave_protocol_version != 0
+            and not self.dave_downgraded
+            and session is not None
+            and dave_compat.session_can_encrypt(session)
+        )
+
+    def expected_dave_user_ids(self) -> list[int] | None:
+        """Build the recognised user-ID roster for MLS proposals & welcomes."""
+        ids: set[int] = set(self.connected_user_ids)
+        self_uid = getattr(getattr(self, "user", None), "id", None)
+        if isinstance(self_uid, int) and self_uid > 0:
+            ids.add(self_uid)
+        channel = getattr(self.voice_client, "channel", None)
+        voice_states = getattr(channel, "voice_states", None)
+        if isinstance(voice_states, dict):
+            for uid in voice_states.keys():
+                if isinstance(uid, int) and uid > 0:
+                    ids.add(uid)
+        # Only pass an explicit allow-list when we have actually seen remote
+        # members on the gateway; otherwise let davey validate credentials alone.
+        remote_count = len(ids - ({self_uid} if isinstance(self_uid, int) else set()))
+        return list(ids) if remote_count > 0 else None
+
+    async def reinit_dave_session(
+        self, *, ws: DiscordVoiceWebSocket | None = None
+    ) -> None:
+        self.dave_pending_transitions.clear()
+        target_ws = ws if ws is not None else self.ws
+        if self.dave_protocol_version > 0:
+            channel_id = int(self.voice_client.channel.id)
+            user_id = int(self.user.id)
+            with self.dave_lock:
+                session = self.dave_session
+                if session is not None:
+                    session.reinit(self.dave_protocol_version, user_id, channel_id)
+                else:
+                    session = davey.DaveSession(
+                        self.dave_protocol_version, user_id, channel_id
+                    )
+                    self.dave_session = session
+                # While upgrading from a v0 session, peers still transmit
+                # unencrypted Opus until DAVE_EXECUTE_TRANSITION completes.
+                if self.dave_downgraded:
+                    dave_compat.set_dave_passthrough(session, True)
+                key_package = session.get_serialized_key_package()
+            if target_ws is not discord_utils.MISSING and target_ws is not None:
+                await target_ws.send_binary(
+                    DiscordVoiceWebSocket.MLS_KEY_PACKAGE, key_package
+                )
+        elif self.dave_session is not None:
+            with self.dave_lock:
+                self.dave_session.reset()
+                dave_compat.set_dave_passthrough(self.dave_session, True)
+
+    async def _recover_from_invalid_commit(
+        self,
+        transition_id: int,
+        *,
+        ws: DiscordVoiceWebSocket | None = None,
+    ) -> None:
+        target_ws = ws if ws is not None else self.ws
+        if target_ws is not discord_utils.MISSING and target_ws is not None:
+            await target_ws.send_as_json(
+                {
+                    "op": DiscordVoiceWebSocket.MLS_INVALID_COMMIT_WELCOME,
+                    "d": {"transition_id": int(transition_id)},
+                }
+            )
+        await self.reinit_dave_session(ws=target_ws)
+
+    def on_mls_transition_prepared(self, transition_id: int) -> None:
+        """Update connection transition bookkeeping after op 29 or op 30."""
+        self._dave_reinitializing = False
+        self.last_dave_transition_id = int(transition_id)
+        if transition_id == 0:
+            # Transition 0 is applied immediately inside prepare_transition().
+            if self.dave_downgraded and self.dave_protocol_version > 0:
+                self.dave_downgraded = False
+                if self.dave_session is not None:
+                    with self.dave_lock:
+                        dave_compat.set_dave_passthrough(
+                            self.dave_session,
+                            False,
+                            dave_compat.DAVE_PASSTHROUGH_TRANSITION_EXPIRY_SECONDS,
+                        )
+
+    async def _execute_transition(self, transition_id: int) -> None:
+        if transition_id not in self.dave_pending_transitions:
+            log.debug(
+                "Ignoring execute_transition for unknown transition id %d",
+                transition_id,
+            )
+            return
+
+        target_version = self.dave_pending_transitions.pop(transition_id)
+        session = self.dave_session
+        # Transition 0 was already applied by prepare_transition(0, version).
+        if session is not None and transition_id != 0:
+            with self.dave_lock:
+                if dave_compat.session_supports_transitions(session):
+                    if not dave_compat.execute_dave_transition(session, transition_id):
+                        log.warning(
+                            "DAVE transition %d was not pending inside davey session",
+                            transition_id,
+                        )
+                        return
+
+        old_version = self.dave_protocol_version
+        self.dave_protocol_version = target_version
+        self.last_dave_transition_id = transition_id
+        self._dave_reinitializing = False
+
+        if old_version != self.dave_protocol_version and self.dave_protocol_version == 0:
+            self.dave_downgraded = True
+            if session is not None:
+                with self.dave_lock:
+                    dave_compat.set_dave_passthrough(session, True)
+            log.debug("DAVE session downgraded to passthrough (v0)")
+        elif transition_id > 0 and self.dave_downgraded and self.dave_protocol_version > 0:
+            self.dave_downgraded = False
+            if session is not None:
+                with self.dave_lock:
+                    # Disable passthrough after the 10 s transition expiry
+                    # (fixes discord.py 2.7.1 bug that passed True here).
+                    dave_compat.set_dave_passthrough(
+                        session,
+                        False,
+                        dave_compat.DAVE_PASSTHROUGH_TRANSITION_EXPIRY_SECONDS,
+                    )
+            log.debug("DAVE session upgraded to protocol v%d", self.dave_protocol_version)
+
+        self.notify_dave_keys_updated()
+
+    def notify_dave_keys_updated(self) -> None:
+        cb = getattr(self.voice_client, "on_dave_keys_updated", None)
+        if callable(cb):
+            cb()
+
+    def request_inplace_dave_recovery(self) -> None:
+        """Thread-safe trigger: refresh MLS keys in-place without disconnecting."""
+        if self._dave_reinitializing or self.dave_pending_transitions:
+            return
+        if self.dave_protocol_version <= 0 or self.dave_downgraded:
+            return
+        now = time.monotonic()
+        if (now - self._last_dave_recovery_mono) < DAVE_INPLACE_RECOVERY_COOLDOWN_SECONDS:
+            return
+        loop = getattr(self.voice_client, "loop", None)
+        if not isinstance(loop, asyncio.AbstractEventLoop) or not loop.is_running():
+            return
+        self._last_dave_recovery_mono = now
+        self._dave_reinitializing = True
+        loop.call_soon_threadsafe(self._spawn_inplace_recovery, loop)
+
+    def _spawn_inplace_recovery(self, loop: asyncio.AbstractEventLoop) -> None:
+        loop.create_task(
+            self._run_inplace_dave_recovery(),
+            name=f"paradise-dave-reinit-{getattr(self.guild, 'id', 0)}",
+        )
+
+    async def _run_inplace_dave_recovery(self) -> None:
+        try:
+            if not self.is_connected() or self.dave_protocol_version <= 0:
+                return
+            ws = self.ws
+            if ws is discord_utils.MISSING or ws is None:
+                return
+            if self.last_dave_transition_id is not None:
+                await self._recover_from_invalid_commit(self.last_dave_transition_id)
+            else:
+                await self.reinit_dave_session()
+            log.info(
+                "Requested in-place DAVE MLS key refresh for guild %s",
+                getattr(self.guild, "id", "?"),
+            )
+        except Exception:  # noqa: BLE001
+            log.debug("In-place DAVE MLS key refresh failed", exc_info=True)
+        finally:
+            self._dave_reinitializing = False
+
+    async def _connect_websocket(self, resume: bool) -> DiscordVoiceWebSocket:
+        seq_ack = -1
+        if self.ws is not discord_utils.MISSING:
+            seq_ack = self.ws.seq_ack
+        if not resume:
+            self.connected_user_ids.clear()
+            self.dave_pending_transitions.clear()
+        ws = await ClipVoiceWebSocket.from_connection_state(
+            self, resume=resume, hook=self.hook, seq_ack=seq_ack
+        )
+        self.state = ConnectionFlowState.websocket_connected
+        return ws
 
 
 class ClipVoiceClient(discord.VoiceClient):
     """``discord.VoiceClient`` subclass adding non-blocking RTP/DAVE voice reception."""
+
+    supported_modes: tuple[str, ...] = SUPPORTED_TRANSPORT_MODES  # type: ignore[assignment]
 
     def __init__(self, client: discord.Client, channel: discord.abc.Connectable) -> None:
         self._receive_router: VoiceReceiveRouter | None = None
@@ -573,23 +1304,79 @@ class ClipVoiceClient(discord.VoiceClient):
         self._silence_task: asyncio.Task[None] | None = None
         self._keepalive_counter: int = 0
         super().__init__(client, channel)
-        # NOTE: the rolling-capture session is intentionally *not* attached
-        # here.  At construction time there is no voice websocket and no UDP
-        # socket yet; registering the socket listener now would leave the
-        # shared SocketReader thread spinning hot on a non-socket.  The first
-        # voice websocket message (READY) binds the service instead — still
-        # long before any RTP can flow.
 
     def create_connection_state(self) -> VoiceConnectionState:
-        return VoiceConnectionState(self, hook=self._on_voice_ws_message)
+        return ClipVoiceConnectionState(self, hook=self._on_voice_ws_message)
+
+    def _encrypt_aead_aes256_gcm_rtpsize(self, header: bytes, data: bytes) -> bytes:
+        """Encrypt an outgoing RTP payload with Discord's AES-256-GCM rtpsize mode."""
+        assert AESGCM is not None
+        aes = AESGCM(bytes(self.secret_key))
+        nonce = bytearray(12)
+        nonce[:4] = struct.pack(">I", self._incr_nonce)
+        self.checked_add("_incr_nonce", 1, 4294967295)
+        return header + aes.encrypt(bytes(nonce), bytes(data), bytes(header)) + bytes(nonce[:4])
+
+    def _get_voice_packet(self, data: bytes) -> bytes | None:  # type: ignore[override]
+        """Formulate an outgoing RTP packet with thread-safe DAVE 0.2 encryption."""
+        packet = bytes(data)
+        conn = self._connection
+        session = getattr(conn, "dave_session", None)
+        if session is not None and conn.can_encrypt and packet != OPUS_SILENCE:
+            dave_lock = getattr(conn, "dave_lock", None)
+            if dave_lock is not None:
+                with dave_lock:
+                    if not dave_compat.session_can_encrypt(session):
+                        return None
+                    packet = session.encrypt_opus(packet)
+            else:
+                if not dave_compat.session_can_encrypt(session):
+                    return None
+                packet = session.encrypt_opus(packet)
+
+        header = bytearray(12)
+        header[0] = 0x80
+        header[1] = 0x78
+        struct.pack_into(">H", header, 2, self.sequence)
+        struct.pack_into(">I", header, 4, self.timestamp)
+        struct.pack_into(">I", header, 8, self.ssrc)
+
+        encrypt_packet = getattr(self, "_encrypt_" + self.mode)
+        return encrypt_packet(bytes(header), packet)
+
+    def send_audio_packet(self, data: bytes, *, encode: bool = True) -> None:
+        """Send one 20 ms Opus/PCM frame, safely skipping pre-key DAVE windows."""
+        self.checked_add("sequence", 1, 65535)
+        if encode:
+            encoded_data = self.encoder.encode(data, self.encoder.SAMPLES_PER_FRAME)
+        else:
+            encoded_data = data
+        packet = self._get_voice_packet(encoded_data)
+        if packet is not None:
+            try:
+                self._connection.send_packet(packet)
+            except OSError:
+                log.debug(
+                    "Outgoing voice packet dropped (seq=%s, ts=%s)",
+                    self.sequence,
+                    self.timestamp,
+                )
+        self.checked_add("timestamp", opus.Encoder.SAMPLES_PER_FRAME, 4294967295)
+
+    def on_dave_keys_updated(self) -> None:
+        """Flush any voice frames queued while MLS ratchets were completing."""
+        router = self._receive_router
+        if router is not None:
+            try:
+                router.flush()
+            except Exception:  # noqa: BLE001
+                log.debug("Post-transition DAVE frame flush error", exc_info=True)
 
     def _bind_clip_service(self, channel_id: int | None) -> None:
         service = getattr(self.client, "voice_clip_service", None)
         guild = getattr(self.channel, "guild", None)
         if service is None or guild is None or channel_id is None:
             return
-        # ``receiving_wanted`` is the clip buffer's answer (and nothing else
-        # needs audio any more). False means this client decrypts nothing.
         if not getattr(service, "receiving_wanted", service.enabled):
             return
         already_bound = self._receive_router is not None
@@ -601,9 +1388,6 @@ class ClipVoiceClient(discord.VoiceClient):
             previous_router=None if old_router is None else old_router,
         )
         self._ensure_socket_listener()
-        # Re-arm transport from the live connection state: on any rebind
-        # without a fresh handshake there is no SESSION_DESCRIPTION coming,
-        # and without a decryptor every packet is dropped silently.
         self._arm_receiver()
         if not already_bound:
             log.info(
@@ -613,13 +1397,7 @@ class ClipVoiceClient(discord.VoiceClient):
             )
 
     def _arm_receiver(self) -> None:
-        """Configure the router's transport decryptor from connection state.
-
-        ``VoiceConnectionState`` keeps ``mode``/``secret_key``/``ssrc`` for the
-        lifetime of the voice connection, so this restores full packet
-        processing after any rebind — no voice-gateway op 4 required.  A no-op
-        when the handshake has not completed yet (op 4 configures later).
-        """
+        """Configure the router's transport decryptor from live connection state."""
         router = self._receive_router
         if router is None or router.has_transport():
             return
@@ -640,33 +1418,32 @@ class ClipVoiceClient(discord.VoiceClient):
                 own_ssrc=ssrc if isinstance(ssrc, int) else None,
             )
             log.info(
-                "Voice receiver transport re-armed from connection state for "
-                "guild %s",
+                "Voice receiver transport re-armed from connection state for guild %s",
                 getattr(getattr(self.channel, "guild", None), "id", "?"),
             )
         except (ValueError, TypeError):
             log.debug("Could not re-arm the voice receiver transport", exc_info=True)
 
     def rebind_recording(self) -> None:
-        """Re-attach the rolling capture after a service-side detach.
-
-        Used when capture had to be dropped (e.g. while the bot was deafened)
-        and later recovered: ``attach_voice_client`` is idempotent for the same
-        channel, so calling this on every recovery path is safe and cannot
-        duplicate recording sessions.
-        """
+        """Re-attach rolling capture after a service-side detach (idempotent)."""
         self._bind_clip_service(getattr(self.channel, "id", None))
 
     def _ensure_socket_listener(self) -> None:
         if self._receive_router is None:
             return
-        if not self._listener_registered:
+        reader = getattr(self._connection, "_socket_reader", None)
+        callbacks = getattr(reader, "_callbacks", None)
+        if isinstance(callbacks, list):
+            if self._on_udp_packet not in callbacks:
+                self._connection.add_socket_listener(self._on_udp_packet)
+            self._listener_registered = True
+        elif not self._listener_registered:
             self._connection.add_socket_listener(self._on_udp_packet)
             self._listener_registered = True
-        if self._connection.socket is not discord.utils.MISSING:
-            reader = getattr(self._connection, "_socket_reader", None)
-            if reader is not None:
-                reader.resume()
+
+        sock = getattr(self._connection, "socket", discord.utils.MISSING)
+        if sock is not discord.utils.MISSING and sock is not None and reader is not None:
+            reader.resume()
 
     def _remove_socket_listener(self) -> None:
         if self._listener_registered:
@@ -686,17 +1463,18 @@ class ClipVoiceClient(discord.VoiceClient):
         await super().on_voice_state_update(data)
         raw_cid = data.get("channel_id") if isinstance(data, dict) else None
         if raw_cid is None:
-            self._teardown_recording()
+            # Ignore transient channel_id=None frames observed while discord.py
+            # is actively executing an internal reconnect flow; tear down only
+            # when the connection state actually transitioned to disconnected.
+            conn_state = getattr(self._connection, "state", ConnectionFlowState.disconnected)
+            if conn_state is ConnectionFlowState.disconnected:
+                self._teardown_recording()
             return
         new_channel_id = int(raw_cid)
         if new_channel_id != old_channel_id:
-            # NOTE: no ``router.reset()`` here.  A channel move does NOT
-            # re-run the voice handshake: the UDP socket, encryption keys and
-            # RTP SSRCs all stay the same.  Resetting used to leave the fresh
-            # router without a transport decryptor — and SESSION_DESCRIPTION
-            # (op 4) never re-arrives on a live connection, so every packet
-            # was dropped until a full reconnect.  ``attach_voice_client``
-            # inherits the live state instead, so capture continues silently.
+            connected_ids = getattr(self._connection, "connected_user_ids", None)
+            if isinstance(connected_ids, set):
+                connected_ids.clear()
             self._bind_clip_service(new_channel_id)
 
     async def _on_voice_ws_message(
@@ -713,41 +1491,44 @@ class ClipVoiceClient(discord.VoiceClient):
             self._bind_clip_service(getattr(self.channel, "id", None))
         router = self._receive_router
 
-        # DAVE E2EE key transitions (voice gateway ops 21/22).  These must be
-        # applied even when the clip receiver is not bound: without
-        # prepare_transition the session never installs decryption key
-        # ratchets, and without execute_transition it never switches its
-        # encryption key — i.e. the bot can neither hear nor be heard.
-        # discord.py 2.7.1 tracks the transition ids but never forwards them
-        # to the davey session (Rapptz/discord.py#10548), so the bridge does.
         if op == VOICE_OP_RESUMED:
-            # After a voice-websocket resume, make sure the receiver is
-            # still fully armed; SESSION_DESCRIPTION usually follows and
-            # reconfigures anyway, but this closes any gap.
+            self._ensure_socket_listener()
             self._arm_receiver()
             return
 
+        # ClipVoiceWebSocket already applies ops 21/22 in received_message
+        # before invoking this hook.  Keep the fallback active whenever a plain
+        # DiscordVoiceWebSocket or test stub calls the hook directly.
+        handled_by_ws = bool(getattr(ws, "_paradise_dave_bridge", False))
+        dave_lock = getattr(self._connection, "dave_lock", None)
+
         if op == VOICE_OP_DAVE_PREPARE_TRANSITION:
-            session = getattr(self._connection, "dave_session", None)
-            tid = data.get("transition_id")
-            version = data.get("protocol_version")
-            if session is not None and isinstance(tid, int) and isinstance(version, int):
-                if dave_compat.prepare_dave_transition(session, tid, version):
-                    guild = getattr(self.channel, "guild", None)
-                    log.info(
-                        "DAVE transition %s (protocol v%s) prepared — E2EE keys "
-                        "installed for guild %s",
-                        tid,
-                        version,
-                        getattr(guild, "id", "?"),
-                    )
+            if not handled_by_ws:
+                session = getattr(self._connection, "dave_session", None)
+                tid = data.get("transition_id")
+                version = data.get("protocol_version")
+                if session is not None and isinstance(tid, int) and isinstance(version, int):
+                    if dave_lock is not None:
+                        with dave_lock:
+                            ok = dave_compat.prepare_dave_transition(session, tid, version)
+                    else:
+                        ok = dave_compat.prepare_dave_transition(session, tid, version)
+                    if ok:
+                        self.on_dave_keys_updated()
             return
 
         if op == VOICE_OP_DAVE_EXECUTE_TRANSITION:
-            session = getattr(self._connection, "dave_session", None)
-            tid = data.get("transition_id")
-            if session is not None and isinstance(tid, int):
-                dave_compat.execute_dave_transition(session, tid)
+            if not handled_by_ws:
+                session = getattr(self._connection, "dave_session", None)
+                tid = data.get("transition_id")
+                if session is not None and isinstance(tid, int):
+                    if dave_lock is not None:
+                        with dave_lock:
+                            ok = dave_compat.execute_dave_transition(session, tid)
+                    else:
+                        ok = dave_compat.execute_dave_transition(session, tid)
+                    if ok:
+                        self.on_dave_keys_updated()
             return
 
         if router is None:
@@ -757,6 +1538,7 @@ class ClipVoiceClient(discord.VoiceClient):
             ssrc = data.get("ssrc")
             if isinstance(ssrc, int):
                 router.set_own_ssrc(ssrc)
+            self._ensure_socket_listener()
 
         elif op == VOICE_OP_SESSION_DESCRIPTION:
             mode = data.get("mode") or self._connection.mode
@@ -770,7 +1552,7 @@ class ClipVoiceClient(discord.VoiceClient):
                     router.configure_transport(
                         mode,
                         bytes(secret_key),
-                        own_ssrc= (
+                        own_ssrc=(
                             self._connection.ssrc
                             if isinstance(self._connection.ssrc, int)
                             else None
@@ -785,9 +1567,13 @@ class ClipVoiceClient(discord.VoiceClient):
         elif op == VOICE_OP_SPEAKING:
             raw_uid = data.get("user_id")
             raw_ssrc = data.get("ssrc")
-            if raw_uid is not None and isinstance(raw_ssrc, int):
+            if raw_uid is not None and isinstance(raw_ssrc, int) and raw_ssrc > 0:
                 try:
-                    router.register_ssrc(int(raw_uid), raw_ssrc)
+                    uid = int(raw_uid)
+                    connected_ids = getattr(self._connection, "connected_user_ids", None)
+                    if isinstance(connected_ids, set):
+                        connected_ids.add(uid)
+                    router.register_ssrc(uid, raw_ssrc)
                 except (TypeError, ValueError):
                     log.debug("Invalid SPEAKING user_id payload")
 
@@ -796,16 +1582,32 @@ class ClipVoiceClient(discord.VoiceClient):
             raw_ssrc = data.get("audio_ssrc")
             if raw_uid is not None and isinstance(raw_ssrc, int) and raw_ssrc > 0:
                 try:
-                    router.register_ssrc(int(raw_uid), raw_ssrc)
+                    uid = int(raw_uid)
+                    connected_ids = getattr(self._connection, "connected_user_ids", None)
+                    if isinstance(connected_ids, set):
+                        connected_ids.add(uid)
+                    router.register_ssrc(uid, raw_ssrc)
                 except (TypeError, ValueError):
                     log.debug("Invalid VIDEO user_id payload")
 
         elif op == VOICE_OP_CLIENT_CONNECT:
+            connected_ids = getattr(self._connection, "connected_user_ids", None)
+            raw_ids = data.get("user_ids")
+            if isinstance(raw_ids, list) and isinstance(connected_ids, set):
+                for item in raw_ids:
+                    try:
+                        connected_ids.add(int(item))
+                    except (TypeError, ValueError):
+                        continue
             raw_uid = data.get("user_id")
             raw_ssrc = data.get("audio_ssrc")
-            if raw_uid is not None and isinstance(raw_ssrc, int) and raw_ssrc > 0:
+            if raw_uid is not None:
                 try:
-                    router.register_ssrc(int(raw_uid), raw_ssrc)
+                    uid = int(raw_uid)
+                    if isinstance(connected_ids, set):
+                        connected_ids.add(uid)
+                    if isinstance(raw_ssrc, int) and raw_ssrc > 0:
+                        router.register_ssrc(uid, raw_ssrc)
                 except (TypeError, ValueError):
                     log.debug("Invalid CLIENT_CONNECT payload")
 
@@ -870,6 +1672,7 @@ class ClipVoiceClient(discord.VoiceClient):
                 sock = self._connection.socket
                 if not sock or sock is discord.utils.MISSING:
                     continue
+                self._ensure_socket_listener()
                 try:
                     self._keepalive_counter = (self._keepalive_counter + 1) & 0xFFFFFFFFFFFFFFFF
                     self._connection.send_packet(
@@ -902,8 +1705,3 @@ class ClipVoiceClient(discord.VoiceClient):
     def cleanup(self) -> None:
         self._teardown_recording()
         super().cleanup()
-
-
-# NOTE: ``voice_client_class_for`` lives in ``join_policy.py``, a
-# dependency-free leaf module, so other join paths (voice presence,
-# dictionary playback) can share it without import cycles.

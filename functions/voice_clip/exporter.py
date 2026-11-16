@@ -3,21 +3,21 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass
-from datetime import UTC, datetime
 import logging
 import os
 import shutil
 import tempfile
+from dataclasses import dataclass
+from datetime import UTC, datetime
 
 from .buffer import ClipIntervalSnapshot
 from .constants import (
+    SAMPLE_RATE,
     ClipBusyError,
     ClipExportError,
     ClipExportTimeoutError,
     ClipFileTooLargeError,
     ClipUnavailableError,
-    SAMPLE_RATE,
 )
 from .mixer import MixResult, mix_snapshot_to_pcm_f32
 
@@ -77,7 +77,7 @@ class ExportedClip:
                 except Exception:  # noqa: BLE001
                     log.debug("Temp disk accounting release callback failed", exc_info=True)
 
-    def __enter__(self) -> "ExportedClip":
+    def __enter__(self) -> ExportedClip:
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
@@ -171,7 +171,7 @@ class ClipExportPipeline:
                 self._run_export_with_semaphore(snapshot),
                 timeout=self.export_timeout_seconds,
             )
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             log.warning(
                 "Voice clip export timed out after %.1fs (guild=%s)",
                 self.export_timeout_seconds,
@@ -317,6 +317,11 @@ class ClipExportPipeline:
             "1",
             "-i",
             "pipe:0",
+            "-vn",
+            "-sn",
+            "-dn",
+            "-map_metadata",
+            "-1",
             "-af",
             self.audio_filter,
             "-ar",
@@ -344,6 +349,7 @@ class ClipExportPipeline:
             log.error("Failed to start FFmpeg encoder process: %s", type(exc).__name__)
             raise ClipExportError("Could not start the audio encoder.") from exc
 
+        stderr_bytes = b""
         try:
             _, stderr_bytes = await proc.communicate(input=pcm_f32_bytes)
         except asyncio.CancelledError:
@@ -353,6 +359,16 @@ class ClipExportPipeline:
                 log.debug("FFmpeg process already exited on cancel")
             await proc.wait()
             raise
+        except OSError as exc:
+            # If FFmpeg exits early while reading a large stdin buffer, wait
+            # and drain stderr so the real encoder reason is logged cleanly.
+            log.debug("FFmpeg stdin closed early (%s)", type(exc).__name__)
+            if proc.stderr is not None:
+                try:
+                    stderr_bytes = await proc.stderr.read()
+                except OSError:
+                    stderr_bytes = b""
+            await proc.wait()
 
         if proc.returncode != 0:
             err_summary = (stderr_bytes or b"").decode("utf-8", errors="replace").strip()

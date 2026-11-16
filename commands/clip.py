@@ -16,12 +16,12 @@ from discord.ext import commands, tasks
 
 from config import VoiceClipConfig
 from functions.voice_clip import (
-    ClipError,
-    ClipVoiceClient,
     MAX_CLIP_DURATION,
     MIN_CLIP_DURATION,
-    NoUsableAudioError,
     UNAUTHORIZED_CLIP_MESSAGE,
+    ClipError,
+    ClipVoiceClient,
+    NoUsableAudioError,
     VoiceClipService,
     authorize_clip_user,
     validate_clip_duration,
@@ -60,6 +60,10 @@ class VoiceClip(commands.Cog):
         self._e2ee_reconnects: dict[int, int] = {}
 
     async def cog_load(self) -> None:
+        # Self-heal on hot-reload: bind any already-connected ClipVoiceClient.
+        for vc in list(getattr(self.bot, "voice_clients", ()) or ()):
+            if isinstance(vc, ClipVoiceClient) and vc.is_connected():
+                vc.rebind_recording()
         self._expiry_sweep.start()
 
     async def cog_unload(self) -> None:
@@ -116,15 +120,20 @@ class VoiceClip(commands.Cog):
             except Exception:  # noqa: BLE001
                 continue
             log.info(
-                "CAPTURE guild=%s recording=%s armed=%s recv=%s buffered=%s "
-                "speech=%s session=%.0fs sess_pkts=%s sess_speech=%s "
-                "last_pkt=%s dave_fail=%s",
+                "CAPTURE guild=%s recording=%s armed=%s dave=v%s(ready=%s) "
+                "recv=%s audio=%s buffered=%s speech=%s ssrc_auto=%s "
+                "session=%.0fs sess_pkts=%s sess_speech=%s last_pkt=%s "
+                "dave_fail=%s dave_unready=%s",
                 gid,
                 h.get("recording"),
                 h.get("receiver_armed"),
+                h.get("dave_protocol_version"),
+                h.get("dave_ready"),
                 h.get("received"),
+                h.get("audio_received"),
                 h.get("buffered"),
                 h.get("non_silence_buffered"),
+                h.get("dave_ssrc_resolved"),
                 float(h.get("session_elapsed_seconds") or 0.0),
                 h.get("session_packets"),
                 h.get("session_non_silence_packets"),
@@ -134,6 +143,7 @@ class VoiceClip(commands.Cog):
                     else "never"
                 ),
                 h.get("dave_fail_since_success"),
+                h.get("dave_not_ready_drops"),
             )
 
     async def _recover_broken_capture(self) -> None:
@@ -340,7 +350,7 @@ class VoiceClip(commands.Cog):
                     "recording",
                     guild.id,
                 )
-        except (discord.DiscordException, asyncio.TimeoutError):
+        except (TimeoutError, discord.DiscordException):
             if server_deaf:
                 self._explain_guild_deafen(guild)
             log.debug("Could not clear the bot's deafen", exc_info=True)
