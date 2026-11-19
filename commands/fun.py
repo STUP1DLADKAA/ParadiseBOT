@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import logging
 import math
 import random
@@ -25,16 +24,6 @@ PING_QUIPS = (
     "still online somehow.",
     "reporting for duty, loosely.",
 )
-
-COIN_FLAVOURS = (
-    "",
-    "\nthe coin has spoken.",
-    "\nno take-backs.",
-    "\nfate is real now.",
-    "\nthat's just how it landed.",
-    "\ndestiny is a flat disc, apparently.",
-)
-
 
 def build_ping_message(latency: float | None, quip: str | None = None) -> str:
     """Random quip plus the real, clearly labelled latency."""
@@ -69,22 +58,6 @@ class Fun(commands.Cog):
             build_ping_message(self.bot.latency),
             allowed_mentions=discord.AllowedMentions.none(),
         )
-
-    @app_commands.command(description="Make a deeply important binary decision")
-    @cooldown()
-    async def coinflip(self, interaction: discord.Interaction) -> None:
-        await interaction.response.send_message("🪙 flipping…")
-        try:
-            await asyncio.sleep(0.7)
-            await interaction.edit_original_response(content="🪙 • • •")
-            await asyncio.sleep(0.7)
-            side = flip_coin()
-            await interaction.edit_original_response(
-                content=f"🪙 **{side}**{random.choice(COIN_FLAVOURS)}"
-            )
-        except discord.DiscordException:
-            # The animation is cosmetic; never crash over a failed edit.
-            log.debug("Coinflip animation edit failed", exc_info=True)
 
     @app_commands.command(description="Let Paradise choose so you don't have to")
     @app_commands.describe(options="Separate choices with | or , (2–20)")

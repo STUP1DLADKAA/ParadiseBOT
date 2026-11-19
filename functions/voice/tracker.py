@@ -1541,6 +1541,9 @@ class VoiceTracker:
                     total_seconds=total_sec,
                     percentage=round(pct, 1),
                     is_active_now=is_active,
+                    active_channel_id=(
+                        active_sess.channel_id if active_sess else None
+                    ),
                 )
             )
 
@@ -1679,7 +1682,72 @@ class VoiceTracker:
             "is_active_now": active_session is not None,
             "active_channel_id": active_session.channel_id if active_session else None,
             "active_session_elapsed": active_all,
+            "channel_stats": channel_stats,
         }
+
+    async def get_per_member_channels(
+        self,
+        guild: discord.Guild,
+        user_id: int,
+        target_date: date | None = None,
+    ) -> list[dict]:
+        """Per-channel voice breakdown for one member.
+
+        Returns a list of ``{"channel_id", "channel_name", "total_seconds",
+        "session_count"}`` dicts ordered by total_seconds descending.
+        """
+        now = ensure_aware(self._clock()).astimezone(timezone.utc)
+        today_date = target_date or now.astimezone(IST).date()
+
+        db_rows = await self.db.get_user_channel_stats(
+            guild.id, user_id, target_date=today_date
+        )
+
+        results: list[dict] = []
+        for row in db_rows:
+            channel = guild.get_channel(row["channel_id"])
+            results.append(
+                {
+                    "channel_id": row["channel_id"],
+                    "channel_name": (
+                        channel.name if channel else f"channel_{row['channel_id']}"
+                    ),
+                    "total_seconds": row["total_seconds"],
+                    "session_count": row["session_count"],
+                }
+            )
+
+        # Add live time for the current active channel (not yet in completed
+        # sessions) so the most-recent channel shows up too.
+        key = (guild.id, user_id)
+        active_session = self.active_sessions.get(key)
+        if active_session and not active_session.is_afk:
+            live = period_overlap_seconds(
+                active_session.credit_from, now, "all_time", today_date, now=now
+            )
+            if live:
+                channel = guild.get_channel(active_session.channel_id)
+                for entry in results:
+                    if entry["channel_id"] == active_session.channel_id:
+                        entry["total_seconds"] += live
+                        entry["session_count"] += 1
+                        break
+                else:
+                    results.append(
+                        {
+                            "channel_id": active_session.channel_id,
+                            "channel_name": (
+                                channel.name
+                                if channel
+                                else f"channel_{active_session.channel_id}"
+                            ),
+                            "total_seconds": live,
+                            "session_count": 1,
+                        }
+                    )
+
+        results.sort(key=lambda r: -r["total_seconds"])
+        return results
 
     # ------------------------------------------------------------------
     # Daily DM Reports Engine (Section 7)

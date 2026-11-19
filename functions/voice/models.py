@@ -70,6 +70,7 @@ class LeaderboardMember:
     total_seconds: int
     percentage: float = 0.0
     is_active_now: bool = False
+    active_channel_id: int | None = None
 
     @property
     def formatted_time(self) -> str:

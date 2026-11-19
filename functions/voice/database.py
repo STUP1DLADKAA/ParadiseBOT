@@ -713,6 +713,50 @@ class VoiceDatabase:
                 "all_time": int(row["all_time_sec"]),
             }
 
+    def get_user_channel_stats(
+        self,
+        guild_id: int,
+        user_id: int,
+        target_date: date | None = None,
+    ) -> list[dict]:
+        """Return per-channel voice breakdown for a user.
+
+        Each item is ``{"channel_id": int, "total_seconds": int, "session_count": int}``,
+        ordered by total_seconds descending. Covers completed sessions only
+        (from ``voice_sessions``); live time is added by the tracker.
+        """
+        today_date = target_date or datetime.now(IST).date()
+        today_str = today_date.isoformat()
+        week_start_str = (
+            today_date - timedelta(days=today_date.weekday())
+        ).isoformat()
+        month_start = today_date.replace(day=1)
+        month_start_str = month_start.isoformat()
+
+        with self._get_connection() as conn:
+            cur = conn.execute(
+                """
+                SELECT
+                    channel_id,
+                    SUM(duration_seconds) as total_seconds,
+                    COUNT(*) as session_count
+                FROM voice_sessions
+                WHERE guild_id = ? AND user_id = ?
+                  AND date(started_at) >= date(?)
+                GROUP BY channel_id
+                ORDER BY total_seconds DESC
+                """,
+                (guild_id, user_id, month_start_str),
+            )
+            return [
+                {
+                    "channel_id": int(row["channel_id"]),
+                    "total_seconds": int(row["total_seconds"]),
+                    "session_count": int(row["session_count"]),
+                }
+                for row in cur.fetchall()
+            ]
+
     def adjust_daily_stat(
         self,
         guild_id: int,

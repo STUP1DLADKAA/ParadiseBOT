@@ -94,29 +94,28 @@ DEFAULT_SCALE = 2
 _MAX_SCALE = 3
 
 # ---------------------------------------------------------------------------
-# Palette — light, quiet, and mostly grey.
+# Palette — dark, Material Expressive 3.
 # ---------------------------------------------------------------------------
-# The card is a document, not a poster: white paper on a faint grey page, one
-# accent colour per period, and grey for everything that is not the number the
-# reader came for. Apple's system colours are used verbatim where they fit, and
-# the text greys are their label / secondaryLabel / tertiaryLabel values.
+# Dark is the safe default next to Discord's dark UI: deep surfaces, one
+# accent colour per period, and muted greys for everything that is not the
+# number the reader came for.
 
-BG_TOP = (255, 255, 255)             # #FFFFFF
-BG_BOTTOM = (242, 242, 247)          # #F2F2F7 systemGroupedBackground
-SURFACE_COLOR = (255, 255, 255)      # card
-SURFACE_LIGHT = (247, 247, 249)      # chips / tracks
-CARD_BORDER = (226, 226, 231)        # #E2E2E7 hairline
-CARD_BORDER_SOFT = (238, 238, 242)   # inner separators
-TRACK_COLOR = (237, 237, 241)        # progress-bar track
-ACCENT_PURPLE = (94, 92, 230)        # #5E5CE6 systemIndigo
-ACCENT_CYAN = (0, 122, 255)          # #007AFF systemBlue
-ACCENT_BLUE = (0, 113, 227)          # #0071E3 (links, focus)
-ACCENT_TEAL = (48, 176, 199)         # #30B0C7
-ACCENT_PINK = (255, 55, 95)          # #FF375F systemPink
-ACCENT_ORANGE = (255, 159, 10)       # #FF9F0A systemOrange
-TEXT_PRIMARY = (29, 29, 31)          # #1D1D1F label
-TEXT_SECONDARY = (110, 110, 115)     # #6E6E73 secondaryLabel
-TEXT_MUTED = (142, 142, 147)         # #8E8E93 tertiaryLabel
+BG_TOP = (18, 20, 24)              # #121418 deep surface
+BG_BOTTOM = (24, 26, 32)           # #181A20 slightly lighter surface
+SURFACE_COLOR = (30, 33, 40)       # #1E2128 card surface
+SURFACE_LIGHT = (38, 41, 48)       # #262930 chips / tracks
+CARD_BORDER = (56, 60, 70)         # #383C46 hairline
+CARD_BORDER_SOFT = (46, 49, 56)    # #2E3138 inner separators
+TRACK_COLOR = (46, 49, 56)         # progress-bar track
+ACCENT_PURPLE = (142, 110, 255)    # #8E6EFF expressive purple
+ACCENT_CYAN = (64, 196, 255)       # #40C4FF expressive cyan
+ACCENT_BLUE = (99, 160, 255)       # #63A0FF expressive blue
+ACCENT_TEAL = (66, 200, 170)       # #42C8AA expressive teal
+ACCENT_PINK = (255, 90, 140)       # #FF5A8C expressive pink
+ACCENT_ORANGE = (255, 165, 80)     # #FFA550 expressive orange
+TEXT_PRIMARY = (238, 242, 250)     # #EEF2FA near-white label
+TEXT_SECONDARY = (165, 174, 190)   # #A5AEBE secondaryLabel
+TEXT_MUTED = (110, 118, 130)       # #6E7682 tertiaryLabel
 
 GOLD = (255, 179, 0)                 # #FFB300
 GOLD_DEEP = (255, 149, 0)            # #FF9500
