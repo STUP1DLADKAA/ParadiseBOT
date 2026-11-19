@@ -65,9 +65,7 @@ class ParadiseTree(app_commands.CommandTree):
     ) -> None:
         if isinstance(error, app_commands.CommandOnCooldown):
             text = f"give it {error.retry_after:.1f}s. I'm only one little guy."
-        elif isinstance(
-            error, (app_commands.TransformerError, app_commands.RangeError)
-        ):
+        elif isinstance(error, app_commands.TransformerError):
             text = "that input doesn't quite work. check the command hints."
         elif isinstance(error, app_commands.NoPrivateMessage):
             text = "that one only works in a server."
