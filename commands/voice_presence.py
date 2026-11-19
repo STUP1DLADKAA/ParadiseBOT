@@ -461,7 +461,11 @@ class VoicePresence(commands.Cog):
                     timeout=CONNECT_TIMEOUT,
                     # Never join deafened: a deafened client receives no audio
                     # at all, which would silently disable voice clipping.
+                    # Personally muted (self_mute) so Paradise never transmits,
+                    # but not server muted / server deafened — those are removed
+                    # by VoiceEnforcement and the clip cog.
                     self_deaf=False,
+                    self_mute=True,
                     cls=self._voice_client_class(),
                 )
 
@@ -504,7 +508,10 @@ class VoicePresence(commands.Cog):
             try:
                 return await channel.connect(
                     timeout=CONNECT_TIMEOUT,
+                    # Personally muted so Paradise never transmits, but never
+                    # server muted or server deafened.
                     self_deaf=False,
+                    self_mute=True,
                     cls=self._voice_client_class(),
                 )
             except (asyncio.TimeoutError, discord.DiscordException):
