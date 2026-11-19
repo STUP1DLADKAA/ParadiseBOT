@@ -125,14 +125,15 @@ class CommandSynchronizer:
         guild_id: int = PRIMARY_GUILD_ID,
         retired: frozenset[str] = RETIRED_COMMANDS,
         sync_global: bool = False,
-        purge_global: bool = True,
+        purge_global: bool = False,
     ) -> None:
         self.bot = bot
         self.guild_id = max(0, int(guild_id or 0))
         self.retired = frozenset(retired)
-        # A guild copy and a global copy of the same command is a duplicate:
-        # one or the other, decided here and nowhere else.
-        self.sync_global = bool(sync_global) and not self.guild_id
+        # Global and guild sync are independent and can both run: Discord
+        # treats them as separate namespaces, guild commands override global
+        # ones inside the home guild, and nothing is listed twice.
+        self.sync_global = bool(sync_global)
         self.purge_global = bool(purge_global) and bool(self.guild_id)
         self._done = False
         self._lock = asyncio.Lock()
@@ -177,19 +178,23 @@ class CommandSynchronizer:
 
             report = SyncReport(guild_id=self.guild_id)
             report.pruned = self.prune()
+
+            # Sync global commands first (if enabled). These propagate to all
+            # servers but can take up to an hour to appear outside the home
+            # guild; the guild sync below makes them instant at home.
+            if self.sync_global:
+                await self._sync_global(report)
+
+            # Then sync to the home guild (instant propagation).
             if self.guild_id:
                 await self._sync_guild(report)
                 if self.purge_global:
                     await self._purge_global(report)
-            elif self.sync_global:
-                # No home server at all: global registration is the only
-                # option, and there is no guild copy to duplicate it.
-                report.guild_ok = True
-                await self._sync_global(report)
-            else:
+            elif not self.sync_global:
                 report.errors.append("no home guild configured")
-            if report.guild_ok:
-                self._done = True
+
+        if report.guild_ok or report.global_ok:
+            self._done = True
             self.last_report = report
             log.info("Command sync — %s", report.summary())
             return report
