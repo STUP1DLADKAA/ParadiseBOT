@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 
 import aiohttp
 
+from functions.perf import shared_session
+
 log = logging.getLogger("paradise.mal.oauth")
 
 MAL_AUTHORIZE_URL = "https://myanimelist.net/v1/oauth2/authorize"
@@ -83,7 +85,7 @@ class MalOAuth:
         client_id: str,
         client_secret: str,
         callback_url: str,
-        session: aiohttp.ClientSession,
+        session: aiohttp.ClientSession | None = None,
     ) -> None:
         self.client_id = client_id
         self.client_secret = client_secret
@@ -91,6 +93,13 @@ class MalOAuth:
         self._session = session
         # discord_user_id -> MalOAuthState. In-memory only, single process.
         self._flows: dict[int, MalOAuthState] = {}
+
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        """Lazily fall back to the shared aiohttp session when none was given."""
+        if self._session is None:
+            self._session = shared_session("mal")
+        return self._session
 
     # ------------------------------------------------------------------
     # Authorization URL (step 1 of the flow)
@@ -164,7 +173,7 @@ class MalOAuth:
             "redirect_uri": self.callback_url,
         }
         try:
-            async with self._session.post(MAL_TOKEN_URL, data=data) as resp:
+            async with self.session.post(MAL_TOKEN_URL, data=data) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     log.warning(
@@ -191,7 +200,7 @@ class MalOAuth:
             "refresh_token": refresh_token,
         }
         try:
-            async with self._session.post(MAL_TOKEN_URL, data=data) as resp:
+            async with self.session.post(MAL_TOKEN_URL, data=data) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     log.warning(
@@ -216,7 +225,7 @@ class MalOAuth:
             "token_type_hint": "access_token",
         }
         try:
-            async with self._session.post(MAL_REVOKE_URL, data=data) as resp:
+            async with self.session.post(MAL_REVOKE_URL, data=data) as resp:
                 return resp.status == 200
         except Exception:  # noqa: BLE001
             log.exception("MAL token revocation raised an exception")
