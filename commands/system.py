@@ -19,13 +19,8 @@ HELP_BLURBS = {
     "coinflip": "a very serious coin toss",
     "choose": "decisions, outsourced",
     "roast": "get roasted (or roast a friend)",
-    "meme": "a random meme from the internet",
-    "gif": "a reaction gif",
-    "remind": "nudge you later in this channel",
-    "poll": "reaction poll",
-    "afk": "temporary AFK status",
+    "mal": "manage your MyAnimeList anime list",
     "translate": "translate a short text",
-    "settimezone": "configure your personal timezone",
     "vc": "voice activity tracking and leaderboard card",
     "clip": "save a recent voice clip via DM",
     "edit": "adjust voice activity time for a user (authorized user only)",
@@ -36,8 +31,8 @@ HELP_BLURBS = {
 }
 
 HELP_GROUPS = {
-    "🎲 fun": ("ping", "coinflip", "choose", "roast", "meme", "gif"),
-    "🧰 useful": ("remind", "poll", "afk", "translate", "settimezone", "recipe"),
+    "🎲 fun": ("ping", "coinflip", "choose", "roast", "mal"),
+    "🧰 useful": ("translate", "recipe"),
     "🎙️ voice": ("vc", "clip", "edit"),
     "🤖 ai": ("summarize", "memory"),
 }
