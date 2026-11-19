@@ -1,4 +1,4 @@
-"""Permanent voice-state enforcement: Paradise stays server-muted, never deafened.
+"""Permanent voice-state enforcement: Paradise is never server-muted or server-deafened.
 
 Two facts about Discord voice make this deliberate design, not an accident:
 
@@ -11,12 +11,12 @@ Two facts about Discord voice make this deliberate design, not an accident:
   Paradise therefore never deafens itself, and removes a server deafen the
   moment it appears.
 
-Self mute/self deafen flags are left alone: they are per-client cosmetic flags
-(this bot joins with both off) and are *not* what moderators toggle.
+Self mute/self deafen flags are managed separately: the bot joins with
+self_mute=True, self_deaf=False (personally muted, can still hear) and the clip cog re-applies self_mute whenever it is cleared.
 
 How enforcement stays loop- and rate-limit-safe:
 
-* The desired state is a constant: ``muted=True, deafened=False``.
+* The desired state is a constant: ``muted=False, deafened=False``.
 * ``on_voice_state_update`` deduplicates identical (before, after) mute/deaf
   pairs, so the bot's *own* enforcement edit never re-triggers anything and
   repeated voice events (channel hops, self-flag flips) cost zero API calls.
@@ -153,8 +153,8 @@ class VoiceEnforcement(commands.Cog):
             )
         elif not mute:
             log.info(
-                "Someone server-unmuted Paradise in guild %s — restoring the "
-                "permanent server mute",
+                "Someone server-muted Paradise in guild %s — removing the server mute "
+                "(Paradise stays personally muted, not server muted)",
                 guild.id,
             )
         self._schedule_enforce(guild)
@@ -243,7 +243,7 @@ class VoiceEnforcement(commands.Cog):
                 state.applied_mute = live_mute
                 state.applied_deafen = live_deaf
 
-                if live_mute and not live_deaf:
+                if not live_mute and not live_deaf:
                     state.failures = 0
                     return  # already the desired state
 
@@ -262,7 +262,7 @@ class VoiceEnforcement(commands.Cog):
 
                 try:
                     await me.edit(
-                        mute=True,
+                        mute=False,
                         deafen=False,
                         reason=f"Paradise permanent voice-state enforcement ({reason})",
                     )
@@ -294,12 +294,12 @@ class VoiceEnforcement(commands.Cog):
                 except asyncio.CancelledError:
                     raise
 
-                state.applied_mute = True
+                state.applied_mute = False
                 state.applied_deafen = False
                 state.failures = 0
                 log.info(
                     "Enforced Paradise's permanent voice state in guild %s "
-                    "(server-muted, server-undeafened)",
+                    "(not server-muted, not server-deafened)",
                     guild.id,
                 )
                 if state.pending:
@@ -328,7 +328,7 @@ class VoiceEnforcement(commands.Cog):
             live_deaf = bool(getattr(voice, "deaf", False))
             state.applied_mute = live_mute
             state.applied_deafen = live_deaf
-            if live_mute and not live_deaf:
+            if not live_mute and not live_deaf:
                 state.failures = 0
                 continue
             if state.inflight:

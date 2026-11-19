@@ -254,10 +254,18 @@ class VoiceClip(commands.Cog):
                 self._schedule_undeafen(guild, after.channel)
                 return
 
-            # Healthy voice state: make sure capture is live for this channel.
-            # This self-heals after deafen recovery, reconnects, or any other
-            # service-side detach (attach is idempotent per channel).
+            if getattr(after, "mute", False):
+                # Server mute applied by a moderator — remove it so Paradise
+                # stays personally muted (self_mute) but never server muted.
+                self.service.clear_guild_buffer(guild.id)
+                self._schedule_undeafen(guild, after.channel, server_mute=True)
+                return
+
+            # Healthy voice state: make sure capture is live and the bot stays
+            # personally muted (self_mute=True, never server muted/deafened).
             self._ensure_capture(guild, after.channel)
+            if not getattr(after, "self_mute", False):
+                self._schedule_undeafen(guild, after.channel)
             if before_id != after_id:
                 buf = self.service.get_buffer(guild.id)
                 if buf is not None and buf.channel_id != after_id:
@@ -302,12 +310,14 @@ class VoiceClip(commands.Cog):
         channel,
         *,
         server_deaf: bool = False,
+        server_mute: bool = False,
     ) -> None:
-        """Clear a deafen flag so the rolling buffer can keep recording."""
+        """Clear a server deafen / server mute so the rolling buffer keeps
+        recording; Paradise stays personally muted (self_mute=True)."""
         if not self.service.enabled or channel is None:
             return
         task = asyncio.create_task(
-            self._undeafen(guild, channel, server_deaf=server_deaf),
+            self._undeafen(guild, channel, server_deaf=server_deaf, server_mute=server_mute),
             name=f"paradise-undeafen-{guild.id}",
         )
         self._tasks.add(task)
@@ -319,11 +329,12 @@ class VoiceClip(commands.Cog):
         channel,
         *,
         server_deaf: bool = False,
+        server_mute: bool = False,
     ) -> None:
         try:
-            if server_deaf:
-                # A server deafen is a member flag only another member with
-                # Mute Members (or the enforcement cog) can clear.
+            if server_deaf or server_mute:
+                # A server deafen / server mute is a member flag only another
+                # member with Mute Members (or the enforcement cog) can clear.
                 enforcement = self.bot.get_cog("VoiceEnforcement")
                 if enforcement is not None:
                     await enforcement.enforce_now(guild)
@@ -331,29 +342,33 @@ class VoiceClip(commands.Cog):
                     me = guild.me
                     if me is not None and me.guild_permissions.mute_members:
                         await me.edit(
+                            mute=False,
                             deafen=False,
-                            reason="Paradise: restoring voice capture after a server deafen",
+                            reason="Paradise: removing server mute / server deafen",
                         )
                     else:
-                        self._explain_guild_deafen(guild)
+                        if server_deaf:
+                            self._explain_guild_deafen(guild)
                         return
+                kind = "server deafen" if server_deaf else "server mute"
                 log.info(
-                    "Lifted a server deafen in guild %s so clipping keeps recording",
+                    "Lifted a %s in guild %s so clipping keeps recording",
+                    kind,
                     guild.id,
                 )
             else:
                 await guild.change_voice_state(
-                    channel=channel, self_deaf=False, self_mute=False
+                    channel=channel, self_deaf=False, self_mute=True
                 )
                 log.info(
-                    "Cleared the bot's self-deafen in guild %s so clipping keeps "
-                    "recording",
+                    "Kept the bot personally muted (self_mute) in guild %s so "
+                    "clipping keeps recording",
                     guild.id,
                 )
         except (TimeoutError, discord.DiscordException):
             if server_deaf:
                 self._explain_guild_deafen(guild)
-            log.debug("Could not clear the bot's deafen", exc_info=True)
+            log.debug("Could not clear the bot's server mute / deafen", exc_info=True)
             return
         # The healthy voice-state update re-attaches capture on its own; do it
         # here too in case that event is delayed or coalesced away.
