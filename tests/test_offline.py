@@ -36,7 +36,7 @@ from functions.personality import PATTERNS, Personality  # noqa: E402
 from functions.presence import IST, NOTES, ROTATE_SECONDS, PresenceManager  # noqa: E402
 
 EXPECTED_COMMANDS = {
-    "ping", "coinflip", "choose", "roast", "translate", "vc", "clip",
+    "ping", "choose", "roast", "translate", "vc", "clip",
     "recipe",
     "summarize", "help", "edit", "memory", "mal",
 }

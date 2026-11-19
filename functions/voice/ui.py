@@ -64,7 +64,7 @@ def leaderboard_image_embed(
     number, so the embed stays out of its way: no second headline, no emoji
     prefix, and a footer only when there is more than one page to move through.
     """
-    embed = discord.Embed(colour=Colour.ACCENT)
+    embed = discord.Embed(colour=0x121418)  # dark surface, Material Expressive 3
     embed.set_image(url=f"attachment://{filename}")
     if caption:
         embed.description = caption
@@ -86,7 +86,7 @@ def build_leaderboard_text_embed(
     page_size: int = 10,
 ) -> discord.Embed:
     """The text version of the board, for servers that prefer it."""
-    embed = discord.Embed(title=period.label, colour=Colour.ACCENT)
+    embed = discord.Embed(title=period.label, colour=0x121418)
 
     if not members:
         embed.description = (
@@ -123,19 +123,32 @@ def build_user_stats_embed(
     user: discord.User | discord.Member,
     stats: dict,
 ) -> discord.Embed:
-    """One person's own numbers, grouped the way a settings screen would be."""
+    """One person's own numbers, grouped the way a settings screen would be.
+
+    Dark theme by default, with channel breakdown and live-call info.
+    """
+    is_active = stats.get("is_active_now", False)
+    active_channel_id = stats.get("active_channel_id")
+    channel_stats = stats.get("channel_stats", [])
+
+    # Status line: in a call now (with channel) or not
+    if is_active and active_channel_id:
+        channel = guild.get_channel(active_channel_id)
+        ch_name = channel.name if channel else f"<#{active_channel_id}>"
+        desc = f"🔊 In a call right now — **#{ch_name}**"
+    else:
+        desc = "Not in a call right now"
+
     embed = discord.Embed(
         title=user.display_name,
-        description=(
-            "In a call right now" if stats.get("is_active_now") else "Not in a call"
-        ),
-        colour=Colour.ACCENT,
+        description=desc,
+        colour=0x1E2128,  # dark surface, Material Expressive 3 surface
     )
     embed.set_thumbnail(url=user.display_avatar.url)
 
     rank = stats.get("rank_today")
     embed.add_field(
-        name="Today",
+        name="📅 Today",
         value=(
             f"{format_duration(stats['today_seconds'])}"
             + (f"\n#{rank} on the board" if rank else "")
@@ -143,26 +156,42 @@ def build_user_stats_embed(
         inline=True,
     )
     embed.add_field(
-        name="Yesterday",
+        name="⏪ Yesterday",
         value=format_duration(stats["yesterday_seconds"]),
         inline=True,
     )
     embed.add_field(name="\u200b", value="\u200b", inline=True)
     embed.add_field(
-        name="This week",
+        name="📊 This Week",
         value=format_duration(stats["week_seconds"]),
         inline=True,
     )
     embed.add_field(
-        name="This month",
+        name="🗓️ This Month",
         value=format_duration(stats["month_seconds"]),
         inline=True,
     )
     embed.add_field(
-        name="All time",
+        name="👑 All Time",
         value=format_duration(stats["all_time_seconds"]),
         inline=True,
     )
+
+    # Channel breakdown — most-joined VC channels in order
+    if channel_stats:
+        lines: list[str] = []
+        for entry in channel_stats[:5]:
+            name = discord.utils.escape_markdown(entry["channel_name"])
+            secs = format_duration(entry["total_seconds"])
+            count = entry["session_count"]
+            lines.append(
+                f"**#{name}** — {secs} ({count} {'session' if count == 1 else 'sessions'})"
+            )
+        embed.add_field(
+            name="🔊 Most-Joined Channels",
+            value="\n".join(lines),
+            inline=False,
+        )
 
     embed.set_footer(text=guild.name)
     return embed

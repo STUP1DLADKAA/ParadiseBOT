@@ -16,7 +16,6 @@ log = logging.getLogger(__name__)
 # against the live tree, and the ping assistant covers everything else.
 HELP_BLURBS = {
     "ping": "am I alive (with the real latency)",
-    "coinflip": "a very serious coin toss",
     "choose": "decisions, outsourced",
     "roast": "get roasted (or roast a friend)",
     "mal": "manage your MyAnimeList anime list",
@@ -31,7 +30,7 @@ HELP_BLURBS = {
 }
 
 HELP_GROUPS = {
-    "🎲 fun": ("ping", "coinflip", "choose", "roast", "mal"),
+    "🎲 fun": ("ping", "choose", "roast", "mal"),
     "🧰 useful": ("translate", "recipe"),
     "🎙️ voice": ("vc", "clip", "edit"),
     "🤖 ai": ("summarize", "memory"),
