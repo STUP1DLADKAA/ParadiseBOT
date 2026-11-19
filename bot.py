@@ -485,9 +485,13 @@ def tune_default_executor(loop: asyncio.AbstractEventLoop | None = None) -> int:
 def main() -> int:
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+        format="%(asctime)s.%(msecs)03d | %(levelname)-8s | %(name)-20s | %(message)s",
+        datefmt="%H:%M:%S",
     )
+    # Reduce third-party log spam: discord.py is chatty at INFO level.
+    logging.getLogger("discord").setLevel(logging.WARNING)
     logging.getLogger("discord.http").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
     config = load_config()
     if not config.token:
