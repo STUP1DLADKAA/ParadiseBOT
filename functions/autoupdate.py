@@ -41,6 +41,7 @@ import json
 import logging
 import os
 import shutil
+import sys
 import tarfile
 import tempfile
 import time
@@ -59,6 +60,9 @@ MAX_FILES = 4000
 REQUEST_TIMEOUT = 45.0
 
 # Paths that must survive an update untouched (relative to the repo root).
+# bot.py / requirements.txt are never removed as orphans: the tarball must
+# contain them (REQUIRED_FILES), and deleting the entrypoint while the
+# process is running is what turns an update into a failed start.
 PROTECTED_NAMES: frozenset[str] = frozenset(
     {
         ".env",
@@ -75,6 +79,8 @@ PROTECTED_NAMES: frozenset[str] = frozenset(
         ".pytest_cache",
         ".mypy_cache",
         ".ruff_cache",
+        "bot.py",
+        "requirements.txt",
     }
 )
 PROTECTED_SUFFIXES: tuple[str, ...] = (
@@ -326,7 +332,12 @@ class AutoUpdater:
             self._extract(archive, staging)
             self._validate(staging)
             changed, written = self._overlay(staging, backup)
-            removed = self._remove_orphans(previous_files, changed)
+            current_tree = {
+                f.relative_to(staging).as_posix()
+                for f in staging.rglob("*")
+                if f.is_file()
+            }
+            removed = self._remove_orphans(previous_files, changed, current_tree)
             # A restore never raises; the update is already logged above.
             if not changed and not removed:
                 log.info("Auto-update: commit %s is identical on disk", sha[:7])
@@ -439,12 +450,23 @@ class AutoUpdater:
             written.append(relative.as_posix())
         return changed, written
 
-    def _remove_orphans(self, previous: set[str], changed: list[str]) -> list[str]:
-        """Delete files a previous update wrote that no longer exist upstream."""
+    def _remove_orphans(
+        self, previous: set[str], changed: list[str], current_tree: set[str]
+    ) -> list[str]:
+        """Delete files a previous update wrote that no longer exist upstream.
+
+        A file is only an orphan when it is absent from the *current* tree —
+        not merely when it is unchanged. Byte-identical files (skipped by
+        ``_overlay`` as "unchanged") still exist upstream and must never be
+        deleted, or the entrypoint itself (``bot.py``) can vanish between the
+        update and the next start.
+        """
         removed: list[str] = []
         for name in sorted(previous):
+            if name in current_tree:
+                continue  # still exists upstream — not an orphan
             if name in changed:
-                continue
+                continue  # just replaced by this update
             relative = PurePosixPath(name)
             if self._is_protected(relative):
                 continue
@@ -672,7 +694,15 @@ async def watch(
             except Exception:  # noqa: BLE001 - the loop must never die
                 log.debug("Auto-update cycle failed", exc_info=True)
                 continue
-            report(result, autoupdater=updater)
+            if (
+                result.status == "updated"
+                and bool(getattr(cfg, "restart_after_update", True))
+            ):
+                log.warning(
+                    "auto-update: update applied — restarting to run the new code"
+                )
+                await updater.close()
+                os.execv(sys.executable, [sys.executable] + sys.argv)
     except asyncio.CancelledError:
         raise
     finally:
