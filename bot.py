@@ -151,8 +151,8 @@ class ParadiseBot(commands.Bot):
         self.synchronizer = CommandSynchronizer(
             self,
             guild_id=config.guild_id or PRIMARY_GUILD_ID,
-            sync_global=True,
-            purge_global=False,
+            sync_global=False,
+            purge_global=True,
         )
         self.commands_ready = False
         self.autoupdate_task: asyncio.Task | None = None
