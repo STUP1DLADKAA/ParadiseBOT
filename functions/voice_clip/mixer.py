@@ -1,4 +1,10 @@
-"""Time-aligned multi-speaker Opus decoding, mixing and anti-clipping limiter."""
+"""Time-aligned multi-speaker Opus decoding, mixing and anti-clipping limiter.
+
+Per-speaker enhancement: each speaker's audio is levelled independently to a
+target RMS so quiet mics and bad microphones are boosted to match louder ones.
+A noise gate suppresses background noise on quiet channels. The global mix
+then receives a safety-net static gain and smooth peak limiter.
+"""
 
 from __future__ import annotations
 
@@ -26,13 +32,20 @@ TALKSPURT_PAUSE_SECONDS: float = 0.60
 MAX_CONTIGUOUS_FRAME_GAP: int = 25
 # Anti-clipping ceiling (-0.72 dBFS) and smooth envelope parameters.
 LIMITER_CEILING: float = 0.92
-# Speech is levelled to this RMS with one *static* gain. A dynamic normaliser
-# (loudnorm in single-pass mode) rides the gain up and down between sentences,
-# which is audible as a wobble on a short clip — the "jitter" people hear.
+# Speech is levelled to this RMS per speaker with one *static* gain per
+# speaker. A dynamic normaliser (loudnorm in single-pass mode) rides the gain
+# up and down between sentences, which is audible as a wobble on a short clip
+# — the "jitter" people hear.
 TARGET_RMS_DBFS: float = -20.0
-# Cap static make-up gain (+26 dB) so near-zero comfort noise / DTX residue is
+# Cap static make-up gain (+20 dB) so near-zero comfort noise / DTX residue is
 # never amplified into audible hiss, while quiet mics still reach target RMS.
 MAX_STATIC_GAIN: float = 20.0
+# Noise gate: samples below this RMS level are treated as background noise and
+# attenuated further. Quiet mics pick up room noise; gating keeps it out of the
+# mix while leaving speech untouched.
+NOISE_GATE_DBFS: float = -40.0
+# Additional attenuation applied to gated (below-threshold) samples (~ -16 dB).
+NOISE_GATE_ATTENUATION: float = 0.15
 LIMITER_BLOCK_SAMPLES: int = 480  # 10 ms @ 48 kHz
 SILENCE_PEAK_THRESHOLD: float = 1e-4
 
@@ -95,26 +108,6 @@ def _order_and_deduplicate(
             ordered.append(pkt)
 
     return ordered
-
-
-def _add_frame(mix: np.ndarray, offset: int, frame: np.ndarray) -> int:
-    """Add ``frame`` into ``mix`` starting at ``offset``, clipping bounds safely."""
-    if frame.size == 0:
-        return offset
-    total = mix.size
-    if offset >= total:
-        return offset
-    start = offset
-    src_start = 0
-    if start < 0:
-        src_start = -start
-        start = 0
-    if src_start >= frame.size:
-        return offset + frame.size
-    avail = min(frame.size - src_start, total - start)
-    if avail > 0:
-        mix[start : start + avail] += frame[src_start : src_start + avail]
-    return offset + frame.size
 
 
 def _frame_step_samples(ordered: list[BufferedAudioPacket], index: int) -> int:
@@ -212,15 +205,25 @@ def plan_speaker_timeline(
     return plan
 
 
-def _render_speaker_into_mix(
-    mix: np.ndarray,
+def _render_speaker_buffer(
     speaker: SpeakerIntervalPackets,
     window_start_mono: float,
-) -> tuple[int, int, int]:
-    """Decode and align one speaker's packets onto the shared ``mix`` buffer."""
+) -> tuple[np.ndarray, int, int, int, int]:
+    """Decode one speaker's packets into a per-speaker float32 buffer.
+
+    Applies per-speaker gain normalization (quiet mics are boosted to match
+    louder speakers) and a noise gate (background noise is suppressed). Returns
+    ``(buffer, offset_in_samples, concealed, decode_errors, decoded_non_silent)``
+    where the buffer starts at ``offset_in_samples`` relative to
+    ``window_start_mono``.
+    """
     decoder = SpeakerOpusDecoder()
     concealed = 0
     decoded_non_silent = 0
+
+    plan = plan_speaker_timeline(speaker.packets, window_start_mono)
+    if not plan:
+        return np.zeros(0, dtype=np.float32), 0, 0, 0, 0
 
     # Warm decoder state with immediately preceding frames; discard PCM output.
     last_warmup_epoch: int | None = None
@@ -235,17 +238,16 @@ def _render_speaker_into_mix(
         last_warmup_epoch = wpkt.stream_epoch
         last_warmup_ssrc = wpkt.ssrc
 
-    if not speaker.packets:
-        return 0, decoder.decode_errors, 0
-
+    # First pass: decode every frame and record its planned timeline offset.
+    frames: list[tuple[int, np.ndarray]] = []  # (offset_from_min_start, samples)
+    min_start: int | None = None
+    max_end = 0
     previous_epoch: int | None = None
     previous_ssrc: int | None = None
-    written_until: int | None = None
-    for start_sample, missing, packet in plan_speaker_timeline(
-        speaker.packets, window_start_mono
-    ):
-        # A new stream (they reconnected, Discord moved their SSRC) needs a
-        # fresh codec: reusing the old one decodes the first frame as garbage.
+
+    for start_sample, missing, packet in plan:
+        if min_start is None or start_sample < min_start:
+            min_start = start_sample
         if (
             previous_epoch is not None
             and (packet.stream_epoch != previous_epoch or packet.ssrc != previous_ssrc)
@@ -254,10 +256,7 @@ def _render_speaker_into_mix(
         previous_epoch = packet.stream_epoch
         previous_ssrc = packet.ssrc
 
-        # Never write over audio that is already there. The planned position is
-        # nominal (it assumes the sender's frame size), while a decoded frame
-        # is the ground truth; when they disagree the frame that exists wins.
-        cursor = start_sample if written_until is None else max(written_until, start_sample)
+        cursor = start_sample
         if missing and not packet.is_silence:
             for lost in range(missing):
                 # The frame right before a received packet can be rebuilt from
@@ -267,7 +266,8 @@ def _render_speaker_into_mix(
                     if lost == missing - 1
                     else decoder.decode_plc()
                 )
-                cursor = _add_frame(mix, cursor, frame)
+                frames.append((cursor, frame))
+                cursor += frame.size
                 concealed += 1
 
         decoded = decoder.decode_packet(packet.opus_data)
@@ -278,9 +278,49 @@ def _render_speaker_into_mix(
             concealed += 1
         elif not packet.is_silence:
             decoded_non_silent += 1
-        written_until = _add_frame(mix, cursor, decoded)
+        frames.append((cursor, decoded))
+        cursor += decoded.size
+        max_end = max(max_end, cursor)
 
-    return concealed, decoder.decode_errors, decoded_non_silent
+    if min_start is None:
+        return np.zeros(0, dtype=np.float32), 0, 0, 0, 0
+
+    # Allocate one buffer for this speaker and copy frames in via slice
+    # assignment (vectorized) instead of per-frame Python calls. This is the
+    # main performance win over frame-by-frame _add_frame into the shared mix.
+    buf_size = max_end - min_start
+    buf = np.zeros(buf_size, dtype=np.float32)
+    for offset_from_min, frame in frames:
+        dst_start = offset_from_min - min_start
+        buf[dst_start : dst_start + frame.size] = frame
+
+    # --- Per-speaker enhancement -------------------------------------------
+    # 1. Static gain normalisation: bring this speaker to target RMS so a quiet
+    #    mic is boosted to match a loud one, capped so comfort noise isn't
+    #    amplified into hiss.
+    if buf.size > 0:
+        np.nan_to_num(buf, copy=False, nan=0.0, posinf=1.0, neginf=-1.0)
+        # Accumulate in float64 so long buffers never lose precision on RMS.
+        rms = float(np.sqrt(np.mean(np.square(buf, dtype=np.float64))))
+        peak = float(np.max(np.abs(buf)))
+        if rms > 1e-7 and peak > 1e-7:
+            gain = float(10.0 ** (TARGET_RMS_DBFS / 20.0) / rms)
+            if MAX_STATIC_GAIN > 0.0 and gain > MAX_STATIC_GAIN:
+                gain = MAX_STATIC_GAIN
+            if gain * peak > LIMITER_CEILING:
+                gain = LIMITER_CEILING / peak
+            buf *= np.float32(gain)
+
+        # 2. Noise gate: if this speaker's overall RMS is below -40 dBFS, treat
+        #    the whole buffer as background noise and attenuate it (~ -16 dB).
+        #    Applied per-buffer (not per-sample) so zero-crossing samples in
+        #    real speech are never distorted — only sustained quiet floors are
+        #    suppressed. Speech boosted to target RMS always passes through.
+        rms_after_gain = float(np.sqrt(np.mean(np.square(buf, dtype=np.float64))))
+        if 0.0 < rms_after_gain < 10.0 ** (NOISE_GATE_DBFS / 20.0):
+            buf *= np.float32(NOISE_GATE_ATTENUATION)
+
+    return buf, min_start, concealed, decoder.decode_errors, decoded_non_silent
 
 
 def apply_static_gain(
@@ -297,6 +337,9 @@ def apply_static_gain(
     the level never breathes. The gain is capped so the loudest sample lands
     under ``peak_ceiling`` (and never exceeds ``max_gain`` on dead comfort
     noise) — no pre-limiter clipping, no pumping.
+
+    This is a safety net on the final mix; per-speaker normalisation happens
+    earlier in :func:`_render_speaker_buffer`.
     """
     if samples.size == 0:
         return 1.0
@@ -379,7 +422,13 @@ def apply_smooth_peak_limiter(
 
 
 def mix_snapshot_to_pcm_f32(snapshot: ClipIntervalSnapshot) -> MixResult:
-    """Decode, time-align, mix and limit all speakers in ``snapshot``."""
+    """Decode, time-align, mix and limit all speakers in ``snapshot``.
+
+    Each speaker is decoded into their own buffer, levelled independently to
+    the target RMS (quiet mics are boosted), and gated to suppress background
+    noise. Speaker buffers are then summed into the shared mix timeline, and
+    a safety-net static gain + smooth peak limiter prevent clipping.
+    """
     total_samples = max(
         FRAME_SAMPLES,
         int(round(snapshot.captured_seconds * SAMPLE_RATE)),
@@ -395,14 +444,22 @@ def mix_snapshot_to_pcm_f32(snapshot: ClipIntervalSnapshot) -> MixResult:
         if not speaker.packets:
             continue
         active_speakers += 1
-        concealed, dec_err, dec_ok = _render_speaker_into_mix(
-            mix,
+        buf, offset, concealed, dec_err, dec_ok = _render_speaker_buffer(
             speaker,
             snapshot.window_start_mono,
         )
         total_concealed += concealed
         total_decode_errors += dec_err
         total_decoded_non_silent += dec_ok
+
+        # Add this speaker's levelled buffer to the shared mix at its timeline
+        # offset. One vectorized slice-add per speaker instead of per-frame.
+        if buf.size > 0:
+            dst_start = max(0, offset)
+            dst_end = min(total_samples, offset + buf.size)
+            if dst_end > dst_start:
+                src_end = dst_end - dst_start
+                mix[dst_start:dst_end] += buf[:src_end]
 
     np.nan_to_num(mix, copy=False, nan=0.0, posinf=LIMITER_CEILING, neginf=-LIMITER_CEILING)
     apply_static_gain(mix)
@@ -443,6 +500,8 @@ def mix_snapshot_to_pcm_f32(snapshot: ClipIntervalSnapshot) -> MixResult:
 __all__ = [
     "MAX_CONCEALED_LOSS_FRAMES",
     "MixResult",
+    "NOISE_GATE_ATTENUATION",
+    "NOISE_GATE_DBFS",
     "apply_smooth_peak_limiter",
     "apply_static_gain",
     "mix_snapshot_to_pcm_f32",
