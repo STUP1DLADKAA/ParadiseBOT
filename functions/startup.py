@@ -125,15 +125,15 @@ class CommandSynchronizer:
         guild_id: int = PRIMARY_GUILD_ID,
         retired: frozenset[str] = RETIRED_COMMANDS,
         sync_global: bool = False,
-        purge_global: bool = False,
+        purge_global: bool = True,
     ) -> None:
         self.bot = bot
         self.guild_id = max(0, int(guild_id or 0))
         self.retired = frozenset(retired)
-        # Global and guild sync are independent and can both run: Discord
-        # treats them as separate namespaces, guild commands override global
-        # ones inside the home guild, and nothing is listed twice.
-        self.sync_global = bool(sync_global)
+        # A configured home guild is the sole command namespace. Never
+        # publish a second global copy: stale global schemas can remain visible
+        # and trigger CommandSignatureMismatch for edited subcommands.
+        self.sync_global = bool(sync_global) and not bool(self.guild_id)
         self.purge_global = bool(purge_global) and bool(self.guild_id)
         self._done = False
         self._lock = asyncio.Lock()
