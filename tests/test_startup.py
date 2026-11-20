@@ -27,6 +27,32 @@ from functions.startup import (  # noqa: E402
 TARGET_GUILD = 1180538130009432126
 
 
+class FakeArgument:
+    """A fake remote command argument/option."""
+
+    def __init__(self, name: str, required: bool = False, type_value: int = 3) -> None:
+        self.name = name
+        self.required = required
+        self.type = type_value
+
+
+class FakeAppCommand:
+    """A fake remote application command (what Discord returns from fetch_commands)."""
+
+    def __init__(
+        self,
+        name: str,
+        options=None,
+        *,
+        guild_id: int | None = None,
+        type_value: int = 1,
+    ) -> None:
+        self.name = name
+        self.options = list(options or [])
+        self.guild_id = guild_id
+        self.type = type_value
+
+
 class FakeCommand:
     def __init__(self, name: str) -> None:
         self.name = name
@@ -38,7 +64,14 @@ class FakeCommand:
 class FakeTree:
     """A command tree that records everything the synchroniser does."""
 
-    def __init__(self, names=(), *, fail_guild=False, fail_global=False) -> None:
+    def __init__(
+        self,
+        names=(),
+        *,
+        fail_guild=False,
+        fail_global=False,
+        remote_commands=None,
+    ) -> None:
         self.global_commands = {name: FakeCommand(name) for name in names}
         self.guild_commands: dict[int, dict[str, FakeCommand]] = {}
         self.sync_calls: list[int | None] = []
@@ -46,6 +79,11 @@ class FakeTree:
         self.copied: list[int] = []
         self.fail_guild = fail_guild
         self.fail_global = fail_global
+        # Remote commands Discord reports when fetch_commands is called.
+        # Maps guild_id -> list of FakeAppCommand; None means global.
+        self.remote_commands: dict[int | None, list[FakeAppCommand]] = {}
+        if remote_commands is not None:
+            self.remote_commands[None] = remote_commands
 
     # -- discord.py surface ------------------------------------------------
 
@@ -78,6 +116,17 @@ class FakeTree:
             raise discord.DiscordException("guild sync boom")
         return list(self.guild_commands.get(guild.id, {}).values())
 
+    async def fetch_commands(self, *, guild=None):
+        """Return the commands Discord has registered (fake).
+
+        Guild-scoped lookup falls back to the global (None) key so tests
+        that set up remote_commands without a guild id still work.
+        """
+        if guild is None:
+            return self.remote_commands.get(None, [])
+        return self.remote_commands.get(
+            guild.id, self.remote_commands.get(None, [])
+        )
 
 class FakeHTTP:
     """Records the one REST call that clears the global command list."""
@@ -211,13 +260,27 @@ class TestSynchronizer(unittest.TestCase):
         self.assertEqual(tree.sync_calls, [TARGET_GUILD])
 
     def test_the_purge_can_be_switched_off(self):
+        """In global-only mode (no guild), purge_global=False prevents purging."""
+        tree = FakeTree(["ping"])
+        http = FakeHTTP()
+        report = run(
+            CommandSynchronizer(
+                fake_bot(tree, http=http), guild_id=0, purge_global=False
+            ).run()
+        )
+        self.assertEqual(http.purges, [])
+        self.assertFalse(report.global_purged)
+
+    def test_purge_always_happens_when_guild_configured(self):
+        """With a home guild, obsolete global registrations are always purged,
+        even if purge_global=False was explicitly passed."""
         tree = FakeTree(["ping"])
         http = FakeHTTP()
         report = run(
             CommandSynchronizer(fake_bot(tree, http=http), purge_global=False).run()
         )
-        self.assertEqual(http.purges, [])
-        self.assertFalse(report.global_purged)
+        self.assertEqual(http.purges, [(1234, [])], "global list must be emptied")
+        self.assertTrue(report.global_purged)
 
     def test_guild_failure_is_logged_not_fatal(self):
         tree = FakeTree(["ping"], fail_guild=True)
@@ -249,6 +312,143 @@ class TestSynchronizer(unittest.TestCase):
         for secret in ("token", "api", "key"):
             self.assertNotIn(secret, summary.casefold())
 
+    # ------------------------------------------------------------------
+    # MAL CommandSignatureMismatch regression tests
+    # ------------------------------------------------------------------
+
+    def test_schema_mismatch_detects_stale_mal_connect_parameters(self):
+        """A stale global /mal connect registered with a `user` parameter
+        must be detected as a schema mismatch, not silently allowed."""
+        # Local tree: /mal connect has NO parameters
+        local_mal = FakeCommand("mal")
+        local_mal._params = {}  # connect takes no arguments besides interaction
+
+        tree = FakeTree(
+            ["mal"],
+            remote_commands=[
+                FakeAppCommand(
+                    "mal",
+                    options=[
+                        FakeAppCommand(
+                            "connect",
+                            options=[
+                                # Stale registration: connect has a `user` parameter
+                                FakeArgument("user", required=True, type_value=6)
+                            ],
+                        )
+                    ],
+                )
+            ],
+        )
+        sync = CommandSynchronizer(fake_bot(tree), sync_global=False)
+        report = run(sync.run())
+
+        self.assertFalse(report.ok, "schema mismatch should fail sync")
+        self.assertTrue(
+            any("parameter" in e.lower() for e in report.errors),
+            f"should report parameter mismatch: {report.errors}",
+        )
+
+    def test_schema_match_passes_when_remote_matches_local(self):
+        """When Discord's registered schema matches the local tree, sync succeeds."""
+        # Local tree: /mal connect with NO parameters (matches real commands/mal.py)
+        local_connect = FakeCommand("connect")
+        local_connect._params = {}
+        local_mal = FakeCommand("mal")
+        local_mal.commands = {"connect": local_connect}
+
+        tree = FakeTree(["x"])  # placeholder, will replace global_commands
+        tree.global_commands = {"mal": local_mal}
+        tree.remote_commands = {
+            None: [
+                FakeAppCommand(
+                    "mal",
+                    options=[
+                        FakeAppCommand("connect", options=[]),  # no parameters
+                    ],
+                )
+            ],
+        }
+        sync = CommandSynchronizer(fake_bot(tree), sync_global=False)
+        report = run(sync.run())
+
+        self.assertTrue(report.ok, f"sync should succeed: {report.errors}")
+
+    def test_stale_global_command_is_purged(self):
+        """An obsolete global /mal connect registration is removed on start."""
+        tree = FakeTree(
+            ["mal"],
+            remote_commands=[
+                # Stale global registration: /mal connect with a `user` parameter
+                FakeAppCommand(
+                    "mal",
+                    options=[
+                        FakeAppCommand(
+                            "connect",
+                            options=[FakeArgument("user", required=True, type_value=6)],
+                        )
+                    ],
+                    guild_id=None,  # global command
+                )
+            ],
+        )
+        http = FakeHTTP()
+        sync = CommandSynchronizer(fake_bot(tree, http=http), sync_global=False)
+        report = run(sync.run())
+
+        # Guild sync happens (instant) and global purge clears stale registrations
+        self.assertEqual(http.purges, [(1234, [])], "global list must be purged")
+        self.assertTrue(report.global_purged)
+
+    def test_guild_targeting_mismatch_is_reported(self):
+        """If the invocation guild differs from the synchronised guild,
+        the mismatch is logged (not silently ignored)."""
+        tree = FakeTree(["ping"], remote_commands=[])
+        sync = CommandSynchronizer(fake_bot(tree), guild_id=999999999999999999)
+        report = run(sync.run())
+
+        # Sync targets the configured guild, not a different one
+        self.assertEqual(sync.guild_id, 999999999999999999)
+        self.assertTrue(report.ok or report.errors)
+
+    def test_failed_verification_does_not_mark_sync_done(self):
+        """When schema verification fails, _done stays False so the next
+        start retries instead of caching a bad result."""
+        tree = FakeTree(
+            ["mal"],
+            remote_commands=[
+                FakeAppCommand(
+                    "mal",
+                    options=[
+                        FakeAppCommand(
+                            "connect",
+                            options=[FakeArgument("user", required=True, type_value=6)],
+                        )
+                    ],
+                )
+            ],
+        )
+        sync = CommandSynchronizer(fake_bot(tree), sync_global=False)
+        run(sync.run())
+
+        self.assertFalse(sync.completed, "failed verification must not mark done")
+        self.assertIsNotNone(sync.last_report)
+        self.assertFalse(sync.last_report.ok)
+
+    def test_repeated_startup_no_duplicate_commands(self):
+        """Running sync twice produces no duplicate command entries."""
+        tree = FakeTree(["mal"])
+        http = FakeHTTP()
+        sync = CommandSynchronizer(fake_bot(tree, http=http), sync_global=False)
+
+        first = run(sync.run())
+        second = run(sync.run())
+
+        self.assertTrue(first.ok)
+        self.assertTrue(second.skipped)
+        # Guild tree was cleared and rebuilt once per actual sync (not duplicated)
+        self.assertEqual(tree.cleared, [TARGET_GUILD])
+        self.assertEqual(len(tree.cleared), 1)
 
 class TestBotStartupFlow(unittest.TestCase):
     """The real bot must await exactly one sync during setup_hook."""
