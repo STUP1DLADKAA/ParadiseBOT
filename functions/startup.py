@@ -130,11 +130,14 @@ class CommandSynchronizer:
         self.bot = bot
         self.guild_id = max(0, int(guild_id or 0))
         self.retired = frozenset(retired)
-        # Global and guild sync are independent and can both run: Discord
-        # treats them as separate namespaces, guild commands override global
-        # ones inside the home guild, and nothing is listed twice.
-        self.sync_global = bool(sync_global)
-        self.purge_global = bool(purge_global) and bool(self.guild_id)
+        # When a home guild is configured, Paradise is guild-only: global
+        # registration would create a duplicate entry that can take an hour to
+        # disappear, and a stale global schema (from an older release) can
+        # cause CommandSignatureMismatch when Discord routes an interaction to
+        # the wrong registration. Force sync_global off and purge_global on so
+        # the guild tree is the single authoritative source.
+        self.sync_global = bool(sync_global) and not bool(self.guild_id)
+        self.purge_global = bool(purge_global) or bool(self.guild_id)
         self._done = False
         self._lock = asyncio.Lock()
         self.last_report: SyncReport | None = None
@@ -195,9 +198,9 @@ class CommandSynchronizer:
 
         if report.guild_ok or report.global_ok:
             self._done = True
-            self.last_report = report
-            log.info("Command sync — %s", report.summary())
-            return report
+        self.last_report = report
+        log.info("Command sync — %s", report.summary())
+        return report
 
     def expected_names(self) -> tuple[str, ...]:
         """Command names the tree currently defines (after pruning)."""
@@ -236,6 +239,11 @@ class CommandSynchronizer:
         report.guild_commands = names
         report.guild_ok = True
         self._verify(report, names)
+        # Verify Discord's actual registered schema matches the local tree.
+        # This catches stale registrations (e.g. an old global /mal connect
+        # with different parameters) that would cause CommandSignatureMismatch
+        # at invocation time.
+        await self._verify_schema(report, guild)
 
     async def _purge_global(self, report: SyncReport) -> None:
         """Delete the global command list, so nothing is listed twice.
@@ -304,6 +312,182 @@ class CommandSynchronizer:
             log.info(
                 "Guild %s reports extra commands: %s", self.guild_id, ", ".join(sorted(extra))
             )
+
+    async def _verify_schema(self, report: SyncReport, guild: discord.Object) -> None:
+        """Fetch Discord's actual registered schema and compare it with the local tree.
+
+        Catches stale registrations (e.g. an old global /mal connect with
+        different parameters) that would cause CommandSignatureMismatch at
+        invocation time. Sets report.guild_ok = False on any mismatch.
+        """
+        tree = self.bot.tree
+        try:
+            remote = await asyncio.wait_for(
+                tree.fetch_commands(guild=guild), timeout=_SYNC_TIMEOUT
+            )
+        except (discord.DiscordException, asyncio.TimeoutError, OSError) as error:
+            report.errors.append(f"schema verification failed: {type(error).__name__}")
+            report.guild_ok = False
+            log.warning(
+                "Could not fetch registered commands for guild %s",
+                self.guild_id,
+                exc_info=True,
+            )
+            return
+        except Exception:  # noqa: BLE001
+            report.errors.append("schema verification error")
+            report.guild_ok = False
+            log.exception("Unexpected schema verification failure")
+            return
+
+        remote_by_name = {cmd.name: cmd for cmd in remote}
+        local_commands = tree.get_commands(guild=guild)
+        local_by_name = {cmd.name: cmd for cmd in local_commands}
+
+        # If Discord reports no commands at all, there is nothing to compare
+        # against (fresh install or test environment).  Command presence is
+        # already checked by _verify; schema comparison only applies where both
+        # sides have the command.
+        if not remote_by_name:
+            return
+
+        # Commands missing from Discord's registration are a sync problem
+        # (already surfaced by _verify as "missing after sync").
+        for name, local_cmd in local_by_name.items():
+            remote_cmd = remote_by_name.get(name)
+            if remote_cmd is None:
+                continue
+            self._compare_command_schemas(local_cmd, remote_cmd, report)
+
+        # Remote commands not in the local tree are stale registrations.
+        for name in remote_by_name:
+            if name not in local_by_name:
+                log.info(
+                    "Remote has extra command not in local tree: %s", name
+                )
+
+    def _compare_command_schemas(
+        self, local_cmd: object, remote_cmd: object, report: SyncReport
+    ) -> None:
+        """Recursively compare a local command with its remote registration."""
+        local_params = self._get_local_params(local_cmd)
+        remote_options = self._get_remote_options(remote_cmd)
+        qualified = getattr(local_cmd, "qualified_name", local_cmd.name)
+
+        for name, local_info in local_params.items():
+            if name not in remote_options:
+                report.errors.append(f"parameter missing remotely: {qualified} {name}")
+                report.guild_ok = False
+            else:
+                remote_info = remote_options[name]
+                if local_info.get("required") != remote_info.get("required"):
+                    report.errors.append(
+                        f"parameter required mismatch: {qualified} {name}"
+                    )
+                    report.guild_ok = False
+                if local_info.get("type") != remote_info.get("type"):
+                    report.errors.append(
+                        f"parameter type mismatch: {qualified} {name}"
+                    )
+                    report.guild_ok = False
+                # Recurse into subcommand groups
+                if "subcommands" in local_info and "subcommands" in remote_info:
+                    self._compare_subcommand_groups(
+                        local_info["subcommands"],
+                        remote_info["subcommands"],
+                        report,
+                        qualified,
+                    )
+
+        for name in remote_options:
+            if name not in local_params:
+                report.errors.append(f"extra parameter remotely: {qualified} {name}")
+                report.guild_ok = False
+
+    def _compare_subcommand_groups(
+        self,
+        local_subs: dict[str, dict],
+        remote_subs: dict[str, dict],
+        report: SyncReport,
+        parent_qualified: str,
+    ) -> None:
+        """Compare subcommand groups recursively."""
+        for name, local_info in local_subs.items():
+            if name not in remote_subs:
+                report.errors.append(
+                    f"subcommand missing remotely: {parent_qualified} {name}"
+                )
+                report.guild_ok = False
+            else:
+                remote_info = remote_subs[name]
+                if local_info.get("required") != remote_info.get("required"):
+                    report.errors.append(
+                        f"subcommand required mismatch: {parent_qualified} {name}"
+                    )
+                    report.guild_ok = False
+                if local_info.get("type") != remote_info.get("type"):
+                    report.errors.append(
+                        f"subcommand type mismatch: {parent_qualified} {name}"
+                    )
+                    report.guild_ok = False
+                if "subcommands" in local_info and "subcommands" in remote_info:
+                    self._compare_subcommand_groups(
+                        local_info["subcommands"],
+                        remote_info["subcommands"],
+                        report,
+                        f"{parent_qualified} {name}",
+                    )
+
+        for name in remote_subs:
+            if name not in local_subs:
+                report.errors.append(
+                    f"extra subcommand remotely: {parent_qualified} {name}"
+                )
+                report.guild_ok = False
+
+    def _get_local_params(self, local_cmd: object) -> dict[str, dict]:
+        """Extract parameter info from a local command object."""
+        params: dict[str, dict] = {}
+        param_dict = getattr(local_cmd, "_params", None)
+        if param_dict:
+            for name, param in param_dict.items():
+                params[name] = {
+                    "type": getattr(param, "type", None),
+                    "required": getattr(param, "required", False),
+                    "display_name": getattr(param, "display_name", name),
+                }
+        subcommands = getattr(local_cmd, "commands", None)
+        if subcommands:
+            for sub_name, sub_cmd in subcommands.items():
+                params[sub_name] = {
+                    "type": "group",
+                    "required": True,
+                    "subcommands": self._get_local_params(sub_cmd),
+                }
+        return params
+
+    def _get_remote_options(self, remote_cmd: object) -> dict[str, dict]:
+        """Extract option info from a remote AppCommand.
+
+        Uses duck typing so it works with both real discord.py objects
+        (AppCommandGroup / Argument) and test fakes.
+        """
+        options: dict[str, dict] = {}
+        for opt in getattr(remote_cmd, "options", []) or []:
+            if hasattr(opt, "options") and hasattr(opt, "name"):
+                # Subcommand group: has nested options
+                options[opt.name] = {
+                    "type": "group",
+                    "required": True,
+                    "subcommands": self._get_remote_options(opt),
+                }
+            elif hasattr(opt, "required") and hasattr(opt, "name"):
+                # Argument / parameter
+                options[opt.name] = {
+                    "type": getattr(opt, "type", None),
+                    "required": opt.required,
+                }
+        return options
 
 
 __all__ = [

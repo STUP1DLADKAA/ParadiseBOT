@@ -65,6 +65,30 @@ class ParadiseTree(app_commands.CommandTree):
     ) -> None:
         if isinstance(error, app_commands.CommandOnCooldown):
             text = f"give it {error.retry_after:.1f}s. I'm only one little guy."
+        elif isinstance(error, app_commands.CommandSignatureMismatch):
+            # Discord's registered schema for this command differs from the
+            # local callback signature — usually a stale global registration
+            # from an older release. Log detailed diagnostics (no secrets).
+            cmd = interaction.command
+            data = interaction.data or {}
+            local_params: dict[str, str] = {}
+            if cmd is not None:
+                for name, param in getattr(cmd, "_params", {}).items():
+                    local_params[name] = {
+                        "type": getattr(param, "type", None),
+                        "required": getattr(param, "required", None),
+                    }
+            log.error(
+                "CommandSignatureMismatch: command=%r qualified=%r guild=%s "
+                "interaction_id=%s received_options=%r local_params=%r",
+                cmd.name if cmd else None,
+                cmd.qualified_name if cmd else None,
+                interaction.guild.id if interaction.guild else None,
+                data.get("id"),
+                data.get("options"),
+                local_params,
+            )
+            text = "that command's registration is out of date — try again in a moment."
         elif isinstance(error, app_commands.TransformerError):
             text = "that input doesn't quite work. check the command hints."
         elif isinstance(error, app_commands.NoPrivateMessage):
@@ -151,8 +175,8 @@ class ParadiseBot(commands.Bot):
         self.synchronizer = CommandSynchronizer(
             self,
             guild_id=config.guild_id or PRIMARY_GUILD_ID,
-            sync_global=True,
-            purge_global=False,
+            sync_global=False,
+            purge_global=True,
         )
         self.commands_ready = False
         self.autoupdate_task: asyncio.Task | None = None
