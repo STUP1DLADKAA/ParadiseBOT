@@ -125,17 +125,14 @@ class CommandSynchronizer:
         guild_id: int = PRIMARY_GUILD_ID,
         retired: frozenset[str] = RETIRED_COMMANDS,
         sync_global: bool = False,
-        purge_global: bool = False,
+        purge_global: bool = True,
     ) -> None:
         self.bot = bot
         self.guild_id = max(0, int(guild_id or 0))
         self.retired = frozenset(retired)
-        # When a home guild is configured, Paradise is guild-only: global
-        # registration would create a duplicate entry that can take an hour to
-        # disappear, and a stale global schema (from an older release) can
-        # cause CommandSignatureMismatch when Discord routes an interaction to
-        # the wrong registration. Force sync_global off and purge_global on so
-        # the guild tree is the single authoritative source.
+        # A configured home guild is the sole command namespace. Never
+        # publish a second global copy: stale global schemas can remain visible
+        # and trigger CommandSignatureMismatch for edited subcommands.
         self.sync_global = bool(sync_global) and not bool(self.guild_id)
         self.purge_global = bool(purge_global) or bool(self.guild_id)
         self._done = False
@@ -488,7 +485,6 @@ class CommandSynchronizer:
                     "required": opt.required,
                 }
         return options
-
 
 __all__ = [
     "PRIMARY_GUILD_ID",

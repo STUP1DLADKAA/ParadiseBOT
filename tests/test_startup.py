@@ -128,7 +128,6 @@ class FakeTree:
             guild.id, self.remote_commands.get(None, [])
         )
 
-
 class FakeHTTP:
     """Records the one REST call that clears the global command list."""
 
@@ -450,7 +449,6 @@ class TestSynchronizer(unittest.TestCase):
         # Guild tree was cleared and rebuilt once per actual sync (not duplicated)
         self.assertEqual(tree.cleared, [TARGET_GUILD])
         self.assertEqual(len(tree.cleared), 1)
-
 
 class TestBotStartupFlow(unittest.TestCase):
     """The real bot must await exactly one sync during setup_hook."""
