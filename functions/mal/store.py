@@ -39,17 +39,17 @@ class MalStore:
         self._url = url
         self._key = key
         self._encryption = encryption
-        self._client = None  # lazy, created on first use
+        self._supabase_client = None  # lazy, created on first use
 
     async def _client(self) -> Any:
-        if self._client is None:
+        if self._supabase_client is None:
             if not self._url or not self._key:
                 raise RuntimeError(
                     "MAL store is not configured (SUPABASE_URL / SUPABASE_SECRET_KEY)"
                 )
             from supabase import AsyncClientOptions, acreate_client
 
-            self._client = await acreate_client(
+            self._supabase_client = await acreate_client(
                 self._url,
                 self._key,
                 options=AsyncClientOptions(
@@ -57,7 +57,7 @@ class MalStore:
                     persist_session=False,
                 ),
             )
-        return self._client
+        return self._supabase_client
 
     async def configured(self) -> bool:
         """True if Supabase credentials are present."""

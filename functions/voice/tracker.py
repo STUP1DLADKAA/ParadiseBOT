@@ -69,19 +69,15 @@ from .ui import (
 
 log = logging.getLogger(__name__)
 
-#: Default operators exempt from the deafened-while-in-VC rule (the lords).
-#: Override with ``VOICE_DEAF_EXEMPT_USER_IDS`` (comma-separated Discord IDs).
-DEAF_TIME_EXEMPT_USER_IDS = (
-    922359954025885737,   # Stupid
-    1049231767585964032,  # Taher
-)
-
-
 def deaf_exempt_user_ids() -> tuple[int, ...]:
-    """IDs exempt from the "deafened means not credited" rule."""
+    """IDs exempt from the "deafened means not credited" rule.
+
+    Fail-closed: defaults to ``()`` when ``VOICE_DEAF_EXEMPT_USER_IDS`` is
+    unset. No dev or lord IDs are hardcoded — configure your own in .env.
+    """
     raw = (os.environ.get("VOICE_DEAF_EXEMPT_USER_IDS") or "").strip()
     if not raw:
-        return tuple(DEAF_TIME_EXEMPT_USER_IDS)
+        return ()
     ids: list[int] = []
     for chunk in raw.replace(";", ",").replace(" ", ",").split(","):
         value = chunk.strip().strip("<>@!")
@@ -1682,7 +1678,7 @@ class VoiceTracker:
             "is_active_now": active_session is not None,
             "active_channel_id": active_session.channel_id if active_session else None,
             "active_session_elapsed": active_all,
-            "channel_stats": channel_stats,
+            "channel_stats": [],
         }
 
     async def get_per_member_channels(

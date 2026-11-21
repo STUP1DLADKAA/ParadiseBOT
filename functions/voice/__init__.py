@@ -23,7 +23,6 @@ from .store import (
 from .sqlite_store import LocalVoiceStore
 from .supabase_database import SupabaseVoiceDatabase
 from .tracker import (
-    DEAF_TIME_EXEMPT_USER_IDS,
     DEAF_WARNING_DELAY_SECONDS,
     VOICE_ALERT_CHANNEL_ID,
     VoiceTracker,
@@ -54,7 +53,6 @@ __all__ = [
     "VoiceStoreUnavailable",
     "LocalVoiceStore",
     "SupabaseVoiceDatabase",
-    "DEAF_TIME_EXEMPT_USER_IDS",
     "DEAF_WARNING_DELAY_SECONDS",
     "VOICE_ALERT_CHANNEL_ID",
     "VoiceTracker",

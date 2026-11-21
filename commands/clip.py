@@ -15,6 +15,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 
 from config import VoiceClipConfig
+from functions.voice.tracker import deaf_exempt_user_ids
 from functions.voice_clip import (
     MAX_CLIP_DURATION,
     MIN_CLIP_DURATION,
@@ -333,13 +334,24 @@ class VoiceClip(commands.Cog):
     ) -> None:
         try:
             if server_deaf or server_mute:
+                # Only a deaf-exempt operator may have the bot un-deafen
+                # itself; otherwise a moderator's server deafen/mute stands.
+                me = guild.me
+                if me is None or me.id not in deaf_exempt_user_ids():
+                    log.info(
+                        "Respecting moderator %s in guild %s (bot not deaf-exempt)",
+                        "deafen" if server_deaf else "mute",
+                        guild.id,
+                    )
+                    if server_deaf:
+                        self._explain_guild_deafen(guild)
+                    return
                 # A server deafen / server mute is a member flag only another
                 # member with Mute Members (or the enforcement cog) can clear.
                 enforcement = self.bot.get_cog("VoiceEnforcement")
                 if enforcement is not None:
                     await enforcement.enforce_now(guild)
                 else:
-                    me = guild.me
                     if me is not None and me.guild_permissions.mute_members:
                         await me.edit(
                             mute=False,

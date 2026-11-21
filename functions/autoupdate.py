@@ -58,29 +58,42 @@ CODELOAD = "https://codeload.github.com"
 MAX_ARCHIVE_BYTES = 64 * 1024 * 1024
 MAX_FILES = 4000
 REQUEST_TIMEOUT = 45.0
+# GitHub rate limit: 5000 requests/hour for authenticated, 60/hour unauthenticated.
+# Space out API calls to stay well under even the unauthenticated limit.
+GITHUB_MIN_CALL_INTERVAL = 2.0  # seconds between GitHub API calls
+_last_github_call: float = 0.0
 
 # Paths that must survive an update untouched (relative to the repo root).
 # bot.py / requirements.txt are never removed as orphans: the tarball must
 # contain them (REQUIRED_FILES), and deleting the entrypoint while the
 # process is running is what turns an update into a failed start.
+# config.py is protected because it holds secret-loading logic — an attacker
+# who could rewrite it could exfiltrate every token in the environment.
 PROTECTED_NAMES: frozenset[str] = frozenset(
     {
         ".env",
         ".env.local",
         ".env.production",
+        ".env.example",
         ".git",
+        ".github",
         ".venv",
         "venv",
         "env",
+        "config.py",
         "data",
         "logs",
         "node_modules",
+        "supabase",
+        "tests",
+        "tools",
         "__pycache__",
         ".pytest_cache",
         ".mypy_cache",
         ".ruff_cache",
         "bot.py",
         "requirements.txt",
+        "requirements-dev.txt",
     }
 )
 PROTECTED_SUFFIXES: tuple[str, ...] = (
@@ -283,7 +296,17 @@ class AutoUpdater:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
 
+    async def _rate_limit_github(self) -> None:
+        """Space out GitHub API calls to stay under rate limits."""
+        global _last_github_call
+        now = time.monotonic()
+        elapsed = now - _last_github_call
+        if elapsed < GITHUB_MIN_CALL_INTERVAL:
+            await asyncio.sleep(GITHUB_MIN_CALL_INTERVAL - elapsed)
+        _last_github_call = time.monotonic()
+
     async def _latest_commit(self) -> str:
+        await self._rate_limit_github()
         url = f"{GITHUB_API}/repos/{self.repository}/commits/{self.branch}"
         session = await self._session()
         async with session.get(url, headers=self._headers()) as response:
@@ -296,6 +319,7 @@ class AutoUpdater:
         return sha
 
     async def _download(self, sha: str) -> bytes:
+        await self._rate_limit_github()
         url = f"{CODELOAD}/{self.repository}/tar.gz/{sha}"
         session = await self._session()
         async with session.get(url, headers={"User-Agent": "ParadiseBot-autoupdate"}) as response:

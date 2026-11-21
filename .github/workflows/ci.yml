@@ -24,21 +24,40 @@ jobs:
         with:
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
+      - name: Dependency vulnerability scan
+        run: python -m pip-audit || true
+
       - name: Lint (pyflakes)
         run: python -m pyflakes bot.py config.py commands functions tools benchmarks
 
-      - name: Unit tests
-        run: python -m pytest -q
+      - name: Lint (ruff)
+        run: python -m ruff check .
+
+      - name: Dependency check
+        run: python -m pip check
+
+      - name: Unit tests (warnings as errors)
+        run: python -m pytest -W error::RuntimeWarning -q
 
       - name: Review agent self-test
         run: python tools/review_agent.py --self-test
+
+      - name: Secret scan
+        run: |
+          if grep -rnE 'sk_live_[A-Za-z0-9]{24,}|sk_test_[A-Za-z0-9]{24,}|xoxb-[A-Za-z0-9-]+|ghp_[A-Za-z0-9]{36,}|github_pat_[A-Za-z0-9_]{82,}|AIza[0-9A-Za-z\\-_]{35,}' bot.py config.py commands functions tools benchmarks requirements*.txt .env*; then
+            echo "::error::Potential secret detected in committed files"
+            exit 1
+          fi
+          echo "No committed secrets detected"
 
       # Smoke test only: the pipeline must run end to end. Latency is 0 so
       # this is a correctness check, not a benchmark gate.

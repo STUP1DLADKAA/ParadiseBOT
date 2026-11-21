@@ -536,12 +536,12 @@ class SupabaseVoiceDatabase(VoiceStore):
                     _credit_from(local.started_at, local.credited_until),
                     ended_at,
                 )
-                await self.delete_active_session(
+                await self._delete_active_session_locked(
                     guild_id, user_id, started_before=local.started_at
                 )
                 return recorded
             if local is not None:  # AFK mirror: nothing to record
-                await self.delete_active_session(
+                await self._delete_active_session_locked(
                     guild_id, user_id, started_before=local.started_at
                 )
                 return 0
@@ -552,7 +552,7 @@ class SupabaseVoiceDatabase(VoiceStore):
             recorded = await self.record_completed_session(
                 guild_id, user_id, channel, started, ended_at
             )
-            await self.delete_active_session(guild_id, user_id, started_before=started)
+            await self._delete_active_session_locked(guild_id, user_id, started_before=started)
             return recorded
 
     # ------------------------------------------------------------------
@@ -716,29 +716,39 @@ class SupabaseVoiceDatabase(VoiceStore):
     async def delete_active_session(
         self, guild_id: int, user_id: int, *, started_before: datetime | None = None
     ) -> None:
-        threshold = _iso(started_before) if started_before is not None else None
         async with self._active_lock:
-            local = self._local.get_active_session(guild_id, user_id)
-            if local is not None and started_before is not None and local.started_at > started_before:
-                # The local mirror already belongs to a newer session.
-                pass
-            else:
-                self._local.delete_active_session(guild_id, user_id)
-            params = {
-                "p_guild_id": int(guild_id),
-                "p_user_id": int(user_id),
-                "p_started_before": threshold,
-            }
-            try:
-                await self._execute(
-                    "delete active session",
-                    lambda c: c.rpc("voice_delete_active_if_older", params),
-                )
-            except VoiceStoreUnavailable:
-                self._queue(
-                    "active_delete",
-                    {"guild_id": int(guild_id), "user_id": int(user_id), "started_before": threshold},
-                )
+            await self._delete_active_session_locked(guild_id, user_id, started_before=started_before)
+
+    async def _delete_active_session_locked(
+        self,
+        guild_id: int,
+        user_id: int,
+        *,
+        started_before: datetime | None = None,
+    ) -> None:
+        """Must be called with self._active_lock held."""
+        threshold = _iso(started_before) if started_before is not None else None
+        local = self._local.get_active_session(guild_id, user_id)
+        if local is not None and started_before is not None and local.started_at > started_before:
+            # The local mirror already belongs to a newer session.
+            pass
+        else:
+            self._local.delete_active_session(guild_id, user_id)
+        params = {
+            "p_guild_id": int(guild_id),
+            "p_user_id": int(user_id),
+            "p_started_before": threshold,
+        }
+        try:
+            await self._execute(
+                "delete active session",
+                lambda c: c.rpc("voice_delete_active_if_older", params),
+            )
+        except VoiceStoreUnavailable:
+            self._queue(
+                "active_delete",
+                {"guild_id": int(guild_id), "user_id": int(user_id), "started_before": threshold},
+            )
 
     async def get_active_sessions(self) -> list[PersistedActiveSession]:
         async with self._active_lock:
