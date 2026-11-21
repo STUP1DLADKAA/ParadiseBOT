@@ -210,7 +210,7 @@ class MemoryStore:
                         int(author_id),
                         _ensure_utc(now),
                         max(0, int(subject_id or 0)),
-                        str(subject_name or "")[:32],
+                        clean_memory_text(str(subject_name or ""))[:32],
                     ),
                 )
                 new_id = int(cursor.lastrowid or 0)
@@ -249,7 +249,7 @@ class MemoryStore:
             author_id=int(author_id),
             created_at=now,
             subject_id=max(0, int(subject_id or 0)),
-            subject_name=str(subject_name or "")[:32],
+            subject_name=clean_memory_text(str(subject_name or ""))[:32],
         )
 
     def remove(self, memory_id: int) -> bool:

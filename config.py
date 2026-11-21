@@ -37,6 +37,16 @@ def _chance(raw: str | None, default: float) -> float:
     return value if 0.0 <= value <= 1.0 else default
 
 
+def _https_url(raw: str | None) -> str:
+    """A URL that must use https (no http, no file, no ws — SSRF defense)."""
+    value = str(raw or "").strip().rstrip("/")
+    if not value:
+        return ""
+    if not value.startswith("https://"):
+        return ""
+    return value
+
+
 def _sources(raw: str | None) -> tuple[str, ...]:
     """Comma/space separated subreddit names, validated into a safe tuple."""
     default = (
@@ -931,7 +941,7 @@ class Config:
         return cls(
             token=env.get("DISCORD_TOKEN", "").strip(),
             gemini=GeminiConfig.from_env(env),
-            ai_base_url=env.get("AI_BASE_URL", "").strip().rstrip("/"),
+            ai_base_url=_https_url(env.get("AI_BASE_URL", "")),
             ai_api_key=env.get("AI_API_KEY", "").strip(),
             ai_model=env.get("AI_MODEL", "").strip(),
             ai_models=parse_ai_models(env.get("AI_MODELS", "")),

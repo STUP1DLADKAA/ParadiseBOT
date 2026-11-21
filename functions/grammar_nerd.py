@@ -309,7 +309,7 @@ SPELLING_MISTAKES: dict[str, str] = {
     "wich": "which",
     "writting": "writing",
 }
-del SPELLING_MISTAKES["assassination"]  # keep only genuine misspellings
+SPELLING_MISTAKES.pop("assassination", None)  # keep only genuine misspellings
 
 _PAST_TO_BASE: dict[str, str] = {
     "ate": "eat",

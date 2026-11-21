@@ -28,6 +28,8 @@ const istMigrationSql = readFileSync(join(here, "migrations", "002_voice_ist_cal
 const checkpointMigrationSql = readFileSync(join(here, "migrations", "003_voice_checkpoint.sql"), "utf8");
 const carryMigrationSql = readFileSync(join(here, "migrations", "004_voice_credit_carry.sql"), "utf8");
 const memoryMigrationSql = readFileSync(join(here, "migrations", "005_memory.sql"), "utf8");
+const malMigrationSql = readFileSync(join(here, "migrations", "006_mal_tokens.sql"), "utf8");
+const hardeningMigrationSql = readFileSync(join(here, "migrations", "007_hardening.sql"), "utf8");
 
 const db = new PGlite();
 let passed = 0;
@@ -878,6 +880,26 @@ check("anon cannot execute the memory version function",
   /permission denied for function paradise_memory_schema_version/i.test(anonVersionErr ?? ""),
   anonVersionErr ?? "no error");
 }
+
+// ---------------------------------------------------------------------------
+console.log("\n== 0f. MAL tokens (006) + hardening (007) ==");
+await db.exec(malMigrationSql);
+await db.exec(malMigrationSql);
+console.log("  ok   mal_tokens migration applied and re-applied (idempotent)");
+passed++;
+
+check("mal schema version is 1",
+  (await scalar("select public.mal_schema_version()")) === 1);
+
+await db.exec(hardeningMigrationSql);
+await db.exec(hardeningMigrationSql);
+console.log("  ok   hardening migration applied and re-applied (idempotent)");
+passed++;
+
+check("voice schema version is 7 (after 007)",
+  (await scalar("select public.voice_schema_version()")) === 7);
+check("hardening marker table exists",
+  (await scalar("select count(*) from public.voice_hardening_marker")) === 1);
 
 // ---------------------------------------------------------------------------
 console.log("\n=================================================================");

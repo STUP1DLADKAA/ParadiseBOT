@@ -623,8 +623,11 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
 
         channel = MagicMock(id=888)
         channel.send = AsyncMock()
-        for user_id, expected in ((777, 1200), (922359954025885737, 1800)):
-            member = _make_mock_member(guild, user_id)
+        # No hardcoded exempt IDs — the exempt user must be configured via env.
+        os.environ["VOICE_DEAF_EXEMPT_USER_IDS"] = "922359954025885737"
+        try:
+            for user_id, expected in ((777, 1200), (922359954025885737, 1800)):
+                member = _make_mock_member(guild, user_id)
             guild.get_member.side_effect = (
                 lambda uid, m=member: m if uid == m.id else None
             )
@@ -672,6 +675,8 @@ class TestTrackerOverSupabase(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(mentions.everyone)
                 self.assertFalse(mentions.roles)
                 self.assertFalse(mentions.users)
+        finally:
+            os.environ.pop("VOICE_DEAF_EXEMPT_USER_IDS", None)
 
     async def test_deaf_warning_is_private_to_affected_user_even_without_alert_channel(self):
         guild = _make_mock_guild()
