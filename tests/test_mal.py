@@ -192,7 +192,7 @@ class TestPKCE(unittest.TestCase):
         self.assertNotEqual(generate_state(), generate_state())
 
 
-class TestOAuthFlow(unittest.TestCase):
+class TestOAuthFlow(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.session = FakeAiohttpSession()
         self.oauth = MalOAuth(

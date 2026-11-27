@@ -688,46 +688,49 @@ class TestVoiceEnforcement(unittest.IsolatedAsyncioTestCase):
         if task is not None:
             await asyncio.wait_for(task, timeout=3)
 
-    async def test_unmuted_bot_is_server_muted_again(self) -> None:
+    async def test_server_unmuted_bot_needs_no_edit(self) -> None:
         cog = self._cog()
         member = _member(mute=False, deaf=False)
         guild = _guild_with_member(member)
         member.guild = guild
-        await self._dispatch(cog, member, before_m=True, before_d=False, after_m=False, after_d=False)
-        member.edit.assert_awaited_once()
-        kwargs = member.edit.await_args.kwargs
-        self.assertTrue(kwargs.get("mute"))
-        self.assertIs(kwargs.get("deafen"), False)
+        await self._dispatch(
+            cog, member, before_m=True, before_d=False, after_m=False, after_d=False
+        )
+        member.edit.assert_not_awaited()
 
-    async def test_deafened_bot_is_undeafened_again(self) -> None:
+    async def test_server_mute_and_deafen_are_cleared(self) -> None:
         cog = self._cog()
         member = _member(mute=True, deaf=True)
         guild = _guild_with_member(member)
         member.guild = guild
-        await self._dispatch(cog, member, before_m=True, before_d=False, after_m=True, after_d=True)
+        await self._dispatch(
+            cog, member, before_m=False, before_d=False, after_m=True, after_d=True
+        )
         member.edit.assert_awaited_once()
         kwargs = member.edit.await_args.kwargs
         self.assertIs(kwargs.get("deafen"), False)
-        self.assertTrue(kwargs.get("mute"))
+        self.assertIs(kwargs.get("mute"), False)
 
     async def test_desired_state_makes_no_api_call(self) -> None:
         cog = self._cog()
-        member = _member(mute=True, deaf=False)
+        member = _member(mute=False, deaf=False)
         guild = _guild_with_member(member)
         member.guild = guild
-        await self._dispatch(cog, member, before_m=False, before_d=True, after_m=True, after_d=False)
+        await self._dispatch(
+            cog, member, before_m=True, before_d=True, after_m=False, after_d=False
+        )
         member.edit.assert_not_awaited()
 
     async def test_identical_voice_events_are_deduplicated(self) -> None:
         cog = self._cog()
-        member = _member(mute=False, deaf=False)
+        member = _member(mute=True, deaf=False)
         guild = _guild_with_member(member)
         member.guild = guild
         for _ in range(5):
             await cog.on_voice_state_update(
                 member,
-                SimpleNamespace(mute=True, deaf=False),
                 SimpleNamespace(mute=False, deaf=False),
+                SimpleNamespace(mute=True, deaf=False),
             )
         state = cog._states.get(guild.id)
         if state is not None and state.retry_task is not None:
@@ -736,10 +739,12 @@ class TestVoiceEnforcement(unittest.IsolatedAsyncioTestCase):
 
     async def test_missing_permission_never_calls_the_api(self) -> None:
         cog = self._cog()
-        member = _member(mute=False, deaf=False, can_manage=False)
+        member = _member(mute=True, deaf=False, can_manage=False)
         guild = _guild_with_member(member)
         member.guild = guild
-        await self._dispatch(cog, member, before_m=True, before_d=False, after_m=False, after_d=False)
+        await self._dispatch(
+            cog, member, before_m=False, before_d=False, after_m=True, after_d=False
+        )
         member.edit.assert_not_awaited()
 
     async def test_other_members_are_ignored(self) -> None:
@@ -757,12 +762,14 @@ class TestVoiceEnforcement(unittest.IsolatedAsyncioTestCase):
 
     async def test_wait_for_idle_resolves_after_enforcement(self) -> None:
         cog = self._cog()
-        member = _member(mute=False, deaf=False)
+        member = _member(mute=True, deaf=False)
         guild = _guild_with_member(member)
         member.guild = guild
-        await self._dispatch(cog, member, before_m=True, before_d=False, after_m=False, after_d=False)
+        await self._dispatch(
+            cog, member, before_m=False, before_d=False, after_m=True, after_d=False
+        )
         await asyncio.wait_for(cog.wait_for_idle(guild.id), timeout=2)
-        self.assertTrue(member.edit.await_count >= 1)
+        self.assertGreaterEqual(member.edit.await_count, 1)
 
 
 # ---------------------------------------------------------------------------

@@ -48,8 +48,11 @@ class Utility(commands.Cog):
         self.conversion_engine = ConversionEngine()
 
     async def cog_unload(self) -> None:
-        for task in self.reminders.values():
+        tasks = tuple(self.reminders.values())
+        for task in tasks:
             task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     # -- retired public commands ------------------------------------------
     #

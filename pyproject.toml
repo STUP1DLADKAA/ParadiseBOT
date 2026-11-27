@@ -22,6 +22,7 @@ dependencies = [
     # Discord API + voice stack. discord.py is listed without [voice] because
     # 2.7.1 caps PyNaCl<1.6 while the bot needs PyNaCl 1.6.x + davey 0.2.0.
     "discord.py>=2.7.1,<3.0",
+    "audioop-lts>=0.2.1; python_version >= '3.13'",
     # Transport AEAD: PyNaCl supplies XChaCha20-Poly1305; cryptography
     # supplies hardware-accelerated AES-256-GCM.
     "PyNaCl>=1.6.2,<1.7",

@@ -483,7 +483,7 @@ def review_file(diff: FileDiff, report: ReviewReport) -> None:
                         snippet,
                     )
                 )
-            if re.search(r"\.table\s*\(", text) and "select\(" in text:
+            if re.search(r"\.table\s*\(", text) and r"select\(" in text:
                 pass  # filter check below
             if re.search(r"select\s*\(\s*[\"']\*[\"']\s*\)", text):
                 report.add(

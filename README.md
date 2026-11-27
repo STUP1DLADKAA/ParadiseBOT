@@ -161,9 +161,12 @@ answers are grounded in the conversation actually happening.
 
 ## Quick start
 
-**Requirements:** Python 3.11+ and a Discord bot token. About 150 MB of disk
-for dependencies, and no speech-recognition weights to download — the bot
-transcribes nothing. Linux, macOS and Windows all work.
+**Requirements:** Python 3.11+ and a Discord bot token. In the measured
+Linux/Python 3.11 environment, the full install used about 537 MB of
+`site-packages` (roughly 555 MiB for the `.venv`); the voice/audio stack
+accounts for most of it, and wheel sizes vary by platform. No
+speech-recognition weights are downloaded — the bot transcribes nothing.
+Linux, macOS and Windows all work.
 
 ```bash
 git clone https://github.com/STUP1DLADKAA/ParadiseBOT.git

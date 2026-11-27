@@ -74,7 +74,6 @@ PROTECTED_NAMES: frozenset[str] = frozenset(
         ".env",
         ".env.local",
         ".env.production",
-        ".env.example",
         ".git",
         ".github",
         ".venv",
@@ -91,7 +90,6 @@ PROTECTED_NAMES: frozenset[str] = frozenset(
         ".pytest_cache",
         ".mypy_cache",
         ".ruff_cache",
-        "bot.py",
         "requirements.txt",
         "requirements-dev.txt",
     }

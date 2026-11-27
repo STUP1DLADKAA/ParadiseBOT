@@ -199,6 +199,9 @@ GITHUB_TOKEN=                   # optional: raises the API rate limit
 * **Never touched:** `.env` (and every `.env.*` except `.env.example`), `.git`,
   `data/`, virtualenvs, caches, `*.db` / `*.sqlite` / `*.log`, plus anything in
   `AUTO_UPDATE_PROTECTED`.
+* **Operator-managed:** `config.py`, `requirements*.txt`, `.github/`, `supabase/`,
+  `tests/` and `tools/` are not overlaid. Dependency changes are not installed
+  automatically and database migrations are never executed by the updater.
 * **Validated first:** the archive must contain `bot.py` and
   `requirements.txt`, every `.py` file must compile, and path traversal is
   rejected. A bad download changes nothing.
