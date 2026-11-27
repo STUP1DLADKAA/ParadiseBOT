@@ -94,28 +94,27 @@ DEFAULT_SCALE = 2
 _MAX_SCALE = 3
 
 # ---------------------------------------------------------------------------
-# Palette — dark, Material Expressive 3.
+# Palette — a light page, white cards, one accent per period.
 # ---------------------------------------------------------------------------
-# Dark is the safe default next to Discord's dark UI: deep surfaces, one
-# accent colour per period, and muted greys for everything that is not the
-# number the reader came for.
+# Kept intentionally light so the rendered image stays clear in Discord's
+# dark theme as well as on a phone screen; body copy remains high-contrast.
 
-BG_TOP = (18, 20, 24)              # #121418 deep surface
-BG_BOTTOM = (24, 26, 32)           # #181A20 slightly lighter surface
-SURFACE_COLOR = (30, 33, 40)       # #1E2128 card surface
-SURFACE_LIGHT = (38, 41, 48)       # #262930 chips / tracks
-CARD_BORDER = (56, 60, 70)         # #383C46 hairline
-CARD_BORDER_SOFT = (46, 49, 56)    # #2E3138 inner separators
-TRACK_COLOR = (46, 49, 56)         # progress-bar track
+BG_TOP = (233, 244, 255)           # #E9F4FF cool header wash
+BG_BOTTOM = (242, 242, 247)        # #F2F2F7 light grey page
+SURFACE_COLOR = (255, 255, 255)    # white cards
+SURFACE_LIGHT = (250, 250, 252)    # #FAFAFC chips / tracks
+CARD_BORDER = (220, 220, 226)      # quiet hairline
+CARD_BORDER_SOFT = (238, 238, 243) # soft inner separators
+TRACK_COLOR = (235, 235, 240)      # progress-bar track
 ACCENT_PURPLE = (142, 110, 255)    # #8E6EFF expressive purple
 ACCENT_CYAN = (64, 196, 255)       # #40C4FF expressive cyan
 ACCENT_BLUE = (99, 160, 255)       # #63A0FF expressive blue
 ACCENT_TEAL = (66, 200, 170)       # #42C8AA expressive teal
 ACCENT_PINK = (255, 90, 140)       # #FF5A8C expressive pink
 ACCENT_ORANGE = (255, 165, 80)     # #FFA550 expressive orange
-TEXT_PRIMARY = (238, 242, 250)     # #EEF2FA near-white label
-TEXT_SECONDARY = (165, 174, 190)   # #A5AEBE secondaryLabel
-TEXT_MUTED = (110, 118, 130)       # #6E7682 tertiaryLabel
+TEXT_PRIMARY = (29, 29, 31)        # #1D1D1F primary label
+TEXT_SECONDARY = (110, 110, 115)   # #6E6E73 secondary label
+TEXT_MUTED = (142, 142, 147)       # #8E8E93 tertiary label
 
 GOLD = (255, 179, 0)                 # #FFB300
 GOLD_DEEP = (255, 149, 0)            # #FF9500

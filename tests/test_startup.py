@@ -454,8 +454,8 @@ class TestBotStartupFlow(unittest.TestCase):
     """The real bot must await exactly one sync during setup_hook."""
 
     def test_setup_hook_loads_then_syncs_then_marks_ready(self):
-        from config import Config
         from bot import EXTENSIONS, ParadiseBot
+        from config import Config
 
         async def run_startup():
             bot = ParadiseBot(Config())
@@ -478,11 +478,9 @@ class TestBotStartupFlow(unittest.TestCase):
             bot.synchronizer.run = tracked_run
             bot.load_extension = fake_load
             bot.presence_manager.start = lambda: order.append("presence")
-            # The real loop is not running here, so tasks are recorded and
-            # closed instead of scheduled (start-up must not need a live loop).
-            bot.loop = SimpleNamespace(
-                create_task=lambda coro, **kwargs: coro.close()
-            )
+            # These one-shot warmups are unrelated to sync ordering; close
+            # their coroutines rather than starting background work in the test.
+            bot._schedule_background_task = lambda coro, *, name: coro.close()
 
             await bot.setup_hook()
             return order, bot, tree
@@ -495,6 +493,70 @@ class TestBotStartupFlow(unittest.TestCase):
         self.assertTrue(bot.commands_ready)
         self.assertIn(TARGET_GUILD, tree.sync_calls)
         self.assertEqual(len(EXTENSIONS), len([x for x in order if x.startswith("load:")]))
+
+    def test_background_startup_tasks_are_cancelled_on_close(self):
+        from bot import ParadiseBot
+        from config import Config
+
+        async def run():
+            bot = ParadiseBot(Config())
+            started = asyncio.Event()
+            stopped = asyncio.Event()
+
+            async def lingering_task():
+                started.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    stopped.set()
+
+            bot._schedule_background_task(lingering_task(), name="test-startup-task")
+            await started.wait()
+            await bot.close()
+            return stopped.is_set()
+
+        self.assertTrue(asyncio.run(run()))
+
+    def test_cogs_unload_before_shared_services_close(self):
+        from unittest.mock import AsyncMock, Mock, patch
+
+        from discord.ext import commands
+
+        import bot as bot_module
+        from config import Config
+
+        async def run():
+            order: list[str] = []
+
+            class MarkerCog(commands.Cog):
+                async def cog_unload(self):
+                    order.append("cog-unload")
+
+            bot = bot_module.ParadiseBot(Config())
+            await bot.add_cog(MarkerCog())
+            bot.presence_manager.stop = AsyncMock(
+                side_effect=lambda: order.append("presence-stop")
+            )
+            bot.ai.close = AsyncMock(side_effect=lambda: order.append("ai-close"))
+            bot.memory.close = Mock(side_effect=lambda: order.append("memory-close"))
+
+            async def close_sessions():
+                order.append("shared-sessions-close")
+
+            async def stop_renderer():
+                order.append("renderer-stop")
+
+            with (
+                patch.object(bot_module.perf, "close_shared_sessions", close_sessions),
+                patch.object(bot_module.perf, "shutdown_render_pool", stop_renderer),
+            ):
+                await bot.close()
+            return order
+
+        order = asyncio.run(run())
+        self.assertLess(order.index("cog-unload"), order.index("ai-close"))
+        self.assertLess(order.index("cog-unload"), order.index("shared-sessions-close"))
+        self.assertLess(order.index("cog-unload"), order.index("renderer-stop"))
 
     def test_bot_never_syncs_from_on_ready(self):
         import inspect

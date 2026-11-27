@@ -3,20 +3,21 @@
 Two facts about Discord voice make this deliberate design, not an accident:
 
 * **Server mute** (``guild.me.edit(mute=True)``) stops the bot *transmitting*
-  to listeners. Paradise is an eavesdropping clipping bot — it should never be
-  audible, so the muted state is the desired state and is restored whenever
-  someone clears it.
+  to listeners. Paradise joins with ``self_mute=True`` so it never speaks, but
+  server mute is not part of the desired state: it can interfere with optional
+  arrival speech and is cleared whenever it appears.
 * **Server deafen** stops the bot *receiving* — Discord does not deliver any
   RTP at all to a server-deafened client, which silently kills ``/clip``.
   Paradise therefore never deafens itself, and removes a server deafen the
   moment it appears.
 
 Self mute/self deafen flags are managed separately: the bot joins with
-self_mute=True, self_deaf=False (personally muted, can still hear) and the clip cog re-applies self_mute whenever it is cleared.
+``self_mute=True, self_deaf=False`` (personally muted, can still hear), and the
+clip cog re-applies ``self_mute`` whenever it is cleared.
 
 How enforcement stays loop- and rate-limit-safe:
 
-* The desired state is a constant: ``muted=False, deafened=False``.
+* The desired state is a constant: ``muted=False, deafened=False`` (no server mute or deafen).
 * ``on_voice_state_update`` deduplicates identical (before, after) mute/deaf
   pairs, so the bot's *own* enforcement edit never re-triggers anything and
   repeated voice events (channel hops, self-flag flips) cost zero API calls.
@@ -69,7 +70,7 @@ class _GuildEnforcementState:
 
 
 class VoiceEnforcement(commands.Cog):
-    """Keep Paradise server-muted and server-undeafened, permanently."""
+    """Keep Paradise server-unmuted and server-undeafened, permanently."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
@@ -219,7 +220,7 @@ class VoiceEnforcement(commands.Cog):
         task.add_done_callback(self._tasks.discard)
 
     async def _apply_desired(self, guild: discord.Guild, *, reason: str) -> None:
-        """Make the live voice state match *muted, undeafened* — once."""
+        """Make the live voice state match *server-unmuted, undeafened* — once."""
         state = self._states.setdefault(guild.id, _GuildEnforcementState())
         if state.inflight:
             state.pending = True
@@ -254,8 +255,7 @@ class VoiceEnforcement(commands.Cog):
                             "Cannot enforce Paradise's permanent voice state in "
                             "guild %s: the bot is missing the 'Mute Members' "
                             "permission. Grant it (Server Settings → Roles) so "
-                            "Paradise can keep itself server-muted and remove "
-                            "server deafens.",
+                            "Paradise can remove server mutes and deafens.",
                             guild.id,
                         )
                     return

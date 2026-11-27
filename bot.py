@@ -180,6 +180,7 @@ class ParadiseBot(commands.Bot):
         )
         self.commands_ready = False
         self.autoupdate_task: asyncio.Task | None = None
+        self._background_tasks: set[asyncio.Task] = set()
         # Exactly-once guard for message dispatch (bounded, in-memory).
         self._handled: deque[int] = deque()
         self._handled_ids: set[int] = set()
@@ -187,6 +188,13 @@ class ParadiseBot(commands.Bot):
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
+
+    def _schedule_background_task(self, coro, *, name: str) -> asyncio.Task:
+        """Create and retain a short-lived startup task for orderly shutdown."""
+        task = asyncio.create_task(coro, name=name)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
 
     async def setup_hook(self) -> None:
         """The explicit startup flow: extensions → prune → sync → ready."""
@@ -213,17 +221,17 @@ class ParadiseBot(commands.Bot):
 
         # Warm fonts, card backdrops and the render pool while Discord is
         # still connecting, so the first `/vc leaderboard` is not the slow one.
-        self.loop.create_task(
+        self._schedule_background_task(
             perf.prewarm(enabled=bool(getattr(self.config, "prewarm", True))),
             name="paradise-prewarm",
         )
         # Validate the Gemini key (if any) in the background — validation is
         # never fatal: an unreachable network simply skips it.
-        self.loop.create_task(self._validate_ai())
+        self._schedule_background_task(self._validate_ai(), name="paradise-ai-validation")
 
         # Warm the meme cache so the first meme reply is instant instead of
         # waiting for Reddit. Best effort: no internet just means an empty cache.
-        self.loop.create_task(self._warm_memes(), name="paradise-memes")
+        self._schedule_background_task(self._warm_memes(), name="paradise-memes")
 
         self.presence_manager.start()
 
@@ -264,50 +272,60 @@ class ParadiseBot(commands.Bot):
             log.debug("AI startup validation skipped", exc_info=True)
 
     async def close(self) -> None:
-        watcher = getattr(self, "autoupdate_task", None)
-        if watcher is not None:
-            watcher.cancel()
-            try:
-                await watcher
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        clip_service = getattr(self, "voice_clip_service", None)
-        if clip_service is not None:
-            try:
-                await clip_service.shutdown()
-            except Exception:
-                log.debug("Voice clip shutdown failed", exc_info=True)
+        # Stop bot-owned loops before extensions unload, but leave their shared
+        # services alive until each cog has had a chance to flush and close.
+        tasks = set(self._background_tasks)
+        for task in (self.autoupdate_task, self.memory_mirror_task):
+            if task is not None:
+                tasks.add(task)
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+        self._background_tasks.clear()
+        self.autoupdate_task = None
+        self.memory_mirror_task = None
+
         try:
             await self.presence_manager.stop()
         except Exception:
             log.debug("Presence stop failed", exc_info=True)
-        mirror_task = getattr(self, "memory_mirror_task", None)
-        if mirror_task is not None:
-            mirror_task.cancel()
-            try:
-                await mirror_task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-        try:
-            await self.ai.close()
-        except Exception:
-            log.debug("Shutdown step failed", exc_info=True)
-        try:
-            self.memory.close()
-        except Exception:
-            log.debug("Memory store shutdown failed", exc_info=True)
+
         callback_server = getattr(self, "mal_callback_server", None)
         if callback_server is not None:
             try:
                 await callback_server.stop()
             except Exception:
                 log.debug("MAL callback server shutdown failed", exc_info=True)
+
         try:
-            await perf.close_shared_sessions()
-            await perf.shutdown_render_pool()
-        except Exception:
-            log.debug("Shared-session shutdown failed", exc_info=True)
-        await super().close()
+            # commands.Bot.close unloads extensions/cogs before closing the
+            # gateway. Their unload hooks may flush voice data, stop renderers,
+            # or close feature-owned HTTP clients, so shared resources remain
+            # open until those hooks finish.
+            await super().close()
+        finally:
+            # The clip cog normally owns this cleanup; keep an idempotent
+            # fallback for partial extension-load failures.
+            clip_service = getattr(self, "voice_clip_service", None)
+            if clip_service is not None:
+                try:
+                    await clip_service.shutdown()
+                except Exception:
+                    log.debug("Voice clip shutdown failed", exc_info=True)
+            try:
+                await self.ai.close()
+            except Exception:
+                log.debug("Shutdown step failed", exc_info=True)
+            try:
+                self.memory.close()
+            except Exception:
+                log.debug("Memory store shutdown failed", exc_info=True)
+            try:
+                await perf.close_shared_sessions()
+                await perf.shutdown_render_pool()
+            except Exception:
+                log.debug("Shared-session shutdown failed", exc_info=True)
 
     async def on_ready(self) -> None:
         # Reaching Discord proves the code that is running works, so the
